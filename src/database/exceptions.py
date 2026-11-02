@@ -1,4 +1,4 @@
-"""Custom exceptions for the SQLite database and job management engine."""
+"""Custom exceptions for the SQLite database, security, and authentication engine."""
 
 
 class DatabaseError(Exception):
@@ -13,6 +13,22 @@ class DuplicateJobError(DatabaseError):
         super().__init__(message)
         self.existing_job_id = existing_job_id
         self.duplicate_field = duplicate_field
+
+
+class DuplicateUserError(DatabaseError):
+    """Raised when an attempt is made to register an email address that already exists."""
+
+    def __init__(self, email: str):
+        super().__init__(f"An account with email '{email}' already exists.")
+        self.email = email
+
+
+class UserNotFoundError(DatabaseError):
+    """Raised when a requested user record cannot be found."""
+
+    def __init__(self, identifier: int | str):
+        super().__init__(f"User '{identifier}' was not found.")
+        self.identifier = identifier
 
 
 class JobNotFoundError(DatabaseError):
@@ -90,3 +106,73 @@ class InvalidSessionError(SecurityAuthorizationError):
     pass
 
 
+class AccountLockedError(SecurityAuthorizationError):
+    """Raised when an account is temporarily locked due to consecutive failed login attempts."""
+
+    def __init__(self, locked_until_str: str):
+        super().__init__(f"Account is temporarily locked due to failed login attempts until {locked_until_str}.")
+        self.locked_until = locked_until_str
+
+
+class AuthenticationFailedError(SecurityAuthorizationError):
+    """Raised on invalid email or password credentials."""
+
+    def __init__(self, message: str = "Invalid email or password."):
+        super().__init__(message)
+
+
+class TicketAlreadyConsumedError(SecurityAuthorizationError):
+    """Raised when an action ticket or approval nonce has already been consumed (replay attack)."""
+
+    def __init__(self, message: str = "Action ticket or approval nonce has already been consumed."):
+        super().__init__(message)
+
+
+class InvalidTicketError(SecurityAuthorizationError):
+    """Raised when an action ticket is malformed, unrecognized, or fails signature verification."""
+    pass
+
+
+class KeyRevokedError(SecurityAuthorizationError):
+    """Raised when an action ticket was signed with a revoked or retired HMAC key."""
+
+    def __init__(self, key_id: str):
+        super().__init__(
+            f"Action ticket signed with revoked or unknown key '{key_id}'. "
+            f"Key rotation in effect. Fresh candidate authorization required."
+        )
+        self.key_id = key_id
+
+
+class TokenExpiredError(SecurityAuthorizationError):
+    """Raised when a password reset token has expired."""
+
+    def __init__(self, message: str = "Password reset token has expired."):
+        super().__init__(message)
+
+
+class TokenAlreadyUsedError(SecurityAuthorizationError):
+    """Raised when a password reset token has already been consumed."""
+
+    def __init__(self, message: str = "Password reset token has already been used."):
+        super().__init__(message)
+
+
+class RateLimitExceededError(SecurityAuthorizationError):
+    """Raised when authentication or recovery rate limits are exceeded."""
+
+    def __init__(self, message: str = "Rate limit exceeded. Please try again later."):
+        super().__init__(message)
+
+
+class CrossUserAccessError(SecurityAuthorizationError):
+    """Raised when an authenticated user attempts to access or link to another user's records."""
+
+    def __init__(self, user_id: int, target_user_id: int, resource: str):
+        super().__init__(
+            f"Cross-user security violation: User #{user_id} unauthorized to access or link "
+            f"{resource} owned by User #{target_user_id}."
+        )
+        self.user_id = user_id
+        self.target_user_id = target_user_id
+        self.resource = resource

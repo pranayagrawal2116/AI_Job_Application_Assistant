@@ -1,0 +1,49 @@
+{
+  "full_name": "Alex Developer",
+  "email": "alex.dev.fixture@example.com",
+  "phone": "+1-555-0100",
+  "location": "Bengaluru, India",
+  "education": {
+    "degree": "B.Tech in Computer Science and Engineering (AI & Data Science)",
+    "institution": "Institute of Technology",
+    "graduation_year": 2028,
+    "cgpa": 7.6,
+    "scale": 10.0
+  },
+  "technical_skills": {
+    "programming_languages": ["Python", "JavaScript", "C++", "Dart"],
+    "machine_learning": ["TensorFlow", "Scikit-Learn", "PyTorch", "NLP", "Computer Vision"],
+    "web_and_mobile": ["FastAPI", "Flask", "Flutter", "Streamlit", "HTML5", "CSS3"],
+    "databases": ["SQLite", "PostgreSQL", "MongoDB"],
+    "tools_and_platforms": ["Git", "Docker", "Playwright", "Linux"]
+  },
+  "work_experience": [
+    {
+      "company": "Tech Innovations Pvt. Ltd.",
+      "role": "Mobile App Developer / Project Coordinator",
+      "duration_months": 3,
+      "location": "Remote",
+      "highlights": [
+        "Coordinated mobile application integration using Flutter and RESTful APIs",
+        "Assisted in technical requirement mapping and deployment pipelines"
+      ]
+    }
+  ],
+  "projects": [
+    {
+      "name": "Medical Assistant AI Chatbot",
+      "technologies": ["Python", "FastAPI", "NLP", "Streamlit"],
+      "description": "Healthcare information triage chatbot powered by transformer-based language models."
+    },
+    {
+      "name": "Health Data Gateway",
+      "technologies": ["Dart", "Flutter", "REST APIs"],
+      "description": "Mobile health data aggregation client following standardized data protocols."
+    }
+  ],
+  "preferences": {
+    "target_roles": ["AI/ML Intern", "Data Science Intern", "Software Engineering Intern"],
+    "work_arrangements": ["Remote", "Hybrid", "In-office"],
+    "preferred_locations": ["India", "Remote"]
+  }
+}

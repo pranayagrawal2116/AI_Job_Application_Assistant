@@ -70,6 +70,7 @@ class Job:
     last_verified: Optional[str] = None
     extraction_confidence: float = 1.0
     notes: Optional[str] = None
+    user_id: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -110,7 +111,11 @@ class Job:
 
 @dataclass
 class Application:
-    job_id: int
+    job_id: Optional[int] = None
+    job_description_id: Optional[int] = None
+    user_id: Optional[int] = None
+    company_name: str = "Unknown"
+    job_title: str = "Role"
     status: str = ApplicationStatus.DISCOVERED.value
     id: Optional[int] = None
     date_prepared: Optional[str] = None
@@ -127,10 +132,12 @@ class Application:
 
 @dataclass
 class ApplicationLog:
-    job_id: int
     action: str
+    job_id: Optional[int] = None
     id: Optional[int] = None
     application_id: Optional[int] = None
+    user_id: Optional[int] = None
+    anonymized_user_pseudonym: Optional[str] = None
     timestamp: Optional[str] = None
     details: Any = None
 
@@ -153,8 +160,111 @@ class ApplicationLog:
 class CandidateProfileRecord:
     profile_data: Dict[str, Any]
     id: Optional[int] = None
+    user_id: Optional[int] = None
+    version: int = 1
+    is_active: bool = True
     last_updated: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+
+@dataclass
+class User:
+    """Authenticated platform user."""
+    id: int
+    email: str
+    password_hash: str
+    password_salt: str
+    full_name: str
+    profession_industry: Optional[str] = None
+    career_level: Optional[str] = None
+    account_status: str = "active"
+    failed_login_attempts: int = 0
+    locked_until: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PasswordResetToken:
+    """Single-use password reset token record."""
+    id: int
+    user_id: int
+    token_hash: str
+    token_salt: str
+    expires_at: str
+    ip_address: Optional[str] = None
+    is_used: bool = False
+    used_at: Optional[str] = None
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class PreparedPacket:
+    """Application revision materials bundle."""
+    application_id: int
+    user_id: int
+    packet_version_hash: str
+    original_resume_hash: str
+    job_description_snapshot_hash: str
+    screening_answers_json: str
+    id: Optional[int] = None
+    version_num: int = 1
+    original_resume_id: Optional[int] = None
+    tailored_resume_path: Optional[str] = None
+    tailored_resume_hash: Optional[str] = None
+    cover_letter_path: Optional[str] = None
+    cover_letter_hash: Optional[str] = None
+    form_payload_json: Optional[str] = None
+    form_payload_hash: Optional[str] = None
+    attachments_manifest_json: Optional[str] = None
+    attachments_manifest_hash: Optional[str] = None
+    is_active_revision: bool = True
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ApplicationApproval:
+    """Human approval record."""
+    application_id: int
+    packet_version_hash: str
+    ticket_nonce: str
+    key_id: str
+    approver_name: str
+    session_id: str
+    id: Optional[int] = None
+    packet_id: Optional[int] = None
+    user_id: Optional[int] = None
+    approved_at: Optional[str] = None
+    consumed_at: Optional[str] = None
+    is_consumed: bool = False
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class JobDescription:
+    """Manual or parsed user-provided job description."""
+    user_id: int
+    source_type: str
+    company_name: str
+    job_title: str
+    raw_content: str
+    content_hash: str
+    id: Optional[int] = None
+    parsed_data: Optional[str] = None
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
