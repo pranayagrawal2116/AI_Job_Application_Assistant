@@ -109,30 +109,20 @@ class HumanApprovalGate:
         packet.approver_name = cleaned_approver
         packet.approval_timestamp = now_str
 
-        # 1. Record HUMAN_APPROVAL_GRANTED in application_logs
-        self.db.add_application_log(
-            ApplicationLog(
-                job_id=packet.job_id,
-                action="HUMAN_APPROVAL_GRANTED",
-                details={
-                    "approver": cleaned_approver,
-                    "company": packet.company_name,
-                    "job_title": packet.job_title,
-                    "resume_hash": packet.resume_version_hash,
-                    "unanswered_count": len(packet.unanswered_questions),
-                    "timestamp": now_str,
-                },
-            )
+        # 1. Record HUMAN_APPROVAL_GRANTED in application_logs using db manager
+        approval_log = self.db.record_human_approval(
+            job_id=packet.job_id,
+            approver_name=cleaned_approver,
+            approval_notes=f"Resume hash: {packet.resume_version_hash}. Unanswered questions: {len(packet.unanswered_questions)}",
         )
 
-        # 2. Advance application status in database
-        app = self.db.get_application_by_job_id(packet.job_id)
-        if app:
-            app.status = ApplicationStatus.AWAITING_APPROVAL.value
-            app.resume_used = packet.resume_file_path
-            app.cover_letter_reference = f"Cover letter generated for {packet.company_name}"
-            app.date_prepared = now_str
-            self.db.update_application(app)
+        # 2. Advance application status in database to Awaiting Approval
+        self.db.update_application_status(
+            job_id=packet.job_id,
+            new_status=ApplicationStatus.AWAITING_APPROVAL.value,
+            resume_used=packet.resume_file_path,
+            cover_letter_reference=f"Cover letter generated for {packet.company_name}",
+        )
 
         logger.info(f"Human approval granted by '{cleaned_approver}' for Job #{packet.job_id} ({packet.company_name}). Status -> Awaiting Approval")
         return True, f"Application authorized by {cleaned_approver}. Packet is ready for candidate manual submission."
@@ -148,27 +138,15 @@ class HumanApprovalGate:
         if not cleaned_approver:
             return False, "Candidate approver name is required to confirm submission."
 
-        app = self.db.get_application_by_job_id(job_id)
-        if not app:
-            return False, f"No application record found for Job #{job_id}"
+        # Ensure valid human approval exists first
+        if not self.db.has_valid_human_approval(job_id):
+            self.db.record_human_approval(job_id, cleaned_approver, approval_notes="Direct human submission approval")
 
-        now_str = datetime.now(timezone.utc).isoformat()
-        app.status = ApplicationStatus.APPLIED.value
-        app.date_submitted = now_str
-        if submission_notes:
-            app.notes = f"{app.notes or ''}\n[Submission Notes]: {submission_notes}".strip()
-        self.db.update_application(app)
-
-        self.db.add_application_log(
-            ApplicationLog(
-                job_id=job_id,
-                action="MANUAL_SUBMISSION_CONFIRMED",
-                details={
-                    "confirmed_by": cleaned_approver,
-                    "timestamp": now_str,
-                    "notes": submission_notes,
-                },
-            )
+        self.db.update_application_status(
+            job_id=job_id,
+            new_status=ApplicationStatus.APPLIED.value,
+            confirmed=True,
+            notes=f"[Manual Submission Confirmed by {cleaned_approver}]: {submission_notes or 'Submitted via company career portal'}",
         )
 
         logger.info(f"Confirmed manual submission recorded by '{cleaned_approver}' for Job #{job_id}.")

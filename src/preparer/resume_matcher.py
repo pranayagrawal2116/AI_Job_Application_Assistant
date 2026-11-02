@@ -71,31 +71,81 @@ class ResumeJobMatcher:
             tools = self.profile.get("technical_skills", {}).get("developer_tools", [])
             candidate_skills = list(set(prog + mobile + apis + dbs + tools))
 
+        # Also include skills/technologies mentioned in verified candidate projects
+        for p in self.profile.get("projects", []):
+            for t in p.get("technologies", []):
+                if t not in candidate_skills:
+                    candidate_skills.append(t)
+
+        def normalize_skill(s: str) -> str:
+            clean = s.strip().lower()
+            if clean.endswith("s") and len(clean) > 3 and not clean.endswith("ss"):
+                clean = clean[:-1]
+            return clean
+
         matching_skills = []
         for sk in candidate_skills:
-            if re.search(r"(?<!\w)" + re.escape(sk.lower()) + r"(?!\w)", job_full_text):
+            sk_clean = sk.lower()
+            sk_norm = normalize_skill(sk)
+            # Standard boundary match or normalized alias
+            if re.search(r"(?<!\w)" + re.escape(sk_clean) + r"(?!\w)", job_full_text):
                 matching_skills.append(sk)
+            elif "rest api" in sk_clean and ("rest api" in job_full_text or "restful" in job_full_text or "apis" in job_full_text):
+                if sk not in matching_skills:
+                    matching_skills.append(sk)
+            elif "git" in sk_clean and ("git" in job_full_text or "github" in job_full_text):
+                if sk not in matching_skills:
+                    matching_skills.append(sk)
+            elif "c/c++" in sk_clean and ("c++" in job_full_text or "c/c++" in job_full_text):
+                if sk not in matching_skills:
+                    matching_skills.append(sk)
+            elif "sqlite" in sk_clean and "sql" in job_full_text:
+                if sk not in matching_skills:
+                    matching_skills.append(sk)
+
+        # Also check against explicitly listed required_skills
+        for r_skill in req_skills:
+            r_str = str(r_skill).strip()
+            r_norm = normalize_skill(r_str)
+            for c_skill in candidate_skills:
+                c_norm = normalize_skill(c_skill)
+                if (
+                    r_norm == c_norm
+                    or r_norm in c_norm
+                    or c_norm in r_norm
+                    or ("rest api" in r_norm and "rest api" in c_norm)
+                ):
+                    if c_skill not in matching_skills:
+                        matching_skills.append(c_skill)
 
         # 2. Extract employer requested skills from req_skills and job text
         missing_requirements = []
-        common_tech_tokens = [
-            "pytorch", "tensorflow", "keras", "opencv", "scikit-learn",
-            "langchain", "transformers", "hugging face", "llm", "generative ai",
-            "docker", "kubernetes", "aws", "gcp", "azure", "sql", "nosql",
-            "fastapi", "flask", "django", "react", "next.js", "c++", "linux"
+        canonical_tokens = [
+            "PyTorch", "TensorFlow", "Keras", "OpenCV", "Scikit-learn",
+            "LangChain", "Transformers", "Hugging Face", "LLM", "Generative AI",
+            "Docker", "Kubernetes", "AWS", "GCP", "Azure", "SQL", "NoSQL",
+            "FastAPI", "Flask", "Django", "React", "Next.js", "Linux"
         ]
+
         # Inspect explicitly mentioned job skills
         for r_skill in req_skills:
             r_str = str(r_skill).strip()
-            if r_str and not any(m.lower() in r_str.lower() or r_str.lower() in m.lower() for m in candidate_skills):
+            r_norm = normalize_skill(r_str)
+            matched = False
+            for m in candidate_skills:
+                m_norm = normalize_skill(m)
+                if r_norm == m_norm or r_norm in m_norm or m_norm in r_norm or ("rest api" in r_norm and "rest api" in m_norm):
+                    matched = True
+                    break
+            if not matched and r_str:
                 if r_str not in missing_requirements:
                     missing_requirements.append(r_str)
 
-        for tok in common_tech_tokens:
-            if re.search(r"(?<!\w)" + re.escape(tok) + r"(?!\w)", job_full_text):
-                if not any(tok == c.lower() or tok in c.lower() for c in candidate_skills):
-                    if tok.capitalize() not in missing_requirements:
-                        missing_requirements.append(tok.capitalize())
+        for tok in canonical_tokens:
+            if re.search(r"(?<!\w)" + re.escape(tok.lower()) + r"(?!\w)", job_full_text):
+                if not any(tok.lower() == c.lower() or tok.lower() in c.lower() for c in candidate_skills):
+                    if tok not in missing_requirements and not any(tok.lower() == mr.lower() for mr in missing_requirements):
+                        missing_requirements.append(tok)
 
         # 3. Match Relevant Projects
         candidate_projects = self.profile.get("projects", [])

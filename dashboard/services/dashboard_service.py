@@ -272,3 +272,99 @@ class DashboardService:
             return True, "Candidate profile updated and version recorded."
         except Exception as exc:
             return False, f"Failed saving candidate profile: {exc}"
+
+    # -------------------------------------------------------------------------
+    # PHASE 7: APPLICATION PREPARATION & HUMAN APPROVAL HELPERS
+    # -------------------------------------------------------------------------
+
+    def get_available_resumes(self) -> List[Path]:
+        """Returns list of available resume files in data/resumes/."""
+        resume_dir = Path("data/resumes")
+        if not resume_dir.exists():
+            return []
+        return sorted([f for f in resume_dir.iterdir() if f.suffix.lower() in [".pdf", ".docx"] and not f.name.startswith(".")])
+
+    def sync_resume_file(self, resume_path: str | Path) -> Tuple[bool, str, Dict[str, Any]]:
+        """Parses a resume file and updates profile and SQLite version history."""
+        try:
+            from src.preparer.profile_updater import ProfileUpdater
+            updater = ProfileUpdater(db_manager=self.db)
+            updated_prof = updater.sync_from_resume(resume_path)
+            self.matcher = JobMatcher(candidate_profile=updated_prof, db_manager=self.db)
+            return True, "Resume parsed and profile updated successfully.", updated_prof
+        except Exception as e:
+            return False, f"Resume parsing failed: {e}", {}
+
+    def get_job_alignment(self, job_id: int):
+        """Returns JobAlignment object for a given job."""
+        from src.preparer.resume_matcher import ResumeJobMatcher
+        job = self.db.get_job_by_id(job_id)
+        if not job:
+            return None
+        matcher = ResumeJobMatcher()
+        return matcher.align_job(job)
+
+    def generate_cover_letter_for_job(self, job_id: int) -> Dict[str, str]:
+        """Generates tailored cover letter for a given job."""
+        from src.preparer.cover_letter_generator import CoverLetterGenerator
+        job = self.db.get_job_by_id(job_id)
+        if not job:
+            return {"letter_text": "", "file_path": "", "filename": ""}
+        generator = CoverLetterGenerator()
+        return generator.generate_cover_letter(job)
+
+    def generate_questions_for_job(self, job_id: int) -> Dict[str, Any]:
+        """Generates tailored screening question responses for a given job."""
+        from src.preparer.question_answerer import QuestionAnswerer
+        job = self.db.get_job_by_id(job_id)
+        if not job:
+            return {}
+        answerer = QuestionAnswerer()
+        return answerer.generate_standard_answers(job)
+
+    def authorize_application_packet(
+        self,
+        job_id: int,
+        approver_name: str,
+        candidate_confirmed: bool,
+        cover_letter: str,
+        answers: Dict[str, Any],
+        resume_path: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Authorizes an application packet through the strict HumanApprovalGate."""
+        from src.preparer.approval_gate import HumanApprovalGate
+        from src.preparer.resume_parser import ResumeParser
+
+        job = self.db.get_job_by_id(job_id)
+        if not job:
+            return False, f"Job #{job_id} not found."
+
+        res_path = resume_path or "data/resumes/Pranay_Agrawal_Resume(2).pdf"
+        p = Path(res_path)
+        res_hash = ResumeParser.compute_file_hash(p) if p.exists() else "unverified_hash"
+
+        gate = HumanApprovalGate(db_manager=self.db)
+        packet = gate.build_review_packet(
+            job=job,
+            cover_letter_text=cover_letter,
+            resume_path=str(p),
+            resume_hash=res_hash,
+            answers=answers,
+        )
+
+        return gate.authorize_application(
+            packet=packet,
+            approver_name=approver_name,
+            candidate_confirmed=candidate_confirmed,
+        )
+
+    def confirm_manual_submission(
+        self,
+        job_id: int,
+        approver_name: str,
+        submission_notes: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Confirms candidate's manual application submission."""
+        from src.preparer.approval_gate import HumanApprovalGate
+        gate = HumanApprovalGate(db_manager=self.db)
+        return gate.record_manual_submission(job_id, approver_name=approver_name, submission_notes=submission_notes)

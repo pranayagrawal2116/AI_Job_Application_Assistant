@@ -49,10 +49,17 @@ class CoverLetterGenerator:
 
         # Candidate details
         personal = self.profile.get("personal", {})
-        cand_name = personal.get("full_name", "Pranay Anup Agrawal")
-        email = personal.get("email", "pranayagrawal2116@gmail.com")
-        phone = personal.get("phone", "95100 29575")
-        location = personal.get("location", "Kothrud, Pune, Maharashtra")
+        cand_name = personal.get("full_name") or "Pranay Anup Agrawal"
+        if cand_name == "Pranay":
+            cand_name = "Pranay Anup Agrawal"
+        email = personal.get("email") or "pranayagrawal2116@gmail.com"
+        phone = personal.get("phone") or "+91 95100 29575"
+        
+        loc_val = personal.get("location") or "Kothrud, Pune, Maharashtra"
+        if isinstance(loc_val, dict):
+            location = f"{loc_val.get('city', 'Pune')}, {loc_val.get('country', 'India')}"
+        else:
+            location = str(loc_val)
 
         edu = self.profile.get("education", [{}])[0]
         institution = edu.get("institution", "MIT World Peace University")
@@ -66,9 +73,12 @@ class CoverLetterGenerator:
         
         top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {
             "title": "Medical Chatbot",
-            "description": "Built a Python-based conversational tool providing structured health information access.",
+            "description": "developed a Python-based conversational tool providing structured health information access",
             "technologies": ["Python", "NLP", "Machine Learning"],
         }
+        proj_title = top_project.get("title") or "Medical Chatbot"
+        proj_desc = top_project.get("description") or "built a data-driven software solution"
+        proj_techs = top_project.get("technologies") or ["Python", "Machine Learning"]
         
         top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {
             "employer": "Sarita Infotech Pvt. Ltd.",
@@ -82,7 +92,7 @@ class CoverLetterGenerator:
         # Draft Letter
         letter_lines = [
             f"# {cand_name}",
-            f"{location} | {phone} | {email}",
+            f"{location} | Phone: {phone} | Email: {email}",
             f"GitHub: https://github.com | LinkedIn: https://linkedin.com",
             "",
             f"**Date:** {today_str}",
@@ -94,12 +104,12 @@ class CoverLetterGenerator:
             "",
             f"I am writing to express my strong interest in the **{title}** position at {company}. "
             f"I am currently pursuing my {degree} in {major} at {institution} (Class of {grad_year}, CGPA: {cgpa}). "
-            f"With a dedicated focus on Artificial Intelligence, Data Science, and practical software engineering, "
+            f"With a dedicated academic focus on Artificial Intelligence, Data Science, and practical software engineering, "
             f"I am eager to contribute meaningfully to your team while further honing my technical capabilities.",
             "",
             f"During my academic and project work, I have focused heavily on building robust, real-world solutions. "
-            f"In my project, **{top_project['title']}**, I {top_project['description'].lower()} utilizing "
-            f"{', '.join(top_project['technologies'])}. This initiative strengthened my ability to decompose complex requirements, "
+            f"In my project, **{proj_title}**, I {proj_desc.lower().replace('built a ', '').replace('developed a ', 'built a ')} utilizing "
+            f"{', '.join(proj_techs)}. This initiative strengthened my ability to decompose complex requirements, "
             f"write clean and maintainable code, and handle data-intensive workflows effectively.",
             "",
             f"In addition to academic project work, I bring hands-on industry exposure from my role as **{top_exp['job_title']}** "

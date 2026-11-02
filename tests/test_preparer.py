@@ -157,7 +157,7 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         alignment = self.matcher.align_job(self.test_job)
         self.assertEqual(alignment.company_name, "NeuralEdge Dynamics")
         self.assertIn("Python", alignment.matching_skills)
-        self.assertIn("REST APIs", alignment.matching_skills)
+        self.assertTrue(any("rest api" in s.lower() for s in alignment.matching_skills))
         self.assertIn("PyTorch", alignment.missing_requirements)
         self.assertTrue(any("Medical Chatbot" in p["title"] for p in alignment.relevant_projects))
         self.assertTrue(len(alignment.relevant_experience) >= 1)

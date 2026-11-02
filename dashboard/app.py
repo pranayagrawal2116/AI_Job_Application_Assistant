@@ -10,6 +10,7 @@ if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
 from dashboard.views.analytics import render_analytics
+from dashboard.views.application_preparer import render_application_preparer
 from dashboard.views.application_tracker import render_application_tracker
 from dashboard.views.candidate_profile import render_candidate_profile
 from dashboard.views.discovery import render_discovery
@@ -99,6 +100,7 @@ def main():
         st.Page(render_overview, title="Overview", icon="📊", url_path="overview", default=True),
         st.Page(render_job_explorer, title="Explore Jobs", icon="🔍", url_path="explore"),
         st.Page(render_shortlisted, title="Shortlisted Jobs", icon="⭐", url_path="shortlisted"),
+        st.Page(render_application_preparer, title="Application Preparer", icon="✍️", url_path="preparer"),
         st.Page(render_application_tracker, title="Application Tracker", icon="📋", url_path="tracker"),
         st.Page(render_analytics, title="Job Matching Analytics", icon="📈", url_path="analytics"),
         st.Page(render_discovery, title="Discovery Management", icon="🚀", url_path="discovery"),
