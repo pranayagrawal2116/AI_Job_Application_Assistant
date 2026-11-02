@@ -394,7 +394,10 @@ class DashboardService:
             except Exception as e:
                 return False, f"Approval rejected: {e}"
         else:
-            sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+            try:
+                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+            except Exception as e:
+                return False, f"Approval rejected: {e}"
 
         active_session_id = sess.session_id
         ticket = action_ticket or self.issue_approval_ticket(
@@ -447,7 +450,10 @@ class DashboardService:
             except Exception as e:
                 return False, f"Submission rejected: {e}"
         else:
-            sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+            try:
+                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+            except Exception as e:
+                return False, f"Submission rejected: {e}"
 
         active_session_id = sess.session_id
         ticket = submission_ticket or self.issue_submission_ticket(

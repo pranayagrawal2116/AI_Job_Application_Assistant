@@ -115,29 +115,55 @@ class TestDashboardArchitecture(unittest.TestCase):
 
     # 4. Strict Human-in-the-Loop Safeguard on Submission
     def test_applied_status_human_governance(self):
-        # First transition to Awaiting Approval
+        # 1. Direct transition to Applied via generic update is strictly prohibited
+        succ_direct, msg_direct = self.service.update_application_status(
+            self.j1.id, ApplicationStatus.APPLIED.value
+        )
+        self.assertFalse(succ_direct)
+        self.assertIn("Direct status transition to 'Applied' is prohibited", msg_direct)
+
+        # 2. Transition through valid sequence to Application Prepared
         self.service.update_application_status(self.j1.id, ApplicationStatus.UNDER_REVIEW.value)
         self.service.update_application_status(self.j1.id, ApplicationStatus.SHORTLISTED.value)
         self.service.update_application_status(self.j1.id, ApplicationStatus.APPLICATION_PREPARED.value)
-        self.service.update_application_status(self.j1.id, ApplicationStatus.AWAITING_APPROVAL.value)
 
-        # Attempt to mark as Applied without approver name -> must fail
-        succ_no_name, msg1 = self.service.update_application_status(
-            self.j1.id, ApplicationStatus.APPLIED.value, approver_name=""
-        )
-        self.assertFalse(succ_no_name)
-        self.assertIn("Human approver name is mandatory", msg1)
-
-        # Attempt to mark as Applied with automated bot name -> must fail
-        succ_bot, msg2 = self.service.update_application_status(
-            self.j1.id, ApplicationStatus.APPLIED.value, approver_name="auto_apply_bot"
+        # 3. Attempt to authorize with automated bot name -> must fail
+        succ_bot, msg_bot = self.service.authorize_application_packet(
+            job_id=self.j1.id,
+            approver_name="auto_apply_bot",
+            candidate_confirmed=True,
+            cover_letter="Sample letter",
+            answers={},
         )
         self.assertFalse(succ_bot)
-        self.assertIn("Approval rejected", msg2)
+        self.assertIn("automated", msg_bot.lower())
 
-        # Mark as Applied with verified human approver -> must succeed
-        succ_valid, msg3 = self.service.update_application_status(
-            self.j1.id, ApplicationStatus.APPLIED.value, approver_name="Candidate Pranay"
+        # 4. Valid human authorization via review packet -> succeeds
+        succ_auth, msg_auth = self.service.authorize_application_packet(
+            job_id=self.j1.id,
+            approver_name="Pranay Agrawal",
+            candidate_confirmed=True,
+            cover_letter="Sample letter",
+            answers={},
+        )
+        self.assertTrue(succ_auth)
+        app_auth = self.db.get_application_by_job_id(self.j1.id)
+        self.assertEqual(app_auth.status, ApplicationStatus.AWAITING_APPROVAL.value)
+
+        # 5. Confirm manual submission with empty name -> fails
+        succ_no_name, msg_no_name = self.service.confirm_manual_submission(
+            job_id=self.j1.id,
+            approver_name="",
+            submission_notes="Code 123",
+        )
+        self.assertFalse(succ_no_name)
+        self.assertIn("Candidate approver name is required", msg_no_name)
+
+        # 6. Confirm manual submission with verified candidate -> succeeds
+        succ_valid, msg_valid = self.service.confirm_manual_submission(
+            job_id=self.j1.id,
+            approver_name="Pranay Agrawal",
+            submission_notes="Portal code 12345",
         )
         self.assertTrue(succ_valid)
         app = self.db.get_application_by_job_id(self.j1.id)

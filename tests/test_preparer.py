@@ -256,44 +256,58 @@ class TestApplicationPreparationEngine(unittest.TestCase):
             answers=answers,
         )
 
+        # Transition job to Application Prepared first
+        app = self.db.get_application_by_job_id(self.test_job.id)
+        if app.status == ApplicationStatus.DISCOVERED.value:
+            self.db.update_application_status(self.test_job.id, ApplicationStatus.UNDER_REVIEW)
+            self.db.update_application_status(self.test_job.id, ApplicationStatus.SHORTLISTED)
+            self.db.update_application_status(self.test_job.id, ApplicationStatus.APPLICATION_PREPARED)
+
+        action_ticket = self.session_mgr.issue_action_ticket(
+            session_id=self.session.session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=self.test_job.id,
+            packet_hash=packet.packet_version_hash,
+        )
+
         # 1. Unconfirmed candidate checkbox -> must fail
         succ_no_check, msg1 = self.gate.authorize_application(
-            packet, "Pranay Agrawal", candidate_confirmed=False, dashboard_token=TRUSTED_APPROVAL_TOKEN
+            packet, "Pranay Agrawal", candidate_confirmed=False, session_id=self.session.session_id, action_ticket=action_ticket
         )
         self.assertFalse(succ_no_check)
         self.assertIn("explicitly check", msg1)
 
         # 2. Empty approver name -> must fail
         succ_empty, msg2 = self.gate.authorize_application(
-            packet, "  ", candidate_confirmed=True, dashboard_token=TRUSTED_APPROVAL_TOKEN
+            packet, "  ", candidate_confirmed=True, session_id=self.session.session_id, action_ticket=action_ticket
         )
         self.assertFalse(succ_empty)
         self.assertIn("Human approver name is mandatory", msg2)
 
         # 3. Automated bot name -> must fail
         succ_bot, msg3 = self.gate.authorize_application(
-            packet, "automated_agent_bot", candidate_confirmed=True, dashboard_token=TRUSTED_APPROVAL_TOKEN
+            packet, "automated_agent_bot", candidate_confirmed=True, session_id=self.session.session_id, action_ticket=action_ticket
         )
         self.assertFalse(succ_bot)
         self.assertIn("automated authorization", msg3)
 
-        # 4. Typed candidate name alone without dashboard_token -> must fail
+        # 4. Typed candidate name alone without ticket/session -> must fail
         succ_name_only, msg_tok = self.gate.authorize_application(
-            packet, "Pranay Agrawal", candidate_confirmed=True, dashboard_token=None
+            packet, "Pranay Agrawal", candidate_confirmed=True, session_id="", action_ticket=""
         )
         self.assertFalse(succ_name_only)
-        self.assertIn("A typed name alone cannot authenticate approval", msg_tok)
+        self.assertIn("Missing or invalid", msg_tok)
 
-        # 5. Invalid dashboard_token -> must fail
+        # 5. Invalid/forged action_ticket -> must fail
         succ_bad_tok, msg_bad = self.gate.authorize_application(
-            packet, "Pranay Agrawal", candidate_confirmed=True, dashboard_token="INVALID_TOKEN"
+            packet, "Pranay Agrawal", candidate_confirmed=True, session_id=self.session.session_id, action_ticket="TKT-badnonce.123.badsig"
         )
         self.assertFalse(succ_bad_tok)
-        self.assertIn("A typed name alone cannot authenticate approval", msg_bad)
+        self.assertIn("Unrecognized or unissued", msg_bad)
 
-        # 6. Valid human authorization with dashboard token -> must succeed
+        # 6. Valid human authorization with authenticated session and ticket -> must succeed
         succ_ok, msg4 = self.gate.authorize_application(
-            packet, "Pranay Agrawal", candidate_confirmed=True, dashboard_token=TRUSTED_APPROVAL_TOKEN
+            packet, "Pranay Agrawal", candidate_confirmed=True, session_id=self.session.session_id, action_ticket=action_ticket
         )
         self.assertTrue(succ_ok)
         self.assertTrue(packet.is_approved)
@@ -303,23 +317,37 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         app = self.db.get_application_by_job_id(self.test_job.id)
         self.assertEqual(app.status, ApplicationStatus.AWAITING_APPROVAL.value)
 
-        # 7. Confirm manual submission without submission token -> must fail
+        # Issue submission ticket
+        sub_ticket = self.session_mgr.issue_action_ticket(
+            session_id=self.session.session_id,
+            action_type="MANUAL_SUBMISSION",
+            application_id=self.test_job.id,
+            packet_hash=packet.packet_version_hash,
+        )
+
+        # 7. Confirm manual submission without submission ticket -> must fail
         succ_no_sub_tok, msg_sub_fail = self.gate.record_manual_submission(
-            self.test_job.id, approver_name="Pranay Agrawal", submission_token=None
+            self.test_job.id, approver_name="Pranay Agrawal", session_id=self.session.session_id, submission_ticket="", packet_version_hash=packet.packet_version_hash
         )
         self.assertFalse(succ_no_sub_tok)
-        self.assertIn("Requires trusted candidate-controlled submission confirmation", msg_sub_fail)
+        self.assertIn("Missing action ticket", msg_sub_fail)
 
         # 8. Confirm manual submission on unapproved job -> must fail
+        sub_ticket_fake = self.session_mgr.issue_action_ticket(
+            session_id=self.session.session_id,
+            action_type="MANUAL_SUBMISSION",
+            application_id=99999,
+            packet_hash=packet.packet_version_hash,
+        )
         succ_unapproved, msg_unapp = self.gate.record_manual_submission(
-            99999, approver_name="Pranay Agrawal", submission_token=TRUSTED_SUBMISSION_TOKEN
+            99999, approver_name="Pranay Agrawal", session_id=self.session.session_id, submission_ticket=sub_ticket_fake, packet_version_hash=packet.packet_version_hash
         )
         self.assertFalse(succ_unapproved)
-        self.assertIn("does not have prior human approval", msg_unapp)
+        self.assertIn("does not have an active, unconsumed human approval record", msg_unapp)
 
-        # 9. Valid manual submission confirmation with submission token -> must succeed
+        # 9. Valid manual submission confirmation with submission ticket -> must succeed
         succ_sub, msg5 = self.gate.record_manual_submission(
-            self.test_job.id, approver_name="Pranay Agrawal", submission_token=TRUSTED_SUBMISSION_TOKEN
+            self.test_job.id, approver_name="Pranay Agrawal", session_id=self.session.session_id, submission_ticket=sub_ticket, packet_version_hash=packet.packet_version_hash
         )
         self.assertTrue(succ_sub)
         app_sub = self.db.get_application_by_job_id(self.test_job.id)

@@ -15,6 +15,7 @@ from src.database.exceptions import (
     DatabaseError,
     DuplicateJobError,
     InvalidStatusError,
+    InvalidStatusTransitionError,
     JobNotFoundError,
     UnconfirmedSubmissionError,
     ValidationError,
@@ -206,7 +207,12 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(app3.status, ApplicationStatus.APPLICATION_PREPARED.value)
         self.assertIsNotNone(app3.date_prepared)
 
-        # Shortlisted -> Awaiting Approval
+        # Application Prepared -> Awaiting Approval (requires human approval)
+        self.db.record_human_approval(
+            job_id,
+            approver_name="Candidate Pranay",
+            approval_notes="Manually reviewed form inputs and authorized review packet.",
+        )
         app4 = self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL)
         self.assertEqual(app4.status, ApplicationStatus.AWAITING_APPROVAL.value)
 
@@ -227,18 +233,20 @@ class TestDatabaseManager(unittest.TestCase):
         inserted = self.db.insert_job(self._create_sample_job())
         job_id = inserted.id
 
-        # 1. Attempt to set Applied without human approval -> MUST fail (boolean flag alone is rejected)
-        with self.assertRaises(UnconfirmedSubmissionError):
-            self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=False)
-
-        with self.assertRaises(UnconfirmedSubmissionError):
+        # 1. Direct illegal transition from Discovered to Applied MUST fail
+        with self.assertRaises(InvalidStatusTransitionError):
             self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True)
 
-        # 2. Automated bots/agents cannot grant approval
+        # 2. Transition through valid sequence to Application Prepared
+        self.db.update_application_status(job_id, ApplicationStatus.UNDER_REVIEW)
+        self.db.update_application_status(job_id, ApplicationStatus.SHORTLISTED)
+        self.db.update_application_status(job_id, ApplicationStatus.APPLICATION_PREPARED)
+
+        # 3. Automated bots/agents cannot grant approval
         with self.assertRaises(ValidationError):
             self.db.record_human_approval(job_id, approver_name="automated_bot")
 
-        # 3. Explicit human approval granted by the candidate
+        # 4. Explicit human approval granted by the candidate
         approval_log = self.db.record_human_approval(
             job_id,
             approver_name="Candidate Pranay",
@@ -247,7 +255,14 @@ class TestDatabaseManager(unittest.TestCase):
         self.assertEqual(approval_log.action, "HUMAN_APPROVAL_GRANTED")
         self.assertTrue(self.db.has_valid_human_approval(job_id))
 
-        # 4. Now transition to Applied succeeds
+        # 5. Transition to Awaiting Approval
+        self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL)
+
+        # 6. Attempt to set Applied without confirmed=True -> MUST fail
+        with self.assertRaises(UnconfirmedSubmissionError):
+            self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=False)
+
+        # 7. Now transition to Applied with confirmed=True succeeds
         app = self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True)
         self.assertEqual(app.status, ApplicationStatus.APPLIED.value)
         self.assertIsNotNone(app.date_submitted)
