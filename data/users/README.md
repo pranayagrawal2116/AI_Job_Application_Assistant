@@ -13,3 +13,4 @@ data/users/<user_id>/
 ```
 
 All contents in subdirectories are strictly local and ignored by version control.
+

@@ -5,3 +5,4 @@ This directory contains offline test fixtures for regression testing and local d
 - Synthetic industry persona fixtures for cross-industry validation tests
 
 Never commit personal resumes or unredacted personal candidate data here.
+

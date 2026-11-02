@@ -7,3 +7,4 @@ data/backups/
 ```
 
 All database backup archives and files in this directory are strictly local and ignored by version control.
+

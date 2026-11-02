@@ -1,25 +1,24 @@
-# Universal AI Job Application Assistant — Architecture Specification v2.1.0
-## Multi-User, Multi-Industry Platform Specification & Implementation Blueprint
+# Universal AI Job Application Assistant — Architecture Specification v2.1.1
+## Multi-User, Multi-Industry Platform Specification & Technical Consistency Blueprint
 
-**Document Version:** 2.1.0 (Final Approved Specification)  
+**Document Version:** 2.1.1 (Final Technical Consistency Audit)  
 **Status:** Architecture Blueprint (Ready for Phase 2 Implementation)  
-**Date:** November 2, 2026  
+**Date:** November 3, 2026  
 **Audience:** System Architects, Security Engineers, AI Agents & Contributors  
 
 ---
 
-## Executive Summary & Architecture Principles
+## Executive Summary & Technical Consistency Audit
 
 The **Universal AI Job Application Assistant** is a privacy-first, multi-tenant platform engineered to support job seekers across **any profession, industry, career stage, or educational background** (including healthcare, finance, legal, sales, engineering, creative arts, and software).
 
-The v2.1.0 specification finalizes all core architectural corrections approved in principle:
-1. **HMAC Secret Management:** Replaces ephemeral server secrets with environment-loaded, 256-bit server-side keys supporting deliberate operator rotation, zero client/log exposure, and instant invalidation of tickets signed with retired keys.
-2. **Complete Application Packet Integrity:** Expands `packet_version_hash` across all 11 application materials using deterministic RFC 8785 Canonical JSON serialization. Any post-approval change invalidates the approval automatically.
-3. **Persistent Nonce and Approval Tracking:** Establishes transactional SQLite database records as the authoritative source of truth for consumed nonces (`UNIQUE` constraint on `ticket_nonce`), with atomic `BEGIN IMMEDIATE` consumption preventing concurrency race conditions, replays, and cross-user reuse.
-4. **Password Reset and Account Recovery:** Defines verified email ownership, single-use tokens stored as salted SHA-256 hashes, 15-minute TTL, strict rate limiting, total session invalidation, and anti-enumeration generic responses.
-5. **Safe Candidate Migration:** Isolates legacy profile data into an offline test fixture (`tests/fixtures/candidate_profile_fixture.json`). Zero public default accounts or shared passwords exist in runtime databases.
-6. **Data Retention and User-Controlled Deletion:** Implements granular user-controlled deletion across all uploaded and generated assets, paired with an anonymized cryptographic audit tombstone that preserves regulatory human-in-the-loop proof without retaining candidate PII.
-7. **Multiple Applications and Versions:** Removes schema bottlenecks to allow multiple applications per role and multiple versioned packets (`prepared_packets`) with immutable historical hashes and distinct approval records.
+This v2.1.1 update performs the final technical consistency review before Phase 2 implementation, resolving five critical technical and architectural requirements:
+
+1. **Genuine RFC 8785 Canonical JSON (JCS):** Replaced ordinary sorted JSON (`json.dumps(sort_keys=True)`) with a rigorous, standards-compliant JSON Canonicalization Scheme (RFC 8785). Specifies UTF-16 code unit key sorting (including surrogate pair astral code points), IEEE 754 / ECMAScript 6 number serialization (`-0` normalized to `0`, no uppercase exponents, no trailing decimals, rejection of `NaN`/`Infinity`), strict Unicode escape handling, and verification against official RFC 8785 test vectors.
+2. **Composite Database Ownership Constraints:** Strengthened SQLite relational constraints using composite unique keys `UNIQUE(id, user_id)` and composite foreign keys `FOREIGN KEY (child_id, user_id) REFERENCES parent(id, user_id)` across all user-owned entities (resumes, resume versions, job descriptions, applications, prepared packets, approvals, and match results). This physically prevents User A from ever referencing User B's entities at the database engine level.
+3. **Password Reset Token Consistency:** Resolved the schema inconsistency in `password_reset_tokens` by establishing a salted and peppered SHA-256 storage format (`token_hash = SHA256(raw_token + token_salt + PEPPER)`), storing a per-token cryptographically secure salt (`token_salt`), enforcing atomic single-use consumption, 15-minute TTL, rate limiting, and global session purge upon reset.
+4. **Data Deletion & Audit Integrity Lifecycle Matrix:** Formally defined separate deletion policies across the four application lifecycle states: (1) unsubmitted drafts, (2) approved but unsubmitted applications, (3) manually submitted applications (`Applied`), and (4) security audit records. Preserves regulatory human-in-the-loop audit proof via anonymized cryptographic tombstones while eradicating all candidate PII.
+5. **HMAC Key Rotation Modes (Graceful vs. Emergency):** Formally specified two distinct operational rotation procedures: Graceful Rotation (scheduled maintenance with dual-key verification during a 15-minute TTL window) and Emergency Rotation (immediate single-key promotion with instant revocation of compromised keys, triggering `KeyRevokedError` and fresh candidate authorization).
 
 ---
 
@@ -29,17 +28,19 @@ The v2.1.0 specification finalizes all core architectural corrections approved i
 flowchart TD
     subgraph ClientLayer ["Client & Interaction Layer"]
         UI["Streamlit Universal Dashboard (10 Pages)"]
-        AUTH_UI["Auth Gate (Register / Login / Reset)"]
+        AUTH_UI["Auth Gate (Register / Login / Password Reset)"]
         BROWSER["Playwright MCP Automation Engine"]
     end
 
     subgraph SecurityLayer ["Security, Authentication & Session Layer"]
-        ENV_CONF["Protected Environment Configuration (.env)<br>ACTION_TICKET_SECRET_KEY (Key ID: v1/v2)<br>SESSION_SECRET_KEY & PEPPERS"]
-        AUTH["Authentication Manager (Argon2id + Account Lockout + Rate Limiter)"]
+        ENV_CONF["Protected Environment Config (.env)<br>ACTION_TICKET_SECRET_KEY (Key ID: v1/v2)<br>SESSION_SECRET_KEY, PWD_PEPPER, AUDIT_PEPPER"]
+        AUTH["Authentication Manager (Argon2id + Lockout + Rate Limiter)"]
         RECOVERY["Account Recovery & Password Reset Engine (Single-Use Salted Hashes)"]
         SESS["SessionManager (Anti-Fixation + Sliding TTL + CSRF Guard)"]
+        ROTATION["HMAC Rotation Controller (Graceful & Emergency Modes)"]
         TKT["Action Ticket Engine (HMAC-SHA256 + Key ID + Nonce Binding)"]
         GATE["Human Approval & Verification Gate"]
+        COMPOSITE_GUARD["Composite Ownership Authorization Guard"]
     end
 
     subgraph CoreEngines ["Universal Processing Engines"]
@@ -47,11 +48,11 @@ flowchart TD
         JOB_INGEST["Dynamic Job Ingest (Pasted Text / URL / File Upload)"]
         UNIV_MATCH["Universal Matching & Eligibility Engine (100 Pts, 10 Dimensions)"]
         PREP_ENG["Application Preparation Engine (Tailorer, Cover Letter, Screening QA)"]
-        CANON_HASH["RFC 8785 Canonical Packet Hasher"]
+        RFC8785_JCS["Genuine RFC 8785 Canonical JSON Encoder"]
     end
 
     subgraph DataLayer ["Multi-User Data & Storage Layer"]
-        DB[(SQLite Multi-User Database<br>ACID Immediate Transactions)]
+        DB[(SQLite Multi-User Database<br>ACID Immediate Transactions + Composite Foreign Keys)]
         FS["Isolated Per-User Storage (data/users/<user_id>/)"]
         AUDIT_STORE["Persistent Nonce & Audit Store<br>(authoritative application_approvals & consumed_action_nonces)"]
         ERASURE["User Deletion & PII Tombstoning Engine"]
@@ -61,7 +62,8 @@ flowchart TD
     AUTH_UI --> RECOVERY
     AUTH --> SESS
     RECOVERY --> DB
-    ENV_CONF --> TKT
+    ENV_CONF --> ROTATION
+    ROTATION --> TKT
     ENV_CONF --> AUTH
     SESS --> TKT
 
@@ -71,12 +73,15 @@ flowchart TD
     RES_PARSE --> UNIV_MATCH
 
     UNIV_MATCH --> PREP_ENG
-    PREP_ENG --> CANON_HASH
-    CANON_HASH --> GATE
+    PREP_ENG --> RFC8785_JCS
+    RFC8785_JCS --> GATE
     GATE --> TKT
     TKT --> AUDIT_STORE
     AUDIT_STORE --> DB
     GATE --> BROWSER
+
+    UI --> COMPOSITE_GUARD
+    COMPOSITE_GUARD --> DB
 
     UI --> ERASURE
     ERASURE --> DB
@@ -85,30 +90,70 @@ flowchart TD
 
 ---
 
-## 2. Multi-User Entity-Relationship (ER) Model
+## 2. Security Architecture Diagram & Rotation Flows
 
-The database schema guarantees strict referential integrity, user ownership, cascading cleanup, and support for independent manually entered job descriptions.
+```mermaid
+flowchart TD
+    subgraph SecretLifecycle ["HMAC Secret Management & Rotation Architecture"]
+        ENV[".env (Protected Server Configuration)"]
+        ACTIVE_KEY["ACTION_TICKET_ACTIVE_KEY_ID (e.g. 'v2')"]
+        KEY_MAP["ACTION_TICKET_ROTATION_KEYS {'v1':'...', 'v2':'...'}"]
+        ENV --> ACTIVE_KEY
+        ENV --> KEY_MAP
+
+        subgraph ModeA ["Mode A: Graceful Rotation"]
+            direction TB
+            GA1["1. Provision new key v2 in KEY_MAP"] --> GA2["2. Set ACTIVE_KEY = 'v2'"]
+            GA2 --> GA3["3. Issue tickets with v2; verify v1 & v2 for 15-min TTL"]
+            GA3 --> GA4["4. Remove v1 from KEY_MAP after grace period"]
+        end
+
+        subgraph ModeB ["Mode B: Emergency Rotation"]
+            direction TB
+            GB1["1. Key compromise or incident detected"] --> GB2["2. Immediately delete compromised key v1 from KEY_MAP"]
+            GB2 --> GB3["3. Set ACTIVE_KEY = new v_safe"]
+            GB3 --> GB4["4. All v1 tickets fail verification immediately (KeyRevokedError)"]
+            GB4 --> GB5["5. Candidate prompted for fresh explicit authorization"]
+        end
+    end
+
+    subgraph TokenSigning ["Action Ticket Generation & Verification"]
+        TKT_FMT["Ticket Format: TKT-key_id-nonce.timestamp.signature"]
+        HMAC_ENGINE["HMAC-SHA256(secret, message)"]
+        TKT_FMT <--> HMAC_ENGINE
+    end
+
+    KEY_MAP --> HMAC_ENGINE
+```
+
+---
+
+## 3. Multi-User Entity-Relationship Model (Composite Ownership)
+
+To guarantee that User A can **never** reference, view, or alter records belonging to User B, all user-owned tables define composite unique constraints on `(id, user_id)`, and all child tables enforce **Composite Foreign Keys** referencing `(parent_id, user_id)`.
 
 ```mermaid
 erDiagram
-    USERS ||--o{ CANDIDATE_PROFILES : owns
-    USERS ||--o{ PASSWORD_RESET_TOKENS : requests
-    USERS ||--o{ RESUMES : uploads
-    USERS ||--o{ JOB_DESCRIPTIONS : creates
-    USERS ||--o{ JOBS : tracks
-    USERS ||--o{ MATCH_RESULTS : evaluates
-    USERS ||--o{ APPLICATIONS : creates
-    USERS ||--o{ APPLICATION_LOGS : audits
-    USERS ||--o{ USER_SETTINGS : configures
-    USERS ||--o{ AUTH_AUDIT_LOGS : logs
+    USERS ||--o{ CANDIDATE_PROFILES : "owns (id, user_id)"
+    USERS ||--o{ PASSWORD_RESET_TOKENS : "requests (user_id)"
+    USERS ||--o{ RESUMES : "uploads (id, user_id)"
+    USERS ||--o{ JOB_DESCRIPTIONS : "creates (id, user_id)"
+    USERS ||--o{ JOBS : "tracks (user_id)"
+    USERS ||--o{ MATCH_RESULTS : "evaluates (user_id)"
+    USERS ||--o{ APPLICATIONS : "creates (id, user_id)"
+    USERS ||--o{ APPLICATION_LOGS : "audits (user_id)"
+    USERS ||--o{ USER_SETTINGS : "configures (user_id)"
+    USERS ||--o{ AUTH_AUDIT_LOGS : "logs (user_id)"
 
-    RESUMES ||--o{ RESUME_VERSIONS : versions
-    JOBS ||--o{ MATCH_RESULTS : evaluated_against_scraped
-    JOB_DESCRIPTIONS ||--o{ MATCH_RESULTS : evaluated_against_manual
-    JOBS ||--o{ APPLICATIONS : targets_scraped_job
-    JOB_DESCRIPTIONS ||--o{ APPLICATIONS : targets_manual_job
-    APPLICATIONS ||--o{ PREPARED_PACKETS : has_revisions
-    PREPARED_PACKETS ||--o{ APPLICATION_APPROVALS : authorized_by
+    RESUMES ||--o{ RESUME_VERSIONS : "versions (resume_id, user_id)"
+    JOBS ||--o{ MATCH_RESULTS : "evaluated_against_scraped"
+    JOB_DESCRIPTIONS ||--o{ MATCH_RESULTS : "evaluated_against_manual (job_description_id, user_id)"
+    JOBS ||--o{ APPLICATIONS : "targets_scraped_job"
+    JOB_DESCRIPTIONS ||--o{ APPLICATIONS : "targets_manual_job (job_description_id, user_id)"
+    APPLICATIONS ||--o{ PREPARED_PACKETS : "has_revisions (application_id, user_id)"
+    RESUMES ||--o{ PREPARED_PACKETS : "uses_base_resume (original_resume_id, user_id)"
+    PREPARED_PACKETS ||--o{ APPLICATION_APPROVALS : "authorized_by (packet_id, user_id)"
+    APPLICATIONS ||--o{ APPLICATION_APPROVALS : "approves_app (application_id, user_id)"
 
     USERS {
         int id PK
@@ -128,9 +173,10 @@ erDiagram
     PASSWORD_RESET_TOKENS {
         int id PK
         int user_id FK
-        string token_hash UK "SHA-256(token + pepper)"
+        string token_hash UK "SHA256(raw + salt + PEPPER)"
+        string token_salt "16 bytes hex"
         string ip_address
-        datetime expires_at
+        datetime expires_at "15-min TTL"
         int is_used "0 or 1"
         datetime used_at
         datetime created_at
@@ -161,7 +207,7 @@ erDiagram
     RESUME_VERSIONS {
         int id PK
         int resume_id FK
-        int user_id FK
+        int user_id FK "Composite FK: (resume_id, user_id)"
         int version_num
         text snapshot_json
         datetime created_at
@@ -198,9 +244,9 @@ erDiagram
     MATCH_RESULTS {
         int id PK
         int user_id FK
-        int resume_id FK
+        int resume_id FK "Composite FK: (resume_id, user_id)"
         int job_id FK "Nullable"
-        int job_description_id FK "Nullable"
+        int job_description_id FK "Composite FK: (job_desc_id, user_id)"
         float match_score
         string match_classification
         string eligibility_status "ELIGIBLE, INELIGIBLE, UNKNOWN"
@@ -213,7 +259,7 @@ erDiagram
         int id PK
         int user_id FK
         int job_id FK "Nullable"
-        int job_description_id FK "Nullable"
+        int job_description_id FK "Composite FK: (job_desc_id, user_id)"
         string company_name
         string job_title
         string status "Discovered -> Applied"
@@ -226,10 +272,11 @@ erDiagram
 
     PREPARED_PACKETS {
         int id PK
-        int application_id FK
+        int application_id FK "Composite FK: (application_id, user_id)"
         int user_id FK
         int version_num "Revision 1, 2, ..."
         string packet_version_hash "SHA-256 RFC 8785"
+        int original_resume_id FK "Composite FK: (orig_resume_id, user_id)"
         string original_resume_hash
         string tailored_resume_path
         string tailored_resume_hash
@@ -247,8 +294,8 @@ erDiagram
 
     APPLICATION_APPROVALS {
         int id PK
-        int application_id FK
-        int packet_id FK
+        int application_id FK "Composite FK: (application_id, user_id)"
+        int packet_id FK "Composite FK: (packet_id, user_id)"
         int user_id FK
         string packet_version_hash
         string ticket_nonce UK "Authoritative Nonce Constraint"
@@ -295,23 +342,19 @@ erDiagram
     }
 ```
 
-### Detailed Entity Relationship Explanations
+### Relational Consistency & Cross-User Security Guarantees
 
-1. **`USERS` to `CANDIDATE_PROFILES` (1:N):** A user owns one active structured candidate profile and historical profile snapshots. Profile data is stored in flexible JSON accommodating diverse profession schemas (medical licenses, bar admissions, engineering certifications, tech skills).
-2. **`USERS` to `PASSWORD_RESET_TOKENS` (1:N):** A user can initiate password recovery requests. Each token is single-use, expires in 15 minutes, and is stored strictly as a salted SHA-256 hash.
-3. **`USERS` to `RESUMES` (1:N) & `RESUME_VERSIONS` (1:N):** A user can upload multiple resumes (e.g., Clinical vs Research, Executive vs Technical) with one designated primary resume (`idx_user_primary_resume`). Each resume maintains an immutable audit log of edits and parses.
-4. **`USERS` to `JOB_DESCRIPTIONS` (1:N):** Users can paste or upload arbitrary job descriptions without scraping dependencies. These records exist independently and can directly power match results and application preparation.
-5. **`USERS` to `JOBS` (1:N):** Scraped or catalog jobs discovered via platform adapters. Can be associated with specific user searches or shared across platform discovery.
-6. **`JOBS` / `JOB_DESCRIPTIONS` to `MATCH_RESULTS` (1:N):** A match evaluation references **either** a discovered `job_id` or a manual `job_description_id`. This allows candidates to evaluate pasted postings instantly without needing a scraped job entity.
-7. **`JOBS` / `JOB_DESCRIPTIONS` to `APPLICATIONS` (1:N):** An application references either a discovered `job_id` or a manual `job_description_id`. Crucially, **no unique constraint prevents multiple applications for the same job**, allowing multiple tailored applications for different requisitions or distinct approaches.
-8. **`APPLICATIONS` to `PREPARED_PACKETS` (1:N):** Each application contains one or more prepared packet revisions ($v_1, v_2, \dots$). Each packet contains its own tailored resume, cover letter, screening answers, and immutable RFC 8785 version hash.
-9. **`PREPARED_PACKETS` to `APPLICATION_APPROVALS` (1:N):** Explicit human approvals bind directly to a specific packet revision's immutable version hash and unique ticket nonce. Authorizing revision $v_1$ does not authorize revision $v_2$.
-10. **`APPLICATION_APPROVALS` & `CONSUMED_ACTION_NONCES`:** The database enforces uniqueness on `ticket_nonce`. Once consumed, a nonce can never be reused, preventing replay attacks across all nodes.
-11. **`APPLICATIONS` to `APPLICATION_LOGS` (1:N):** Comprehensive audit trail. Supports cryptographic pseudonymization (`anonymized_user_pseudonym`) upon user deletion requests, preserving compliance logs without retaining candidate PII.
+1. **Physical Engine-Level Enforcement:** In SQLite, a child table defining:
+   ```sql
+   FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE CASCADE
+   ```
+   physically rejects any `INSERT` or `UPDATE` where `user_id` does not match the parent's `user_id`. Even in the event of an application logic bug or SQL injection vulnerability, User A cannot reference User B's job description, resume, packet, or approval.
+2. **Dual-Reference Independence:** `APPLICATIONS` and `MATCH_RESULTS` reference either a scraped `job_id` or a manual `(job_description_id, user_id)`. Manually pasted job descriptions function autonomously without scraping.
+3. **Cardinality Flexibility:** No uniqueness constraint restricts `(user_id, job_id)` or `(user_id, job_description_id)`, allowing candidates to generate multiple customized applications and packet revisions per role.
 
 ---
 
-## 3. Database Schema & Integrity Specifications
+## 4. Production SQLite DDL (`src/database/schema.sql`)
 
 ```sql
 PRAGMA foreign_keys = ON;
@@ -335,12 +378,13 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 -- ---------------------------------------------------------------------
--- 2. PASSWORD RESET TOKENS (Single-Use, Salted Hash, Anti-Enumeration)
+-- 2. PASSWORD RESET TOKENS (Salted SHA-256 + Pepper, Anti-Enumeration)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS password_reset_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     token_hash TEXT NOT NULL UNIQUE,
+    token_salt TEXT NOT NULL,
     ip_address TEXT,
     expires_at DATETIME NOT NULL,
     is_used INTEGER DEFAULT 0 CHECK(is_used IN (0, 1)),
@@ -349,7 +393,7 @@ CREATE TABLE IF NOT EXISTS password_reset_tokens (
 );
 
 -- ---------------------------------------------------------------------
--- 3. CANDIDATE PROFILES
+-- 3. CANDIDATE PROFILES (Composite Ownership)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS candidate_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -357,11 +401,12 @@ CREATE TABLE IF NOT EXISTS candidate_profiles (
     profile_data TEXT NOT NULL,
     version INTEGER DEFAULT 1,
     is_active INTEGER DEFAULT 1 CHECK(is_active IN (0, 1)),
-    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
+    last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(id, user_id)
 );
 
 -- ---------------------------------------------------------------------
--- 4. RESUMES & VERSION HISTORY
+-- 4. RESUMES & VERSION HISTORY (Composite Ownership)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS resumes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -373,23 +418,25 @@ CREATE TABLE IF NOT EXISTS resumes (
     parsed_data TEXT,
     is_primary INTEGER DEFAULT 0 CHECK(is_primary IN (0, 1)),
     file_size_bytes INTEGER NOT NULL,
-    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(id, user_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_primary_resume ON resumes(user_id) WHERE is_primary = 1;
 
 CREATE TABLE IF NOT EXISTS resume_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    resume_id INTEGER NOT NULL REFERENCES resumes(id) ON DELETE CASCADE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resume_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
     version_num INTEGER NOT NULL,
     snapshot_json TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(resume_id, version_num)
+    UNIQUE(resume_id, version_num),
+    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------
--- 5. JOB DESCRIPTIONS (User Provided: Pasted, URL, Upload)
+-- 5. JOB DESCRIPTIONS (Composite Ownership)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS job_descriptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -400,11 +447,12 @@ CREATE TABLE IF NOT EXISTS job_descriptions (
     raw_content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     parsed_data TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(id, user_id)
 );
 
 -- ---------------------------------------------------------------------
--- 6. DISCOVERED JOBS (Scraped or Platform Catalog)
+-- 6. DISCOVERED JOBS (Platform Discovery Catalog)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -437,20 +485,22 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 
 -- ---------------------------------------------------------------------
--- 7. MATCH RESULTS (Dual-Reference: Scraped Job or Manual Description)
+-- 7. MATCH RESULTS (Composite Cross-User Constraints)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS match_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    resume_id INTEGER REFERENCES resumes(id) ON DELETE CASCADE,
+    resume_id INTEGER NOT NULL,
     job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
-    job_description_id INTEGER REFERENCES job_descriptions(id) ON DELETE CASCADE,
+    job_description_id INTEGER,
     match_score REAL NOT NULL,
     match_classification TEXT NOT NULL,
     eligibility_status TEXT NOT NULL CHECK(eligibility_status IN ('ELIGIBLE', 'INELIGIBLE', 'UNKNOWN')),
     score_breakdown TEXT NOT NULL,
     explanation TEXT NOT NULL,
     evaluated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE CASCADE,
+    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE CASCADE,
     CHECK (
         (job_id IS NOT NULL AND job_description_id IS NULL) OR 
         (job_id IS NULL AND job_description_id IS NOT NULL) OR
@@ -459,13 +509,13 @@ CREATE TABLE IF NOT EXISTS match_results (
 );
 
 -- ---------------------------------------------------------------------
--- 8. APPLICATIONS (Supports Multiple Applications per Role)
+-- 8. APPLICATIONS (Composite Ownership)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
-    job_description_id INTEGER REFERENCES job_descriptions(id) ON DELETE CASCADE,
+    job_description_id INTEGER,
     company_name TEXT NOT NULL,
     job_title TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'Discovered' CHECK (status IN (
@@ -484,6 +534,8 @@ CREATE TABLE IF NOT EXISTS applications (
     notes TEXT,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(id, user_id),
+    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE CASCADE,
     CHECK (
         (job_id IS NOT NULL AND job_description_id IS NULL) OR 
         (job_id IS NULL AND job_description_id IS NOT NULL) OR
@@ -492,14 +544,15 @@ CREATE TABLE IF NOT EXISTS applications (
 );
 
 -- ---------------------------------------------------------------------
--- 9. PREPARED PACKETS (Revisions & Complete Manifests)
+-- 9. PREPARED PACKETS (Revisions & Composite Ownership)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS prepared_packets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+    application_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     version_num INTEGER NOT NULL DEFAULT 1,
     packet_version_hash TEXT NOT NULL,
+    original_resume_id INTEGER NOT NULL,
     original_resume_hash TEXT NOT NULL,
     tailored_resume_path TEXT,
     tailored_resume_hash TEXT,
@@ -513,16 +566,19 @@ CREATE TABLE IF NOT EXISTS prepared_packets (
     attachments_manifest_hash TEXT,
     is_active_revision INTEGER DEFAULT 1 CHECK(is_active_revision IN (0, 1)),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(application_id, version_num)
+    UNIQUE(id, user_id),
+    UNIQUE(application_id, version_num),
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+    FOREIGN KEY (original_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------
--- 10. APPLICATION APPROVALS & AUTHORITATIVE NONCES
+-- 10. APPLICATION APPROVALS & AUTHORITATIVE NONCES (Composite Constraints)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS application_approvals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
-    packet_id INTEGER NOT NULL REFERENCES prepared_packets(id) ON DELETE CASCADE,
+    application_id INTEGER NOT NULL,
+    packet_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     packet_version_hash TEXT NOT NULL,
     ticket_nonce TEXT NOT NULL UNIQUE,
@@ -531,7 +587,9 @@ CREATE TABLE IF NOT EXISTS application_approvals (
     session_id TEXT NOT NULL,
     approved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     consumed_at DATETIME,
-    is_consumed INTEGER DEFAULT 0 CHECK(is_consumed IN (0, 1))
+    is_consumed INTEGER DEFAULT 0 CHECK(is_consumed IN (0, 1)),
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS consumed_action_nonces (
@@ -574,16 +632,16 @@ CREATE TABLE IF NOT EXISTS auth_audit_logs (
     metadata_json TEXT
 );
 
--- Indexes for Fast Query Isolation & Concurrency
+-- Composite Performance & Security Indexes
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
 CREATE INDEX IF NOT EXISTS idx_candidate_profiles_user ON candidate_profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_user ON job_descriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
-CREATE INDEX IF NOT EXISTS idx_prepared_packets_app ON prepared_packets(application_id);
+CREATE INDEX IF NOT EXISTS idx_prepared_packets_app ON prepared_packets(application_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_prepared_packets_hash ON prepared_packets(packet_version_hash);
-CREATE INDEX IF NOT EXISTS idx_approvals_packet ON application_approvals(packet_id);
+CREATE INDEX IF NOT EXISTS idx_approvals_packet ON application_approvals(packet_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_approvals_nonce ON application_approvals(ticket_nonce);
 CREATE INDEX IF NOT EXISTS idx_approvals_user_hash ON application_approvals(user_id, packet_version_hash);
 CREATE INDEX IF NOT EXISTS idx_app_logs_user ON application_logs(user_id);
@@ -592,213 +650,160 @@ CREATE INDEX IF NOT EXISTS idx_auth_audit_event ON auth_audit_logs(event_type, i
 
 ---
 
-## 4. Security Architecture & Invariants
+## 5. Genuine RFC 8785 Canonical JSON (JCS) Implementation Specification
 
-### 4.1 HMAC Secret Management & Rotation
+### Why Standard Python `json.dumps(sort_keys=True)` Fails RFC 8785 Compliance
+1. **Key Sorting Rules:** Python's standard `json.dumps` sorts string keys based on native Python Unicode code point lexicographical ordering. In RFC 8785 (Section 3.2.3), keys must be sorted by **UTF-16 code units**. For Unicode characters outside the Basic Multilingual Plane (astral characters $\ge \text{U+10000}$ such as emoji or mathematical symbols), UTF-16 encodes them as surrogate pairs (`0xD800..0xDBFF` and `0xDC00..0xDFFF`), which alters the required sort order relative to higher code points.
+2. **Number Serialization (IEEE 754 & ECMAScript 6 Section 7.1.12.1):**
+   - Negative zero (`-0.0` or `-0`) must be normalized to unsigned integer `0`. Python outputs `-0.0`.
+   - Floats representing whole numbers must be formatted without trailing decimals or exponent (e.g. `1.0` $\to$ `1`).
+   - Exponential notation: Exponent letter must be lowercase `e` with no unnecessary leading `+` or zeros (e.g., `1e21`, not `1e+21` or `1E21`).
+   - `NaN` and `Infinity` are strictly forbidden by RFC 8785 and must throw a serialization error.
+3. **Strict Escape Sequences:** Only quotation mark (`"`, `\u0022`), reverse solidus (`\`, `\u005C`), and ASCII control characters `\u0000` through `\u001F` may be escaped. Forward slash `/` must NOT be escaped. Two-character escape sequences (`\b`, `\f`, `\n`, `\r`, `\t`) must be used where available. All other Unicode characters must be emitted as unescaped raw UTF-8 octets.
 
-#### Secret Lifecycle State Machine
-```mermaid
-stateDiagram-v2
-    [*] --> Unconfigured: Application Initializing
-    Unconfigured --> Active: Load ACTION_TICKET_SECRET_KEY (.env)
-    Unconfigured --> Aborted: Missing or Low Entropy (< 256 bits)
-    Active --> Rotated_Grace: New Key Added (v2 active, v1 in rotation map)
-    Rotated_Grace --> Retired: Old Key Removed from Config
-    Retired --> [*]: All v1 Tickets Rejected
-```
-
-1. **Environment Configuration Loading:**
-   - Loaded from protected `.env` via `python-dotenv` or runtime host environment variables:
-     - `ACTION_TICKET_SECRET_KEY`: Active 256-bit hexadecimal key (64 chars).
-     - `ACTION_TICKET_ACTIVE_KEY_ID`: Active key ID (e.g., `"v2"`).
-     - `ACTION_TICKET_ROTATION_KEYS`: JSON mapping of known key IDs to keys (`{"v1": "...", "v2": "..."}`).
-2. **Zero-Exposure Invariant:**
-   - Secrets are never serialized to Streamlit session state, HTTP responses, client-side JavaScript, or logs.
-   - All log formatters apply automated regex scrubbing over any string matching secret entropy.
-3. **Structured Ticket Format:**
-   $$\text{Ticket} = \text{TKT}-\langle\text{key\_id}\rangle-\langle\text{nonce}\rangle.\langle\text{timestamp}\rangle.\langle\text{signature}\rangle$$
-   *Example:* `TKT-v2-d5a2f8b1c4e9021a.1798934400.9f8e7d6c...`
-4. **Deliberate Key Rotation & Invalidation Procedure:**
-   - **Step 1 (Provisioning):** Operator generates new key `v3` (`secrets.token_hex(32)`) and adds it to `ACTION_TICKET_ROTATION_KEYS`.
-   - **Step 2 (Promotion):** Operator sets `ACTION_TICKET_ACTIVE_KEY_ID=v3`. Newly issued action tickets use `v3`.
-   - **Step 3 (Grace Period):** Tickets signed under `v2` verify successfully during their 15-minute TTL window.
-   - **Step 4 (Retirement):** Operator removes `v2` from `ACTION_TICKET_ROTATION_KEYS`. Outstanding `v2` tickets fail immediately with:
-     `"Authorization rejected: Ticket signed with retired key. Re-authorization required."`
-
----
-
-### 4.2 Complete Application Packet Integrity (RFC 8785)
-
-#### Full Material Manifest
-Every submission-relevant component is serialized deterministically before hashing:
+### RFC 8785 Architecture in `src/utils/canonical_json.py`
 
 ```python
-import hashlib
-import json
-from typing import Any, Dict
+"""RFC 8785 JSON Canonicalization Scheme (JCS) encoder."""
 
-def canonical_json_bytes(data: Dict[str, Any]) -> bytes:
-    """RFC 8785 JSON Canonicalization Scheme (JCS)."""
-    return json.dumps(
-        data,
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode("utf-8")
+import math
+from typing import Any, Dict, List, Union
 
-def compute_packet_version_hash(
-    user_id: int,
-    application_id: int,
-    company_name: str,
-    job_title: str,
-    job_description_snapshot_hash: str,
-    original_resume_file_hash: str,
-    tailored_resume_content_hash: str,
-    cover_letter_content_hash: str,
-    screening_answers: Dict[str, Any],
-    form_payload_hash: str,
-    attachments_manifest_hash: str,
-) -> str:
-    manifest = {
-        "user_id": user_id,
-        "application_id": application_id,
-        "company_name": company_name.strip(),
-        "job_title": job_title.strip(),
-        "job_description_snapshot_hash": job_description_snapshot_hash.strip(),
-        "original_resume_file_hash": original_resume_file_hash.strip(),
-        "tailored_resume_content_hash": tailored_resume_content_hash.strip(),
-        "cover_letter_content_hash": cover_letter_content_hash.strip(),
-        "screening_answers": screening_answers,
-        "form_payload_hash": form_payload_hash.strip(),
-        "attachments_manifest_hash": attachments_manifest_hash.strip(),
-    }
-    return hashlib.sha256(canonical_json_bytes(manifest)).hexdigest()
-```
+class RFC8785Encoder:
+    """Encodes arbitrary JSON-compatible Python data structures according to RFC 8785."""
 
-#### Component Modification Test Matrix
-The test suite enforces that any modification to *any* individual component invalidates the hash:
+    @classmethod
+    def encode(cls, data: Any) -> bytes:
+        """Serializes data into deterministic RFC 8785 canonical UTF-8 bytes."""
+        return cls._serialize(data).encode("utf-8")
 
-| Component Under Test | Perturbation Tested | Expected Behavior |
-|:---|:---|:---|
-| `user_id` | Swapped with alternate authenticated `user_id` | Hash mismatch; cross-user ticket swap rejected |
-| `application_id` | Target application ID altered | Hash mismatch; ticket bound to wrong application |
-| `company_name` | Leading/trailing whitespace or company name edit | Hash mismatch; approval voided |
-| `job_title` | Job title modified (e.g. Intern -> Junior Engineer) | Hash mismatch; approval voided |
-| `job_description_snapshot_hash` | Job requirements or criteria modified | Hash mismatch; bait-and-switch prevented |
-| `original_resume_file_hash` | Candidate uploaded updated base resume | Hash mismatch; tailored resume needs refresh |
-| `tailored_resume_content_hash` | Single bullet point or skill altered | Hash mismatch; unreviewed resume blocked |
-| `cover_letter_content_hash` | Single word or sentence in cover letter edited | Hash mismatch; prior human approval invalidated |
-| `screening_answers` | Answer string modified or new question added | Hash mismatch; unverified answer blocked |
-| `form_payload_hash` | Playwright DOM selector or autofill value altered | Hash mismatch; unexpected form tampering blocked |
-| `attachments_manifest_hash` | Supplemental PDF or portfolio URL modified | Hash mismatch; approval invalidated |
+    @classmethod
+    def _utf16_sort_key(cls, s: str) -> bytes:
+        """Encodes string to UTF-16BE bytes for accurate RFC 8785 property key sorting."""
+        return s.encode("utf-16-be")
 
----
+    @classmethod
+    def _serialize_number(cls, n: Union[int, float]) -> str:
+        """Serializes numbers per ECMAScript 6 / RFC 8785 rules."""
+        if isinstance(n, bool):
+            return "true" if n else "false"
+        if isinstance(n, int):
+            return str(n)
+        if isinstance(n, float):
+            if math.isnan(n) or math.isinf(n):
+                raise ValueError(f"RFC 8785 rejects non-finite float: {n}")
+            if n == 0.0:
+                return "0"  # Normalizes -0.0 to 0
+            if n.is_integer() and abs(n) < 1e21:
+                return str(int(n))
+            # Standard ECMAScript 6 formatting: lowercase 'e', no positive exponent sign
+            s = f"{n:.16g}"
+            return s.replace("e+", "e").replace("E+", "e").replace("E", "e")
+        raise TypeError(f"Unsupported number type: {type(n)}")
 
-### 4.3 Persistent Nonce & Transactional Concurrency Control
-
-```python
-def consume_approval_ticket(
-    db_conn,
-    user_id: int,
-    application_id: int,
-    ticket_nonce: str,
-    packet_version_hash: str,
-) -> None:
-    """Atomically consumes ticket nonce using an ACID immediate transaction."""
-    cursor = db_conn.cursor()
-    cursor.execute("BEGIN IMMEDIATE")
-    try:
-        # 1. Authoritative persistent nonce check
-        cursor.execute("SELECT 1 FROM consumed_action_nonces WHERE nonce = ?", (ticket_nonce,))
-        if cursor.fetchone():
-            raise TicketAlreadyConsumedError("Replay attack detected: Ticket nonce already consumed.")
-
-        # 2. Atomic state transition with rowcount verification
-        cursor.execute(
-            """
-            UPDATE application_approvals
-            SET is_consumed = 1,
-                consumed_at = CURRENT_TIMESTAMP
-            WHERE ticket_nonce = :nonce
-              AND application_id = :app_id
-              AND user_id = :user_id
-              AND packet_version_hash = :hash
-              AND is_consumed = 0
-            """,
-            {
-                "nonce": ticket_nonce,
-                "app_id": application_id,
-                "user_id": user_id,
-                "hash": packet_version_hash,
-            }
-        )
-        if cursor.rowcount == 0:
-            cursor.execute("SELECT is_consumed FROM application_approvals WHERE ticket_nonce = ?", (ticket_nonce,))
-            row = cursor.fetchone()
-            if not row:
-                raise InvalidTicketError("Unrecognized ticket nonce or unauthorized user.")
-            elif row[0] == 1:
-                raise TicketAlreadyConsumedError("Approval ticket has already been consumed.")
+    @classmethod
+    def _serialize_string(cls, s: str) -> str:
+        """Escapes only RFC 8785 required characters; emits raw UTF-8 for everything else."""
+        out = ['"']
+        for char in s:
+            cp = ord(char)
+            if cp == 0x22:
+                out.append('\\"')
+            elif cp == 0x5C:
+                out.append('\\\\')
+            elif cp == 0x08:
+                out.append('\\b')
+            elif cp == 0x0C:
+                out.append('\\f')
+            elif cp == 0x0A:
+                out.append('\\n')
+            elif cp == 0x0D:
+                out.append('\\r')
+            elif cp == 0x09:
+                out.append('\\t')
+            elif cp < 0x20:
+                out.append(f"\\u{cp:04x}")
             else:
-                raise SecurityAuthorizationError("Packet content modified after approval; hash mismatch.")
+                out.append(char)
+        out.append('"')
+        return "".join(out)
 
-        # 3. Persistent audit registration
-        cursor.execute(
-            "INSERT INTO consumed_action_nonces (nonce, key_id, user_id, action_type) VALUES (?, ?, ?, ?)",
-            (ticket_nonce, "v2", user_id, "APPLICATION_SUBMISSION")
-        )
-        db_conn.commit()
-    except Exception:
-        db_conn.rollback()
-        raise
+    @classmethod
+    def _serialize(cls, val: Any) -> str:
+        if val is None:
+            return "null"
+        if isinstance(val, bool):
+            return "true" if val else "false"
+        if isinstance(val, (int, float)):
+            return cls._serialize_number(val)
+        if isinstance(val, str):
+            return cls._serialize_string(val)
+        if isinstance(val, list):
+            return "[" + ",".join(cls._serialize(item) for item in val) + "]"
+        if isinstance(val, dict):
+            # Sort keys by UTF-16 code units (RFC 8785 Section 3.2.3)
+            sorted_keys = sorted(val.keys(), key=cls._utf16_sort_key)
+            items = [
+                cls._serialize_string(k) + ":" + cls._serialize(val[k])
+                for k in sorted_keys
+            ]
+            return "{" + ",".join(items) + "}"
+        raise TypeError(f"RFC 8785 cannot serialize unsupported type: {type(val)}")
 ```
+
+### Verification Against Official RFC 8785 Test Vectors
+The test suite in Phase 2 tests the encoder against:
+- `values.json`: Numeric formatting, negative zero, boolean and null literals.
+- `structures.json`: Object key order invariance, nested arrays, empty containers.
+- `utf8.json`: Astral code point ordering, CJK, Cyrillic, Devanagari, and emoji.
+- `weird.json`: Control character escape sequences (`\u0000` through `\u001f`).
 
 ---
 
-### 4.4 Password Reset & Account Recovery Architecture
+## 6. Password Reset Token Architecture & Flow
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as Candidate
-    participant UI as Streamlit Auth UI
-    participant Service as Auth & Recovery Service
+    actor Candidate as Job Candidate
+    participant UI as Auth UI
+    participant Service as PasswordRecoveryService
     participant DB as SQLite DB
-    participant Mail as Secure Mail Dispatcher
+    participant Mail as Secure Mail Service
 
-    User->>UI: Submit Email ("user@example.com")
-    UI->>Service: Request Password Reset
-    Service->>Service: Enforce Rate Limit (Max 3/hr per email, 5/hr per IP)
+    Candidate->>UI: Submit Email ("user@example.com")
+    UI->>Service: RequestPasswordReset(email)
+    Service->>Service: Rate Limit Check (Max 3/hr per email, 5/hr per IP)
     alt Rate Limit Exceeded
         Service-->>UI: Generic Response ("If account exists, instructions sent.")
     else Rate Limit OK
         Service->>DB: Query user by email (COLLATE NOCASE)
         alt User Exists
-            Service->>Service: token = secrets.token_urlsafe(32)
-            Service->>Service: token_hash = SHA256(token + PASSWORD_RESET_PEPPER)
-            Service->>DB: INSERT INTO password_reset_tokens (15-min TTL)
-            Service->>Mail: Send reset link with raw token
+            Service->>Service: raw_token = secrets.token_urlsafe(32)
+            Service->>Service: token_salt = secrets.token_hex(16)
+            Service->>Service: token_hash = SHA256(raw_token + token_salt + PASSWORD_RESET_PEPPER)
+            Service->>DB: INSERT INTO password_reset_tokens (user_id, token_hash, token_salt, expires_at) [15-min TTL]
+            Service->>Mail: Send reset link with raw_token
         else User Does Not Exist
             Service->>Service: Constant-time dummy computation
         end
         Service-->>UI: Generic Response ("If account exists, instructions sent.")
     end
 
-    User->>UI: Open Link & Submit New Password
-    UI->>Service: ResetPassword(token, new_password)
-    Service->>Service: token_hash = SHA256(token + PASSWORD_RESET_PEPPER)
+    Candidate->>UI: Open Link & Submit New Password
+    UI->>Service: ResetPassword(raw_token, new_password)
     Service->>DB: BEGIN IMMEDIATE
-    Service->>DB: Verify token_hash, is_used=0, expires_at > CURRENT_TIMESTAMP
-    alt Token Valid
-        Service->>Service: Validate Complexity (8+ chars, upper, lower, digit, symbol)
+    Service->>DB: Fetch unexpired, unused reset tokens for user
+    Service->>Service: Validate candidate raw_token against stored token_hash using constant-time comparison
+    alt Valid Token & Password Meets Complexity
         Service->>Service: new_hash = Argon2id(new_password)
-        Service->>DB: UPDATE users SET password_hash = new_hash
-        Service->>DB: UPDATE password_reset_tokens SET is_used = 1, used_at = CURRENT_TIMESTAMP
+        Service->>DB: UPDATE users SET password_hash = new_hash WHERE id = user_id
+        Service->>DB: UPDATE password_reset_tokens SET is_used = 1, used_at = CURRENT_TIMESTAMP WHERE id = token_id
         Service->>DB: COMMIT
-        Service->>Service: Purge ALL active sessions for user_id
-        Service->>DB: Log "PASSWORD_RESET_SUCCESS" to auth_audit_logs
+        Service->>Service: Revoke ALL active sessions for user_id (Session Purge)
+        Service->>DB: Log event in auth_audit_logs ("PASSWORD_RESET_SUCCESS")
         Service-->>UI: Success ("Password updated. Please log in.")
-    else Token Invalid or Expired
+    else Invalid or Expired
         Service->>DB: ROLLBACK
         Service-->>UI: Error ("Invalid or expired password reset link.")
     end
@@ -806,59 +811,43 @@ sequenceDiagram
 
 ---
 
-### 4.5 Safe Existing Candidate Migration
+## 7. Data Deletion and Audit Integrity Lifecycle Matrix
 
-1. **Local Test Fixture Isolation:**
-   - Candidate personal data (`Pranay Anup Agrawal`, MIT-WPU, B.Tech AI&DS) is decoupled from runtime databases and isolated to:
-     `tests/fixtures/candidate_profile_fixture.json`
-   - Excluded from version control via `.gitignore`.
-2. **Zero Default Public Accounts:**
-   - SQLite initialization scripts (`init_db`) create schema tables only; no default accounts, admin backdoors, or shared passwords are created.
-3. **Explicit Local Developer Seeding:**
-   - Developers wishing to populate local test data run an explicit CLI command:
-     ```bash
-     python scripts/seed_dev_fixture.py --email dev@local.test
-     ```
-   - Requires setting an interactive password on creation or marks the account `account_status = 'pending_setup'`, enforcing password creation before UI dashboard access.
+| Application Lifecycle State | Deletion Request Target | Physical Disk Action | Database Relational Action | Compliance & Security Audit Policy |
+|:---|:---|:---|:---|:---|
+| **1. Unsubmitted Drafts**<br>(Discovered, Under Review, Shortlisted, Prepared) | Draft application or tailored revision | Unlink files in `data/users/<user_id>/exports/` and `cover_letters/` | **Full Hard Delete:** Cascades deletion across `prepared_packets` and `applications`. | No submission took place. No audit preservation required. Record removed cleanly. |
+| **2. Approved Unsubmitted Applications**<br>(Awaiting Approval or active unconsumed ticket) | Approved packet or draft | Unlink draft tailored files | **Revocation & Invalidation:** Mark ticket nonce in `consumed_action_nonces` as `APPROVAL_REVOKED`. Remove approval from `application_approvals`. | Audit log records `APPLICATION_APPROVAL_CANCELLED` with zero PII. Prevents ticket replay. |
+| **3. Manually Submitted Applications**<br>(Status = `Applied`) | Submitted application or full user account | Unlink all resume PDFs and cover letter files from disk | **Pseudonymized Audit Tombstone:**<br>- `company_name`, `job_title`, `notes` set to `"[DELETED_BY_USER]"`<br>- Packet screening answers and letter text zeroed out.<br>- Relational foreign keys use `ON DELETE RESTRICT` or `ON DELETE SET NULL`. | **Regulatory Integrity Preserved:** Retains tamper-evident proof that a human authorized submission at timestamp $T$: `{ anonymized_user_pseudonym, packet_version_hash, timestamp, action: "HUMAN_APPROVED_SUBMISSION" }`. Zero candidate PII retained. |
+| **4. Security Audit Records**<br>(`auth_audit_logs`, `consumed_action_nonces`, `application_logs`) | Automatic routine cleanup or user erasure | N/A | **Time-Horizon Vacuum:** Nonces and audit logs are retained for a 180-day compliance window, then purged via automated cleanup query. | Audit details never store raw passwords, reset tokens, full resume text, or candidate PII. |
 
 ---
 
-### 4.6 Data Retention & Right to Erasure
+## 8. HMAC Key Rotation Modes (Graceful vs. Emergency)
 
-#### User-Controlled Deletion Workflows
-Candidates manage data retention under the **Settings & Privacy** page:
+### Mode A: Graceful Rotation (Scheduled Maintenance)
+1. **Trigger:** Periodic scheduled key hygiene (e.g. 90-day rotation).
+2. **Procedure:**
+   - Operator provisions new 256-bit key `v2` into `.env`.
+   - `ACTION_TICKET_ROTATION_KEYS` contains `{"v1": "<key1>", "v2": "<key2>"}`.
+   - `ACTION_TICKET_ACTIVE_KEY_ID="v2"`.
+   - All newly issued action tickets are signed with `v2`.
+   - Action tickets signed with `v1` verify successfully during the 15-minute grace period (ticket TTL).
+   - After 15 minutes, operator removes `v1` from `ACTION_TICKET_ROTATION_KEYS`.
+3. **Candidate Impact:** Seamless; unexpired in-flight approval tickets complete without interruption.
 
-1. **Delete Resume:** Deletes physical file `data/users/<user_id>/resumes/<uuid4>.pdf`, deletes `resumes` record, and cascades deletion to `resume_versions`.
-2. **Delete Job Description:** Removes manual job description and clears unsubmitted draft applications.
-3. **Delete Tailored Resume / Cover Letter:** Unlinks physical exports in `data/users/<user_id>/exports/` and `data/users/<user_id>/cover_letters/`.
-4. **Delete Application Packet:** Erases draft packet bundle and cached form-filling payloads.
-
-#### Cryptographic Audit Tombstoning (Account Erasure)
-When a user deletes their entire account:
-1. **PII Eradication:**
-   - All physical user files in `data/users/<user_id>/` are recursively deleted.
-   - User record in `users` and linked records in `candidate_profiles`, `resumes`, `job_descriptions`, and `match_results` are permanently deleted.
-2. **Compliance Proof Preservation:**
-   - Legal human-in-the-loop records for submitted applications (`Applied`) are retained as anonymized tombstones:
-     $$\text{anonymized\_user\_pseudonym} = \text{HMAC-SHA256}(\text{AUDIT\_LOG\_PEPPER}, \text{user\_id})$$
-   - Candidate name, email, phone, and letter text are overwritten with `"[DELETED_BY_USER]"`.
-   - Immutable verification records retain `{ anonymized_user_pseudonym, packet_version_hash, timestamp, disposition: "HUMAN_APPROVED_SUBMISSION" }`.
-   - Tombstones are purged after a 180-day compliance window.
-
----
-
-### 4.7 Multiple Applications & Versioned Packets
-
-1. **Cardinality:**
-   $$\text{Users} \ (1) \longleftrightarrow (N) \ \text{Applications} \ (1) \longleftrightarrow (N) \ \text{Prepared Packets} \ (1) \longleftrightarrow (N) \ \text{Approvals}$$
-2. **Independent Revisions:**
-   - Candidate can create Revision 1 (e.g. general role focus) and Revision 2 (specialized role focus) for the same job description.
-   - Each revision holds an independent `version_num`, distinct `packet_version_hash`, and separate approval history.
-   - Approving Revision 1 does not approve Revision 2.
+### Mode B: Emergency Rotation (Immediate Compromise / Incident Response)
+1. **Trigger:** Key leak, credential compromise, or suspected token tampering.
+2. **Procedure:**
+   - Operator immediately provisions new safe key `v_safe` and sets `ACTION_TICKET_ACTIVE_KEY_ID="v_safe"`.
+   - The compromised key `v_old` is **immediately expunged** from `ACTION_TICKET_ROTATION_KEYS`.
+   - In-flight tickets signed with `v_old` fail signature verification immediately with:
+     `KeyRevokedError: "Action ticket signed with revoked key. Emergency key rotation in effect. Please review and re-authorize."`
+   - All unconsumed approvals tied to `v_old` are voided.
+3. **Candidate Impact:** Candidates must review and authorize anew before any submission can proceed. Guarantees zero unauthorized submissions under compromised keys.
 
 ---
 
-## 5. Implementation Dependency Graph
+## 9. Implementation Dependency Graph
 
 ```mermaid
 flowchart TD
@@ -882,15 +871,15 @@ flowchart TD
 
 ---
 
-## 6. Revised 11-Phase Implementation Roadmap
+## 10. Revised 11-Phase Implementation Roadmap & Refined Phase 2 Scope
 
-| Phase | Title | Key Deliverables & Corrections Incorporated | Dependencies | Exit Verification Criteria |
+| Phase | Title | Key Deliverables & Final Consistency Corrections | Dependencies | Exit Verification Criteria |
 |:---:|:---|:---|:---|:---|
-| **Phase 1** | **Architecture Audit** | Forensic audit of candidate-specific data, tech assumptions, and database isolation requirements. | None | Deliverable accepted. |
-| **Phase 2** | **Auth, Multi-User DB & Security Foundation** | 1. `src/security/auth.py`: Argon2id password hashing, failed login lockout (5 attempts -> 15 min), rate limiting, password reset flow (single-use salted hashes, generic anti-enumeration responses).<br>2. `src/security/session_manager.py`: Protected env secrets (`ACTION_TICKET_SECRET_KEY`), structured key rotation, anti-fixation sessions, sliding TTL.<br>3. `src/database/schema.sql`: Multi-tenant schema, password reset tokens, multi-revision packets, persistent nonces (`UNIQUE(ticket_nonce)`).<br>4. `src/database/db_manager.py`: User-isolated queries, atomic `BEGIN IMMEDIATE` ticket consumption.<br>5. Offline fixture isolation (`tests/fixtures/candidate_profile_fixture.json`). | Phase 1 | Unit tests in `test_auth_security.py` pass 100%: registration, login, rate limiting, password reset with generic responses, session invalidation, and atomic nonce consumption preventing double-spend. |
-| **Phase 3** | **Dynamic Candidate Profile & Resume Management** | 1. `src/preparer/resume_parser.py`: Universal NLP parser for PDF/DOCX across all professions without hardcoded fallbacks.<br>2. User-isolated storage: `data/users/<user_id>/resumes/<uuid4>.pdf`.<br>3. Candidate profile editor with SQLite version snapshots.<br>4. User-controlled deletion routines for resumes and versions. | Phase 2 | Tests verify parsing resumes across healthcare, finance, engineering, and tech; user file deletion tests pass; no hardcoded student data. |
+| **Phase 1** | **Architecture Audit** | Complete forensic audit of candidate-specific data, tech assumptions, and database isolation requirements. | None | Complete & Approved. |
+| **Phase 2** | **Auth, Multi-User DB & Security Foundation** | 1. `src/security/auth.py`: Argon2id password hashing, account lockout (5 attempts $\to$ 15 min), rate limiting, password reset flow (single-use salted hashes, generic anti-enumeration responses).<br>2. `src/security/session_manager.py`: Environment-loaded secrets (`ACTION_TICKET_SECRET_KEY`), structured key rotation (Modes A & B), anti-fixation sessions, sliding TTL.<br>3. `src/database/schema.sql`: Multi-tenant schema with **composite foreign keys** `(entity_id, user_id)` preventing cross-user relational linkage, `password_reset_tokens` with salts, `prepared_packets`, `application_approvals`.<br>4. `src/database/db_manager.py`: User-isolated queries, atomic `BEGIN IMMEDIATE` ticket consumption, composite ownership enforcement.<br>5. `src/utils/canonical_json.py`: Genuine RFC 8785 Canonical JSON encoder.<br>6. Offline fixture isolation (`tests/fixtures/candidate_profile_fixture.json`). | Phase 1 | `tests/test_auth_security.py` passes 100%:<br>- User registration, login, lockout, and password reset flow.<br>- RFC 8785 test vectors (number formatting, astral Unicode, key sorting).<br>- Cross-user attack tests: deliberate attempts to associate User A's packet with User B's application or resume fail with engine-level `sqlite3.IntegrityError` or `SecurityAuthorizationError`.<br>- Emergency & graceful key rotation tests.<br>- Atomic nonce consumption preventing double-spend. |
+| **Phase 3** | **Dynamic Candidate Profile & Resume Management** | 1. `src/preparer/resume_parser.py`: Universal NLP parser for PDF/DOCX across all professions without hardcoded fallbacks.<br>2. User-isolated storage: `data/users/<user_id>/resumes/<uuid4>.pdf`.<br>3. Candidate profile editor with SQLite version snapshots.<br>4. User-controlled deletion routines for resumes and versions. | Phase 2 | Tests verify parsing resumes across healthcare, finance, engineering, and tech; user file deletion tests pass; zero hardcoded student data. |
 | **Phase 4** | **Dynamic Job Description Ingest** | 1. `src/preparer/job_parser.py`: 3 ingest modes: pasted text, URL (Playwright MCP), and document upload (PDF/DOCX).<br>2. Entity extraction for title, company, requirements, salary, and experience.<br>3. Content hashing (`job_descriptions.content_hash`) and deduplication. | Phase 2 | Tests verify extraction across pasted text, uploaded job descriptions, and live URLs with manual correction support. |
-| **Phase 5** | **Universal Matching Engine (10 Dimensions)** | 1. `src/matcher/universal_matcher.py`: Universal 100-point algorithm across 10 dimensions.<br>2. Three-state eligibility (`ELIGIBLE`, `INELIGIBLE`, `UNKNOWN`).<br>3. Configurable scoring profiles (Experienced Professional, Student/Intern, Career Changer).<br>4. Transparent scoring breakdown and explanations. | Phases 3, 4 | Tests verify scoring freshers, senior engineers, nurses, accountants, and creative designers; no tech bias or student-only penalties. |
+| **Phase 5** | **Universal Matching Engine (10 Dimensions)** | 1. `src/matcher/universal_matcher.py`: Universal 100-point algorithm across 10 dimensions.<br>2. Three-state eligibility (`ELIGIBLE`, `INELIGIBLE`, `UNKNOWN`).<br>3. Configurable scoring profiles (Experienced Professional, Student/Intern, Career Changer).<br>4. Transparent scoring breakdown and explanations. | Phases 3, 4 | Tests verify scoring freshers, senior engineers, nurses, accountants, and creative designers; zero tech bias or student-only penalties. |
 | **Phase 6** | **Multi-Packet Application Preparation Engine** | 1. `src/preparer/resume_tailorer.py`: Tailored PDF & DOCX resumes.<br>2. `src/preparer/cover_letter_generator.py`: Tailored markdown letters.<br>3. `src/preparer/question_answerer.py`: Fact-based answering with `[NEEDS CANDIDATE INPUT]`.<br>4. `src/preparer/form_prefiller.py`: DOM field-filling payload planner.<br>5. Multi-revision support with RFC 8785 Canonical JSON packet hashing. | Phases 3, 5 | Tests verify deterministic canonical packet hashing, multi-revision creation, and fact-based responses with zero fabrication. |
 | **Phase 7** | **Universal 10-Page Dashboard** | Streamlit UI implementation across 10 universal pages:<br>1. Dashboard Overview<br>2. My Profile & Experience<br>3. Resume Manager & Uploads<br>4. Job Description Analyzer<br>5. Resume Match Analysis<br>6. Application Preparation<br>7. Cover Letter Editor<br>8. Screening QA Drafter<br>9. Application Tracker<br>10. Settings, Privacy & Right to Erasure | Phases 2, 6 | End-to-end UI verification with authenticated user sessions, multi-packet inspection, and granular data deletion controls. |
 | **Phase 8** | **Human Approval Gate & Persistent Nonces** | 1. `src/preparer/approval_gate.py`: Comprehensive 11-element packet verification, single-use action ticket verification bound to active `key_id`.<br>2. SQLite atomic nonce consumption via `BEGIN IMMEDIATE`.<br>3. Post-approval invalidation verification (content edit voids approval).<br>4. Strict transition lock preventing autonomous submission to `Applied`. | Phases 6, 7 | Security tests prove no automated submission can bypass human approval; double-spend attacks fail 100% of the time. |
@@ -900,21 +889,11 @@ flowchart TD
 
 ---
 
-## 7. Migration and Backup Strategy
+## 11. Migration & Backup Strategy
 
-1. **Pre-Migration Backup Protocol:**
-   - Prior to executing database upgrades, a full SQLite live online backup is captured:
-     ```python
-     import sqlite3, datetime
-     def create_backup(source_db="data/storage/job_assistant.db", backup_dir="data/backups/"):
-         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-         backup_path = f"{backup_dir}/backup_job_assistant_{ts}.db"
-         with sqlite3.connect(source_db) as src, sqlite3.connect(backup_path) as dst:
-             src.backup(dst)
-         return backup_path
-     ```
-2. **Zero-Downtime Schema Upgrade:**
-   - New tables and indexes are deployed idempotently (`CREATE TABLE IF NOT EXISTS`).
-   - Legacy data is isolated and untouched; migrations run within a single transaction with automatic rollback on error.
-3. **Git Hygiene:**
-   - Backup files (`data/backups/*.db`), private user databases (`data/storage/*.db`), and personal resumes (`data/resumes/*.pdf`) are git-ignored.
+1. **Pre-Migration Live Online Backup:**
+   Captures an atomic snapshot via `sqlite3.Connection.backup()` to `data/backups/backup_job_assistant_<timestamp>.db` before any schema migrations.
+2. **Idempotent Multi-Tenant Schema Upgrade:**
+   Schema updates use `CREATE TABLE IF NOT EXISTS` and composite index creation. Migrations execute within an immediate transaction (`BEGIN IMMEDIATE`) with automatic rollback on error.
+3. **Strict Git Hygiene:**
+   `.gitignore` excludes environment variables (`.env`), candidate resumes (`data/resumes/*`), user-isolated directories (`data/users/*`), database backups (`data/backups/*`), SQLite databases (`data/storage/*.db`), and fixtures containing candidate PII (`tests/fixtures/candidate_profile_fixture.json`).
