@@ -16,8 +16,8 @@ from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
     CrossUserAccessError,
     DuplicateResumeError,
-    ResumeNotFoundError,
 )
+from dashboard.services.dashboard_service import DashboardService
 from tests.fixtures.synthetic_personas import (
     generate_persona_docx,
     generate_persona_pdf,
@@ -182,6 +182,160 @@ class TestResumeUploadsAndIsolation(unittest.TestCase):
         # Check total user resumes
         resumes = self.db.list_user_resumes(self.userA_id)
         self.assertEqual(len(resumes), 2)
+
+    # 5. Comprehensive Bidirectional Isolation Regression Tests
+    def test_bidirectional_multi_user_isolation(self):
+        """Proves Candidate A and B cannot list, access, download, toggle primary, or delete each other's resumes."""
+        pdf_a = generate_persona_pdf("cardiologist")
+        u_dir_a = self.user_base_dir / str(self.userA_id) / "resumes"
+        res_a = self.db.upload_user_resume(
+            user_id=self.userA_id,
+            file_bytes=pdf_a,
+            original_filename="alice_resume.pdf",
+            user_base_dir=u_dir_a,
+        )
+
+        docx_b = generate_persona_docx("mechanical_engineer")
+        u_dir_b = self.user_base_dir / str(self.userB_id) / "resumes"
+        res_b = self.db.upload_user_resume(
+            user_id=self.userB_id,
+            file_bytes=docx_b,
+            original_filename="bob_resume.docx",
+            user_base_dir=u_dir_b,
+        )
+
+        # 1. Listing Isolation: User A only sees A; User B only sees B
+        list_a = self.db.list_user_resumes(self.userA_id)
+        list_b = self.db.list_user_resumes(self.userB_id)
+        self.assertTrue(all(r["user_id"] == self.userA_id for r in list_a))
+        self.assertTrue(all(r["user_id"] == self.userB_id for r in list_b))
+        self.assertNotIn(res_b["id"], [r["id"] for r in list_a])
+        self.assertNotIn(res_a["id"], [r["id"] for r in list_b])
+
+        # 2. Cross-user Path Resolution / Download: raises CrossUserAccessError
+        with self.assertRaises(CrossUserAccessError):
+            self.db.get_resume_file_path(self.userA_id, res_b["id"], user_base_dir=u_dir_a)
+        with self.assertRaises(CrossUserAccessError):
+            self.db.get_resume_file_path(self.userB_id, res_a["id"], user_base_dir=u_dir_b)
+
+        # 3. Cross-user Primary Toggle: raises CrossUserAccessError
+        with self.assertRaises(CrossUserAccessError):
+            self.db.set_primary_resume(self.userA_id, res_b["id"])
+        with self.assertRaises(CrossUserAccessError):
+            self.db.set_primary_resume(self.userB_id, res_a["id"])
+
+        # 4. Cross-user Version Creation: raises CrossUserAccessError
+        new_pdf = generate_persona_pdf("biotech_scientist")
+        with self.assertRaises(CrossUserAccessError):
+            self.db.add_resume_version(
+                user_id=self.userA_id,
+                resume_id=res_b["id"],
+                file_bytes=new_pdf,
+                original_filename="malicious_v2.pdf",
+                user_base_dir=u_dir_a,
+            )
+        with self.assertRaises(CrossUserAccessError):
+            self.db.add_resume_version(
+                user_id=self.userB_id,
+                resume_id=res_a["id"],
+                file_bytes=new_pdf,
+                original_filename="malicious_v2.pdf",
+                user_base_dir=u_dir_b,
+            )
+
+        # 5. Cross-user Deletion: raises CrossUserAccessError
+        with self.assertRaises(CrossUserAccessError):
+            self.db.delete_user_resume(self.userA_id, res_b["id"])
+        with self.assertRaises(CrossUserAccessError):
+            self.db.delete_user_resume(self.userB_id, res_a["id"])
+
+        # Confirm neither record was modified or deleted
+        self.assertIsNotNone(self.db.get_user_resume(res_a["id"], self.userA_id))
+        self.assertIsNotNone(self.db.get_user_resume(res_b["id"], self.userB_id))
+
+    # 6. DashboardService Multi-User Access Safeguards
+    def test_dashboard_service_multi_user_isolation(self):
+        """Verifies DashboardService enforces multi-user boundaries across service methods."""
+        service = DashboardService(db_manager=self.db)
+
+        pdf_a = generate_persona_pdf("cfa_investment_banker")
+        u_dir_a = self.temp_path / "data" / "users" / str(self.userA_id) / "resumes"
+        res_a = self.db.upload_user_resume(
+            user_id=self.userA_id,
+            file_bytes=pdf_a,
+            original_filename="alice_banking.pdf",
+            user_base_dir=u_dir_a,
+        )
+
+        docx_b = generate_persona_docx("supply_chain_director")
+        u_dir_b = self.temp_path / "data" / "users" / str(self.userB_id) / "resumes"
+        res_b = self.db.upload_user_resume(
+            user_id=self.userB_id,
+            file_bytes=docx_b,
+            original_filename="bob_supply.docx",
+            user_base_dir=u_dir_b,
+        )
+
+        # Service-level primary toggle rejection
+        succ_a_set_b, msg_a_set_b = service.set_primary_resume(self.userA_id, res_b["id"])
+        self.assertFalse(succ_a_set_b)
+        self.assertIn("Cross-user security violation", msg_a_set_b)
+
+        succ_b_set_a, msg_b_set_a = service.set_primary_resume(self.userB_id, res_a["id"])
+        self.assertFalse(succ_b_set_a)
+        self.assertIn("Cross-user security violation", msg_b_set_a)
+
+        # Service-level delete rejection
+        succ_a_del_b, msg_a_del_b = service.delete_user_resume(self.userA_id, res_b["id"])
+        self.assertFalse(succ_a_del_b)
+        self.assertIn("Cross-user security violation", msg_a_del_b)
+
+        succ_b_del_a, msg_b_del_a = service.delete_user_resume(self.userB_id, res_a["id"])
+        self.assertFalse(succ_b_del_a)
+        self.assertIn("Cross-user security violation", msg_b_del_a)
+
+        # Service-level download data rejection
+        data_a_on_b, name_a_on_b, _ = service.get_resume_download_data(self.userA_id, res_b["id"])
+        self.assertIsNone(data_a_on_b)
+        self.assertIsNone(name_a_on_b)
+
+        data_b_on_a, name_b_on_a, _ = service.get_resume_download_data(self.userB_id, res_a["id"])
+        self.assertIsNone(data_b_on_a)
+        self.assertIsNone(name_b_on_a)
+
+    # 7. Directory Containment & Legacy Path Isolation
+    def test_legacy_path_containment_and_isolation(self):
+        """Verifies directory traversal prevention and isolated storage path resolution."""
+        from src.security.file_security import FileSecurityValidator
+        from src.database.exceptions import FileSecurityError
+
+        pdf_a = generate_persona_pdf("cpa_auditor")
+        u_dir_a = self.user_base_dir / str(self.userA_id) / "resumes"
+        res_a = self.db.upload_user_resume(
+            user_id=self.userA_id,
+            file_bytes=pdf_a,
+            original_filename="alice_cpa.pdf",
+            user_base_dir=u_dir_a,
+        )
+
+        # Legitimate path resolution is contained
+        legit_path = self.db.get_resume_file_path(self.userA_id, res_a["id"], user_base_dir=u_dir_a)
+        self.assertTrue(legit_path.exists())
+        self.assertTrue(legit_path.resolve().is_relative_to(u_dir_a.resolve()))
+
+        # Direct containment check: path traversal in filename or path escapes directory
+        with self.assertRaises(FileSecurityError):
+            traversal_path = u_dir_a / ".." / "secret.txt"
+            FileSecurityValidator.validate_path_containment(traversal_path, u_dir_a)
+
+        # Service-level available resumes returns strictly user A files
+        service = DashboardService(db_manager=self.db)
+        a_resumes = service.get_available_resumes(user_id=self.userA_id, user_base_dir=u_dir_a)
+        self.assertEqual(len(a_resumes), 1)
+        self.assertEqual(a_resumes[0].name, legit_path.name)
+
+        b_resumes = service.get_available_resumes(user_id=self.userB_id, user_base_dir=self.user_base_dir / str(self.userB_id) / "resumes")
+        self.assertEqual(len(b_resumes), 0)
 
 
 if __name__ == "__main__":

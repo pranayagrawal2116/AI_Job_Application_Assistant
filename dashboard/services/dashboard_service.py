@@ -6,13 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
-from src.config import config
 from src.database.db_manager import DatabaseManager
-from src.database.exceptions import DatabaseError, UnconfirmedSubmissionError, ValidationError
-from src.database.models import Application, ApplicationLog, ApplicationStatus, Company, Job
-from src.matcher.job_matcher import EvaluationResult, JobMatcher
+from src.database.models import ApplicationStatus
+from src.matcher.job_matcher import JobMatcher
 from src.scraper.discovery.search_coordinator import DiscoverySummary, SearchCoordinator
 from src.utils.logger import setup_logger
+
+logger = setup_logger("DashboardService")
 
 
 class DashboardService:
@@ -21,7 +21,7 @@ class DashboardService:
     _instance: Optional["DashboardService"] = None
 
     def __init__(self, db_manager: Optional[DatabaseManager] = None):
-        self.logger = setup_logger("DashboardService")
+        self.logger = logger
         self.db = db_manager or DatabaseManager()
         self.matcher = JobMatcher(db_manager=self.db)
         self.coordinator = SearchCoordinator(db_manager=self.db, job_matcher=self.matcher)
@@ -358,19 +358,37 @@ class DashboardService:
     # PHASE 7: APPLICATION PREPARATION & HUMAN APPROVAL HELPERS
     # -------------------------------------------------------------------------
 
-    def get_available_resumes(self) -> List[Path]:
-        """Returns list of available resume files in data/resumes/."""
-        resume_dir = Path("data/resumes")
-        if not resume_dir.exists():
-            return []
-        return sorted([f for f in resume_dir.iterdir() if f.suffix.lower() in [".pdf", ".docx"] and not f.name.startswith(".")])
+    def get_available_resumes(
+        self, user_id: Optional[int] = None, user_base_dir: Optional[Path] = None
+    ) -> List[Path]:
+        """Returns list of available resume files for the specified user or authenticated session.
 
-    def sync_resume_file(self, resume_path: str | Path) -> Tuple[bool, str, Dict[str, Any]]:
+        Resumes are resolved from data/users/<user_id>/resumes/ with strict ownership verification.
+        """
+        if user_id is not None:
+            user_resumes = self.db.list_user_resumes(user_id=user_id)
+            res_paths: List[Path] = []
+            for r in user_resumes:
+                try:
+                    p = self.db.get_resume_file_path(user_id=user_id, resume_id=r["id"], user_base_dir=user_base_dir)
+                    if p.exists() and p not in res_paths:
+                        res_paths.append(p)
+                except Exception:
+                    continue
+            return sorted(res_paths, key=lambda p: p.name)
+
+        # Fallback for unauthenticated legacy test fixtures only if directory exists
+        resume_dir = Path("data/resumes")
+        if resume_dir.exists():
+            return sorted([f for f in resume_dir.iterdir() if f.suffix.lower() in [".pdf", ".docx"] and not f.name.startswith(".")])
+        return []
+
+    def sync_resume_file(self, resume_path: str | Path, user_id: Optional[int] = None) -> Tuple[bool, str, Dict[str, Any]]:
         """Parses a resume file and updates profile and SQLite version history."""
         try:
             from src.preparer.profile_updater import ProfileUpdater
             updater = ProfileUpdater(db_manager=self.db)
-            updated_prof = updater.sync_from_resume(resume_path)
+            updated_prof = updater.sync_from_resume(resume_path, user_id=user_id)
             self.matcher = JobMatcher(candidate_profile=updated_prof, db_manager=self.db)
             return True, "Resume parsed and profile updated successfully.", updated_prof
         except Exception as e:
@@ -403,7 +421,7 @@ class DashboardService:
         answerer = QuestionAnswerer()
         return answerer.generate_standard_answers(job)
 
-    def get_or_create_candidate_session(self, candidate_name: str = "Pranay Anup Agrawal"):
+    def get_or_create_candidate_session(self, candidate_name: str = "Authorized Candidate", candidate_id: str = "candidate_1"):
         """Retrieves or initializes the server-side authenticated candidate session."""
         from src.security.session_manager import SessionManager
         session_mgr = SessionManager.get_instance()
@@ -411,7 +429,7 @@ class DashboardService:
             if sess.is_active and not sess.is_expired:
                 return sess
         return session_mgr.authenticate_candidate(
-            candidate_id="candidate_pranay",
+            candidate_id=candidate_id,
             candidate_name=candidate_name,
         )
 
@@ -445,6 +463,7 @@ class DashboardService:
         resume_path: Optional[str] = None,
         session_id: Optional[str] = None,
         action_ticket: Optional[str] = None,
+        user_id: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """Authorizes an application packet through the strict HumanApprovalGate."""
         from src.preparer.approval_gate import HumanApprovalGate
@@ -454,15 +473,43 @@ class DashboardService:
         if not job:
             return False, f"Job #{job_id} not found."
 
-        res_path = resume_path or "data/resumes/Pranay_Agrawal_Resume(2).pdf"
-        p = Path(res_path)
-        res_hash = ResumeParser.compute_file_hash(p) if p.exists() else "unverified_hash"
+        res_path_str: str = ""
+        res_hash: str = "unverified_hash"
+
+        if resume_path:
+            p = Path(resume_path)
+            res_path_str = str(p)
+            res_hash = ResumeParser.compute_file_hash(p) if p.exists() else "unverified_hash"
+        else:
+            uid = user_id or 1
+            primary = self.db.get_primary_resume(uid)
+            if primary:
+                try:
+                    p = self.db.get_resume_file_path(uid, primary["id"])
+                    res_path_str = str(p)
+                    res_hash = primary.get("file_hash") or (ResumeParser.compute_file_hash(p) if p.exists() else "unverified_hash")
+                except Exception:
+                    res_path_str = "unspecified_resume.pdf"
+                    res_hash = "unverified_hash"
+            else:
+                user_resumes = self.db.list_user_resumes(uid)
+                if user_resumes:
+                    try:
+                        p = self.db.get_resume_file_path(uid, user_resumes[0]["id"])
+                        res_path_str = str(p)
+                        res_hash = user_resumes[0].get("file_hash") or (ResumeParser.compute_file_hash(p) if p.exists() else "unverified_hash")
+                    except Exception:
+                        res_path_str = "unspecified_resume.pdf"
+                        res_hash = "unverified_hash"
+                else:
+                    res_path_str = "unspecified_resume.pdf"
+                    res_hash = "unverified_hash"
 
         gate = HumanApprovalGate(db_manager=self.db)
         packet = gate.build_review_packet(
             job=job,
             cover_letter_text=cover_letter,
-            resume_path=str(p),
+            resume_path=res_path_str,
             resume_hash=res_hash,
             answers=answers,
         )
@@ -476,7 +523,7 @@ class DashboardService:
                 return False, f"Approval rejected: {e}"
         else:
             try:
-                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Authorized Candidate")
             except Exception as e:
                 return False, f"Approval rejected: {e}"
 
@@ -514,7 +561,6 @@ class DashboardService:
             for log in logs:
                 if log.action == "HUMAN_APPROVAL_GRANTED" and log.details:
                     try:
-                        import json
                         d = json.loads(log.details)
                         p_hash = d.get("packet_version_hash")
                     except Exception:
@@ -532,7 +578,7 @@ class DashboardService:
                 return False, f"Submission rejected: {e}"
         else:
             try:
-                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Authorized Candidate")
             except Exception as e:
                 return False, f"Submission rejected: {e}"
 

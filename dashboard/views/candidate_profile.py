@@ -5,16 +5,12 @@ provenance tracking, diff-based synchronization, and immutable SQLite version sn
 """
 
 from datetime import datetime, timezone
-import json
-from pathlib import Path
-from typing import Any, Dict, List, Optional
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
 from src.config import config
-from src.database.exceptions import DuplicateResumeError, FileSecurityError, ResumeInUseError
 from src.preparer.profile_updater import ProfileUpdater
-from src.preparer.resume_parser import ParsedResume, ResumeParser, VerificationStatus
+from src.preparer.resume_parser import ResumeParser, VerificationStatus
 
 
 def get_current_user_id() -> int:
@@ -183,8 +179,6 @@ def render_candidate_profile():
         exp_entries = prof.get("work_experience", [])
         tech_skills = prof.get("technical_skills", {})
         all_skills = tech_skills.get("all_skills", [])
-        projects = prof.get("projects", [])
-        certs = prof.get("certifications", [])
         provenance = prof.get("field_provenance", {})
 
         with st.form("universal_profile_form"):

@@ -705,3 +705,4 @@ def generate_persona_pdf(persona_id: str) -> bytes:
 
     c.save()
     return stream.getvalue()
+

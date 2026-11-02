@@ -1,8 +1,7 @@
 """Application Screening Question Answer Generator based strictly on verified resume information."""
 
 from pathlib import Path
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from src.database.models import Job
 from src.preparer.resume_matcher import JobAlignment, ResumeJobMatcher
@@ -49,7 +48,6 @@ class QuestionAnswerer:
 
         personal = self.profile.get("personal", {})
         cand_name = personal.get("full_name", "Pranay Anup Agrawal")
-        location = personal.get("location", "Kothrud, Pune, Maharashtra")
 
         edu = self.profile.get("education", [{}])[0]
         inst = edu.get("institution", "MIT World Peace University")
@@ -57,8 +55,6 @@ class QuestionAnswerer:
         major = edu.get("major", "Computer Science Engineering – Artificial Intelligence & Data Science")
         grad_year = edu.get("expected_graduation_year", 2028)
         cgpa = edu.get("current_cgpa", 7.6)
-
-        skills = self.profile.get("technical_skills", {}).get("all_skills", ["Python", "Dart", "JavaScript", "C/C++", "Flutter"])
 
         top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {
             "title": "Medical Chatbot",
@@ -141,9 +137,9 @@ class QuestionAnswerer:
             "technical_skills": {
                 "question": "What technical skills do you possess?",
                 "answer": (
-                    f"My verified programming languages include Python, Dart, JavaScript, and C/C++. On the application side, "
-                    f"I have hands-on experience with Flutter, Android development, REST API integration, Node.js fundamentals, "
-                    f"SQLite, and MySQL. My tooling stack includes Git/GitHub, VS Code, Android Studio, and Postman."
+                    "My verified programming languages include Python, Dart, JavaScript, and C/C++. On the application side, "
+                    "I have hands-on experience with Flutter, Android development, REST API integration, Node.js fundamentals, "
+                    "SQLite, and MySQL. My tooling stack includes Git/GitHub, VS Code, Android Studio, and Postman."
                 ),
                 "status": "READY",
             },

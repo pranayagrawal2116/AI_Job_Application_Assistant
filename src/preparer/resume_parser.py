@@ -8,7 +8,6 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import io
-import os
 from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -21,7 +20,6 @@ from src.database.exceptions import (
     CorruptedFileError,
     EncryptedFileError,
     InvalidFileFormatError,
-    ValidationError,
 )
 from src.utils.logger import setup_logger
 

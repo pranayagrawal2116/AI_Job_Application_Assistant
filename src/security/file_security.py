@@ -141,7 +141,7 @@ class FileSecurityValidator:
             detected_format = self._validate_docx_structure(file_bytes)
         else:
             raise InvalidFileFormatError(
-                f"File signature mismatch. Document is neither a valid PDF nor a valid DOCX file."
+                "File signature mismatch. Document is neither a valid PDF nor a valid DOCX file."
             )
 
         file_hash = hashlib.sha256(file_bytes).hexdigest()

@@ -1,35 +1,10 @@
 """Profile Updater module that syncs verified resume details into candidate profile and database."""
 
-from datetime import datetime, timezone
-import json
-from pathlib import Path
-from typing import Any, Dict, Optional
-
-from src.database.db_manager import DatabaseManager
-from src.preparer.resume_parser import ParsedResume, ResumeParser
-from src.utils.logger import setup_logger
-
-logger = setup_logger("ProfileUpdater")
-
-
-class ProfileUpdater:
-    """Updates the canonical candidate profile JSON and records immutable SQLite snapshots."""
-
-    def __init__(
-        self,
-        db_manager: Optional[DatabaseManager] = None,
-        profile_path: Optional[str | Path] = None,
-    ):
-        self.db = db_manager or DatabaseManager()
-        self.profile_path = Path(profile_path or "data/profile/candidate_profile.json").resolve()
-
-"""Profile Updater module that syncs verified resume details into candidate profile and database."""
-
 import copy
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional
 
 from src.database.db_manager import DatabaseManager
 from src.preparer.resume_parser import ParsedResume, ResumeParser, VerificationStatus

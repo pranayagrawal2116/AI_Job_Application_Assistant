@@ -4,7 +4,6 @@ from contextlib import contextmanager
 from datetime import datetime
 import hashlib
 import json
-import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
@@ -12,32 +11,18 @@ from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 import pandas as pd
 
 from src.database.exceptions import (
-    AccountLockedError,
     ApplicationNotFoundError,
-    AuthenticationFailedError,
-    CompanyNotFoundError,
-    CorruptedFileError,
     CrossUserAccessError,
     DatabaseError,
     DuplicateJobError,
     DuplicateResumeError,
-    DuplicateUserError,
-    EncryptedFileError,
-    FileSecurityError,
-    FileTooLargeError,
-    InvalidFileFormatError,
     InvalidStatusError,
     InvalidStatusTransitionError,
-    InvalidTicketError,
     JobNotFoundError,
-    KeyRevokedError,
-    RateLimitExceededError,
     ResumeInUseError,
     ResumeNotFoundError,
     SecurityAuthorizationError,
     TicketAlreadyConsumedError,
-    TokenAlreadyUsedError,
-    TokenExpiredError,
     UnconfirmedSubmissionError,
     UserNotFoundError,
     ValidationError,
@@ -51,13 +36,10 @@ from src.database.models import (
     Company,
     Job,
     JobDescription,
-    PasswordResetToken,
     PreparedPacket,
-    User,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
-    normalize_entity_name,
     normalize_job_url,
 )
 from src.utils.logger import setup_logger

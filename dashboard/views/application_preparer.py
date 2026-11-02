@@ -1,6 +1,5 @@
 """Application Preparer View: Resume parsing, job alignment, cover letter editing, screening questions, and human approval."""
 
-from datetime import datetime
 from pathlib import Path
 import streamlit as st
 
@@ -31,25 +30,26 @@ def render_application_preparer():
     # =========================================================================
     with tab_resume:
         st.markdown("### 📄 Resume Repository & Zero-Hallucination Parser")
-        st.caption("Authoritative resume files stored in data/resumes/. Only verified details are extracted.")
+        st.caption("Authoritative resume files stored in secure user-isolated directories. Only verified details are extracted.")
 
-        available_resumes = service.get_available_resumes()
+        user_id = st.session_state.get("user_id", 1)
+        available_resumes = service.get_available_resumes(user_id=user_id)
         c1, c2 = st.columns([2, 1])
 
         with c1:
             if available_resumes:
-                selected_resume = st.selectbox(
+                selected_name = st.selectbox(
                     "Select Active Resume Document",
                     options=[f.name for f in available_resumes],
                     index=0,
                 )
-                selected_path = Path("data/resumes") / selected_resume
+                selected_path = next((f for f in available_resumes if f.name == selected_name), available_resumes[0])
 
                 col_btn1, col_btn2 = st.columns(2)
                 with col_btn1:
                     if st.button("⚡ Parse & Synchronize Candidate Profile", type="primary"):
                         with st.spinner("Extracting resume details..."):
-                            succ, msg, prof = service.sync_resume_file(selected_path)
+                            succ, msg, prof = service.sync_resume_file(selected_path, user_id=user_id)
                             if succ:
                                 st.success(f"{msg} Recorded snapshot in SQLite.")
                                 st.rerun()
@@ -59,22 +59,28 @@ def render_application_preparer():
                     st.caption(f"File Size: {selected_path.stat().st_size / 1024:.1f} KB")
 
             else:
-                st.warning("No resume files found in data/resumes/. Please upload a resume below.")
+                st.warning("No resume files found for this account. Please upload a resume below.")
 
         with c2:
             st.markdown("#### 📤 Upload New Resume")
             uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
             if uploaded_file is not None:
-                save_dest = Path("data/resumes") / uploaded_file.name
-                with open(save_dest, "wb") as f:
-                    f.write(uploaded_file.getbuffer())
-                st.success(f"Uploaded `{uploaded_file.name}`. Click 'Parse & Synchronize' above.")
-                st.rerun()
+                succ, msg, _ = service.upload_user_resume(
+                    user_id=user_id,
+                    file_bytes=uploaded_file.getbuffer().tobytes(),
+                    original_filename=uploaded_file.name,
+                    set_as_primary=True,
+                )
+                if succ:
+                    st.success(f"Uploaded `{uploaded_file.name}`. Click 'Parse & Synchronize' above.")
+                    st.rerun()
+                else:
+                    st.error(msg)
 
         st.divider()
 
         # Display active profile details
-        cand_prof = service.db.get_latest_candidate_profile()
+        cand_prof = service.db.get_latest_candidate_profile(user_id=user_id)
         if cand_prof and cand_prof.profile_data:
             pdata = cand_prof.profile_data
             st.markdown(f"### 👤 Verified Candidate Profile (Version #{cand_prof.id})")
@@ -335,7 +341,7 @@ def render_application_preparer():
 
             for key, q_data in questions.items():
                 with st.expander(f"❓ {q_data['question']}", expanded=False):
-                    ans_val = st.text_area(
+                    st.text_area(
                         f"Response ({q_data['question']})",
                         value=q_data['answer'],
                         key=f"qa_{qa_job_id}_{key}",
@@ -378,7 +384,10 @@ def render_application_preparer():
             with st.container():
                 st.markdown(f"#### 📦 Application Review Packet: {job_obj.company_name} — {job_obj.job_title}")
                 st.write(f"**Official Application Portal:** [{job_obj.job_url}]({job_obj.job_url})")
-                st.write(f"**Active Resume File:** `data/resumes/Pranay_Agrawal_Resume(2).pdf`")
+
+                primary_res = service.db.get_primary_resume(user_id=user_id)
+                active_res_name = primary_res.get("original_filename", "None selected") if primary_res else "None uploaded"
+                st.write(f"**Active Resume:** `{active_res_name}`")
 
                 # Approval Checklist
                 chk_details = st.checkbox("✅ I have reviewed the job description and confirmed eligibility.")
@@ -386,7 +395,13 @@ def render_application_preparer():
                 chk_answers = st.checkbox("✅ I have reviewed the screening question responses.")
                 chk_no_auto = st.checkbox("✅ I understand this system will NOT automatically submit the application.")
 
-                approver_input = st.text_input("Human Approver Signature (Candidate Full Name):", value="Pranay Agrawal")
+                cand_name = st.session_state.get("candidate_name")
+                if not cand_name and cand_prof and cand_prof.profile_data:
+                    cand_name = cand_prof.profile_data.get("personal", {}).get("full_name")
+                approver_input = st.text_input(
+                    "Human Approver Signature (Candidate Full Name):",
+                    value=cand_name or "Authorized Candidate",
+                )
 
                 col_app1, col_app2 = st.columns(2)
                 with col_app1:
@@ -401,6 +416,7 @@ def render_application_preparer():
                                 candidate_confirmed=True,
                                 cover_letter=st.session_state.get(f"cover_letter_{app_job_id}", "Tailored Letter"),
                                 answers=service.generate_questions_for_job(app_job_id),
+                                user_id=user_id,
                             )
                             if succ:
                                 st.success(msg)

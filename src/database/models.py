@@ -159,9 +159,11 @@ class ApplicationLog:
 
 @dataclass
 class CandidateProfileRecord:
-    profile_data: Dict[str, Any]
+    """Candidate profile snapshot (supports both user-scoped and legacy single-candidate)."""
+    profile_data: Any
     id: Optional[int] = None
     user_id: Optional[int] = None
+    profile_hash: Optional[str] = None
     version: int = 1
     is_active: bool = True
     last_updated: Optional[str] = None
@@ -311,17 +313,3 @@ class ResumeVersionRecord:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
-
-@dataclass
-class CandidateProfileRecord:
-    """Candidate profile snapshot (supports both user-scoped and legacy single-candidate)."""
-    profile_data: Any
-    id: Optional[int] = None
-    user_id: Optional[int] = None
-    profile_hash: Optional[str] = None
-    version: int = 1
-    is_active: bool = True
-    last_updated: Optional[str] = None
-
-    def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
