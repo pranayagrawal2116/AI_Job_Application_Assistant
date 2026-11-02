@@ -23,8 +23,18 @@ class CoverLetterGenerator:
         if candidate_profile:
             self.profile = candidate_profile
         else:
-            from src.config import config
-            self.profile = config.candidate_profile
+            json_path = Path("data/profile/candidate_profile.json")
+            if json_path.exists():
+                try:
+                    import json
+                    with open(json_path, "r", encoding="utf-8") as pf:
+                        self.profile = json.load(pf)
+                except Exception:
+                    from src.config import config
+                    self.profile = config.candidate_profile
+            else:
+                from src.config import config
+                self.profile = config.candidate_profile
 
         self.output_dir = Path(output_dir or "data/exports/cover_letters").resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -61,6 +71,17 @@ class CoverLetterGenerator:
         else:
             location = str(loc_val)
 
+        # Profile Links: Only include if explicitly provided; never invent dummy URLs
+        cand_inputs = self.profile.get("candidate_inputs", {})
+        gh = personal.get("github") or cand_inputs.get("github_url") or ""
+        li = personal.get("linkedin") or cand_inputs.get("linkedin_url") or ""
+        links_parts = []
+        if gh and "http" in gh:
+            links_parts.append(f"GitHub: {gh}")
+        if li and "http" in li:
+            links_parts.append(f"LinkedIn: {li}")
+        links_line = " | ".join(links_parts)
+
         edu = self.profile.get("education", [{}])[0]
         institution = edu.get("institution", "MIT World Peace University")
         degree = edu.get("degree", "Bachelor of Technology (B.Tech)")
@@ -73,13 +94,18 @@ class CoverLetterGenerator:
         
         top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {
             "title": "Medical Chatbot",
-            "description": "developed a Python-based conversational tool providing structured health information access",
-            "technologies": ["Python", "NLP", "Machine Learning"],
+            "description": "built a Python-based medical chatbot project focused on conversational access to health-related information.",
+            "technologies": ["Python"],
         }
         proj_title = top_project.get("title") or "Medical Chatbot"
-        proj_desc = top_project.get("description") or "built a data-driven software solution"
-        proj_techs = top_project.get("technologies") or ["Python", "Machine Learning"]
-        
+        proj_desc = (top_project.get("description") or "built a software application").strip().rstrip(".")
+        if proj_desc.lower().startswith("built a "):
+            proj_desc = proj_desc[8:]
+        elif proj_desc.lower().startswith("developed a "):
+            proj_desc = proj_desc[12:]
+        elif proj_desc.lower().startswith("worked on a "):
+            proj_desc = proj_desc[12:]
+
         top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {
             "employer": "Sarita Infotech Pvt. Ltd.",
             "job_title": "Project Manager | Mobile App Development",
@@ -93,7 +119,10 @@ class CoverLetterGenerator:
         letter_lines = [
             f"# {cand_name}",
             f"{location} | Phone: {phone} | Email: {email}",
-            f"GitHub: https://github.com | LinkedIn: https://linkedin.com",
+        ]
+        if links_line:
+            letter_lines.append(links_line)
+        letter_lines.extend([
             "",
             f"**Date:** {today_str}",
             "",
@@ -105,20 +134,19 @@ class CoverLetterGenerator:
             f"I am writing to express my strong interest in the **{title}** position at {company}. "
             f"I am currently pursuing my {degree} in {major} at {institution} (Class of {grad_year}, CGPA: {cgpa}). "
             f"With a dedicated academic focus on Artificial Intelligence, Data Science, and practical software engineering, "
-            f"I am eager to contribute meaningfully to your team while further honing my technical capabilities.",
+            f"I am eager to contribute meaningfully to your team while further developing my technical skills.",
             "",
-            f"During my academic and project work, I have focused heavily on building robust, real-world solutions. "
-            f"In my project, **{proj_title}**, I {proj_desc.lower().replace('built a ', '').replace('developed a ', 'built a ')} utilizing "
-            f"{', '.join(proj_techs)}. This initiative strengthened my ability to decompose complex requirements, "
-            f"write clean and maintainable code, and handle data-intensive workflows effectively.",
+            f"During my academic coursework and project work, I have focused on building practical, reliable software. "
+            f"In my project, **{proj_title}**, I built {proj_desc}. This project gave me direct hands-on experience "
+            f"structuring application workflows, writing clean code, and verifying functionality.",
             "",
             f"In addition to academic project work, I bring hands-on industry exposure from my role as **{top_exp['job_title']}** "
             f"at **{top_exp['employer']}** ({top_exp['duration']}). There, I contributed directly to coordinating mobile application delivery, "
             f"building core UI screens, integrating backend REST APIs, and troubleshooting critical workflows. This experience instilled in me "
-            f"a rigorous engineering discipline, strong team collaboration, and a deep appreciation for shipping reliable software.",
+            f"engineering discipline, team collaboration, and a commitment to shipping dependable software.",
             "",
-            f"Your work at {company} represents exactly the dynamic environment where I seek to apply my verified proficiencies in {skills_highlight}. "
-            f"I am adaptable, analytically minded, and excited to tackle challenging problems alongside experienced engineers.",
+            f"I am eager to apply my verified background in {skills_highlight} to the {title} internship at {company}. "
+            f"I am adaptable, analytically minded, and excited to take on engineering challenges under experienced mentorship.",
             "",
             "Thank you for your time and consideration. I welcome the opportunity to discuss how my background, enthusiasm, "
             "and technical foundation can support your objectives.",
@@ -126,7 +154,7 @@ class CoverLetterGenerator:
             "Sincerely,",
             f"**{cand_name}**",
             f"{phone} | {email}",
-        ]
+        ])
 
         letter_text = "\n".join(letter_lines)
 

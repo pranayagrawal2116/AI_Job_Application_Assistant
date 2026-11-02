@@ -61,3 +61,32 @@ class ValidationError(DatabaseError):
     """Raised when model or input field validation fails."""
     pass
 
+
+class InvalidStatusTransitionError(DatabaseError):
+    """Raised when an illegal application status transition is attempted."""
+
+    def __init__(self, old_status: str, new_status: str, allowed: list[str]):
+        super().__init__(
+            f"Illegal status transition from '{old_status}' to '{new_status}'. "
+            f"Allowed next transitions are: {', '.join(allowed)}"
+        )
+        self.old_status = old_status
+        self.new_status = new_status
+        self.allowed = allowed
+
+
+class SecurityAuthorizationError(DatabaseError):
+    """Raised when an operation fails security, session, or signature verification."""
+    pass
+
+
+class SessionExpiredError(SecurityAuthorizationError):
+    """Raised when an authenticated session has expired."""
+    pass
+
+
+class InvalidSessionError(SecurityAuthorizationError):
+    """Raised when a session is missing, invalid, or forged."""
+    pass
+
+

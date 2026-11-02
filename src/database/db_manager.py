@@ -16,7 +16,9 @@ from src.database.exceptions import (
     DatabaseError,
     DuplicateJobError,
     InvalidStatusError,
+    InvalidStatusTransitionError,
     JobNotFoundError,
+    SecurityAuthorizationError,
     UnconfirmedSubmissionError,
     ValidationError,
 )
@@ -40,6 +42,56 @@ logger = setup_logger("DatabaseManager")
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "job_assistant.db"
 DEFAULT_EXPORTS_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "exports"
+
+
+ALLOWED_TRANSITIONS: Dict[str, List[str]] = {
+    ApplicationStatus.DISCOVERED.value: [
+        ApplicationStatus.UNDER_REVIEW.value,
+        ApplicationStatus.SHORTLISTED.value,
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.UNDER_REVIEW.value: [
+        ApplicationStatus.SHORTLISTED.value,
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.SHORTLISTED.value: [
+        ApplicationStatus.APPLICATION_PREPARED.value,
+        ApplicationStatus.UNDER_REVIEW.value,
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.APPLICATION_PREPARED.value: [
+        ApplicationStatus.AWAITING_APPROVAL.value,
+        ApplicationStatus.SHORTLISTED.value,
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.AWAITING_APPROVAL.value: [
+        ApplicationStatus.APPLIED.value,
+        ApplicationStatus.APPLICATION_PREPARED.value,
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.APPLIED.value: [
+        ApplicationStatus.INTERVIEW.value,
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.INTERVIEW.value: [
+        ApplicationStatus.REJECTED.value,
+        ApplicationStatus.WITHDRAWN.value,
+    ],
+    ApplicationStatus.REJECTED.value: [
+        ApplicationStatus.UNDER_REVIEW.value,
+        ApplicationStatus.SHORTLISTED.value,
+    ],
+    ApplicationStatus.WITHDRAWN.value: [
+        ApplicationStatus.UNDER_REVIEW.value,
+        ApplicationStatus.SHORTLISTED.value,
+    ],
+}
 
 
 class DatabaseManager:
@@ -483,25 +535,20 @@ class DatabaseManager:
         notes: Optional[str] = None,
         resume_used: Optional[str] = None,
         cover_letter_reference: Optional[str] = None,
+        packet_version_hash: Optional[str] = None,
+        user_id: Optional[str] = None,
     ) -> Application:
-        """Updates the application status for a job, with strict submission verification
-
-        and audit logging.
-
-        Args:
-            job_id: ID of the job.
-            new_status: Target status (must match ApplicationStatus values).
-            confirmed: Required to be True when setting status to 'Applied'.
-            notes: Optional updated notes.
-            resume_used: Reference to resume file used.
-            cover_letter_reference: Reference to tailored cover letter.
+        """Updates the application status for a job, with strict transition state machines,
+        human-in-the-loop authorization, and immutable audit logging.
 
         Raises:
             JobNotFoundError: If job does not exist.
+            ApplicationNotFoundError: If application record does not exist.
             InvalidStatusError: If new_status is not a recognized status.
-            UnconfirmedSubmissionError: If trying to set 'Applied' without confirmed=True.
+            InvalidStatusTransitionError: If the transition skips intermediate state machines.
+            SecurityAuthorizationError: If human approval or packet verification fails.
+            UnconfirmedSubmissionError: If trying to set 'Applied' without confirmed=True or valid approval.
         """
-        # Validate status enum
         valid_statuses = ApplicationStatus.list()
         status_value = (
             new_status.value if isinstance(new_status, ApplicationStatus) else str(new_status)
@@ -516,26 +563,49 @@ class DatabaseManager:
         if not matched_status:
             raise InvalidStatusError(status_value, valid_statuses)
 
-        # STRICT HUMAN-IN-THE-LOOP SAFEGUARD:
-        # A boolean flag is NOT enough. An explicit human approval record MUST exist in the audit trail.
+        # Retrieve current application state
+        app = self.get_application_by_job_id(job_id)
+        if not app:
+            raise ApplicationNotFoundError(f"Job ID {job_id}")
+
+        old_status = app.status
+        if old_status == matched_status:
+            return app
+
+        # 1. State Machine Validation
+        allowed = ALLOWED_TRANSITIONS.get(old_status, [])
+        if matched_status not in allowed:
+            raise InvalidStatusTransitionError(old_status=old_status, new_status=matched_status, allowed=allowed)
+
+        # 2. Strict Human Authorization Validation for Awaiting Approval
+        if matched_status == ApplicationStatus.AWAITING_APPROVAL.value:
+            if not self.has_valid_human_approval(job_id, expected_packet_hash=packet_version_hash):
+                raise SecurityAuthorizationError(
+                    f"Transition to 'Awaiting Approval' rejected: Job #{job_id} requires valid, authenticated "
+                    f"human approval of the reviewed application packet."
+                )
+
+        # 3. Strict Submission Safeguard for Applied
         if matched_status == ApplicationStatus.APPLIED.value:
-            if not self.has_valid_human_approval(job_id):
+            if not confirmed:
                 raise UnconfirmedSubmissionError(
-                    "STRICT SAFEGUARD: Cannot mark application as 'Applied' without an explicit human approval record "
-                    "in the audit trail. Automated processes or boolean flags cannot self-authorize submissions."
+                    "Cannot mark application as 'Applied' without confirmed manual submission."
+                )
+            if old_status != ApplicationStatus.AWAITING_APPROVAL.value:
+                raise InvalidStatusTransitionError(
+                    old_status=old_status,
+                    new_status=matched_status,
+                    allowed=[ApplicationStatus.AWAITING_APPROVAL.value],
+                )
+            if not self.has_valid_human_approval(job_id, expected_packet_hash=packet_version_hash):
+                raise UnconfirmedSubmissionError(
+                    "STRICT SAFEGUARD: Cannot mark application as 'Applied' without an active, unconsumed human approval record "
+                    "matching the reviewed application packet hash in the audit trail."
                 )
 
         with self.transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM applications WHERE job_id = ?", (job_id,))
-            app_row = cursor.fetchone()
-            if not app_row:
-                raise ApplicationNotFoundError(f"Job ID {job_id}")
 
-            current_app = Application(**dict(app_row))
-            old_status = current_app.status
-
-            # Set submission timestamps conditionally
             date_submitted_clause = ""
             date_prepared_clause = ""
             params: List[Any] = [matched_status]
@@ -548,17 +618,17 @@ class DatabaseManager:
             if resume_used is not None:
                 params.append(resume_used)
             else:
-                params.append(current_app.resume_used)
+                params.append(app.resume_used)
 
             if cover_letter_reference is not None:
                 params.append(cover_letter_reference)
             else:
-                params.append(current_app.cover_letter_reference)
+                params.append(app.cover_letter_reference)
 
             if notes is not None:
                 params.append(notes)
             else:
-                params.append(current_app.notes)
+                params.append(app.notes)
 
             params.append(job_id)
 
@@ -577,7 +647,14 @@ class DatabaseManager:
                 params,
             )
 
-            # Record audit log
+            # Record immutable audit log
+            log_details = {
+                "old_status": old_status,
+                "new_status": matched_status,
+                "notes": notes,
+                "user_id": user_id or "candidate_pranay",
+                "packet_version_hash": packet_version_hash or "",
+            }
             cursor.execute(
                 """
                 INSERT INTO application_logs (job_id, application_id, action, details)
@@ -585,11 +662,31 @@ class DatabaseManager:
                 """,
                 (
                     job_id,
-                    current_app.id,
+                    app.id,
                     f"STATUS_TRANSITION: {old_status} -> {matched_status}",
-                    json.dumps({"old_status": old_status, "new_status": matched_status, "notes": notes}),
+                    json.dumps(log_details),
                 ),
             )
+
+            if matched_status == ApplicationStatus.APPLIED.value:
+                cursor.execute(
+                    """
+                    INSERT INTO application_logs (job_id, application_id, action, details)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        job_id,
+                        app.id,
+                        "HUMAN_APPROVAL_CONSUMED",
+                        json.dumps({
+                            "action": "CONSUMED",
+                            "consumed_at": datetime.now().isoformat(),
+                            "user_id": user_id or "candidate_pranay",
+                            "packet_version_hash": packet_version_hash or "",
+                            "notes": notes or "Approval record consumed for confirmed manual application submission.",
+                        }),
+                    ),
+                )
 
             cursor.execute("SELECT * FROM applications WHERE job_id = ?", (job_id,))
             updated_row = cursor.fetchone()
@@ -600,6 +697,10 @@ class DatabaseManager:
         self,
         job_id: int,
         approver_name: str,
+        approver_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        packet_version_hash: Optional[str] = None,
+        ticket_nonce: Optional[str] = None,
         approval_notes: Optional[str] = None,
     ) -> ApplicationLog:
         """Records an explicit human approval record in the application audit trail.
@@ -622,9 +723,14 @@ class DatabaseManager:
 
         details = {
             "approver": clean_approver,
+            "approver_id": approver_id or "candidate_pranay",
+            "session_id": session_id or "",
+            "packet_version_hash": packet_version_hash or "",
+            "ticket_nonce": ticket_nonce or "",
             "approved_at": datetime.now().isoformat(),
             "notes": approval_notes or "Human authorization confirmed for final submission.",
             "is_human": True,
+            "status": "ACTIVE",
         }
 
         with self.transaction() as conn:
@@ -641,16 +747,71 @@ class DatabaseManager:
             logger.info("Human approval granted for job %d by '%s'", job_id, clean_approver)
             return ApplicationLog(**dict(cursor.fetchone()))
 
-    def has_valid_human_approval(self, job_id: int) -> bool:
-        """Checks whether an active, unrevoked human approval record exists in the audit trail."""
+    def consume_human_approval(
+        self,
+        job_id: int,
+        packet_version_hash: Optional[str] = None,
+        session_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> None:
+        """Marks a prior human approval as consumed upon manual submission confirmation, preventing replay."""
+        app = self.get_application_by_job_id(job_id)
+        if not app:
+            raise ApplicationNotFoundError(f"Job ID {job_id}")
+
+        details = {
+            "action": "CONSUMED",
+            "consumed_at": datetime.now().isoformat(),
+            "user_id": user_id or "candidate_pranay",
+            "session_id": session_id or "",
+            "packet_version_hash": packet_version_hash or "",
+            "notes": notes or "Approval record consumed for confirmed manual application submission.",
+        }
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO application_logs (job_id, application_id, action, details)
+                VALUES (?, ?, ?, ?)
+                """,
+                (job_id, app.id, "HUMAN_APPROVAL_CONSUMED", json.dumps(details)),
+            )
+            logger.info("Human approval consumed for job %d (replay prevention active)", job_id)
+
+    def has_valid_human_approval(self, job_id: int, expected_packet_hash: Optional[str] = None) -> bool:
+        """Checks whether an active, unrevoked, and unconsumed human approval record exists in the audit trail."""
         logs = self.get_application_logs(job_id)
         has_approval = False
+        latest_approval_hash = None
         for log in logs:
             if log.action == "HUMAN_APPROVAL_GRANTED":
                 has_approval = True
-            elif log.action in ("HUMAN_APPROVAL_REVOKED", "STATUS_TRANSITION: Applied -> Rejected", "STATUS_TRANSITION: Applied -> Withdrawn"):
+                try:
+                    det = json.loads(log.details) if log.details else {}
+                    latest_approval_hash = det.get("packet_version_hash")
+                except Exception:
+                    latest_approval_hash = None
+            elif log.action in (
+                "HUMAN_APPROVAL_REVOKED",
+                "HUMAN_APPROVAL_CONSUMED",
+                "STATUS_TRANSITION: Applied -> Rejected",
+                "STATUS_TRANSITION: Applied -> Withdrawn",
+            ):
                 has_approval = False
-        return has_approval
+                latest_approval_hash = None
+
+        if not has_approval:
+            return False
+
+        if expected_packet_hash:
+            if not latest_approval_hash or latest_approval_hash != expected_packet_hash:
+                logger.warning(
+                    f"Approval packet hash mismatch for Job #{job_id}: approved {latest_approval_hash}, expected {expected_packet_hash}"
+                )
+                return False
+
+        return True
 
     def get_application_logs(self, job_id: int) -> List[ApplicationLog]:
         """Retrieves audit trail logs for a given job."""

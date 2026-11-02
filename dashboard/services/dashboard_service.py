@@ -161,13 +161,13 @@ class DashboardService:
         except ValueError as e:
             return False, str(e)
 
-        if target_status == ApplicationStatus.APPLIED:
-            if not approver_name or not approver_name.strip():
-                return False, "Submission safeguard: Human approver name is mandatory before marking as Applied."
-            try:
-                self.db.record_human_approval(job_id=job_id, approver_name=approver_name)
-            except (ValidationError, Exception) as exc:
-                return False, f"Approval rejected: {exc}"
+        if target_status in (ApplicationStatus.APPLIED, ApplicationStatus.AWAITING_APPROVAL):
+            return (
+                False,
+                f"Direct status transition to '{target_status.value}' is prohibited. "
+                "Applications require review packet authorization and confirmed submission "
+                "via the Application Preparer under an authenticated candidate session.",
+            )
 
         try:
             self.db.update_application_status(
@@ -322,6 +322,38 @@ class DashboardService:
         answerer = QuestionAnswerer()
         return answerer.generate_standard_answers(job)
 
+    def get_or_create_candidate_session(self, candidate_name: str = "Pranay Anup Agrawal"):
+        """Retrieves or initializes the server-side authenticated candidate session."""
+        from src.security.session_manager import SessionManager
+        session_mgr = SessionManager.get_instance()
+        for sess in session_mgr._sessions.values():
+            if sess.is_active and not sess.is_expired:
+                return sess
+        return session_mgr.authenticate_candidate(
+            candidate_id="candidate_pranay",
+            candidate_name=candidate_name,
+        )
+
+    def issue_approval_ticket(self, session_id: str, job_id: int, packet_hash: str) -> str:
+        """Issues an authenticated single-use ticket for application approval."""
+        from src.security.session_manager import SessionManager
+        return SessionManager.get_instance().issue_action_ticket(
+            session_id=session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=job_id,
+            packet_hash=packet_hash,
+        )
+
+    def issue_submission_ticket(self, session_id: str, job_id: int, packet_hash: str) -> str:
+        """Issues an authenticated single-use ticket for manual submission confirmation."""
+        from src.security.session_manager import SessionManager
+        return SessionManager.get_instance().issue_action_ticket(
+            session_id=session_id,
+            action_type="MANUAL_SUBMISSION",
+            application_id=job_id,
+            packet_hash=packet_hash,
+        )
+
     def authorize_application_packet(
         self,
         job_id: int,
@@ -330,6 +362,8 @@ class DashboardService:
         cover_letter: str,
         answers: Dict[str, Any],
         resume_path: Optional[str] = None,
+        session_id: Optional[str] = None,
+        action_ticket: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """Authorizes an application packet through the strict HumanApprovalGate."""
         from src.preparer.approval_gate import HumanApprovalGate
@@ -352,10 +386,29 @@ class DashboardService:
             answers=answers,
         )
 
+        sess = None
+        if session_id:
+            try:
+                from src.security.session_manager import SessionManager
+                sess = SessionManager.get_instance().validate_session(session_id)
+            except Exception as e:
+                return False, f"Approval rejected: {e}"
+        else:
+            sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+
+        active_session_id = sess.session_id
+        ticket = action_ticket or self.issue_approval_ticket(
+            session_id=active_session_id,
+            job_id=job_id,
+            packet_hash=packet.packet_version_hash,
+        )
+
         return gate.authorize_application(
             packet=packet,
             approver_name=approver_name,
             candidate_confirmed=candidate_confirmed,
+            session_id=active_session_id,
+            action_ticket=ticket,
         )
 
     def confirm_manual_submission(
@@ -363,8 +416,51 @@ class DashboardService:
         job_id: int,
         approver_name: str,
         submission_notes: Optional[str] = None,
+        session_id: Optional[str] = None,
+        submission_ticket: Optional[str] = None,
+        packet_version_hash: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Confirms candidate's manual application submission."""
+        """Confirms candidate's manual application submission with authenticated session and ticket."""
         from src.preparer.approval_gate import HumanApprovalGate
         gate = HumanApprovalGate(db_manager=self.db)
-        return gate.record_manual_submission(job_id, approver_name=approver_name, submission_notes=submission_notes)
+
+        p_hash = packet_version_hash
+        if not p_hash:
+            logs = self.db.get_application_logs(job_id)
+            for log in logs:
+                if log.action == "HUMAN_APPROVAL_GRANTED" and log.details:
+                    try:
+                        import json
+                        d = json.loads(log.details)
+                        p_hash = d.get("packet_version_hash")
+                    except Exception:
+                        pass
+
+        if not p_hash:
+            return False, f"Submission rejected: No prior human approval record found for Job #{job_id}."
+
+        sess = None
+        if session_id:
+            try:
+                from src.security.session_manager import SessionManager
+                sess = SessionManager.get_instance().validate_session(session_id)
+            except Exception as e:
+                return False, f"Submission rejected: {e}"
+        else:
+            sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Pranay Anup Agrawal")
+
+        active_session_id = sess.session_id
+        ticket = submission_ticket or self.issue_submission_ticket(
+            session_id=active_session_id,
+            job_id=job_id,
+            packet_hash=p_hash,
+        )
+
+        return gate.record_manual_submission(
+            job_id=job_id,
+            approver_name=approver_name,
+            session_id=active_session_id,
+            submission_ticket=ticket,
+            packet_version_hash=p_hash,
+            submission_notes=submission_notes,
+        )

@@ -16,8 +16,9 @@ def render_application_preparer():
     service = DashboardService.get_instance()
     df_jobs = service.get_all_jobs_df()
 
-    tab_resume, tab_align, tab_cover, tab_qa, tab_approval, tab_history = st.tabs([
+    tab_resume, tab_inputs, tab_align, tab_cover, tab_qa, tab_approval, tab_history = st.tabs([
         "📄 Resume Management",
+        "📋 Candidate Inputs & Logistics",
         "🎯 Job-Resume Alignment",
         "✍️ Tailored Cover Letter",
         "💬 Screening Questions",
@@ -108,7 +109,113 @@ def render_application_preparer():
                     st.caption(f"  {prj.get('description')} *(Tech: {', '.join(prj.get('technologies', []))})*")
 
     # =========================================================================
-    # TAB 2: JOB-RESUME ALIGNMENT
+    # TAB 2: CANDIDATE INPUTS & LOGISTICS
+    # =========================================================================
+    with tab_inputs:
+        st.markdown("### 📋 Candidate Logistics & Application Preferences")
+        st.caption("Provide explicit candidate preferences. Unanswered fields remain strictly tagged as NEEDS CANDIDATE INPUT.")
+
+        cand_rec = service.db.get_latest_candidate_profile()
+        existing_prof = cand_rec.profile_data if cand_rec else {}
+        inputs_data = existing_prof.get("candidate_inputs", {})
+
+        col_in1, col_in2 = st.columns(2)
+        with col_in1:
+            in_stipend = st.text_input(
+                "Expected Monthly Stipend (e.g. ₹15,000 /month or Negotiable):",
+                value=inputs_data.get("expected_stipend") or "",
+                placeholder="Leave blank to mark as NEEDS CANDIDATE INPUT",
+            )
+            in_availability = st.text_input(
+                "Internship Availability (e.g. Immediate / Flexible / Summer 2026):",
+                value=inputs_data.get("internship_availability") or "",
+                placeholder="e.g. Flexible / Immediate",
+            )
+            in_hours = st.text_input(
+                "Weekly Working Hours (e.g. 20–25 hours/week):",
+                value=inputs_data.get("weekly_working_hours") or "",
+                placeholder="e.g. 20 hours/week",
+            )
+            in_duration = st.text_input(
+                "Internship Duration Preference (e.g. 3 months / 6 months):",
+                value=inputs_data.get("internship_duration_preference") or "",
+                placeholder="e.g. 3 months",
+            )
+            in_joining = st.text_input(
+                "Earliest Joining Date (e.g. Immediate / June 2025):",
+                value=inputs_data.get("joining_date") or "",
+                placeholder="e.g. Immediate",
+            )
+
+        with col_in2:
+            in_relocation = st.selectbox(
+                "Relocation Willingness:",
+                options=[
+                    "Not Specified (Needs Candidate Input)",
+                    "Remote / Pune only (No relocation)",
+                    "Open to relocate within India for summer internship",
+                    "Open to remote opportunities only",
+                ],
+                index=0 if not inputs_data.get("relocation_willingness") else (
+                    1 if "pune" in str(inputs_data.get("relocation_willingness")).lower() else 2
+                ),
+            )
+            in_work_mode = st.selectbox(
+                "On-site / Hybrid / Remote Preferences:",
+                options=[
+                    "Not Specified (Needs Candidate Input)",
+                    "Remote / Work from home preferred",
+                    "Hybrid preferred (Pune)",
+                    "On-site / In-office acceptable",
+                ],
+                index=0 if not inputs_data.get("work_mode_preference") else (
+                    1 if "remote" in str(inputs_data.get("work_mode_preference")).lower() else 2
+                ),
+            )
+            in_notice = st.text_input(
+                "Notice Period, if applicable (e.g. Immediate / None):",
+                value=inputs_data.get("notice_period") or "",
+                placeholder="e.g. Immediate",
+            )
+            in_github = st.text_input(
+                "Verified GitHub Profile URL:",
+                value=inputs_data.get("github_url") or "",
+                placeholder="https://github.com/username",
+            )
+            in_linkedin = st.text_input(
+                "Verified LinkedIn Profile URL:",
+                value=inputs_data.get("linkedin_url") or "",
+                placeholder="https://linkedin.com/in/username",
+            )
+
+        if st.button("💾 Save Logistics & Candidate Inputs", type="primary"):
+            updated_inputs = {
+                "expected_stipend": in_stipend.strip() or None,
+                "internship_availability": in_availability.strip() or None,
+                "weekly_working_hours": in_hours.strip() or None,
+                "internship_duration_preference": in_duration.strip() or None,
+                "joining_date": in_joining.strip() or None,
+                "relocation_willingness": None if "Not Specified" in in_relocation else in_relocation,
+                "work_mode_preference": None if "Not Specified" in in_work_mode else in_work_mode,
+                "notice_period": in_notice.strip() or None,
+                "github_url": in_github.strip() or None,
+                "linkedin_url": in_linkedin.strip() or None,
+            }
+            existing_prof["candidate_inputs"] = updated_inputs
+            if in_github.strip():
+                existing_prof.setdefault("personal", {})["github"] = in_github.strip()
+            if in_linkedin.strip():
+                existing_prof.setdefault("personal", {})["linkedin"] = in_linkedin.strip()
+
+            succ, msg = service.save_candidate_profile(existing_prof)
+            if succ:
+                st.success("Candidate logistics & inputs updated. Responses and cover letters will reflect these facts.")
+                st.rerun()
+            else:
+                st.error(msg)
+
+    # =========================================================================
+    # TAB 3: JOB-RESUME ALIGNMENT
     # =========================================================================
     with tab_align:
         st.markdown("### 🎯 Job-Resume Alignment & Gap Analysis")

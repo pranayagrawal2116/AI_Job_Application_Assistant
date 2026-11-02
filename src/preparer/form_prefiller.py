@@ -44,8 +44,18 @@ class FormPrefiller:
         if candidate_profile:
             self.profile = candidate_profile
         else:
-            from src.config import config
-            self.profile = config.candidate_profile
+            json_path = Path("data/profile/candidate_profile.json")
+            if json_path.exists():
+                try:
+                    import json
+                    with open(json_path, "r", encoding="utf-8") as pf:
+                        self.profile = json.load(pf)
+                except Exception:
+                    from src.config import config
+                    self.profile = config.candidate_profile
+            else:
+                from src.config import config
+                self.profile = config.candidate_profile
 
     def detect_anti_automation(self, snapshot_text: str) -> bool:
         """Detects anti-bot mechanisms like Cloudflare, CAPTCHA, or login gates."""

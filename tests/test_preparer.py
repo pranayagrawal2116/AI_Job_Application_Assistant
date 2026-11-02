@@ -18,6 +18,7 @@ from src.preparer.profile_updater import ProfileUpdater
 from src.preparer.question_answerer import QuestionAnswerer
 from src.preparer.resume_matcher import ResumeJobMatcher
 from src.preparer.resume_parser import ResumeParser
+from src.security.session_manager import SessionManager
 
 
 class TestApplicationPreparationEngine(unittest.TestCase):
@@ -84,7 +85,13 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         )
         self.answerer = QuestionAnswerer(candidate_profile=self.profile)
         self.prefiller = FormPrefiller(candidate_profile=self.profile)
-        self.gate = HumanApprovalGate(db_manager=self.db)
+        SessionManager.reset_instance()
+        self.session_mgr = SessionManager()
+        self.session = self.session_mgr.authenticate_candidate(
+            candidate_id="candidate_pranay",
+            candidate_name="Pranay Agrawal",
+        )
+        self.gate = HumanApprovalGate(db_manager=self.db, session_manager=self.session_mgr)
 
     # 1. PDF Resume Parsing Tests
     def test_pdf_resume_parsing(self):
@@ -116,6 +123,17 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         self.assertIn("C/C++", parsed.technical_skills)
         self.assertTrue(any("Medical Chatbot" in p.title for p in parsed.projects))
         self.assertTrue(any("Sarita ABDM" in p.title for p in parsed.projects))
+
+        # Zero-fabrication verifications
+        self.assertEqual(parsed.github_url, "")
+        self.assertEqual(parsed.linkedin_url, "")
+        medical_bot = next(p for p in parsed.projects if "Medical Chatbot" in p.title)
+        self.assertEqual(medical_bot.technologies, ["Python"])
+        self.assertNotIn("NLP", medical_bot.technologies)
+        self.assertNotIn("Machine Learning", medical_bot.technologies)
+        self.assertNotIn("Pandas", parsed.technical_skills)
+        self.assertNotIn("NumPy", parsed.technical_skills)
+        self.assertNotIn("Scikit-learn", parsed.technical_skills)
 
     # 2. DOCX Resume Parsing Tests
     def test_docx_resume_parsing(self):
@@ -187,7 +205,22 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         self.assertIn("Sarita Infotech Pvt. Ltd.", answers["describe_relevant_experience"]["answer"])
         self.assertIn("Medical Chatbot", answers["explain_project"]["answer"])
         self.assertIn("Python, Dart, JavaScript, and C/C++", answers["technical_skills"]["answer"])
-        self.assertEqual(answers["availability"]["status"], "READY")
+        
+        # Unpopulated candidate inputs mark availability as NEEDS_CANDIDATE_INPUT
+        self.assertEqual(answers["availability"]["status"], "NEEDS_CANDIDATE_INPUT")
+        self.assertIn("NEEDS CANDIDATE INPUT", answers["availability"]["answer"])
+
+        # When candidate inputs are populated, availability transitions to READY
+        profile_with_inputs = dict(self.profile)
+        profile_with_inputs["candidate_inputs"] = {
+            "internship_availability": "Immediate",
+            "weekly_working_hours": "40 hours / week (Full-time)",
+        }
+        answerer_with_inputs = QuestionAnswerer(candidate_profile=profile_with_inputs)
+        answers_ready = answerer_with_inputs.generate_standard_answers(self.test_job)
+        self.assertEqual(answers_ready["availability"]["status"], "READY")
+        self.assertIn("Immediate", answers_ready["availability"]["answer"])
+        self.assertIn("40 hours / week", answers_ready["availability"]["answer"])
 
         # Test custom question requiring candidate input
         custom_salary = self.answerer.answer_custom_question("What is your expected monthly salary?")
@@ -224,22 +257,44 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         )
 
         # 1. Unconfirmed candidate checkbox -> must fail
-        succ_no_check, msg1 = self.gate.authorize_application(packet, "Pranay Agrawal", candidate_confirmed=False)
+        succ_no_check, msg1 = self.gate.authorize_application(
+            packet, "Pranay Agrawal", candidate_confirmed=False, dashboard_token=TRUSTED_APPROVAL_TOKEN
+        )
         self.assertFalse(succ_no_check)
         self.assertIn("explicitly check", msg1)
 
         # 2. Empty approver name -> must fail
-        succ_empty, msg2 = self.gate.authorize_application(packet, "  ", candidate_confirmed=True)
+        succ_empty, msg2 = self.gate.authorize_application(
+            packet, "  ", candidate_confirmed=True, dashboard_token=TRUSTED_APPROVAL_TOKEN
+        )
         self.assertFalse(succ_empty)
         self.assertIn("Human approver name is mandatory", msg2)
 
         # 3. Automated bot name -> must fail
-        succ_bot, msg3 = self.gate.authorize_application(packet, "automated_agent_bot", candidate_confirmed=True)
+        succ_bot, msg3 = self.gate.authorize_application(
+            packet, "automated_agent_bot", candidate_confirmed=True, dashboard_token=TRUSTED_APPROVAL_TOKEN
+        )
         self.assertFalse(succ_bot)
         self.assertIn("automated authorization", msg3)
 
-        # 4. Valid human authorization -> must succeed
-        succ_ok, msg4 = self.gate.authorize_application(packet, "Pranay Agrawal", candidate_confirmed=True)
+        # 4. Typed candidate name alone without dashboard_token -> must fail
+        succ_name_only, msg_tok = self.gate.authorize_application(
+            packet, "Pranay Agrawal", candidate_confirmed=True, dashboard_token=None
+        )
+        self.assertFalse(succ_name_only)
+        self.assertIn("A typed name alone cannot authenticate approval", msg_tok)
+
+        # 5. Invalid dashboard_token -> must fail
+        succ_bad_tok, msg_bad = self.gate.authorize_application(
+            packet, "Pranay Agrawal", candidate_confirmed=True, dashboard_token="INVALID_TOKEN"
+        )
+        self.assertFalse(succ_bad_tok)
+        self.assertIn("A typed name alone cannot authenticate approval", msg_bad)
+
+        # 6. Valid human authorization with dashboard token -> must succeed
+        succ_ok, msg4 = self.gate.authorize_application(
+            packet, "Pranay Agrawal", candidate_confirmed=True, dashboard_token=TRUSTED_APPROVAL_TOKEN
+        )
         self.assertTrue(succ_ok)
         self.assertTrue(packet.is_approved)
         self.assertEqual(packet.approver_name, "Pranay Agrawal")
@@ -248,11 +303,114 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         app = self.db.get_application_by_job_id(self.test_job.id)
         self.assertEqual(app.status, ApplicationStatus.AWAITING_APPROVAL.value)
 
-        # 5. Confirm manual submission
-        succ_sub, msg5 = self.gate.record_manual_submission(self.test_job.id, approver_name="Pranay Agrawal")
+        # 7. Confirm manual submission without submission token -> must fail
+        succ_no_sub_tok, msg_sub_fail = self.gate.record_manual_submission(
+            self.test_job.id, approver_name="Pranay Agrawal", submission_token=None
+        )
+        self.assertFalse(succ_no_sub_tok)
+        self.assertIn("Requires trusted candidate-controlled submission confirmation", msg_sub_fail)
+
+        # 8. Confirm manual submission on unapproved job -> must fail
+        succ_unapproved, msg_unapp = self.gate.record_manual_submission(
+            99999, approver_name="Pranay Agrawal", submission_token=TRUSTED_SUBMISSION_TOKEN
+        )
+        self.assertFalse(succ_unapproved)
+        self.assertIn("does not have prior human approval", msg_unapp)
+
+        # 9. Valid manual submission confirmation with submission token -> must succeed
+        succ_sub, msg5 = self.gate.record_manual_submission(
+            self.test_job.id, approver_name="Pranay Agrawal", submission_token=TRUSTED_SUBMISSION_TOKEN
+        )
         self.assertTrue(succ_sub)
         app_sub = self.db.get_application_by_job_id(self.test_job.id)
         self.assertEqual(app_sub.status, ApplicationStatus.APPLIED.value)
+
+    # 10. Candidate Input Requirements Verification
+    def test_candidate_input_requirements(self):
+        # Empty candidate inputs profile
+        empty_profile = dict(self.profile)
+        empty_profile["candidate_inputs"] = {}
+        qa_empty = QuestionAnswerer(candidate_profile=empty_profile)
+
+        unanswered_queries = [
+            "What is your expected stipend?",
+            "How many hours per week can you dedicate?",
+            "What is your preferred internship duration?",
+            "When can you join?",
+            "Are you willing to relocate?",
+            "What is your preferred work mode?",
+            "What is your notice period?",
+        ]
+        for query in unanswered_queries:
+            resp = qa_empty.answer_custom_question(query)
+            self.assertEqual(resp["status"], "NEEDS_CANDIDATE_INPUT")
+            self.assertIn("NEEDS CANDIDATE INPUT", resp["answer"])
+
+        # Populated candidate inputs profile
+        populated_profile = dict(self.profile)
+        populated_profile["candidate_inputs"] = {
+            "expected_stipend": "₹20,000 / month",
+            "weekly_working_hours": "30-40 hours / week",
+            "internship_duration_preference": "6 months",
+            "joining_date": "Within 2 weeks",
+            "relocation_willingness": "Yes, Pune or Bengaluru",
+            "work_mode_preference": "Remote preferred, open to Hybrid",
+            "notice_period": "Immediate",
+        }
+        qa_populated = QuestionAnswerer(candidate_profile=populated_profile)
+
+        stipend_resp = qa_populated.answer_custom_question("What is your expected stipend?")
+        self.assertEqual(stipend_resp["status"], "READY")
+        self.assertIn("₹20,000 / month", stipend_resp["answer"])
+
+        hours_resp = qa_populated.answer_custom_question("How many hours per week can you dedicate?")
+        self.assertEqual(hours_resp["status"], "READY")
+        self.assertIn("30-40 hours / week", hours_resp["answer"])
+
+        duration_resp = qa_populated.answer_custom_question("What is your preferred internship duration?")
+        self.assertEqual(duration_resp["status"], "READY")
+        self.assertIn("6 months", duration_resp["answer"])
+
+        joining_resp = qa_populated.answer_custom_question("When can you join?")
+        self.assertEqual(joining_resp["status"], "READY")
+        self.assertIn("Within 2 weeks", joining_resp["answer"])
+
+        reloc_resp = qa_populated.answer_custom_question("Are you willing to relocate?")
+        self.assertEqual(reloc_resp["status"], "READY")
+        self.assertIn("Yes, Pune or Bengaluru", reloc_resp["answer"])
+
+        mode_resp = qa_populated.answer_custom_question("What is your preferred work mode?")
+        self.assertEqual(mode_resp["status"], "READY")
+        self.assertIn("Remote preferred, open to Hybrid", mode_resp["answer"])
+
+        notice_resp = qa_populated.answer_custom_question("What is your notice period?")
+        self.assertEqual(notice_resp["status"], "READY")
+        self.assertIn("Immediate", notice_resp["answer"])
+
+    # 11. Zero-Fabrication Cover Letter Validation
+    def test_zero_fabrication_cover_letter(self):
+        # Generate with empty candidate profile URLs
+        gen = CoverLetterGenerator(candidate_profile=self.profile)
+        res = gen.generate_cover_letter(self.test_job)
+        letter = res["letter_text"]
+
+        # Must not contain placeholder dummy URLs
+        self.assertNotIn("https://github.com |", letter)
+        self.assertNotIn("https://linkedin.com", letter)
+        self.assertNotIn("GitHub: https://github.com", letter)
+
+        # Must not fabricate NLP/ML on Medical Chatbot
+        self.assertNotIn("natural language processing", letter.lower())
+        self.assertNotIn("machine learning models", letter.lower())
+
+        # Must avoid generic flattery
+        self.assertNotIn("represents exactly the dynamic environment", letter)
+
+        # Must contain factual resume content
+        self.assertIn("Medical Chatbot", letter)
+        self.assertIn("conversational access to health-related information", letter)
+        self.assertIn("Sarita Infotech Pvt. Ltd.", letter)
+        self.assertIn("Project Manager | Mobile App Development", letter)
 
 
 if __name__ == "__main__":

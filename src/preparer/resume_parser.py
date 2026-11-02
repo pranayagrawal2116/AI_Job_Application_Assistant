@@ -175,9 +175,12 @@ class ResumeParser:
                 location = m.group(0).strip()
                 break
 
-        # Links
-        github_url = "https://github.com" if "github" in text.lower() else ""
-        linkedin_url = "https://linkedin.com" if "linkedin" in text.lower() else ""
+        # Links: Extract ONLY real URLs if present in the text; never fabricate dummy URLs
+        github_match = re.search(r"https?://(?:www\.)?github\.com/[\w\.-]+", text)
+        github_url = github_match.group(0) if github_match else ""
+
+        linkedin_match = re.search(r"https?://(?:www\.)?linkedin\.com/in/[\w\.-]+", text)
+        linkedin_url = linkedin_match.group(0) if linkedin_match else ""
 
         # 3. Education
         education_list = []
@@ -242,7 +245,7 @@ class ResumeParser:
             )
 
         # 5. Technical Skills
-        # Parse technical skill tokens explicitly documented in the resume
+        # Parse technical skill tokens explicitly documented in the resume's TECHNICAL SKILLS section
         known_skill_catalog = [
             "Python", "JavaScript", "C/C++", "C++", "C", "Dart", "Flutter",
             "Android application development", "Android", "REST API integration",
@@ -250,8 +253,6 @@ class ResumeParser:
             "JSON", "XML", "JSON / XML data handling", "Git", "GitHub", "Git & GitHub",
             "Android Studio", "VS Code", "Postman", "PDF generation & QR scanning",
             "Debugging & UI development", "Debugging", "UI development",
-            "Machine Learning", "Artificial Intelligence", "Data Science",
-            "Pandas", "NumPy", "Scikit-learn"
         ]
         extracted_skills = []
         for skill in known_skill_catalog:
@@ -261,14 +262,14 @@ class ResumeParser:
                 if skill not in extracted_skills:
                     extracted_skills.append(skill)
 
-        # 6. Projects
+        # 6. Projects: Strictly stick to documented statements without inferring unverified technologies
         projects = []
         if "sarita abdm" in text.lower() or "abdm – milestone 2" in text.lower() or "abdm" in text.lower():
             projects.append(
                 ProjectEntry(
                     title="Sarita ABDM – Milestone 2 Integration",
                     description="Worked on healthcare interoperability workflows involving ABDM consent management and data exchange.",
-                    technologies=["Flutter", "REST API", "ABDM", "JSON"],
+                    technologies=["ABDM", "Healthcare Interoperability Workflows"],
                 )
             )
         if "flutter healthcare management" in text.lower() or "healthcare management system" in text.lower():
@@ -276,7 +277,7 @@ class ResumeParser:
                 ProjectEntry(
                     title="Flutter Healthcare Management System",
                     description="Developed mobile app functionality for hospital workflows, patient management, and service access.",
-                    technologies=["Flutter", "Dart", "SQLite", "REST API"],
+                    technologies=["Flutter"],
                 )
             )
         if "qr-based patient registration" in text.lower() or "patient registration & consent" in text.lower():
@@ -284,7 +285,7 @@ class ResumeParser:
                 ProjectEntry(
                     title="QR-Based Patient Registration & Consent",
                     description="Implemented QR-driven patient registration and consent-related workflows with backend API communication.",
-                    technologies=["Flutter", "QR scanning", "REST API"],
+                    technologies=["QR Scanning", "Backend API Communication"],
                 )
             )
         if "medical chatbot" in text.lower():
@@ -292,7 +293,7 @@ class ResumeParser:
                 ProjectEntry(
                     title="Medical Chatbot",
                     description="Built a Python-based medical chatbot project focused on conversational access to health-related information.",
-                    technologies=["Python", "NLP", "Machine Learning"],
+                    technologies=["Python"],
                 )
             )
         if "factory management" in text.lower():
@@ -300,7 +301,7 @@ class ResumeParser:
                 ProjectEntry(
                     title="Factory Management Mobile App",
                     description="Worked on a mobile application project designed to support factory operations and management workflows.",
-                    technologies=["Flutter", "Dart", "Android"],
+                    technologies=["Mobile Application Development"],
                 )
             )
 

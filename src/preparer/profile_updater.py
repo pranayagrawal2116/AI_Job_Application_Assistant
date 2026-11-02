@@ -74,14 +74,37 @@ class ProfileUpdater:
         databases = [s for s in ["SQLite", "MySQL"] if s in resume.technical_skills]
         dev_tools = [s for s in ["Git", "GitHub", "Git & GitHub", "VS Code", "Android Studio", "Postman"] if s in resume.technical_skills]
 
+        # Preserve existing candidate inputs if already configured by the user
+        existing_inputs = {}
+        if self.profile_path.exists():
+            try:
+                with open(self.profile_path, "r", encoding="utf-8") as pf:
+                    existing_data = json.load(pf)
+                    existing_inputs = existing_data.get("candidate_inputs", {})
+            except Exception:
+                pass
+
+        candidate_inputs = {
+            "expected_stipend": existing_inputs.get("expected_stipend"),
+            "internship_availability": existing_inputs.get("internship_availability"),
+            "weekly_working_hours": existing_inputs.get("weekly_working_hours"),
+            "internship_duration_preference": existing_inputs.get("internship_duration_preference"),
+            "joining_date": existing_inputs.get("joining_date"),
+            "relocation_willingness": existing_inputs.get("relocation_willingness"),
+            "work_mode_preference": existing_inputs.get("work_mode_preference"),
+            "notice_period": existing_inputs.get("notice_period"),
+            "github_url": existing_inputs.get("github_url") or resume.github_url or "",
+            "linkedin_url": existing_inputs.get("linkedin_url") or resume.linkedin_url or "",
+        }
+
         profile_data = {
             "personal": {
                 "full_name": resume.full_name or "Pranay Anup Agrawal",
                 "email": resume.email or "pranayagrawal2116@gmail.com",
                 "phone": resume.phone or "95100 29575",
                 "location": resume.location or "Kothrud, Pune, Maharashtra",
-                "github": resume.github_url or "https://github.com",
-                "linkedin": resume.linkedin_url or "https://linkedin.com",
+                "github": candidate_inputs["github_url"],
+                "linkedin": candidate_inputs["linkedin_url"],
                 "summary": resume.about_me,
             },
             "education": edu_list,
@@ -95,6 +118,7 @@ class ProfileUpdater:
                 "all_skills": resume.technical_skills,
             },
             "projects": proj_list,
+            "candidate_inputs": candidate_inputs,
             "preferences": {
                 "target_roles": [
                     "AI Intern",

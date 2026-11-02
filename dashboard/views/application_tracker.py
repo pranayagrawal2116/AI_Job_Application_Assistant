@@ -70,21 +70,26 @@ def render_application_tracker():
 
             with col_form:
                 st.markdown("#### Transition Status")
+                allowed_tracker_statuses = [
+                    ApplicationStatus.UNDER_REVIEW.value,
+                    ApplicationStatus.SHORTLISTED.value,
+                    ApplicationStatus.APPLICATION_PREPARED.value,
+                    ApplicationStatus.INTERVIEW.value,
+                    ApplicationStatus.REJECTED.value,
+                    ApplicationStatus.WITHDRAWN.value,
+                ]
+                if curr_stat not in allowed_tracker_statuses:
+                    allowed_tracker_statuses = [curr_stat] + allowed_tracker_statuses
+
                 next_stat = st.selectbox(
                     "New Status",
-                    options=statuses,
-                    index=statuses.index(curr_stat) if curr_stat in statuses else 0,
+                    options=allowed_tracker_statuses,
+                    index=allowed_tracker_statuses.index(curr_stat) if curr_stat in allowed_tracker_statuses else 0,
                     key=f"status_sel_{job_id}",
                 )
 
-                approver = ""
-                if next_stat == ApplicationStatus.APPLIED.value:
-                    st.warning("⚠️ **Safety Safeguard**: Human submission authorization is mandatory.")
-                    approver = st.text_input(
-                        "Authorized Human Approver Name",
-                        placeholder="e.g. Candidate Pranay",
-                        key=f"appr_{job_id}",
-                    )
+                if curr_stat in (ApplicationStatus.AWAITING_APPROVAL.value, ApplicationStatus.APPLIED.value):
+                    st.info("🛡️ Applications in 'Awaiting Approval' or 'Applied' are governed strictly through the **Application Preparer** approval gate.")
 
                 notes_input = st.text_area(
                     "Application Notes",
@@ -98,7 +103,6 @@ def render_application_tracker():
                         job_id=job_id,
                         new_status=next_stat,
                         notes=notes_input,
-                        approver_name=approver if next_stat == ApplicationStatus.APPLIED.value else None,
                     )
                     if succ:
                         st.success(msg)
