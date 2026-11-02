@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS candidate_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     profile_data TEXT NOT NULL,
+    profile_hash TEXT,
     version INTEGER DEFAULT 1,
     is_active INTEGER DEFAULT 1 CHECK(is_active IN (0, 1)),
     last_updated DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -70,18 +71,28 @@ CREATE TABLE IF NOT EXISTS resumes (
     file_hash TEXT NOT NULL,
     parsed_data TEXT,
     is_primary INTEGER DEFAULT 0 CHECK(is_primary IN (0, 1)),
+    label TEXT DEFAULT 'General',
+    target_role TEXT,
     file_size_bytes INTEGER NOT NULL,
+    parsing_status TEXT DEFAULT 'COMPLETED' CHECK(parsing_status IN ('PENDING', 'PARSED', 'FAILED', 'COMPLETED')),
+    active_version INTEGER DEFAULT 1,
     uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id, user_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_primary_resume ON resumes(user_id) WHERE is_primary = 1;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_resumes_user_file_hash ON resumes(user_id, file_hash);
 
 CREATE TABLE IF NOT EXISTS resume_versions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     resume_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL,
     version_num INTEGER NOT NULL,
+    storage_filename TEXT,
+    file_hash TEXT,
+    file_size_bytes INTEGER,
+    change_notes TEXT,
     snapshot_json TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(resume_id, version_num),
@@ -174,6 +185,7 @@ CREATE TABLE IF NOT EXISTS applications (
     job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
     job_description_id INTEGER,
     user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    resume_id INTEGER,
     company_name TEXT,
     job_title TEXT,
     status TEXT NOT NULL DEFAULT 'Discovered' CHECK (status IN (

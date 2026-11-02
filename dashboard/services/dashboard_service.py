@@ -273,6 +273,87 @@ class DashboardService:
         except Exception as exc:
             return False, f"Failed saving candidate profile: {exc}"
 
+    def get_user_resumes(self, user_id: int) -> List[Dict[str, Any]]:
+        """Returns list of user resumes."""
+        return self.db.list_user_resumes(user_id)
+
+    def upload_user_resume(
+        self,
+        user_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        label: str = "General",
+        target_role: Optional[str] = None,
+        set_as_primary: bool = False,
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Uploads, validates, parses, and saves a user resume."""
+        try:
+            record = self.db.upload_user_resume(
+                user_id=user_id,
+                file_bytes=file_bytes,
+                original_filename=original_filename,
+                label=label,
+                target_role=target_role,
+                set_as_primary=set_as_primary,
+            )
+            return True, f"Successfully uploaded '{original_filename}'.", record
+        except Exception as e:
+            logger.error("Failed to upload user resume: %s", e)
+            return False, str(e), None
+
+    def add_resume_version(
+        self,
+        user_id: int,
+        resume_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        change_notes: str = "",
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Uploads a new version of a resume."""
+        try:
+            ver = self.db.add_resume_version(
+                user_id=user_id,
+                resume_id=resume_id,
+                file_bytes=file_bytes,
+                original_filename=original_filename,
+                change_notes=change_notes,
+            )
+            return True, f"Successfully created Version {ver['version_num']} for Resume #{resume_id}.", ver
+        except Exception as e:
+            logger.error("Failed to add resume version: %s", e)
+            return False, str(e), None
+
+    def set_primary_resume(self, user_id: int, resume_id: int) -> Tuple[bool, str]:
+        """Sets a resume as primary."""
+        try:
+            self.db.set_primary_resume(user_id, resume_id)
+            return True, f"Resume #{resume_id} is now your primary resume."
+        except Exception as e:
+            logger.error("Failed to set primary resume: %s", e)
+            return False, str(e)
+
+    def delete_user_resume(self, user_id: int, resume_id: int) -> Tuple[bool, str]:
+        """Deletes a resume if not in use by applications."""
+        try:
+            self.db.delete_user_resume(user_id, resume_id)
+            return True, f"Resume #{resume_id} deleted successfully."
+        except Exception as e:
+            logger.error("Failed to delete resume: %s", e)
+            return False, str(e)
+
+    def get_resume_download_data(
+        self, user_id: int, resume_id: int, version_num: Optional[int] = None
+    ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+        """Returns file bytes, filename, and mime type for downloading."""
+        try:
+            path = self.db.get_resume_file_path(user_id, resume_id, version_num)
+            file_bytes = path.read_bytes()
+            mime = "application/pdf" if path.suffix.lower() == ".pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            return file_bytes, path.name, mime
+        except Exception as e:
+            logger.error("Failed to read resume file for download: %s", e)
+            return None, None, None
+
     # -------------------------------------------------------------------------
     # PHASE 7: APPLICATION PREPARATION & HUMAN APPROVAL HELPERS
     # -------------------------------------------------------------------------

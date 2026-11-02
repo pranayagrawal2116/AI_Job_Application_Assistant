@@ -114,6 +114,7 @@ class Application:
     job_id: Optional[int] = None
     job_description_id: Optional[int] = None
     user_id: Optional[int] = None
+    resume_id: Optional[int] = None
     company_name: str = "Unknown"
     job_title: str = "Role"
     status: str = ApplicationStatus.DISCOVERED.value
@@ -265,6 +266,62 @@ class JobDescription:
     id: Optional[int] = None
     parsed_data: Optional[str] = None
     created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ResumeRecord:
+    """User-owned resume document record."""
+    user_id: int
+    storage_filename: str
+    original_filename: str
+    file_format: str
+    file_hash: str
+    file_size_bytes: int
+    id: Optional[int] = None
+    parsed_data: Optional[str] = None
+    is_primary: bool = False
+    label: str = "General"
+    target_role: Optional[str] = None
+    parsing_status: str = "COMPLETED"
+    active_version: int = 1
+    uploaded_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ResumeVersionRecord:
+    """Historical version snapshot of a user resume."""
+    resume_id: int
+    user_id: int
+    version_num: int
+    snapshot_json: str
+    id: Optional[int] = None
+    storage_filename: Optional[str] = None
+    file_hash: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    change_notes: Optional[str] = None
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class CandidateProfileRecord:
+    """Candidate profile snapshot (supports both user-scoped and legacy single-candidate)."""
+    profile_data: Any
+    id: Optional[int] = None
+    user_id: Optional[int] = None
+    profile_hash: Optional[str] = None
+    version: int = 1
+    is_active: bool = True
+    last_updated: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

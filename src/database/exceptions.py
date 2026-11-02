@@ -176,3 +176,53 @@ class CrossUserAccessError(SecurityAuthorizationError):
         self.user_id = user_id
         self.target_user_id = target_user_id
         self.resource = resource
+
+
+# -------------------------------------------------------------------------
+# PHASE 3: RESUME & FILE SECURITY EXCEPTIONS
+# -------------------------------------------------------------------------
+
+class ResumeNotFoundError(DatabaseError):
+    """Raised when a requested resume record cannot be found."""
+
+    def __init__(self, resume_id: int | str):
+        super().__init__(f"Resume with ID '{resume_id}' was not found.")
+        self.resume_id = resume_id
+
+
+class DuplicateResumeError(DatabaseError):
+    """Raised when an identical resume file has already been uploaded by the user."""
+
+    def __init__(self, message: str, existing_resume_id: int | None = None):
+        super().__init__(message)
+        self.existing_resume_id = existing_resume_id
+
+
+class FileSecurityError(SecurityAuthorizationError):
+    """Base exception for file upload validation and security checks."""
+    pass
+
+
+class InvalidFileFormatError(FileSecurityError, ValueError):
+    """Raised when an uploaded document format or magic-bytes signature is unsupported."""
+    pass
+
+
+class FileTooLargeError(FileSecurityError):
+    """Raised when an uploaded document exceeds the 10 MB limit."""
+    pass
+
+
+class CorruptedFileError(FileSecurityError):
+    """Raised when an uploaded document is structurally invalid or unreadable."""
+    pass
+
+
+class EncryptedFileError(FileSecurityError):
+    """Raised when an uploaded PDF is password-protected or encrypted."""
+    pass
+
+
+class ResumeInUseError(DatabaseError):
+    """Raised when trying to delete a resume that is locked by submitted applications."""
+    pass

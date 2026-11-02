@@ -16,16 +16,24 @@ from src.database.exceptions import (
     ApplicationNotFoundError,
     AuthenticationFailedError,
     CompanyNotFoundError,
+    CorruptedFileError,
     CrossUserAccessError,
     DatabaseError,
     DuplicateJobError,
+    DuplicateResumeError,
     DuplicateUserError,
+    EncryptedFileError,
+    FileSecurityError,
+    FileTooLargeError,
+    InvalidFileFormatError,
     InvalidStatusError,
     InvalidStatusTransitionError,
     InvalidTicketError,
     JobNotFoundError,
     KeyRevokedError,
     RateLimitExceededError,
+    ResumeInUseError,
+    ResumeNotFoundError,
     SecurityAuthorizationError,
     TicketAlreadyConsumedError,
     TokenAlreadyUsedError,
@@ -163,6 +171,27 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    def _ensure_backward_compatible_columns(self, cursor: sqlite3.Cursor) -> None:
+        """Ensures newly added columns exist in older database tables before schema indexes are applied."""
+        def add_col_if_missing(table: str, col: str, col_def: str) -> None:
+            try:
+                cursor.execute(f"PRAGMA table_info({table})")
+                cols = [r[1] for r in cursor.fetchall()]
+                if cols and col not in cols:
+                    cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+            except sqlite3.OperationalError:
+                pass
+
+        add_col_if_missing("applications", "user_id", "INTEGER")
+        add_col_if_missing("applications", "resume_id", "INTEGER")
+        add_col_if_missing("application_logs", "user_id", "INTEGER")
+        add_col_if_missing("resumes", "label", "TEXT DEFAULT 'General'")
+        add_col_if_missing("resumes", "target_role", "TEXT")
+        add_col_if_missing("resumes", "updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
+        add_col_if_missing("resumes", "parsing_status", "TEXT DEFAULT 'COMPLETED'")
+        add_col_if_missing("resumes", "active_version", "INTEGER DEFAULT 1")
+        add_col_if_missing("candidate_profiles", "profile_hash", "TEXT")
+
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
         if not self.schema_path.is_file():
@@ -172,6 +201,9 @@ class DatabaseManager:
             schema_sql = f.read()
 
         with self.connection() as conn:
+            cursor = conn.cursor()
+            self._ensure_backward_compatible_columns(cursor)
+            conn.commit()
             conn.executescript(schema_sql)
             conn.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
@@ -1373,6 +1405,14 @@ class DatabaseManager:
     # PHASE 2: USER-SCOPED APPLICATIONS
     # -------------------------------------------------------------------------
 
+    def get_user_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Fetches a user record by primary key id."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
     def create_user_application(
         self,
         user_id: int,
@@ -1548,6 +1588,433 @@ class DatabaseManager:
             v_id = cursor.lastrowid
             cursor.execute("SELECT * FROM resume_versions WHERE id = ?", (v_id,))
             return dict(cursor.fetchone())
+
+    def upload_user_resume(
+        self,
+        user_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        label: str = "General",
+        target_role: Optional[str] = None,
+        set_as_primary: bool = False,
+        user_base_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """Validates, stores, parses, and persists a user resume document.
+
+        Enforces file security, unique hash per user, isolated storage, and primary resume rules.
+        """
+        from src.security.file_security import FileSecurityValidator
+        from src.preparer.resume_parser import ResumeParser
+
+        # 1. Verify user exists
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError(f"User #{user_id}")
+
+        # 2. File security validation
+        validator = FileSecurityValidator()
+        validator.validate_file(file_bytes, original_filename)
+
+        ext = Path(original_filename).suffix.lstrip(".").lower()
+        file_format = ext
+        file_size = len(file_bytes)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+        # 3. Check for duplicate hash for this user
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM resumes WHERE user_id = ? AND file_hash = ?", (user_id, file_hash))
+            existing = cursor.fetchone()
+            if existing:
+                raise DuplicateResumeError(
+                    f"A resume with identical content hash {file_hash[:12]} already exists as Resume #{existing['id']}."
+                )
+
+        # 4. Generate isolated user storage path
+        storage_filename = validator.generate_storage_filename(original_filename)
+        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        dest_path = base_dir / storage_filename
+        validator.save_file(file_bytes, dest_path, user_id=user_id)
+
+        # 5. Universal parsing
+        parser = ResumeParser()
+        try:
+            parsed = parser.parse_file(dest_path)
+            parsed_json = json.dumps(parsed.to_dict())
+            parsing_status = "COMPLETED"
+        except Exception as e:
+            logger.warning("Resume parsing encountered issues for user %d: %s", user_id, e)
+            parsed_json = json.dumps({"raw_error": str(e)})
+            parsing_status = "FAILED"
+
+        # 6. Database persistence with primary resume logic
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute("SELECT COUNT(*) as cnt FROM resumes WHERE user_id = ?", (user_id,))
+            resume_count = cursor.fetchone()["cnt"]
+
+            make_primary = set_as_primary or (resume_count == 0)
+            if make_primary:
+                cursor.execute("UPDATE resumes SET is_primary = 0 WHERE user_id = ?", (user_id,))
+
+            cursor.execute(
+                """
+                INSERT INTO resumes (
+                    user_id, storage_filename, original_filename, file_format,
+                    file_hash, parsed_data, is_primary, label, target_role,
+                    file_size_bytes, parsing_status, active_version, uploaded_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                """,
+                (
+                    user_id,
+                    storage_filename,
+                    original_filename,
+                    file_format,
+                    file_hash,
+                    parsed_json,
+                    1 if make_primary else 0,
+                    label or "General",
+                    target_role,
+                    file_size,
+                    parsing_status,
+                ),
+            )
+            resume_id = cursor.lastrowid
+
+            # Create initial version 1
+            cursor.execute(
+                """
+                INSERT INTO resume_versions (
+                    resume_id, user_id, version_num, storage_filename,
+                    file_hash, file_size_bytes, change_notes, snapshot_json, created_at
+                ) VALUES (?, ?, 1, ?, ?, ?, 'Initial upload', ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    resume_id,
+                    user_id,
+                    storage_filename,
+                    file_hash,
+                    file_size,
+                    parsed_json,
+                ),
+            )
+
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            return dict(cursor.fetchone())
+
+    def add_resume_version(
+        self,
+        user_id: int,
+        resume_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        change_notes: str = "",
+        user_base_dir: Optional[Path] = None,
+    ) -> Dict[str, Any]:
+        """Uploads a new version of an existing resume."""
+        from src.security.file_security import FileSecurityValidator
+        from src.preparer.resume_parser import ResumeParser
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(user_id=user_id, target_user_id=row["user_id"], resource=f"Resume #{resume_id}")
+
+        validator = FileSecurityValidator()
+        validator.validate_file(file_bytes, original_filename)
+
+        ext = Path(original_filename).suffix.lstrip(".").lower()
+        file_size = len(file_bytes)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+
+        # Check duplicate hash against versions of this resume
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id FROM resume_versions WHERE resume_id = ? AND file_hash = ?", (resume_id, file_hash))
+            if cursor.fetchone():
+                raise DuplicateResumeError(f"This exact version content (hash {file_hash[:12]}) is already stored for Resume #{resume_id}.")
+
+            cursor.execute("SELECT MAX(version_num) as max_v FROM resume_versions WHERE resume_id = ?", (resume_id,))
+            max_row = cursor.fetchone()
+            next_version = (max_row["max_v"] or 1) + 1
+
+        storage_filename = validator.generate_storage_filename(original_filename)
+        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        dest_path = base_dir / storage_filename
+        validator.save_file(file_bytes, dest_path, user_id=user_id)
+
+        parser = ResumeParser()
+        try:
+            parsed = parser.parse_file(dest_path)
+            parsed_json = json.dumps(parsed.to_dict())
+            parsing_status = "COMPLETED"
+        except Exception as e:
+            logger.warning("Resume version parsing error: %s", e)
+            parsed_json = json.dumps({"raw_error": str(e)})
+            parsing_status = "FAILED"
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO resume_versions (
+                    resume_id, user_id, version_num, storage_filename,
+                    file_hash, file_size_bytes, change_notes, snapshot_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    resume_id,
+                    user_id,
+                    next_version,
+                    storage_filename,
+                    file_hash,
+                    file_size,
+                    change_notes or f"Version {next_version}",
+                    parsed_json,
+                ),
+            )
+            v_id = cursor.lastrowid
+
+            cursor.execute(
+                """
+                UPDATE resumes SET
+                    storage_filename = ?,
+                    original_filename = ?,
+                    file_format = ?,
+                    file_hash = ?,
+                    file_size_bytes = ?,
+                    parsed_data = ?,
+                    parsing_status = ?,
+                    active_version = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    storage_filename,
+                    original_filename,
+                    ext,
+                    file_hash,
+                    file_size,
+                    parsed_json,
+                    parsing_status,
+                    next_version,
+                    resume_id,
+                    user_id,
+                ),
+            )
+
+            cursor.execute("SELECT * FROM resume_versions WHERE id = ?", (v_id,))
+            return dict(cursor.fetchone())
+
+    def set_primary_resume(self, user_id: int, resume_id: int) -> Dict[str, Any]:
+        """Toggles the primary resume for a user atomically."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(user_id=user_id, target_user_id=row["user_id"], resource=f"Resume #{resume_id}")
+
+            cursor.execute("UPDATE resumes SET is_primary = 0 WHERE user_id = ?", (user_id,))
+            cursor.execute("UPDATE resumes SET is_primary = 1 WHERE id = ? AND user_id = ?", (resume_id, user_id))
+
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            return dict(cursor.fetchone())
+
+    def get_primary_resume(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Returns the primary resume record for a user, or None."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE user_id = ? AND is_primary = 1 LIMIT 1", (user_id,))
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_user_resume_versions(self, user_id: int, resume_id: int) -> List[Dict[str, Any]]:
+        """Lists all version snapshots for a resume."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(user_id=user_id, target_user_id=row["user_id"], resource=f"Resume #{resume_id}")
+
+            cursor.execute(
+                "SELECT * FROM resume_versions WHERE resume_id = ? AND user_id = ? ORDER BY version_num DESC",
+                (resume_id, user_id),
+            )
+            return [dict(r) for r in cursor.fetchall()]
+
+    def get_resume_file_path(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: Optional[int] = None,
+        user_base_dir: Optional[Path] = None,
+    ) -> Path:
+        """Returns the verified disk path to a resume file, strictly contained within the user sandbox."""
+        from src.security.file_security import FileSecurityValidator
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(user_id=user_id, target_user_id=row["user_id"], resource=f"Resume #{resume_id}")
+
+            if version_num is not None:
+                cursor.execute(
+                    "SELECT storage_filename FROM resume_versions WHERE resume_id = ? AND version_num = ? AND user_id = ?",
+                    (resume_id, version_num, user_id),
+                )
+                v_row = cursor.fetchone()
+                if not v_row:
+                    raise ResumeNotFoundError(f"Version {version_num} for Resume #{resume_id} not found.")
+                storage_filename = v_row["storage_filename"]
+            else:
+                storage_filename = row["storage_filename"]
+
+        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        target_path = base_dir / storage_filename
+        FileSecurityValidator.validate_path_containment(target_path, base_dir)
+
+        if not target_path.exists():
+            raise FileNotFoundError(f"Resume file on disk not found: {target_path}")
+
+        return target_path
+
+    def delete_user_resume(
+        self,
+        user_id: int,
+        resume_id: int,
+        user_base_dir: Optional[Path] = None,
+    ) -> bool:
+        """Deletes a resume and its version files, checking for active application lock."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(user_id=user_id, target_user_id=row["user_id"], resource=f"Resume #{resume_id}")
+
+            # Check if referenced by applications
+            cursor.execute("SELECT id FROM applications WHERE resume_id = ? AND user_id = ?", (resume_id, user_id))
+            if cursor.fetchone():
+                raise ResumeInUseError(f"Cannot delete Resume #{resume_id}: referenced by existing job applications.")
+
+            # Check if referenced by prepared_packets
+            cursor.execute("SELECT id FROM prepared_packets WHERE original_resume_id = ? AND user_id = ?", (resume_id, user_id))
+            if cursor.fetchone():
+                raise ResumeInUseError(f"Cannot delete Resume #{resume_id}: referenced by prepared application packets.")
+
+            cursor.execute("SELECT storage_filename FROM resume_versions WHERE resume_id = ?", (resume_id,))
+            version_files = [r["storage_filename"] for r in cursor.fetchall() if r["storage_filename"]]
+            if row["storage_filename"] not in version_files:
+                version_files.append(row["storage_filename"])
+
+            was_primary = bool(row["is_primary"])
+
+        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM resume_versions WHERE resume_id = ? AND user_id = ?", (resume_id, user_id))
+            cursor.execute("DELETE FROM resumes WHERE id = ? AND user_id = ?", (resume_id, user_id))
+
+            # If it was primary, promote the latest remaining resume
+            if was_primary:
+                cursor.execute(
+                    "SELECT id FROM resumes WHERE user_id = ? ORDER BY uploaded_at DESC LIMIT 1",
+                    (user_id,),
+                )
+                rem = cursor.fetchone()
+                if rem:
+                    cursor.execute("UPDATE resumes SET is_primary = 1 WHERE id = ?", (rem["id"],))
+
+        for fname in version_files:
+            fpath = base_dir / fname
+            try:
+                if fpath.exists():
+                    fpath.unlink()
+            except OSError as e:
+                logger.warning("Could not delete physical resume file %s: %s", fpath, e)
+
+        return True
+
+    def save_user_candidate_profile(self, user_id: int, profile_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Saves a user candidate profile snapshot with immutable version history."""
+        if not profile_data:
+            raise ValidationError("Profile data cannot be empty.")
+
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError(f"User #{user_id}")
+
+        profile_json = json.dumps(profile_data, sort_keys=True)
+        profile_hash = hashlib.sha256(profile_json.encode("utf-8")).hexdigest()
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT MAX(version) as max_v FROM candidate_profiles WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            next_version = (row["max_v"] or 0) + 1
+
+            cursor.execute("UPDATE candidate_profiles SET is_active = 0 WHERE user_id = ?", (user_id,))
+            cursor.execute(
+                """
+                INSERT INTO candidate_profiles (
+                    user_id, profile_data, profile_hash, version, is_active, last_updated
+                ) VALUES (?, ?, ?, ?, 1, CURRENT_TIMESTAMP)
+                """,
+                (user_id, profile_json, profile_hash, next_version),
+            )
+            profile_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,))
+            res = dict(cursor.fetchone())
+            res["profile_data"] = json.loads(res["profile_data"])
+            return res
+
+    def get_user_candidate_profile(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieves the active candidate profile for a user."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM candidate_profiles WHERE user_id = ? AND is_active = 1 ORDER BY version DESC LIMIT 1",
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            res["profile_data"] = json.loads(res["profile_data"])
+            return res
+
+    def get_user_candidate_profile_history(self, user_id: int) -> List[Dict[str, Any]]:
+        """Retrieves all version snapshots for a user's candidate profile."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM candidate_profiles WHERE user_id = ? ORDER BY version DESC",
+                (user_id,),
+            )
+            records = []
+            for r in cursor.fetchall():
+                d = dict(r)
+                d["profile_data"] = json.loads(d["profile_data"])
+                records.append(d)
+            return records
 
     # -------------------------------------------------------------------------
     # PHASE 2: PREPARED PACKETS (MULTI-VERSION & COMPOSITE OWNERSHIP)
