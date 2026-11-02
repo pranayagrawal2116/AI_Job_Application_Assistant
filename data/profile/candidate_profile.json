@@ -1,18 +1,195 @@
 {
   "personal": {
-    "full_name": "Pranay"
+    "full_name": "Pranay Anup Agrawal",
+    "email": "pranayagrawal2116@gmail.com",
+    "phone": "95100 29575",
+    "location": "Kothrud, Pune, Maharashtra",
+    "github": "https://github.com",
+    "linkedin": "https://linkedin.com",
+    "summary": "Computer Science and Engineering student specializing in Artificial Intelligence"
   },
   "education": [
     {
-      "institution": "MIT WPU",
-      "current_cgpa": 7.6,
-      "expected_graduation_year": 2028
+      "institution": "MIT World Peace University",
+      "degree": "Bachelor of Technology (B.Tech)",
+      "major": "Computer Science Engineering – Artificial Intelligence & Data Science",
+      "expected_graduation_year": 2028,
+      "current_cgpa": 7.6
+    }
+  ],
+  "work_experience": [
+    {
+      "employer": "Sarita Infotech Pvt. Ltd.",
+      "job_title": "Project Manager | Mobile App Development",
+      "duration": "3 months",
+      "duration_months": 3,
+      "responsibilities": [
+        "Developed and managed a mobile application, coordinating implementation and feature delivery.",
+        "Worked on Flutter-based application screens, API integration, and application workflows.",
+        "Supported debugging, testing, and communication across the development process."
+      ]
     }
   ],
   "technical_skills": {
     "programming_languages": [
       "Python",
-      "Dart"
+      "Dart",
+      "JavaScript",
+      "C/C++",
+      "C++",
+      "C"
+    ],
+    "mobile_development": [
+      "Flutter",
+      "Android application development",
+      "Android Studio"
+    ],
+    "backend_and_apis": [
+      "REST API integration",
+      "Node.js",
+      "Node.js fundamentals",
+      "Postman",
+      "JSON",
+      "XML"
+    ],
+    "databases": [
+      "SQLite",
+      "MySQL"
+    ],
+    "developer_tools": [
+      "Git",
+      "GitHub",
+      "Git & GitHub",
+      "VS Code",
+      "Android Studio",
+      "Postman"
+    ],
+    "all_skills": [
+      "Python",
+      "JavaScript",
+      "C/C++",
+      "C++",
+      "C",
+      "Dart",
+      "Flutter",
+      "Android application development",
+      "Android",
+      "REST API integration",
+      "Node.js",
+      "Node.js fundamentals",
+      "SQLite",
+      "MySQL",
+      "JSON",
+      "XML",
+      "JSON / XML data handling",
+      "Git",
+      "GitHub",
+      "Git & GitHub",
+      "Android Studio",
+      "VS Code",
+      "Postman",
+      "PDF generation & QR scanning",
+      "Debugging & UI development",
+      "Debugging",
+      "UI development",
+      "Artificial Intelligence",
+      "Data Science"
     ]
+  },
+  "projects": [
+    {
+      "title": "Sarita ABDM – Milestone 2 Integration",
+      "description": "Worked on healthcare interoperability workflows involving ABDM consent management and data exchange.",
+      "technologies": [
+        "Flutter",
+        "REST API",
+        "ABDM",
+        "JSON"
+      ]
+    },
+    {
+      "title": "Flutter Healthcare Management System",
+      "description": "Developed mobile app functionality for hospital workflows, patient management, and service access.",
+      "technologies": [
+        "Flutter",
+        "Dart",
+        "SQLite",
+        "REST API"
+      ]
+    },
+    {
+      "title": "QR-Based Patient Registration & Consent",
+      "description": "Implemented QR-driven patient registration and consent-related workflows with backend API communication.",
+      "technologies": [
+        "Flutter",
+        "QR scanning",
+        "REST API"
+      ]
+    },
+    {
+      "title": "Medical Chatbot",
+      "description": "Built a Python-based medical chatbot project focused on conversational access to health-related information.",
+      "technologies": [
+        "Python",
+        "NLP",
+        "Machine Learning"
+      ]
+    },
+    {
+      "title": "Factory Management Mobile App",
+      "description": "Worked on a mobile application project designed to support factory operations and management workflows.",
+      "technologies": [
+        "Flutter",
+        "Dart",
+        "Android"
+      ]
+    }
+  ],
+  "preferences": {
+    "target_roles": [
+      "AI Intern",
+      "Machine Learning Intern",
+      "Data Science Intern",
+      "Python Developer Intern",
+      "Deep Learning Intern",
+      "Generative AI Intern",
+      "NLP Intern",
+      "Computer Vision Intern"
+    ],
+    "target_locations": [
+      "India",
+      "Remote",
+      "Work from Home",
+      "Pune",
+      "Bengaluru"
+    ],
+    "experience_level": "Student / Fresher"
+  },
+  "languages": [
+    "English",
+    "Hindi",
+    "Gujarati"
+  ],
+  "areas_of_interest": [
+    "Healthcare technology",
+    "Mobile application development",
+    "API integration & system design",
+    "Product coordination",
+    "Artificial Intelligence",
+    "Data Science"
+  ],
+  "core_strengths": [
+    "Project coordination",
+    "Problem solving",
+    "Analytical thinking",
+    "Team collaboration",
+    "Adaptability",
+    "Continuous learning"
+  ],
+  "resume_metadata": {
+    "source_file": "Pranay_Agrawal_Resume(2).pdf",
+    "file_hash": "823c5c666be6fe05dab8cf097156d1cbff233eb6b3939c9df412aaa619fbde7d",
+    "file_format": "PDF",
+    "extraction_timestamp": "2026-11-02T11:06:47.775029+00:00"
   }
 }
