@@ -40,6 +40,23 @@ venv.bak/
 data/resumes/*
 !data/resumes/README.md
 
+# Multi-User Private Isolated Storage
+data/users/*
+!data/users/README.md
+
+# Database Backups & Snapshots
+data/backups/*
+!data/backups/README.md
+*.bak
+*.backup
+
+# Local Development Fixtures Containing Candidate PII
+tests/fixtures/*.pdf
+tests/fixtures/*.docx
+tests/fixtures/candidate_profile_fixture.json
+!tests/fixtures/README.md
+!tests/fixtures/*.example.json
+
 # Application Database & SQLite Data
 data/storage/*.db
 data/storage/*.sqlite
