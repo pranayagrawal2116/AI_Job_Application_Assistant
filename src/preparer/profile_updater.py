@@ -145,3 +145,4 @@ class ProfileUpdater:
             logger.debug(f"Config reload notice: {e}")
 
         return profile_data
+

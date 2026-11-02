@@ -355,3 +355,4 @@ def render_application_preparer():
             st.dataframe(recent_logs, use_container_width=True)
         else:
             st.caption("No audit entries logged yet.")
+

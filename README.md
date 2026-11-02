@@ -75,8 +75,15 @@ AI_Job_Application_Assistant/
 │   │   └── __init__.py
 │   ├── scraper/                 # Job discovery & Playwright MCP integration (Phases 4 & 5)
 │   │   └── __init__.py
-│   ├── preparer/                # Tailored cover letters & application preparer (Phase 7)
-│   │   └── __init__.py
+│   ├── preparer/                # Resume parser, job matcher, cover letter & approval engine (Phase 7)
+│   │   ├── __init__.py
+│   │   ├── resume_parser.py     # PDF & DOCX zero-hallucination parser
+│   │   ├── profile_updater.py   # Canonical profile & SQLite snapshot synchronizer
+│   │   ├── resume_matcher.py    # Opportunity-to-resume alignment & gap analysis
+│   │   ├── cover_letter_generator.py # Tailored cover letter drafter
+│   │   ├── question_answerer.py # Screening QA generator with unverified tags
+│   │   ├── form_prefiller.py    # Playwright form mapping & anti-bot safety
+│   │   └── approval_gate.py     # Strict human review packet & authorization gate
 │   └── utils/
 │       ├── __init__.py
 │       └── logger.py            # Centralized logging configuration
@@ -169,5 +176,5 @@ streamlit run dashboard/app.py
 - [x] **Phase 4:** Playwright MCP browser integration & safety fallbacks (accessibility tree inspection, TodoMVC interactive verification, data extraction schemas, anti-automation detection).
 - [x] **Phase 5:** Modular job discovery adapters (LinkedIn, Internshala, Indeed, Naukri, Company Careers ATS feeds) with anti-automation defense handling, automated deduplication, real-time matching, and SQLite persistence.
 - [x] **Phase 6:** Full Streamlit interactive dashboard with 8 dedicated views (Overview, Explore Jobs, Shortlisted Jobs, Application Tracker, Job Matching Analytics, Discovery Management, Candidate Profile, Settings), real-time SQLite metrics, interactive Plotly visualizations, skill gap analysis, state machine lifecycle management, human approval safeguards, live atomic database backup, and CSV export.
-- [ ] **Phase 7:** Application preparation (resume parsing, cover letter drafting, pre-filling, and manual submission approval).
+- [x] **Phase 7:** End-to-end Application Preparation Engine: zero-hallucination PDF/DOCX resume parsing, candidate profile synchronizer with immutable SQLite snapshots, resume-job alignment, personalized cover letter generator, screening question answer drafter with `NEEDS CANDIDATE INPUT` tagging, Playwright form pre-filling payload planner, and strict human-in-the-loop review packet & approval gate.
 
