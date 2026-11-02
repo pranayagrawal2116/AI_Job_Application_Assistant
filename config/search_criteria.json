@@ -1,0 +1,74 @@
+{
+  "search_queries": [
+    "AI Intern",
+    "Machine Learning Intern",
+    "Data Science Intern",
+    "Python Developer Intern",
+    "Deep Learning Intern",
+    "Generative AI Intern",
+    "NLP Intern",
+    "Computer Vision Intern",
+    "Artificial Intelligence Intern",
+    "ML Engineer Intern"
+  ],
+  "target_locations": [
+    "India",
+    "Remote",
+    "Work from Home",
+    "Pune",
+    "Bengaluru",
+    "Hyderabad",
+    "Mumbai",
+    "Delhi NCR"
+  ],
+  "experience_keywords": [
+    "fresher",
+    "student",
+    "intern",
+    "internship",
+    "entry level",
+    "college",
+    "trainee"
+  ],
+  "negative_keywords": [
+    "Senior",
+    "Lead",
+    "Principal",
+    "Staff",
+    "Manager",
+    "Director",
+    "5+ years",
+    "4+ years",
+    "3+ years",
+    "PhD required",
+    "Graduation before 2026"
+  ],
+  "platforms": {
+    "linkedin": {
+      "base_search_url": "https://www.linkedin.com/jobs/search/",
+      "query_param": "keywords",
+      "location_param": "location",
+      "f_E_param": "1",
+      "notes": "f_E=1 filters for Internship experience level"
+    },
+    "internshala": {
+      "base_search_url": "https://internshala.com/internships/",
+      "paths": [
+        "artificial-intelligence-ai-internship",
+        "machine-learning-internship",
+        "data-science-internship",
+        "python-django-internship"
+      ]
+    },
+    "indeed": {
+      "base_search_url": "https://in.indeed.com/jobs",
+      "query_param": "q",
+      "location_param": "l"
+    },
+    "naukri": {
+      "base_search_url": "https://www.naukri.com/",
+      "query_format": "{role}-internship-jobs"
+    }
+  }
+}
+

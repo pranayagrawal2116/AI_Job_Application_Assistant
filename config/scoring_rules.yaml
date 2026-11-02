@@ -1,0 +1,160 @@
+# =====================================================================
+# JOB MATCHING & SCORING RULES CONFIGURATION
+# =====================================================================
+# Total available points: 100
+#
+version: "1.0.0"
+# Scoring Breakdown:
+# 1. Domain Relevance: 30 points
+# 2. Technical Skill Match: 25 points
+# 3. Educational Eligibility: 20 points
+# 4. Experience Compatibility: 10 points
+# 5. Location Preference: 10 points
+# 6. Internship Duration Compatibility: 5 points
+# =====================================================================
+
+weights:
+  domain_relevance:
+    max_points: 30
+    description: "Evaluates alignment with AI, ML, Data Science, NLP, CV, and Python domains."
+    keywords:
+      tier_1_keywords: # 30 points (Full match)
+        - "Artificial Intelligence"
+        - "Machine Learning"
+        - "Deep Learning"
+        - "Generative AI"
+        - "Data Science"
+        - "NLP"
+        - "Computer Vision"
+      tier_2_keywords: # 20 points (High match)
+        - "Python Developer"
+        - "Data Analyst"
+        - "Data Preprocessing"
+        - "Statistical Modeling"
+      tier_3_keywords: # 10 points (Tangential match)
+        - "Software Engineering"
+        - "Flutter Developer"
+        - "Backend Developer"
+
+  technical_skills:
+    max_points: 25
+    description: "Matches required job skills against candidate's verified technical skills and interests."
+    core_skills:
+      - "Python"
+      - "Machine Learning"
+      - "Artificial Intelligence"
+      - "Data Science"
+      - "Data Preprocessing"
+      - "Data Visualization"
+      - "Flutter"
+      - "Dart"
+    bonus_tools:
+      - "Pandas"
+      - "NumPy"
+      - "Scikit-Learn"
+      - "SQL"
+      - "Git"
+
+  educational_eligibility:
+    max_points: 20
+    description: "Verifies degree field, current student status, graduation year (2028), and employer-specific CGPA requirement."
+    candidate_profile:
+      candidate_cgpa: 7.6
+      degree_match_keywords:
+        - "Computer Science"
+        - "AI & Data Science"
+        - "Information Technology"
+        - "Engineering"
+        - "B.Tech"
+        - "Any Degree"
+      graduation_year: 2028
+    rules:
+      exact_degree_match_meets_or_no_cgpa_cutoff: 20  # Full points if degree matches and employer specifies no CGPA cutoff OR candidate meets employer cutoff
+      exact_degree_match_below_employer_cutoff: 10     # Deducted points if employer specifies cutoff > candidate's CGPA
+      general_engineering_match: 15
+      non_eligible_degree: 0
+    cgpa_policy:
+      universal_cutoff_assumed: false
+      rule: "Compare candidate's CGPA (7.6) only against the employer's explicit minimum requirement. If no CGPA cutoff is specified by the employer, do NOT penalize or disqualify the candidate."
+
+  experience_compatibility:
+    max_points: 10
+    description: "Matches role level (Fresher, Student, Intern) against candidate's profile."
+    candidate_level: "Fresher / Student"
+    rules:
+      explicitly_for_freshers_or_interns: 10
+      requires_0_to_1_years: 8
+      requires_1_to_2_years: 3
+      requires_2_plus_years: 0 # Flagged as non-compatible
+
+  location_preference:
+    max_points: 10
+    description: "Evaluates location and work arrangements (Remote, Work from Home, India)."
+    preferred_locations:
+      - "Remote"
+      - "Work from Home"
+      - "India"
+      - "Pune"
+      - "Bengaluru"
+      - "Hyderabad"
+      - "Mumbai"
+    rules:
+      remote_or_home: 10
+      preferred_indian_city: 8
+      any_india_location: 6
+      international_relocation_required: 0
+
+  duration_compatibility:
+    max_points: 5
+    description: "Evaluates internship period (1 to 6 months) and flexibility with student schedule."
+    rules:
+      flexible_or_part_time: 5
+      standard_summer_winter_internship: 5
+      full_time_6_months_with_remote: 4
+      requires_full_time_on_site_during_semester: 1
+
+thresholds:
+  excellent_match:
+    min_score: 85
+    max_score: 100
+    label: "Excellent Match"
+    action: "Top Priority - Prepare Application"
+    badge_color: "green"
+
+  good_match:
+    min_score: 70
+    max_score: 84
+    label: "Good Match"
+    action: "Recommended - Review and Prepare"
+    badge_color: "blue"
+
+  moderate_match:
+    min_score: 50
+    max_score: 69
+    label: "Moderate Match"
+    action: "Secondary - Review Discrepancies"
+    badge_color: "orange"
+
+  low_match:
+    min_score: 0
+    max_score: 49
+    label: "Low Match"
+    action: "Not Recommended"
+    badge_color: "red"
+
+eligibility_constraints:
+  mandatory_checks:
+    - name: "experience_cap"
+      condition: "requires_years_experience <= 1"
+      failure_reason: "Position demands prior professional experience beyond student/fresher level."
+    - name: "student_eligibility"
+      condition: "accepts_ongoing_students == true OR allows_graduating_year >= 2028"
+      failure_reason: "Position requires completed degree or earlier graduation year."
+    - name: "legal_work_authorization"
+      condition: "work_authorization_country == 'India' OR is_global_remote == true"
+      failure_reason: "Job requires local work authorization in an unsupported country."
+    - name: "employer_cgpa_cutoff"
+      condition: "employer_min_cgpa == null OR candidate_cgpa >= employer_min_cgpa"
+      failure_reason: "Candidate CGPA is below the employer's explicit minimum cutoff."
+  strict_disqualification_rule: "Mandatory eligibility checks operate independently of the 0-100 numerical matching score. If any mandatory check fails, set is_eligible to FALSE and record the exact failure reason, while preserving the granular score breakdown."
+

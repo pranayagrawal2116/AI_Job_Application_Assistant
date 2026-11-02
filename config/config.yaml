@@ -1,0 +1,102 @@
+# =====================================================================
+# AI JOB APPLICATION ASSISTANT - MASTER CONFIGURATION
+# =====================================================================
+
+app:
+  name: "AI Job Application Assistant"
+  version: "1.0.0"
+  environment: "development"
+  log_level: "INFO"
+  database:
+    path: "data/storage/job_assistant.db"
+
+target_preferences:
+  target_roles:
+    - "AI Intern"
+    - "Machine Learning Intern"
+    - "Data Science Intern"
+    - "Python Developer Intern"
+    - "Deep Learning Intern"
+    - "Generative AI Intern"
+    - "NLP Intern"
+    - "Computer Vision Intern"
+
+  locations:
+    - "India"
+    - "Remote"
+    - "Work from Home"
+    - "Pune"
+    - "Bengaluru"
+    - "Hyderabad"
+    - "Delhi NCR"
+    - "Mumbai"
+
+  experience_levels:
+    - "Student"
+    - "Fresher"
+    - "Entry-level"
+
+  internship_types:
+    - "Full-time Internship"
+    - "Part-time Internship"
+    - "Virtual / Remote Internship"
+
+platforms:
+  linkedin:
+    name: "LinkedIn"
+    enabled: true
+    requires_auth: true
+    respect_robots_txt: true
+    rate_limit_delay_seconds: 5.0
+    notes: "Requires authentication. Provide official direct links if automated access restricted."
+
+  internshala:
+    name: "Internshala"
+    enabled: true
+    requires_auth: false
+    respect_robots_txt: true
+    rate_limit_delay_seconds: 3.0
+    notes: "Primary portal for Indian student internships."
+
+  indeed:
+    name: "Indeed"
+    enabled: true
+    requires_auth: false
+    respect_robots_txt: true
+    rate_limit_delay_seconds: 4.0
+    notes: "Strict rate-limiting and Cloudflare protection; manual link fallback required."
+
+  naukri:
+    name: "Naukri"
+    enabled: true
+    requires_auth: false
+    respect_robots_txt: true
+    rate_limit_delay_seconds: 4.0
+    notes: "Indian job portal with specific internship and fresher sections."
+
+  company_career_pages:
+    name: "Official Company Career Pages"
+    enabled: true
+    requires_auth: false
+    respect_robots_txt: true
+    rate_limit_delay_seconds: 2.0
+    notes: "Direct career portals (Workday, Greenhouse, Lever, Ashby, etc.)."
+
+safety_and_compliance:
+  # CRITICAL SAFEGUARD: Never submit applications without manual user approval
+  require_manual_submission_approval: true
+  allow_automated_submission: false
+  stop_before_submission: true
+  
+  # Anti-automation & ethics compliance
+  respect_robots_txt: true
+  bypass_captcha: false
+  bypass_authentication: false
+  report_access_restrictions: true
+
+browser_automation:
+  use_playwright_mcp: true
+  timeout_ms: 30000
+  headless: true
+  slow_mo_ms: 250
+

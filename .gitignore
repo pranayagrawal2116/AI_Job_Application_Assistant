@@ -1,0 +1,72 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Variables & Secrets
+.env
+.env.local
+*.env
+*.secret
+
+# Candidate Resumes & Private Personal Documents
+data/resumes/*
+!data/resumes/README.md
+
+# Application Database & SQLite Data
+data/storage/*.db
+data/storage/*.sqlite
+data/storage/*.sqlite3
+!data/storage/README.md
+
+# Exports & Generated Reports
+data/exports/*.csv
+data/exports/*.xlsx
+data/exports/*.json
+!data/exports/README.md
+
+# Playwright MCP Logs & Snapshots
+.playwright-mcp/
+test-results/
+playwright-report/
+
+# IDE & OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+

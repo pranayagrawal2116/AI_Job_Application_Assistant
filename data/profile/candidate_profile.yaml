@@ -1,0 +1,113 @@
+# =====================================================================
+# CANDIDATE PROFILE TEMPLATE (EDITABLE)
+# =====================================================================
+# IMPORTANT:
+# 1. Do NOT invent missing information, employment history, certifications,
+#    or unverified project achievements.
+# 2. Before preparing real applications, provide your latest resume file
+#    in the `data/resumes/` folder to populate verified personal info.
+# =====================================================================
+
+candidate:
+  personal:
+    # Please fill in your contact information when ready:
+    full_name: "Pranay" # Default identifier, edit as needed
+    email: ""           # Provide your email address here
+    phone: ""           # Provide your phone number here
+    location:
+      country: "India"
+      city: "Pune"      # Inferred from MIT WPU; editable
+      work_authorization: "India"
+    links:
+      github: ""        # Add your GitHub profile URL
+      linkedin: ""      # Add your LinkedIn profile URL
+      portfolio: ""     # Add your portfolio website if any
+
+  education:
+    - institution: "MIT World Peace University"
+      degree: "Bachelor of Technology (B.Tech)"
+      major: "Computer Science Engineering – AI & Data Science"
+      expected_graduation_year: 2028
+      current_cgpa: 7.6
+      status: "Currently Enrolled / Student"
+
+  experience_level: "Fresher / Student"
+  work_experience: [] # No formal internship experience currently provided. Do not fabricate.
+
+  technical_interests:
+    - "Python"
+    - "Machine Learning"
+    - "Artificial Intelligence"
+    - "Data Science"
+    - "Data preprocessing"
+    - "Data visualization"
+    - "Flutter development"
+
+  technical_skills:
+    programming_languages:
+      - "Python"
+      - "Dart" # From Flutter development
+    domains:
+      - "Machine Learning"
+      - "Artificial Intelligence"
+      - "Data Science"
+      - "Mobile Application Development"
+    specializations:
+      - "Data preprocessing"
+      - "Data visualization"
+      - "Flutter development"
+    frameworks_and_tools: [] # Empty pending resume/candidate input. Do not fabricate.
+
+  projects:
+    - name: "Hospital Management Application"
+      description: "Application designed for hospital management workflows."
+      technologies: [] # Specify technologies used (e.g., Flutter / Python / SQL) when editing
+      role: ""
+      highlights: []
+      github_url: ""
+    
+    - name: "Factory Management Application"
+      description: "Application designed for factory tracking and operations management."
+      technologies: [] # Specify technologies used when editing
+      role: ""
+      highlights: []
+      github_url: ""
+
+    - name: "Diabetes Risk Prediction using Machine Learning"
+      description: "Machine learning model to predict diabetes risk using health metrics and data preprocessing."
+      technologies:
+        - "Python"
+        - "Machine Learning"
+      role: ""
+      highlights: []
+      github_url: ""
+
+  certifications: [] # Empty pending user verification. Do not fabricate.
+  achievements: []    # Empty pending user verification. Do not fabricate.
+
+preferences:
+  target_roles:
+    - "AI Intern"
+    - "Machine Learning Intern"
+    - "Data Science Intern"
+    - "Python Developer Intern"
+    - "Deep Learning Intern"
+    - "Generative AI Intern"
+    - "NLP Intern"
+    - "Computer Vision Intern"
+  
+  target_experience_levels:
+    - "Student"
+    - "Fresher"
+    - "Entry-level"
+
+  locations:
+    - "India"
+    - "Remote"
+    - "Work from Home"
+
+  work_type_preference:
+    remote_only: false
+    hybrid_acceptable: true
+    on_site_acceptable: true
+

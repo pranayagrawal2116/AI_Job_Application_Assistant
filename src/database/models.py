@@ -1,0 +1,160 @@
+"""Data models, enums, and structured representations for the database layer."""
+
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+import json
+from typing import Any, Dict, List, Optional
+
+
+class ApplicationStatus(str, Enum):
+    """Permitted application lifecycle statuses."""
+    DISCOVERED = "Discovered"
+    UNDER_REVIEW = "Under Review"
+    SHORTLISTED = "Shortlisted"
+    APPLICATION_PREPARED = "Application Prepared"
+    AWAITING_APPROVAL = "Awaiting Approval"
+    APPLIED = "Applied"
+    INTERVIEW = "Interview"
+    REJECTED = "Rejected"
+    WITHDRAWN = "Withdrawn"
+
+    @classmethod
+    def list(cls) -> List[str]:
+        return [c.value for c in cls]
+
+    @classmethod
+    def from_str(cls, val: str) -> "ApplicationStatus":
+        for item in cls:
+            if item.value.lower() == val.strip().lower():
+                return item
+        raise ValueError(f"Unknown status '{val}'. Valid options: {cls.list()}")
+
+
+@dataclass
+class Company:
+    name: str
+    id: Optional[int] = None
+    website: Optional[str] = None
+    careers_url: Optional[str] = None
+    location: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class Job:
+    company_name: str
+    job_title: str
+    job_url: str
+    platform: str
+    id: Optional[int] = None
+    company_id: Optional[int] = None
+    job_description: Optional[str] = None
+    location: Optional[str] = None
+    stipend: Optional[str] = None
+    required_skills: Any = field(default_factory=list)
+    eligibility_criteria: Any = field(default_factory=dict)
+    application_deadline: Optional[str] = None
+    match_score: float = 0.0
+    match_classification: str = "Low"
+    is_eligible: bool = True
+    score_breakdown: Any = field(default_factory=dict)
+    discovery_date: Optional[str] = None
+    work_arrangement: Optional[str] = None
+    publication_date: Optional[str] = None
+    internship_duration: Optional[str] = None
+    listing_status: str = "ACTIVE"
+    last_verified: Optional[str] = None
+    extraction_confidence: float = 1.0
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def get_skills_as_json(self) -> str:
+        if isinstance(self.required_skills, (list, dict)):
+            return json.dumps(self.required_skills)
+        return json.dumps([s.strip() for s in str(self.required_skills or "").split(",") if s.strip()])
+
+    def get_eligibility_as_json(self) -> str:
+        if isinstance(self.eligibility_criteria, (dict, list)):
+            return json.dumps(self.eligibility_criteria)
+        return json.dumps({"description": str(self.eligibility_criteria or "")})
+
+    def get_score_breakdown_as_json(self) -> str:
+        if isinstance(self.score_breakdown, (dict, list)):
+            return json.dumps(self.score_breakdown)
+        return json.dumps({"summary": str(self.score_breakdown or "")})
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        if isinstance(data.get("required_skills"), str):
+            try:
+                data["required_skills"] = json.loads(data["required_skills"])
+            except Exception:
+                pass
+        if isinstance(data.get("eligibility_criteria"), str):
+            try:
+                data["eligibility_criteria"] = json.loads(data["eligibility_criteria"])
+            except Exception:
+                pass
+        if isinstance(data.get("score_breakdown"), str):
+            try:
+                data["score_breakdown"] = json.loads(data["score_breakdown"])
+            except Exception:
+                pass
+        return data
+
+
+@dataclass
+class Application:
+    job_id: int
+    status: str = ApplicationStatus.DISCOVERED.value
+    id: Optional[int] = None
+    date_prepared: Optional[str] = None
+    date_submitted: Optional[str] = None
+    resume_used: Optional[str] = None
+    cover_letter_reference: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ApplicationLog:
+    job_id: int
+    action: str
+    id: Optional[int] = None
+    application_id: Optional[int] = None
+    timestamp: Optional[str] = None
+    details: Any = None
+
+    def get_details_as_str(self) -> str:
+        if isinstance(self.details, (dict, list)):
+            return json.dumps(self.details)
+        return str(self.details or "")
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        if isinstance(data.get("details"), str):
+            try:
+                data["details"] = json.loads(data["details"])
+            except Exception:
+                pass
+        return data
+
+
+@dataclass
+class CandidateProfileRecord:
+    profile_data: Dict[str, Any]
+    id: Optional[int] = None
+    last_updated: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+

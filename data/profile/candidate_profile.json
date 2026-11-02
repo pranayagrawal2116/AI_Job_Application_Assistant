@@ -1,0 +1,18 @@
+{
+  "personal": {
+    "full_name": "Pranay"
+  },
+  "education": [
+    {
+      "institution": "MIT WPU",
+      "current_cgpa": 7.6,
+      "expected_graduation_year": 2028
+    }
+  ],
+  "technical_skills": {
+    "programming_languages": [
+      "Python",
+      "Dart"
+    ]
+  }
+}
