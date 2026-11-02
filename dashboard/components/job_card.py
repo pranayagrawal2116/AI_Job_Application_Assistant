@@ -77,3 +77,4 @@ def render_job_card(
         with col_btn3:
             if url and url != "#":
                 st.link_button("🌐 Open URL", url=url)
+

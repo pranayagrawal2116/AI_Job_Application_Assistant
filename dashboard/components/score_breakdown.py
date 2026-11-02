@@ -97,3 +97,4 @@ def _render_progress(label: str, score: float, max_score: float):
     pct = min(1.0, max(0.0, score / max_score if max_score > 0 else 0))
     st.write(f"**{label}**: {score:.1f} / {max_score:.0f} pts")
     st.progress(pct)
+

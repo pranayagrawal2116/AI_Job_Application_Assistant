@@ -113,3 +113,4 @@ def render_job_filters(df: pd.DataFrame) -> pd.DataFrame:
         filtered_df = filtered_df[filtered_df["stipend"].str.lower().str.contains("unpaid", na=False)]
 
     return filtered_df
+
