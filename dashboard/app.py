@@ -9,14 +9,14 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from dashboard.pages.analytics import render_analytics
-from dashboard.pages.application_tracker import render_application_tracker
-from dashboard.pages.candidate_profile import render_candidate_profile
-from dashboard.pages.discovery import render_discovery
-from dashboard.pages.job_explorer import render_job_explorer
-from dashboard.pages.overview import render_overview
-from dashboard.pages.settings import render_settings
-from dashboard.pages.shortlisted import render_shortlisted
+from dashboard.views.analytics import render_analytics
+from dashboard.views.application_tracker import render_application_tracker
+from dashboard.views.candidate_profile import render_candidate_profile
+from dashboard.views.discovery import render_discovery
+from dashboard.views.job_explorer import render_job_explorer
+from dashboard.views.overview import render_overview
+from dashboard.views.settings import render_settings
+from dashboard.views.shortlisted import render_shortlisted
 from dashboard.services.dashboard_service import DashboardService
 from src.config import config
 
