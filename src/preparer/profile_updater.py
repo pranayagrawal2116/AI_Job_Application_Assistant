@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.database.db_manager import DatabaseManager
+from src.matcher.terminology import split_date_range
 from src.preparer.resume_parser import ParsedResume, ResumeParser, VerificationStatus
 from src.utils.logger import setup_logger
 
@@ -45,20 +46,45 @@ class ProfileUpdater:
         # Experience
         exp_list = []
         for exp in resume.work_experience:
-            duration_months = None
-            if exp.duration:
+            start_d = exp.start_date
+            end_d = exp.end_date
+            is_curr = exp.is_current
+            dur_str = exp.duration or ""
+
+            if (not start_d or not end_d) and dur_str:
+                s_part, e_part = split_date_range(dur_str)
+                if s_part:
+                    start_d = start_d or s_part
+                if e_part:
+                    end_d = end_d or e_part
+                    if "present" in e_part.lower() or "current" in e_part.lower():
+                        is_curr = True
+
+            duration_months = getattr(exp, "duration_months", None)
+            if duration_months is None and dur_str:
                 import re
-                m = re.search(r"(\d+)\s*month", exp.duration, re.IGNORECASE)
+                m = re.search(r"(\d+)\s*(?:month|mo)", dur_str, re.IGNORECASE)
                 if m:
                     duration_months = int(m.group(1))
+                y = re.search(r"(\d+)\s*(?:year|yr)", dur_str, re.IGNORECASE)
+                if y:
+                    duration_months = (duration_months or 0) + int(y.group(1)) * 12
+
+            exp_status = VerificationStatus.EXTRACTED_UNVERIFIED
+            if exp.provenance and isinstance(exp.provenance, dict):
+                exp_status = exp.provenance.get("verification_status", VerificationStatus.EXTRACTED_UNVERIFIED)
 
             exp_list.append({
                 "employer": exp.employer,
                 "job_title": exp.job_title,
-                "duration": exp.duration,
+                "duration": dur_str,
                 "duration_months": duration_months,
+                "start_date": start_d,
+                "end_date": end_d,
+                "is_current": is_curr,
                 "responsibilities": exp.responsibilities,
                 "achievements": exp.achievements,
+                "verification_status": exp_status,
             })
 
         # Projects
@@ -307,11 +333,24 @@ class ProfileUpdater:
         else:
             unmodified_fields.append({"field": "projects", "current_value": curr_proj, "new_value": new_proj})
 
-        # Check certifications
+        # Check certifications & licenses
         curr_cert = current_profile.get("certifications", [])
         new_cert = new_prof.get("certifications", [])
         if curr_cert != new_cert:
-            if not curr_cert and new_cert:
+            prov = field_provenance.get("certifications", {}) or field_provenance.get("licenses", {})
+            status = prov.get("verification_status") if isinstance(prov, dict) else None
+            if not status and any(isinstance(c, dict) and c.get("verification_status") in (VerificationStatus.USER_CONFIRMED, VerificationStatus.USER_CORRECTED) for c in curr_cert):
+                status = VerificationStatus.USER_CONFIRMED
+
+            if status in (VerificationStatus.USER_CONFIRMED, VerificationStatus.USER_CORRECTED):
+                protected_fields.append({
+                    "field": "certifications",
+                    "current_value": curr_cert,
+                    "new_value": new_cert,
+                    "verification_status": status,
+                    "reason": "User confirmed certifications/licenses must not be overwritten without explicit approval.",
+                })
+            elif not curr_cert and new_cert:
                 new_fields.append({"field": "certifications", "current_value": curr_cert, "new_value": new_cert})
             else:
                 modified_fields.append({"field": "certifications", "current_value": curr_cert, "new_value": new_cert})
@@ -400,6 +439,14 @@ class ProfileUpdater:
                 }
             elif fname == "certifications":
                 updated["certifications"] = field_info["new_value"]
+                field_provenance["certifications"] = {
+                    "source_section": "Certifications",
+                    "confidence": 0.95,
+                    "verification_status": (
+                        VerificationStatus.USER_CORRECTED if is_protected else VerificationStatus.EXTRACTED_UNVERIFIED
+                    ),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }
 
         # Sync auxiliary sections if present in new resume
         for aux in ["languages", "awards", "publications", "custom_sections"]:

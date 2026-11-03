@@ -176,9 +176,29 @@ def render_candidate_profile():
 
         personal = prof.get("personal", {})
         edu_entries = prof.get("education", [])
-        exp_entries = prof.get("work_experience", [])
+        exp_entries = prof.get("work_experience", []) or prof.get("experience", [])
         tech_skills = prof.get("technical_skills", {})
-        all_skills = tech_skills.get("all_skills", [])
+
+        # Consolidate existing skills for pre-populating editor
+        existing_skills = []
+        if isinstance(tech_skills, dict):
+            existing_skills.extend(tech_skills.get("all_skills", []))
+            for v in tech_skills.values():
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, str) and item not in existing_skills:
+                            existing_skills.append(item)
+        elif isinstance(tech_skills, list):
+            existing_skills.extend([s for s in tech_skills if isinstance(s, str)])
+        if isinstance(prof.get("skills"), list):
+            for s in prof["skills"]:
+                if isinstance(s, str) and s not in existing_skills:
+                    existing_skills.append(s)
+
+        raw_certs = prof.get("certifications", [])
+        cert_names = [c.get("name", "") if isinstance(c, dict) else str(c) for c in raw_certs]
+        raw_lics = prof.get("licenses", []) or prof.get("statutory_licenses", [])
+        lic_names = [l.get("name", "") if isinstance(l, dict) else str(l) for l in raw_lics]
         provenance = prof.get("field_provenance", {})
 
         with st.form("universal_profile_form"):
@@ -213,13 +233,13 @@ def render_candidate_profile():
                     "Graduation Year",
                     min_value=1970,
                     max_value=2035,
-                    value=int(edu_primary.get("expected_graduation_year") or 2028),
+                    value=int(edu_primary.get("expected_graduation_year") or edu_primary.get("graduation_year") or 2028),
                 )
                 cgpa_val = st.number_input(
                     "CGPA / GPA / Score",
                     min_value=0.0,
                     max_value=100.0,
-                    value=float(edu_primary.get("current_cgpa") or 7.6),
+                    value=float(edu_primary.get("current_cgpa") or edu_primary.get("cgpa") or prof.get("current_cgpa") or 7.6),
                     step=0.01,
                 )
 
@@ -232,8 +252,17 @@ def render_candidate_profile():
             with w_col1:
                 emp_val = st.text_input("Recent Employer / Organization", value=exp_primary.get("employer", ""))
                 title_val = st.text_input("Job Title / Role", value=exp_primary.get("job_title", ""))
+                start_date_val = st.text_input("Start Date (e.g. 2020-01 or Jan 2020)", value=exp_primary.get("start_date", ""))
             with w_col2:
-                dur_val = st.text_input("Duration", value=exp_primary.get("duration", ""))
+                dur_val = st.text_input("Duration / Date Range (e.g. Jan 2020 - Dec 2022)", value=exp_primary.get("duration", ""))
+                end_date_val = st.text_input("End Date (leave blank if current)", value=exp_primary.get("end_date", ""))
+                is_current_exp = st.checkbox("Currently Working Here", value=bool(exp_primary.get("is_current", False)))
+
+            history_complete_val = st.checkbox(
+                "My documented work experience history is complete",
+                value=bool(prof.get("employment_history_complete", True)),
+                help="Check if your profile contains your full employment history. Uncheck if you have other unlisted experience.",
+            )
 
             resps_raw = exp_primary.get("responsibilities", [])
             resps_txt = "\n".join(resps_raw) if isinstance(resps_raw, list) else str(resps_raw)
@@ -245,9 +274,29 @@ def render_candidate_profile():
             st.markdown("#### 4. Skills & Competencies")
             skills_txt = st.text_area(
                 "All Professional Skills (comma separated)",
-                value=", ".join(all_skills),
+                value=", ".join(existing_skills),
                 height=100,
             )
+
+            st.divider()
+
+            # 5. Certifications & Statutory Licenses
+            st.markdown("#### 5. Certifications & Statutory Licenses")
+            cert_col1, cert_col2 = st.columns(2)
+            with cert_col1:
+                certs_txt = st.text_area(
+                    "Certifications (comma separated)",
+                    value=", ".join(filter(None, cert_names)),
+                    height=80,
+                    help="e.g. AWS Solutions Architect, PMP, CompTIA Security+",
+                )
+            with cert_col2:
+                lics_txt = st.text_area(
+                    "Statutory Professional Licenses (comma separated)",
+                    value=", ".join(filter(None, lic_names)),
+                    height=80,
+                    help="e.g. Registered Nurse (RN), Professional Engineer (PE), State Bar Admission",
+                )
 
             st.divider()
 
@@ -255,25 +304,27 @@ def render_candidate_profile():
             save_btn = st.form_submit_button("💾 Save Profile Changes & Record Snapshot", type="primary")
 
             if save_btn:
-                # Update provenance for modified fields as USER_CONFIRMED or USER_CORRECTED
+                now_iso = datetime.now(timezone.utc).isoformat()
                 new_prov = dict(provenance)
-                new_prov["full_name"] = {
-                    "value": name_val.strip(),
-                    "source_section": "Manual Profile Form",
-                    "confidence": 1.0,
-                    "verification_status": VerificationStatus.USER_CONFIRMED.value,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
-                new_prov["email"] = {
-                    "value": email_val.strip(),
-                    "source_section": "Manual Profile Form",
-                    "confidence": 1.0,
-                    "verification_status": VerificationStatus.USER_CONFIRMED.value,
-                    "updated_at": datetime.now(timezone.utc).isoformat(),
-                }
+
+                # Update provenance for all confirmed sections
+                for sec in (
+                    "personal", "full_name", "email", "education", "current_cgpa",
+                    "work_experience", "technical_skills", "skills", "professional_skills",
+                    "certifications", "licenses"
+                ):
+                    new_prov[sec] = {
+                        "value": "Confirmed via Universal Profile Editor",
+                        "source_section": "Manual Profile Form",
+                        "confidence": 1.0,
+                        "verification_status": VerificationStatus.USER_CONFIRMED.value,
+                        "updated_at": now_iso,
+                    }
 
                 parsed_skills = [s.strip() for s in skills_txt.split(",") if s.strip()]
                 parsed_resps = [r.strip() for r in resps_val.split("\n") if r.strip()]
+                parsed_certs = [c.strip() for c in certs_txt.split(",") if c.strip()]
+                parsed_lics = [l.strip() for l in lics_txt.split(",") if l.strip()]
 
                 updated_data = dict(prof)
                 updated_data["personal"] = {
@@ -294,20 +345,45 @@ def render_candidate_profile():
                         "major": major_val.strip(),
                         "expected_graduation_year": int(grad_year_val),
                         "current_cgpa": float(cgpa_val),
+                        "verification_status": VerificationStatus.USER_CONFIRMED.value,
+                        "is_confirmed": True,
                     }
                 ]
-                updated_data["work_experience"] = [
-                    {
-                        "employer": emp_val.strip(),
-                        "job_title": title_val.strip(),
-                        "duration": dur_val.strip(),
-                        "responsibilities": parsed_resps,
-                    }
-                ]
+                updated_data["current_cgpa"] = float(cgpa_val)
+
+                if emp_val.strip() or title_val.strip():
+                    updated_data["work_experience"] = [
+                        {
+                            "employer": emp_val.strip(),
+                            "job_title": title_val.strip(),
+                            "start_date": start_date_val.strip() if start_date_val else None,
+                            "end_date": "Present" if is_current_exp else (end_date_val.strip() if end_date_val else None),
+                            "is_current": is_current_exp,
+                            "duration": dur_val.strip(),
+                            "responsibilities": parsed_resps,
+                            "verification_status": VerificationStatus.USER_CONFIRMED.value,
+                            "is_confirmed": True,
+                        }
+                    ]
+                else:
+                    updated_data["work_experience"] = []
+
                 updated_data["technical_skills"] = {
                     "all_skills": parsed_skills,
-                    "programming_languages": [s for s in parsed_skills if s in ["Python", "Dart", "C++", "Java", "JavaScript", "SQL"]],
+                    "programming_languages": [s for s in parsed_skills if s in ["Python", "Dart", "C++", "Java", "JavaScript", "SQL", "TypeScript", "Rust", "Go", "C#", "R", "PHP", "Swift", "Kotlin"]],
                 }
+                updated_data["skills"] = parsed_skills
+                updated_data["professional_skills"] = parsed_skills
+                updated_data["certifications"] = [
+                    {"name": c, "verification_status": VerificationStatus.USER_CONFIRMED.value, "is_confirmed": True}
+                    for c in parsed_certs
+                ]
+                updated_data["licenses"] = [
+                    {"name": l, "is_license": True, "verification_status": VerificationStatus.USER_CONFIRMED.value, "is_confirmed": True}
+                    for l in parsed_lics
+                ]
+                updated_data["employment_history_complete"] = history_complete_val
+                updated_data["is_user_confirmed"] = True
                 updated_data["field_provenance"] = new_prov
 
                 succ, msg = service.save_candidate_profile(updated_data)

@@ -21,6 +21,7 @@ from src.database.exceptions import (
     EncryptedFileError,
     InvalidFileFormatError,
 )
+from src.matcher.terminology import split_date_range
 from src.utils.logger import setup_logger
 
 logger = setup_logger("ResumeParser")
@@ -81,6 +82,7 @@ class ExperienceEntry:
     employer: str = ""
     job_title: str = ""
     duration: str = ""
+    duration_months: Optional[int] = None
     start_date: Optional[str] = None
     end_date: Optional[str] = None
     is_current: bool = False
@@ -809,6 +811,13 @@ class ResumeParser:
                     for p in parts:
                         if "month" in p.lower() or "year" in p.lower() or re.search(r"\d{4}", p):
                             entry.duration = p
+                            s_part, e_part = split_date_range(p)
+                            if s_part:
+                                entry.start_date = s_part
+                            if e_part:
+                                entry.end_date = e_part
+                                if "present" in e_part.lower() or "current" in e_part.lower():
+                                    entry.is_current = True
                         else:
                             entry.employer = p.title() if p.isupper() else p
                             employer_found = True

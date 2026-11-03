@@ -30,6 +30,7 @@ from src.matcher.terminology import (
     is_statutory_license,
     match_license_names,
     normalize_skill_token,
+    split_date_range,
     RELATED_SKILLS_MAP,
 )
 from src.preparer.job_parser import StructuredJobDescription
@@ -63,6 +64,7 @@ class NormalizedEducation:
     cgpa: Optional[float] = None
     graduation_year: Optional[int] = None
     verification_status: str = "EXTRACTED_UNVERIFIED"
+    cgpa_verification_status: Optional[str] = None
 
 
 @dataclass
@@ -74,6 +76,7 @@ class NormalizedExperience:
     duration_months: Optional[int] = None
     is_internship: bool = False
     is_freelance: bool = False
+    is_current: bool = False
     responsibilities: List[str] = field(default_factory=list)
     verification_status: str = "EXTRACTED_UNVERIFIED"
 
@@ -103,6 +106,7 @@ class NormalizedCandidateFacts:
     total_experience_months: Optional[int] = None
     confirmed_experience_months: Optional[int] = None
     experience_dates_missing: bool = False
+    is_employment_history_complete: Optional[bool] = None
     projects: List[NormalizedProject] = field(default_factory=list)
     certifications: List[NormalizedCertification] = field(default_factory=list)
     location: Optional[str] = None
@@ -251,6 +255,16 @@ class CandidateFactNormalizer:
             facts.location = personal.get("location") or ""
             facts.career_level = personal.get("career_level") or "entry"
 
+        # Check employment history complete flag
+        emp_complete = None
+        if "employment_history_complete" in profile:
+            emp_complete = bool(profile["employment_history_complete"])
+        elif "is_employment_history_complete" in profile:
+            emp_complete = bool(profile["is_employment_history_complete"])
+        elif isinstance(profile.get("candidate_inputs"), dict) and "is_employment_history_complete" in profile["candidate_inputs"]:
+            emp_complete = bool(profile["candidate_inputs"]["is_employment_history_complete"])
+        facts.is_employment_history_complete = emp_complete
+
         # 2. Resume Data Layer
         r_dict: Dict[str, Any] = {}
         if isinstance(resume_data, ResumeRecord):
@@ -300,84 +314,165 @@ class CandidateFactNormalizer:
                 return True
             if item.get("is_confirmed") is True or item.get("is_verified") is True:
                 return True
-            if status in ("EXTRACTED_UNVERIFIED", "UNVERIFIED", "PENDING"):
+            if status in ("EXTRACTED_UNVERIFIED", "UNVERIFIED", "PENDING", "NEEDS_REVIEW"):
                 return False
-            if item.get("is_confirmed") is False:
+            if item.get("is_confirmed") is False or item.get("is_verified") is False:
                 return False
 
-        # Check section-level field provenance in profile
-        field_prov = profile.get("field_provenance")
-        if isinstance(field_prov, dict) and field_prov:
+        # If profile contains field_provenance (real candidate profiles and imported profiles)
+        if "field_provenance" in profile:
+            field_prov = profile.get("field_provenance")
+            if not field_prov or not isinstance(field_prov, dict):
+                # Empty provenance dictionary explicitly denotes an unconfirmed imported profile
+                return False
+
             prov = field_prov.get(section_key, {})
-            if isinstance(prov, dict):
+            if not prov and section_key == "technical_skills":
+                prov = field_prov.get("skills", {})
+            elif not prov and section_key == "skills":
+                prov = field_prov.get("technical_skills", {})
+            elif not prov and section_key == "work_experience":
+                prov = field_prov.get("experience", {})
+            elif not prov and section_key == "experience":
+                prov = field_prov.get("work_experience", {})
+            elif not prov and section_key in ("licenses", "certifications"):
+                prov = field_prov.get("licenses") or field_prov.get("certifications", {})
+
+            if isinstance(prov, dict) and prov:
                 p_status = prov.get("verification_status")
                 if p_status in ("USER_CONFIRMED", "USER_CORRECTED", "CONFIRMED"):
                     return True
                 if prov.get("is_confirmed") is True:
                     return True
-                if p_status in ("EXTRACTED_UNVERIFIED", "UNVERIFIED", "PENDING"):
+                if p_status in ("EXTRACTED_UNVERIFIED", "UNVERIFIED", "PENDING", "NEEDS_REVIEW"):
                     return False
+                if prov.get("is_confirmed") is False:
+                    return False
+
+            # Section missing from field_provenance remains unverified
             return False
 
         if profile.get("is_user_confirmed") is True or profile.get("status") == "CONFIRMED":
             return True
 
+        if profile.get("is_user_confirmed") is False or profile.get("status") in ("UNVERIFIED", "EXTRACTED_UNVERIFIED"):
+            return False
+
+        # Legacy synthetic profile dictionaries lacking provenance keys
         if from_profile:
             return True
 
         return False
 
     @classmethod
-    def _normalize_skills(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
-        """Consolidates skills with provenance and verification status."""
-        profile_skills = profile.get("skills", {})
-        is_skills_conf = cls._is_confirmed(profile_skills, "skills", profile, from_profile=True) or cls._is_confirmed(profile_skills, "technical_skills", profile, from_profile=True)
-        if isinstance(profile_skills, dict):
-            for category, skills_list in profile_skills.items():
-                if isinstance(skills_list, list):
-                    for s in skills_list:
-                        s_str = str(s).strip()
-                        if s_str:
-                            norm_key = normalize_skill_token(s_str)
-                            facts.skills[norm_key] = NormalizedSkill(
-                                name=s_str,
-                                canonical_name=norm_key,
-                                provenance_field=f"profile.skills.{category}",
-                                verification_status="USER_CONFIRMED" if is_skills_conf else "EXTRACTED_UNVERIFIED",
-                                raw_text=s_str,
-                                is_confirmed=is_skills_conf,
-                            )
-        elif isinstance(profile_skills, list):
-            for s in profile_skills:
-                s_str = str(s).strip()
-                if s_str:
-                    norm_key = normalize_skill_token(s_str)
-                    facts.skills[norm_key] = NormalizedSkill(
-                        name=s_str,
-                        canonical_name=norm_key,
-                        provenance_field="profile.skills",
-                        verification_status="USER_CONFIRMED" if is_skills_conf else "EXTRACTED_UNVERIFIED",
-                        raw_text=s_str,
-                        is_confirmed=is_skills_conf,
-                    )
+    def _extract_skills_from_container(
+        cls, container: Any, base_prov: str, section_key: str, profile: Dict[str, Any], from_profile: bool = False
+    ) -> List[Tuple[str, bool, str]]:
+        """Extracts (skill_name, is_confirmed, provenance) from list or dict structures."""
+        extracted: List[Tuple[str, bool, str]] = []
+        if not container:
+            return extracted
 
-        # B. Resume skills (extracted, fallback if not already confirmed)
-        for cat in ("technical_skills", "professional_skills", "soft_skills", "tools_and_software", "languages"):
-            skills_val = r_dict.get(cat, [])
-            if isinstance(skills_val, list):
-                for s in skills_val:
-                    s_str = str(s).strip()
-                    if s_str:
-                        norm_key = normalize_skill_token(s_str)
-                        if norm_key not in facts.skills:
+        sec_confirmed = cls._is_confirmed(container, section_key, profile, from_profile=from_profile)
+
+        if isinstance(container, list):
+            for item in container:
+                if isinstance(item, dict):
+                    name = item.get("name") or item.get("skill") or ""
+                    if name and str(name).strip():
+                        item_conf = cls._is_confirmed(item, section_key, profile, from_profile=from_profile)
+                        extracted.append((str(name).strip(), item_conf, base_prov))
+                elif isinstance(item, str) and item.strip():
+                    extracted.append((item.strip(), sec_confirmed, base_prov))
+        elif isinstance(container, dict):
+            for k, v in container.items():
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            name = item.get("name") or item.get("skill") or ""
+                            if name and str(name).strip():
+                                item_conf = cls._is_confirmed(item, section_key, profile, from_profile=from_profile)
+                                extracted.append((str(name).strip(), item_conf, f"{base_prov}.{k}"))
+                        elif isinstance(item, str) and item.strip():
+                            extracted.append((item.strip(), sec_confirmed, f"{base_prov}.{k}"))
+                elif isinstance(v, dict):
+                    name = v.get("name") or k
+                    if name and str(name).strip():
+                        item_conf = cls._is_confirmed(v, section_key, profile, from_profile=from_profile)
+                        extracted.append((str(name).strip(), item_conf, f"{base_prov}.{k}"))
+                elif isinstance(v, str) and v.strip():
+                    extracted.append((v.strip(), sec_confirmed, f"{base_prov}.{k}"))
+        return extracted
+
+    @classmethod
+    def _normalize_skills(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
+        """Consolidates skills with provenance and verification status across profile and resume."""
+        # 1. Candidate Profile Skills (Primary)
+        profile_sections = (
+            "technical_skills",
+            "skills",
+            "professional_skills",
+            "soft_skills",
+            "tools_and_software",
+            "languages",
+            "competencies",
+        )
+        for sec_name in profile_sections:
+            sec_val = profile.get(sec_name)
+            if sec_val:
+                items = cls._extract_skills_from_container(sec_val, f"profile.{sec_name}", sec_name, profile, from_profile=True)
+                for s_name, s_conf, s_prov in items:
+                    norm_key = normalize_skill_token(s_name)
+                    if not norm_key:
+                        continue
+                    if norm_key in facts.skills:
+                        existing = facts.skills[norm_key]
+                        if s_conf and not existing.is_confirmed:
                             facts.skills[norm_key] = NormalizedSkill(
-                                name=s_str,
+                                name=s_name,
                                 canonical_name=norm_key,
-                                provenance_field=f"resume.{cat}",
-                                verification_status="EXTRACTED_UNVERIFIED",
-                                raw_text=s_str,
-                                is_confirmed=False,
+                                provenance_field=s_prov,
+                                verification_status="USER_CONFIRMED",
+                                raw_text=s_name,
+                                is_confirmed=True,
                             )
+                    else:
+                        facts.skills[norm_key] = NormalizedSkill(
+                            name=s_name,
+                            canonical_name=norm_key,
+                            provenance_field=s_prov,
+                            verification_status="USER_CONFIRMED" if s_conf else "EXTRACTED_UNVERIFIED",
+                            raw_text=s_name,
+                            is_confirmed=s_conf,
+                        )
+
+        # 2. Resume skills (extracted, fallback if not already confirmed)
+        resume_sections = (
+            "technical_skills",
+            "skills",
+            "professional_skills",
+            "soft_skills",
+            "tools_and_software",
+            "languages",
+            "competencies",
+        )
+        for cat in resume_sections:
+            skills_val = r_dict.get(cat)
+            if skills_val:
+                items = cls._extract_skills_from_container(skills_val, f"resume.{cat}", cat, profile={}, from_profile=False)
+                for s_name, _, s_prov in items:
+                    norm_key = normalize_skill_token(s_name)
+                    if not norm_key:
+                        continue
+                    if norm_key not in facts.skills:
+                        facts.skills[norm_key] = NormalizedSkill(
+                            name=s_name,
+                            canonical_name=norm_key,
+                            provenance_field=s_prov,
+                            verification_status="EXTRACTED_UNVERIFIED",
+                            raw_text=s_name,
+                            is_confirmed=False,
+                        )
 
     @classmethod
     def _normalize_education(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
@@ -404,7 +499,12 @@ class CandidateFactNormalizer:
                         pass
 
                 rank = get_degree_level_rank(f"{deg} {major}")
-                is_conf = cls._is_confirmed(edu, "education", profile, from_profile=from_profile)
+                is_edu_conf = cls._is_confirmed(edu, "education", profile, from_profile=from_profile)
+                is_cgpa_conf = (
+                    cls._is_confirmed(raw_cgpa, "current_cgpa", profile, from_profile=from_profile)
+                    or cls._is_confirmed(raw_cgpa, "cgpa", profile, from_profile=from_profile)
+                    or is_edu_conf
+                )
                 facts.education.append(
                     NormalizedEducation(
                         institution=inst,
@@ -413,9 +513,25 @@ class CandidateFactNormalizer:
                         degree_rank=rank,
                         cgpa=cgpa_val,
                         graduation_year=grad_year,
-                        verification_status="USER_CONFIRMED" if is_conf else "EXTRACTED_UNVERIFIED",
+                        verification_status="USER_CONFIRMED" if is_edu_conf else "EXTRACTED_UNVERIFIED",
+                        cgpa_verification_status="USER_CONFIRMED" if is_cgpa_conf else "EXTRACTED_UNVERIFIED",
                     )
                 )
+
+        # Fallback for standalone profile CGPA if education entry lacked it
+        if facts.education and facts.education[0].cgpa is None:
+            prof_cgpa = profile.get("current_cgpa") or profile.get("cgpa")
+            if prof_cgpa is not None:
+                try:
+                    c_val = float(str(prof_cgpa).replace("/10", "").replace("/4", "").strip())
+                    is_cgpa_conf = (
+                        cls._is_confirmed(prof_cgpa, "current_cgpa", profile, from_profile=True)
+                        or cls._is_confirmed(prof_cgpa, "cgpa", profile, from_profile=True)
+                    )
+                    facts.education[0].cgpa = c_val
+                    facts.education[0].cgpa_verification_status = "USER_CONFIRMED" if is_cgpa_conf else "EXTRACTED_UNVERIFIED"
+                except ValueError:
+                    pass
 
     @classmethod
     def _normalize_experience(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
@@ -433,26 +549,45 @@ class CandidateFactNormalizer:
                 title = exp.get("job_title") or exp.get("title", "")
                 dur_str = exp.get("duration") or exp.get("dates", "")
                 dur_months = exp.get("duration_months")
+                s_str = exp.get("start_date")
+                e_str = exp.get("end_date")
+                is_curr = bool(exp.get("is_current", False))
                 resp = exp.get("responsibilities", [])
                 if isinstance(resp, str):
                     resp = [resp]
 
-                is_intern = "intern" in title.lower() or "intern" in dur_str.lower()
-                is_free = "freelance" in title.lower() or "freelance" in emp.lower()
-                is_conf = cls._is_confirmed(exp, "work_experience", profile, from_profile=from_profile) or cls._is_confirmed(exp, "experience", profile, from_profile=from_profile)
+                is_intern = "intern" in title.lower() or "intern" in str(dur_str).lower()
+                is_free = "freelance" in title.lower() or "freelance" in str(emp).lower()
+                is_conf = (
+                    cls._is_confirmed(exp, "work_experience", profile, from_profile=from_profile)
+                    or cls._is_confirmed(exp, "experience", profile, from_profile=from_profile)
+                )
+
+                # Split duration string if start or end date missing
+                if (not s_str or not e_str) and dur_str:
+                    s_split, e_split = split_date_range(dur_str)
+                    s_str = s_str or s_split
+                    e_str = e_str or e_split
+
+                if not is_curr and e_str and any(w in str(e_str).lower() for w in ("present", "current", "now")):
+                    is_curr = True
 
                 # Parse duration months if not explicit
                 if dur_months is None and dur_str:
-                    m = re.search(r"(\d+)\s*(?:month|mo)", dur_str, re.IGNORECASE)
+                    m = re.search(r"(\d+)\s*(?:month|mo)", str(dur_str), re.IGNORECASE)
                     if m:
                         dur_months = int(m.group(1))
-                    y = re.search(r"(\d+)\s*(?:year|yr)", dur_str, re.IGNORECASE)
+                    y = re.search(r"(\d+)\s*(?:year|yr)", str(dur_str), re.IGNORECASE)
                     if y:
                         dur_months = (dur_months or 0) + int(y.group(1)) * 12
 
-                # Date parsing for interval overlap merging
-                start_dt = cls._parse_month_year(exp.get("start_date") or dur_str)
-                end_dt = cls._parse_month_year(exp.get("end_date") or dur_str, default_now=True)
+                # Date parsing for interval overlap merging — never pass a full range string to both parsers
+                start_dt = cls._parse_month_year(s_str)
+                end_dt: Optional[datetime] = None
+                if is_curr:
+                    end_dt = datetime.now(timezone.utc)
+                else:
+                    end_dt = cls._parse_month_year(e_str, default_now=False)
 
                 if start_dt and end_dt and start_dt <= end_dt:
                     all_intervals.append((start_dt, end_dt))
@@ -469,11 +604,12 @@ class CandidateFactNormalizer:
                     NormalizedExperience(
                         employer=emp,
                         job_title=title,
-                        start_date=exp.get("start_date"),
-                        end_date=exp.get("end_date"),
+                        start_date=s_str,
+                        end_date="Present" if is_curr else e_str,
                         duration_months=dur_months,
                         is_internship=is_intern,
                         is_freelance=is_free,
+                        is_current=is_curr,
                         responsibilities=resp,
                         verification_status="USER_CONFIRMED" if is_conf else "EXTRACTED_UNVERIFIED",
                     )
@@ -582,20 +718,33 @@ class CandidateFactNormalizer:
 
     @classmethod
     def _normalize_certifications(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
-        raw_certs = profile.get("certifications") or r_dict.get("certifications") or []
-        from_profile = bool(profile.get("certifications"))
+        raw_certs = (
+            (profile.get("certifications") or [])
+            + (profile.get("licenses") or [])
+            + (profile.get("statutory_licenses") or [])
+        )
+        from_profile = bool(raw_certs)
+        if not raw_certs:
+            raw_certs = (r_dict.get("certifications") or []) + (r_dict.get("licenses") or [])
+            from_profile = False
+
         for c in raw_certs:
             c_name = ""
             org = None
+            is_lic_flag = False
             if isinstance(c, dict):
                 c_name = c.get("name") or c.get("title", "")
                 org = c.get("issuing_organization") or c.get("issuer")
+                is_lic_flag = bool(c.get("is_license", False))
             elif isinstance(c, str):
                 c_name = c
 
             if c_name:
-                is_lic = is_statutory_license(c_name)
-                is_conf = cls._is_confirmed(c, "certifications", profile, from_profile=from_profile)
+                is_lic = is_lic_flag or is_statutory_license(c_name)
+                is_conf = (
+                    cls._is_confirmed(c, "certifications", profile, from_profile=from_profile)
+                    or cls._is_confirmed(c, "licenses", profile, from_profile=from_profile)
+                )
                 facts.certifications.append(
                     NormalizedCertification(
                         name=c_name,
@@ -1270,7 +1419,10 @@ class UniversalEligibilityEvaluator:
                 )
             else:
                 cand_cgpa = best_edu.cgpa
-                is_conf = (best_edu.verification_status == "USER_CONFIRMED")
+                is_conf = (
+                    best_edu.cgpa_verification_status == "USER_CONFIRMED"
+                    or best_edu.verification_status == "USER_CONFIRMED"
+                )
                 if cand_cgpa < reqs.min_gpa:
                     if is_conf:
                         ineligible_reasons.append(
@@ -1289,34 +1441,34 @@ class UniversalEligibilityEvaluator:
         # 4. Mandatory Experience Duration (for non-internship experienced roles)
         if reqs.min_years_experience and reqs.min_years_experience > 0.0 and not reqs.is_internship:
             min_yrs = reqs.min_years_experience
-            if facts.experience_dates_missing:
+            if facts.experience_dates_missing or facts.total_experience_months is None:
                 unknown_reasons.append(
-                    f"Job mandates {min_yrs} years experience; candidate dates cannot be verified."
-                )
-            elif facts.total_experience_months is None:
-                unknown_reasons.append(
-                    f"Job mandates {min_yrs} years experience, but candidate experience duration cannot be determined."
+                    f"Job mandates {min_yrs} years experience; candidate experience duration cannot be determined due to missing dates."
                 )
             else:
                 tot_yrs = facts.total_experience_months / 12.0
                 conf_yrs = (facts.confirmed_experience_months / 12.0) if facts.confirmed_experience_months is not None else 0.0
-                all_unverified = bool(facts.experience and all(e.verification_status != "USER_CONFIRMED" for e in facts.experience))
+                has_unverified_exp = any(e.verification_status != "USER_CONFIRMED" for e in facts.experience)
+                has_unverified_months = (facts.total_experience_months or 0) > (facts.confirmed_experience_months or 0)
 
-                if tot_yrs < min_yrs:
-                    if not all_unverified:
-                        ineligible_reasons.append(
-                            f"Documented experience ({tot_yrs:.1f} yrs) is below mandatory minimum requirement of {min_yrs:.1f} yrs."
-                        )
-                    else:
-                        unknown_reasons.append(
-                            f"Extracted experience ({tot_yrs:.1f} yrs) is below mandatory requirement of {min_yrs:.1f} yrs, but remains unverified."
-                        )
+                if conf_yrs >= min_yrs:
+                    # Verified experience alone meets or exceeds requirement
+                    pass
+                elif has_unverified_exp or has_unverified_months:
+                    # Candidate has unverified experience records or unverified duration
+                    unknown_reasons.append(
+                        f"Documented experience ({tot_yrs:.1f} yrs total, {conf_yrs:.1f} yrs confirmed) vs {min_yrs:.1f} yrs required; unverified experience requires candidate confirmation."
+                    )
+                elif facts.is_employment_history_complete is False:
+                    # Confirmed experience is below requirement, but candidate explicitly indicated employment history is not complete
+                    unknown_reasons.append(
+                        f"Candidate confirmed experience ({conf_yrs:.1f} yrs) is below {min_yrs:.1f} yrs required, but employment history is marked as incomplete."
+                    )
                 else:
-                    # Meets or exceeds, but check if confirmed
-                    if conf_yrs < min_yrs:
-                        unknown_reasons.append(
-                            f"Experience meets mandatory requirement ({tot_yrs:.1f} yrs >= {min_yrs:.1f} yrs), but unverified experience requires candidate confirmation."
-                        )
+                    # Confirmed complete history demonstrably below minimum requirement
+                    ineligible_reasons.append(
+                        f"Candidate's confirmed experience ({conf_yrs:.1f} yrs) is demonstrably below mandatory minimum requirement of {min_yrs:.1f} yrs."
+                    )
 
         # Final Status Decision
         if ineligible_reasons:

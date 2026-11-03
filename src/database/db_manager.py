@@ -171,6 +171,7 @@ class DatabaseManager:
 
         add_col_if_missing("applications", "user_id", "INTEGER")
         add_col_if_missing("applications", "resume_id", "INTEGER")
+        add_col_if_missing("applications", "job_description_id", "INTEGER")
         add_col_if_missing("application_logs", "user_id", "INTEGER")
         add_col_if_missing("resumes", "label", "TEXT DEFAULT 'General'")
         add_col_if_missing("resumes", "target_role", "TEXT")
@@ -178,6 +179,8 @@ class DatabaseManager:
         add_col_if_missing("resumes", "parsing_status", "TEXT DEFAULT 'COMPLETED'")
         add_col_if_missing("resumes", "active_version", "INTEGER DEFAULT 1")
         add_col_if_missing("resumes", "is_active", "INTEGER DEFAULT 1")
+        add_col_if_missing("resumes", "is_primary", "INTEGER DEFAULT 0")
+        add_col_if_missing("jobs", "company_id", "INTEGER")
         add_col_if_missing("candidate_profiles", "profile_hash", "TEXT")
         add_col_if_missing("job_descriptions", "source_url", "TEXT")
         add_col_if_missing("job_descriptions", "original_filename", "TEXT")
@@ -208,6 +211,109 @@ class DatabaseManager:
         add_col_if_missing("match_results", "recommendations", "TEXT")
         add_col_if_missing("match_results", "details_json", "TEXT")
 
+        # Composite indexes required to safely satisfy composite foreign keys in application_approvals
+        try:
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_prepared_packets_id_user ON prepared_packets(id, user_id)")
+        except sqlite3.OperationalError:
+            pass
+
+    def _migrate_match_results_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Migrates match_results table in existing SQLite databases to enforce RESTRICT on resumes/JDs and SET NULL on jobs.
+
+        Uses SQLite's 12-step table rebuild procedure safely preserving all IDs, timestamps,
+        scores, provenance, hashes, explanations, and JSON columns.
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='match_results'")
+        if not cursor.fetchone():
+            return  # Table will be created fresh by schema.sql
+
+        # Check existing foreign keys and columns
+        cursor.execute("PRAGMA foreign_key_list(match_results)")
+        fks = cursor.fetchall()
+        cursor.execute("PRAGMA table_info(match_results)")
+        existing_cols = [r[1] for r in cursor.fetchall()]
+
+        needs_migration = False
+        if "candidate_profile_hash" not in existing_cols:
+            needs_migration = True
+
+        for fk in fks:
+            table_ref = fk[2]
+            on_delete = fk[6]
+            if table_ref == "jobs" and on_delete != "SET NULL":
+                needs_migration = True
+            elif table_ref in ("resumes", "job_descriptions") and on_delete != "RESTRICT":
+                needs_migration = True
+
+        if not needs_migration:
+            return
+
+        logger.info("Performing table rebuild migration for match_results foreign keys...")
+        # Disable foreign keys on this connection for the table rebuild
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("DROP TABLE IF EXISTS match_results_v2")
+
+        cursor.execute("""
+            CREATE TABLE match_results_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                resume_id INTEGER,
+                job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+                job_description_id INTEGER,
+                match_score REAL NOT NULL,
+                match_classification TEXT NOT NULL,
+                eligibility_status TEXT NOT NULL CHECK(eligibility_status IN ('ELIGIBLE', 'INELIGIBLE', 'UNKNOWN')),
+                score_breakdown TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                resume_version_num INTEGER DEFAULT 1,
+                resume_file_hash TEXT,
+                candidate_profile_version INTEGER DEFAULT 1,
+                candidate_profile_hash TEXT,
+                job_snapshot_hash TEXT,
+                scoring_profile TEXT DEFAULT 'general_baseline',
+                scoring_config_version TEXT DEFAULT '1.0.0',
+                assessment_confidence REAL DEFAULT 1.0,
+                engine_version TEXT DEFAULT '2.1.1',
+                matching_skills TEXT,
+                related_skills TEXT,
+                partial_matches TEXT,
+                missing_skills TEXT,
+                education_analysis TEXT,
+                experience_analysis TEXT,
+                certification_analysis TEXT,
+                eligibility_reasons TEXT,
+                scoring_explanations TEXT,
+                recommendations TEXT,
+                details_json TEXT,
+                evaluated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT,
+                FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT
+            )
+        """)
+
+        cursor.execute("PRAGMA table_info(match_results_v2)")
+        v2_cols = [r[1] for r in cursor.fetchall()]
+        common_cols = [c for c in v2_cols if c in existing_cols]
+        cols_str = ", ".join(common_cols)
+
+        cursor.execute(f"INSERT INTO match_results_v2 ({cols_str}) SELECT {cols_str} FROM match_results")
+        cursor.execute("DROP TABLE match_results")
+        cursor.execute("ALTER TABLE match_results_v2 RENAME TO match_results")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_results_resume ON match_results(user_id, resume_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_results_jd ON match_results(user_id, job_description_id)")
+
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.execute("PRAGMA foreign_key_check(match_results)")
+        fk_errors = cursor.fetchall()
+        if fk_errors:
+            raise RuntimeError(f"Foreign key integrity check failed after match_results migration: {fk_errors}")
+
+        logger.info("match_results migration completed successfully.")
+
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
         if not self.schema_path.is_file():
@@ -219,6 +325,8 @@ class DatabaseManager:
         with self.connection() as conn:
             cursor = conn.cursor()
             self._ensure_backward_compatible_columns(cursor)
+            conn.commit()
+            self._migrate_match_results_foreign_keys(conn)
             conn.commit()
             conn.executescript(schema_sql)
             conn.commit()
@@ -2631,6 +2739,9 @@ class DatabaseManager:
                 """,
                 (user_id,),
             )
+
+            # 2.5 Delete user match_results to prevent ON DELETE RESTRICT from blocking cascade deletion of resumes/JDs
+            cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
 
             # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
             #    applications, prepared_packets, application_approvals, password_reset_tokens)

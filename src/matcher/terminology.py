@@ -5,7 +5,7 @@ guards (e.g. Java != JavaScript), degree level hierarchies, and professional lic
 """
 
 import re
-from typing import Dict, Set, Tuple
+from typing import Dict, Optional, Set, Tuple
 
 # Degree Level Ranking Hierarchy
 DEGREE_LEVEL_HIERARCHY: Dict[str, int] = {
@@ -462,3 +462,21 @@ def is_statutory_license(license_name: str) -> bool:
         if re.search(pattern, clean):
             return True
     return False
+
+
+def split_date_range(s: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """Splits a date range string (e.g. 'Jan 2020 - Dec 2023', '2020-01 to 2024-01') into start and end parts.
+
+    Returns (start_str, end_str) or (None, None) if not a recognizable date range.
+    Never returns a complete range in either start or end.
+    """
+    if not s:
+        return None, None
+    clean = str(s).strip()
+    m = re.split(r"\s+(?:to|–|—|-|->)\s+|\s*(?:–|—)\s*|\s*-\s*(?=[A-Za-z]|\d{4})", clean, maxsplit=1)
+    if len(m) == 2:
+        start_part = m[0].strip()
+        end_part = m[1].strip()
+        if start_part and end_part:
+            return start_part, end_part
+    return None, None

@@ -175,7 +175,7 @@ CREATE TABLE IF NOT EXISTS match_results (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     resume_id INTEGER,
-    job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+    job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
     job_description_id INTEGER,
     match_score REAL NOT NULL,
     match_classification TEXT NOT NULL,
