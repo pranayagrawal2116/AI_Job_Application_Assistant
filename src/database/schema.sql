@@ -113,13 +113,15 @@ CREATE TABLE IF NOT EXISTS job_descriptions (
     job_title TEXT NOT NULL,
     raw_content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
+    snapshot_hash TEXT,
     parsed_data TEXT,
     parser_version TEXT DEFAULT '1.0.0',
     extraction_confidence REAL DEFAULT 1.0,
-    supersedes_job_description_id INTEGER REFERENCES job_descriptions(id) ON DELETE SET NULL,
+    supersedes_job_description_id INTEGER,
     is_active INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    UNIQUE(id, user_id)
+    UNIQUE(id, user_id),
+    FOREIGN KEY (supersedes_job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT
 );
 
 -- ---------------------------------------------------------------------
@@ -317,6 +319,7 @@ CREATE INDEX IF NOT EXISTS idx_candidate_profiles_user ON candidate_profiles(use
 CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_user ON job_descriptions(user_id);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_user_content ON job_descriptions(user_id, content_hash);
+CREATE INDEX IF NOT EXISTS idx_job_descriptions_snapshot_hash ON job_descriptions(user_id, snapshot_hash);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_supersedes ON job_descriptions(supersedes_job_description_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);

@@ -45,6 +45,7 @@ from src.database.url_normalizer import (
     generate_company_title_key,
     normalize_job_url,
 )
+from src.utils.canonical_json import canonical_json_hash
 from src.utils.logger import setup_logger
 
 logger = setup_logger("DatabaseManager")
@@ -182,6 +183,7 @@ class DatabaseManager:
         add_col_if_missing("job_descriptions", "parser_version", "TEXT DEFAULT '1.0.0'")
         add_col_if_missing("job_descriptions", "extraction_confidence", "REAL DEFAULT 1.0")
         add_col_if_missing("job_descriptions", "supersedes_job_description_id", "INTEGER")
+        add_col_if_missing("job_descriptions", "snapshot_hash", "TEXT")
         add_col_if_missing("job_descriptions", "is_active", "INTEGER DEFAULT 1")
 
     def _init_db(self) -> None:
@@ -1330,6 +1332,7 @@ class DatabaseManager:
         raw_content: str,
         source_type: str = "pasted",
         content_hash: Optional[str] = None,
+        snapshot_hash: Optional[str] = None,
         parsed_data: Optional[Dict[str, Any]] = None,
         source_url: Optional[str] = None,
         original_filename: Optional[str] = None,
@@ -1351,8 +1354,25 @@ class DatabaseManager:
         if not user:
             raise UserNotFoundError(f"User #{user_id}")
 
+        raw_content_clean = raw_content.strip()
+        raw_content_hash = hashlib.sha256(raw_content_clean.encode("utf-8")).hexdigest()
         if not content_hash:
-            content_hash = hashlib.sha256(raw_content.strip().encode("utf-8")).hexdigest()
+            content_hash = raw_content_hash
+
+        # Compute RFC 8785 canonical snapshot_hash if not explicitly provided
+        if not snapshot_hash:
+            manifest = {
+                "user_id": user_id,
+                "company_name": company_name.strip(),
+                "job_title": job_title.strip(),
+                "raw_content_hash": raw_content_hash,
+                "parsed_data": parsed_data,
+                "parser_version": parser_version,
+                "source_type": source_type,
+                "source_url": source_url,
+                "original_filename": original_filename,
+            }
+            snapshot_hash = canonical_json_hash(manifest)
 
         # Check deduplication per-user
         if supersedes_job_description_id is None:
@@ -1390,18 +1410,19 @@ class DatabaseManager:
             cursor.execute(
                 """
                 INSERT INTO job_descriptions (
-                    user_id, source_type, company_name, job_title, raw_content, content_hash, parsed_data,
+                    user_id, source_type, company_name, job_title, raw_content, content_hash, snapshot_hash, parsed_data,
                     source_url, original_filename, storage_filename, parser_version, extraction_confidence,
                     supersedes_job_description_id, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
                     source_type,
                     company_name.strip(),
                     job_title.strip(),
-                    raw_content.strip(),
+                    raw_content_clean,
                     content_hash,
+                    snapshot_hash,
                     parsed_json,
                     source_url,
                     original_filename,
@@ -1424,6 +1445,7 @@ class DatabaseManager:
         raw_content: str,
         source_type: str = "pasted",
         content_hash: Optional[str] = None,
+        snapshot_hash: Optional[str] = None,
         parsed_data: Optional[Dict[str, Any]] = None,
         source_url: Optional[str] = None,
         original_filename: Optional[str] = None,
@@ -1441,6 +1463,7 @@ class DatabaseManager:
             raw_content=raw_content,
             source_type=source_type,
             content_hash=content_hash,
+            snapshot_hash=snapshot_hash,
             parsed_data=parsed_data,
             source_url=source_url,
             original_filename=original_filename,
@@ -1547,36 +1570,92 @@ class DatabaseManager:
 
         return history
 
-    def delete_job_description(self, jd_id: int, user_id: int) -> bool:
-        """Deletes a user's job description snapshot and removes associated files if safe."""
+    def delete_job_description(self, jd_id: int, user_id: int) -> Dict[str, Any]:
+        """Deletes or archives a user's job description snapshot and removes associated files if safe."""
         jd = self.get_job_description(jd_id, user_id=user_id)
         if not jd:
             raise JobDescriptionNotFoundError(f"Job Description #{jd_id} not found.")
 
+        # Check references across applications, match_results, and supersedes lineage
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) as cnt FROM applications WHERE job_id = ?", (jd_id,))
+
+            # 1. Applications reference (using job_description_id)
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM applications WHERE user_id = ? AND job_description_id = ?",
+                (user_id, jd_id),
+            )
             linked_apps = cursor.fetchone()["cnt"]
 
-        if linked_apps > 0:
+            # 2. Match results reference
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM match_results WHERE user_id = ? AND job_description_id = ?",
+                (user_id, jd_id),
+            )
+            linked_matches = cursor.fetchone()["cnt"]
+
+            # 3. Supersedes lineage (child records that supersede this snapshot)
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM job_descriptions WHERE user_id = ? AND supersedes_job_description_id = ?",
+                (user_id, jd_id),
+            )
+            linked_lineage = cursor.fetchone()["cnt"]
+
+        total_refs = linked_apps + linked_matches + linked_lineage
+
+        if total_refs > 0:
+            # Soft-delete / Archive
             with self.transaction() as t_conn:
                 t_cursor = t_conn.cursor()
-                t_cursor.execute("UPDATE job_descriptions SET is_active = 0 WHERE id = ? AND user_id = ?", (jd_id, user_id))
-            return True
+                t_cursor.execute(
+                    "UPDATE job_descriptions SET is_active = 0 WHERE id = ? AND user_id = ?",
+                    (jd_id, user_id),
+                )
+            logger.info(
+                f"Job Description #{jd_id} archived (soft-deleted) due to {total_refs} active references "
+                f"({linked_apps} apps, {linked_matches} matches, {linked_lineage} lineage child records)."
+            )
+            return {
+                "success": True,
+                "action": "archived",
+                "archived": True,
+                "deleted": False,
+                "message": (
+                    f"Job description #{jd_id} is referenced by existing applications, matches, or version lineage. "
+                    "It has been safely archived instead of deleted to protect historical application integrity."
+                ),
+            }
 
+        # Hard-delete when 0 references exist
         with self.transaction() as t_conn:
             t_cursor = t_conn.cursor()
             t_cursor.execute("DELETE FROM job_descriptions WHERE id = ? AND user_id = ?", (jd_id, user_id))
 
+        # Check if physical file can be removed (only if no remaining records for this user share the file)
         if jd.storage_filename:
-            try:
-                from src.security.file_security import FileSecurityValidator
-                validator = FileSecurityValidator()
-                validator.delete_stored_job_description_file(user_id, jd.storage_filename)
-            except Exception as e:
-                logger.warning(f"Error removing storage file for JD #{jd_id}: {e}")
+            with self.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT COUNT(*) as cnt FROM job_descriptions WHERE user_id = ? AND storage_filename = ?",
+                    (user_id, jd.storage_filename),
+                )
+                remaining_file_refs = cursor.fetchone()["cnt"]
 
-        return True
+            if remaining_file_refs == 0:
+                try:
+                    from src.security.file_security import FileSecurityValidator
+                    validator = FileSecurityValidator()
+                    validator.delete_stored_job_description_file(user_id, jd.storage_filename)
+                except Exception as e:
+                    logger.warning(f"Error removing storage file for JD #{jd_id}: {e}")
+
+        return {
+            "success": True,
+            "action": "deleted",
+            "archived": False,
+            "deleted": True,
+            "message": f"Job description #{jd_id} and associated unreferenced files deleted successfully.",
+        }
 
     def upload_user_job_description(
         self,

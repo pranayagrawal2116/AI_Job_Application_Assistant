@@ -160,6 +160,88 @@ class TestJobURLSafety(unittest.TestCase):
             with self.assertRaises(FileTooLargeError):
                 self.fetcher.fetch_job_url("https://careers.example.com/massive-page")
 
+    def test_ssrf_ipv4_mapped_ipv6_blocked(self):
+        """IPv4-mapped IPv6 representations of loopback, private, and metadata IPs are strictly blocked."""
+        mapped_urls = [
+            "http://[::ffff:127.0.0.1]/admin",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:10.0.0.1]/intranet",
+            "http://[::ffff:192.168.1.1]/gateway",
+        ]
+        for url in mapped_urls:
+            with self.assertRaises(UnsafeURLError):
+                self.validator.validate_url(url)
+
+    def test_connection_pinning_adapter_attaches_validated_ip(self):
+        """PinnedHTTPAdapter correctly propagates the pinned public IP to its connection pools."""
+        from src.scraper.url_fetcher import PinnedHTTPAdapter
+        adapter = PinnedHTTPAdapter(pinned_ip="93.184.216.34")
+        adapter.init_poolmanager(connections=2, maxsize=2)
+        pool = adapter.poolmanager.connection_from_host("example.com", scheme="https", port=443)
+        self.assertEqual(pool.pinned_ip, "93.184.216.34")
+        conn = pool._new_conn()
+        self.assertEqual(conn.pinned_ip, "93.184.216.34")
+        # Ensure host is preserved for TLS SNI and cert check
+        self.assertEqual(conn.host, "example.com")
+
+    def test_session_trust_env_disabled(self):
+        """Requests session enforces trust_env=False to prevent ambient proxy SSRF bypasses."""
+        with patch("requests.Session") as mock_session_cls:
+            mock_session = MagicMock()
+            mock_session_cls.return_value.__enter__.return_value = mock_session
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.headers = {"Content-Type": "text/html"}
+            mock_resp.encoding = "utf-8"
+            mock_resp.iter_content = MagicMock(return_value=[b"<html><title>Job</title><body>Clean Job</body></html>"])
+            mock_session.get.return_value = mock_resp
+
+            self.fetcher.fetch_job_url("https://jobs.example.com/posting/1")
+            self.assertFalse(mock_session.trust_env)
+
+    def test_response_lifecycle_closed_on_success_and_error(self):
+        """Responses are deterministically closed on success, redirects, and error paths."""
+        # 1. Success path closes response
+        with patch("requests.Session.get") as mock_get:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.headers = {"Content-Type": "text/html"}
+            mock_resp.encoding = "utf-8"
+            mock_resp.iter_content = MagicMock(return_value=[b"<html><body>Engineer at Acme</body></html>"])
+            mock_get.return_value = mock_resp
+
+            self.fetcher.fetch_job_url("https://jobs.example.com/posting/1")
+            mock_resp.close.assert_called()
+
+        # 2. Redirect path closes original response
+        with patch("requests.Session.get") as mock_get:
+            redirect_resp = MagicMock()
+            redirect_resp.status_code = 301
+            redirect_resp.headers = {"Location": "https://jobs.example.com/posting/2"}
+
+            final_resp = MagicMock()
+            final_resp.status_code = 200
+            final_resp.headers = {"Content-Type": "text/html"}
+            final_resp.encoding = "utf-8"
+            final_resp.iter_content = MagicMock(return_value=[b"<html><body>Content</body></html>"])
+
+            mock_get.side_effect = [redirect_resp, final_resp]
+
+            self.fetcher.fetch_job_url("https://jobs.example.com/posting/1")
+            redirect_resp.close.assert_called()
+            final_resp.close.assert_called()
+
+        # 3. Error path (e.g. 403 Forbidden) closes response
+        with patch("requests.Session.get") as mock_get:
+            err_resp = MagicMock()
+            err_resp.status_code = 403
+            err_resp.headers = {"Content-Type": "text/html"}
+            mock_get.return_value = err_resp
+
+            with self.assertRaises(URLFetchRestrictedError):
+                self.fetcher.fetch_job_url("https://jobs.example.com/posting/protected")
+            err_resp.close.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -802,7 +802,9 @@ class DashboardService:
     def delete_user_job_description(self, user_id: int, jd_id: int) -> Tuple[bool, str]:
         """Deletes or archives a user's job description snapshot."""
         try:
-            self.db.delete_job_description(jd_id=jd_id, user_id=user_id)
+            res = self.db.delete_job_description(jd_id=jd_id, user_id=user_id)
+            if isinstance(res, dict) and res.get("action") == "archived":
+                return True, res.get("message", f"Job description #{jd_id} archived because it is linked to active applications or matches.")
             return True, f"Job description #{jd_id} deleted successfully."
         except Exception as e:
             self.logger.warning("Failed to delete JD #%d for user %d: %s", jd_id, user_id, e)

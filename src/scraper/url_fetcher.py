@@ -7,11 +7,17 @@ redirect validation, size caps, timeouts, and automated anti-bot restriction det
 from dataclasses import dataclass
 import json
 import re
+import socket
 from typing import Dict, List, Optional
 import urllib.parse
 
 from bs4 import BeautifulSoup
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.connectionpool import HTTPConnectionPool, HTTPSConnectionPool
+from urllib3.exceptions import ConnectTimeoutError, NameResolutionError, NewConnectionError
+from urllib3.util import connection
 
 from src.database.exceptions import (
     FileTooLargeError,
@@ -53,6 +59,139 @@ RESTRICTION_SIGNATURES = [
 ]
 
 
+class PinnedHTTPConnection(HTTPConnection):
+    """HTTPConnection that connects directly to pre-validated pinned_ip."""
+    pinned_ip: Optional[str] = None
+
+    def _new_conn(self) -> socket.socket:
+        connect_host = self.pinned_ip if self.pinned_ip else self._dns_host
+        try:
+            sock = connection.create_connection(
+                (connect_host, self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except socket.gaierror as e:
+            raise NameResolutionError(self.host, self, e) from e
+        except (TimeoutError, socket.timeout) as e:
+            raise ConnectTimeoutError(
+                self,
+                f"Connection to {self.host} timed out. (connect timeout={self.timeout})",
+            ) from e
+        except OSError as e:
+            raise NewConnectionError(
+                self, f"Failed to establish a new connection: {e}"
+            ) from e
+
+        # Secondary defense: inspect actual peer IP of the connected socket
+        try:
+            peer_ip = sock.getpeername()[0]
+            if URLSafetyValidator.is_ip_str_private_or_restricted(peer_ip):
+                sock.close()
+                raise UnsafeURLError(
+                    f"Outbound connection terminated: peer IP '{peer_ip}' is private or restricted."
+                )
+        except UnsafeURLError:
+            raise
+        except Exception:
+            pass
+
+        return sock
+
+
+class PinnedHTTPSConnection(HTTPSConnection):
+    """HTTPSConnection that connects directly to pre-validated pinned_ip while preserving SNI and TLS cert validation."""
+    pinned_ip: Optional[str] = None
+
+    def _new_conn(self) -> socket.socket:
+        connect_host = self.pinned_ip if self.pinned_ip else self._dns_host
+        try:
+            sock = connection.create_connection(
+                (connect_host, self.port),
+                self.timeout,
+                source_address=self.source_address,
+                socket_options=self.socket_options,
+            )
+        except socket.gaierror as e:
+            raise NameResolutionError(self.host, self, e) from e
+        except (TimeoutError, socket.timeout) as e:
+            raise ConnectTimeoutError(
+                self,
+                f"Connection to {self.host} timed out. (connect timeout={self.timeout})",
+            ) from e
+        except OSError as e:
+            raise NewConnectionError(
+                self, f"Failed to establish a new connection: {e}"
+            ) from e
+
+        # Secondary defense: inspect actual peer IP of the connected socket
+        try:
+            peer_ip = sock.getpeername()[0]
+            if URLSafetyValidator.is_ip_str_private_or_restricted(peer_ip):
+                sock.close()
+                raise UnsafeURLError(
+                    f"Outbound connection terminated: peer IP '{peer_ip}' is private or restricted."
+                )
+        except UnsafeURLError:
+            raise
+        except Exception:
+            pass
+
+        return sock
+
+
+class PinnedHTTPConnectionPool(HTTPConnectionPool):
+    ConnectionCls = PinnedHTTPConnection
+    pinned_ip: Optional[str] = None
+
+    def _new_conn(self):
+        conn = super()._new_conn()
+        conn.pinned_ip = self.pinned_ip  # type: ignore[attr-defined]
+        return conn
+
+
+class PinnedHTTPSConnectionPool(HTTPSConnectionPool):
+    ConnectionCls = PinnedHTTPSConnection
+    pinned_ip: Optional[str] = None
+
+    def _new_conn(self):
+        conn = super()._new_conn()
+        conn.pinned_ip = self.pinned_ip  # type: ignore[attr-defined]
+        return conn
+
+
+class PinnedHTTPAdapter(HTTPAdapter):
+    """Custom HTTP adapter that pins TCP connections to a pre-validated public IP address.
+    
+    Guarantees that DNS resolution performed by URLSafetyValidator is the exact address
+    used by the socket connection, completely eliminating DNS rebinding (TOCTOU).
+    Preserves TLS SNI, host header, and certificate verification.
+    """
+
+    def __init__(self, pinned_ip: str, **kwargs):
+        self.pinned_ip = pinned_ip
+        super().__init__(**kwargs)
+
+    def init_poolmanager(self, connections: int, maxsize: int, block: bool = False, **pool_kwargs) -> None:
+        super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+        
+        pinned_ip = self.pinned_ip
+
+        class BoundHTTPConnectionPool(PinnedHTTPConnectionPool):
+            pass
+        BoundHTTPConnectionPool.pinned_ip = pinned_ip
+
+        class BoundHTTPSConnectionPool(PinnedHTTPSConnectionPool):
+            pass
+        BoundHTTPSConnectionPool.pinned_ip = pinned_ip
+
+        self.poolmanager.pool_classes_by_scheme = {
+            "http": BoundHTTPConnectionPool,
+            "https": BoundHTTPSConnectionPool,
+        }
+
+
 @dataclass
 class FetchedJobContent:
     """Represents safely fetched job web page content and metadata."""
@@ -84,7 +223,7 @@ class URLJobFetcher:
         self.max_bytes = max_bytes
 
     def fetch_job_url(self, target_url: str) -> FetchedJobContent:
-        """Safely fetches a job listing URL with complete SSRF and redirect validation.
+        """Safely fetches a job listing URL with complete SSRF defense, connection pinning, and anti-bot handling.
 
         Args:
             target_url: Public URL of the job listing.
@@ -98,8 +237,8 @@ class URLJobFetcher:
             FileTooLargeError: If response body exceeds 5 MB.
             InvalidFileFormatError: If response is a binary/unsupported media type.
         """
-        # 1. Validate initial target URL
-        current_url = URLSafetyValidator.validate_url(target_url)
+        # 1. Pre-validate and resolve initial target URL to pinned IP
+        current_url, hostname, port, pinned_ip = URLSafetyValidator.validate_and_resolve_destination(target_url)
 
         headers = {
             "User-Agent": USER_AGENT,
@@ -111,8 +250,15 @@ class URLJobFetcher:
         final_response: Optional[requests.Response] = None
 
         with requests.Session() as session:
-            # We manage redirects manually to validate every hop against SSRF
+            # Guarantee no ambient proxy interference (prevent proxy bypass of SSRF validation)
+            session.trust_env = False
+
             while redirect_count <= self.max_redirects:
+                # Mount pinned adapter for the validated IP
+                adapter = PinnedHTTPAdapter(pinned_ip=pinned_ip)
+                session.mount("http://", adapter)
+                session.mount("https://", adapter)
+
                 try:
                     resp = session.get(
                         current_url,
@@ -131,6 +277,7 @@ class URLJobFetcher:
 
                 # Check for redirect status codes
                 if resp.status_code in (301, 302, 303, 307, 308):
+                    resp.close()  # Immediately close redirect response
                     redirect_count += 1
                     if redirect_count > self.max_redirects:
                         raise UnsafeURLError(f"Too many redirects (exceeded limit of {self.max_redirects}).")
@@ -139,10 +286,10 @@ class URLJobFetcher:
                     if not location:
                         raise UnsafeURLError("Redirect response missing Location header.")
 
-                    # Resolve relative redirect URLs against current URL
                     resolved_url = urllib.parse.urljoin(current_url, location)
                     logger.info(f"Validating redirect #{redirect_count} from '{current_url}' to '{resolved_url}'")
-                    current_url = URLSafetyValidator.validate_url(resolved_url)
+                    # Validate redirect target and resolve new pinned IP
+                    current_url, hostname, port, pinned_ip = URLSafetyValidator.validate_and_resolve_destination(resolved_url)
                     continue
 
                 final_response = resp
@@ -151,74 +298,77 @@ class URLJobFetcher:
         if final_response is None:
             raise UnsafeURLError("Failed to establish safe HTTP connection.")
 
-        # 2. Check HTTP status code for anti-bot / permissions
-        status_code = final_response.status_code
-        if status_code in (401, 403, 429):
-            reason = {
-                401: "Authentication Required",
-                403: "Access Forbidden / Bot Protection Active",
-                429: "Rate Limit Exceeded",
-            }.get(status_code, "Access Restricted")
-
-            logger.warning(f"Access restricted (HTTP {status_code}) on '{current_url}': {reason}")
-            raise URLFetchRestrictedError(
-                f"Automated access was restricted by the host (HTTP {status_code}: {reason}). "
-                "Please inspect the job listing in your browser and paste the job description text directly.",
-                official_url=current_url,
-                restriction_type=f"HTTP_{status_code}",
-            )
-        elif status_code >= 400:
-            raise URLFetchRestrictedError(
-                f"Job posting page returned HTTP error {status_code}. "
-                "Please verify the URL or paste the job description text manually.",
-                official_url=current_url,
-                restriction_type=f"HTTP_{status_code}",
-            )
-
-        # 3. Validate Content-Type
-        content_type_header = final_response.headers.get("Content-Type", "").lower()
-        if not any(allowed in content_type_header for allowed in ALLOWED_CONTENT_TYPES):
-            logger.warning(f"Unsupported content type '{content_type_header}' from '{current_url}'")
-            raise InvalidFileFormatError(
-                f"URL returned unsupported content type '{content_type_header}'. "
-                "Expected HTML, plain text, or JSON."
-            )
-
-        # 4. Stream response body enforcing max size limit
-        chunks: List[bytes] = []
-        downloaded_bytes = 0
-
-        for chunk in final_response.iter_content(chunk_size=8192):
-            if chunk:
-                chunks.append(chunk)
-                downloaded_bytes += len(chunk)
-                if downloaded_bytes > self.max_bytes:
-                    raise FileTooLargeError(
-                        f"Job page content exceeds maximum allowed download limit of {self.max_bytes // (1024 * 1024)} MB."
-                    )
-
-        raw_bytes = b"".join(chunks)
-
-        # Determine encoding
-        encoding = final_response.encoding or "utf-8"
         try:
-            body_text = raw_bytes.decode(encoding, errors="replace")
-        except Exception:
-            body_text = raw_bytes.decode("utf-8", errors="replace")
+            # 2. Check HTTP status code for anti-bot / permissions
+            status_code = final_response.status_code
+            if status_code in (401, 403, 429):
+                reason = {
+                    401: "Authentication Required",
+                    403: "Access Forbidden / Bot Protection Active",
+                    429: "Rate Limit Exceeded",
+                }.get(status_code, "Access Restricted")
 
-        # 5. Check response content for anti-bot signatures and login walls
-        for pattern, label in RESTRICTION_SIGNATURES:
-            if pattern.search(body_text):
-                logger.warning(f"Anti-bot restriction detected on '{current_url}': {label}")
+                logger.warning(f"Access restricted (HTTP {status_code}) on '{current_url}': {reason}")
                 raise URLFetchRestrictedError(
-                    f"Job page triggered automated protection ({label}). "
-                    "Please open the URL in your browser and paste the job description text directly.",
+                    f"Automated access was restricted by the host (HTTP {status_code}: {reason}). "
+                    "Please inspect the job listing in your browser and paste the job description text directly.",
                     official_url=current_url,
-                    restriction_type=label,
+                    restriction_type=f"HTTP_{status_code}",
+                )
+            elif status_code >= 400:
+                raise URLFetchRestrictedError(
+                    f"Job posting page returned HTTP error {status_code}. "
+                    "Please verify the URL or paste the job description text manually.",
+                    official_url=current_url,
+                    restriction_type=f"HTTP_{status_code}",
                 )
 
-        # 6. Parse structured metadata and extract visible job text
-        return self._extract_job_content(current_url, body_text, content_type_header, status_code)
+            # 3. Validate Content-Type
+            content_type_header = final_response.headers.get("Content-Type", "").lower()
+            if not any(allowed in content_type_header for allowed in ALLOWED_CONTENT_TYPES):
+                logger.warning(f"Unsupported content type '{content_type_header}' from '{current_url}'")
+                raise InvalidFileFormatError(
+                    f"URL returned unsupported content type '{content_type_header}'. "
+                    "Expected HTML, plain text, or JSON."
+                )
+
+            # 4. Stream response body enforcing max size limit
+            chunks: List[bytes] = []
+            downloaded_bytes = 0
+
+            for chunk in final_response.iter_content(chunk_size=8192):
+                if chunk:
+                    chunks.append(chunk)
+                    downloaded_bytes += len(chunk)
+                    if downloaded_bytes > self.max_bytes:
+                        raise FileTooLargeError(
+                            f"Job page content exceeds maximum allowed download limit of {self.max_bytes // (1024 * 1024)} MB."
+                        )
+
+            raw_bytes = b"".join(chunks)
+
+            # Determine encoding
+            encoding = final_response.encoding or "utf-8"
+            try:
+                body_text = raw_bytes.decode(encoding, errors="replace")
+            except Exception:
+                body_text = raw_bytes.decode("utf-8", errors="replace")
+
+            # 5. Check response content for anti-bot signatures and login walls
+            for pattern, label in RESTRICTION_SIGNATURES:
+                if pattern.search(body_text):
+                    logger.warning(f"Anti-bot restriction detected on '{current_url}': {label}")
+                    raise URLFetchRestrictedError(
+                        f"Job page triggered automated protection ({label}). "
+                        "Please open the URL in your browser and paste the job description text directly.",
+                        official_url=current_url,
+                        restriction_type=label,
+                    )
+
+            # 6. Parse structured metadata and extract visible job text
+            return self._extract_job_content(current_url, body_text, content_type_header, status_code)
+        finally:
+            final_response.close()
 
     def _extract_job_content(
         self,

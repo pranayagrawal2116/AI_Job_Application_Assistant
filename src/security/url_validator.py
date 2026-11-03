@@ -38,15 +38,23 @@ BLOCKED_DOMAIN_SUFFIXES = (
 
 # Custom private/restricted networks beyond standard ipaddress checks
 EXTRA_BLOCKED_NETWORKS = [
-    ipaddress.ip_network("100.64.0.0/10"),     # Shared Address Space (Carrier-Grade NAT)
-    ipaddress.ip_network("198.18.0.0/15"),     # Benchmarking
-    ipaddress.ip_network("192.0.0.0/24"),      # IETF Protocol Assignments
-    ipaddress.ip_network("192.0.2.0/24"),      # Documentation (TEST-NET-1)
-    ipaddress.ip_network("198.51.100.0/24"),   # Documentation (TEST-NET-2)
-    ipaddress.ip_network("203.0.113.0/24"),    # Documentation (TEST-NET-3)
-    ipaddress.ip_network("240.0.0.0/4"),       # Reserved for Future Use
+    ipaddress.ip_network("0.0.0.0/8"),          # Current network ("this" network)
+    ipaddress.ip_network("10.0.0.0/8"),         # RFC 1918 Private
+    ipaddress.ip_network("100.64.0.0/10"),      # Shared Address Space (Carrier-Grade NAT)
+    ipaddress.ip_network("127.0.0.0/8"),        # Loopback
+    ipaddress.ip_network("169.254.0.0/16"),     # Link-Local (including 169.254.169.254)
+    ipaddress.ip_network("172.16.0.0/12"),      # RFC 1918 Private
+    ipaddress.ip_network("192.0.0.0/24"),       # IETF Protocol Assignments
+    ipaddress.ip_network("192.0.2.0/24"),       # Documentation (TEST-NET-1)
+    ipaddress.ip_network("192.168.0.0/16"),     # RFC 1918 Private
+    ipaddress.ip_network("198.18.0.0/15"),      # Benchmarking
+    ipaddress.ip_network("198.51.100.0/24"),    # Documentation (TEST-NET-2)
+    ipaddress.ip_network("203.0.113.0/24"),     # Documentation (TEST-NET-3)
+    ipaddress.ip_network("240.0.0.0/4"),        # Reserved for Future Use
     ipaddress.ip_network("255.255.255.255/32"), # Limited Broadcast
-    ipaddress.ip_network("169.254.169.254/32"), # Cloud Metadata Endpoint
+    ipaddress.ip_network("::1/128"),            # IPv6 Loopback
+    ipaddress.ip_network("fc00::/7"),           # IPv6 Unique Local
+    ipaddress.ip_network("fe80::/10"),          # IPv6 Link-Local
 ]
 
 
@@ -56,6 +64,10 @@ class URLSafetyValidator:
     @classmethod
     def is_ip_private_or_restricted(cls, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         """Determines whether an IP address is private, loopback, link-local, or restricted."""
+        # Check global routability first
+        if not ip.is_global:
+            return True
+
         # Standard library properties
         if (
             ip.is_private
@@ -67,12 +79,34 @@ class URLSafetyValidator:
         ):
             return True
 
+        # Check IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1, ::ffff:169.254.169.254)
+        ipv4_mapped = getattr(ip, "ipv4_mapped", None)
+        if ipv4_mapped is not None and cls.is_ip_private_or_restricted(ipv4_mapped):
+            return True
+
         # Check against explicitly restricted network ranges
         for net in EXTRA_BLOCKED_NETWORKS:
-            if ip in net:
-                return True
+            try:
+                if ip in net:
+                    return True
+            except TypeError:
+                continue
 
         return False
+
+    @classmethod
+    def is_ip_str_private_or_restricted(cls, ip_str: str) -> bool:
+        """Determines whether an IP address string is private or restricted.
+        
+        Fails closed (returns True) if the string is empty or cannot be parsed as a valid IP.
+        """
+        if not ip_str or not isinstance(ip_str, str):
+            return True
+        try:
+            ip_obj = ipaddress.ip_address(ip_str.strip())
+            return cls.is_ip_private_or_restricted(ip_obj)
+        except ValueError:
+            return True
 
     @classmethod
     def resolve_and_validate_hostname(cls, hostname: str, port: int = 80) -> List[str]:
@@ -106,6 +140,45 @@ class URLSafetyValidator:
                 resolved_ips.append(ip_str)
 
         return resolved_ips
+
+    @classmethod
+    def validate_and_resolve_destination(cls, url: str) -> tuple[str, str, int, str]:
+        """Validates a user-supplied URL and pre-resolves it to a validated public IP.
+
+        Enforces SSRF boundary checks, port restrictions, hostname validation, and
+        pre-resolves destination IP for connection pinning.
+
+        Returns:
+            Tuple of (clean_url, hostname, port, pinned_ip)
+
+        Raises:
+            UnsafeURLError: If the URL or any resolved IP violates security constraints.
+        """
+        clean_url = cls.validate_url(url)
+        parsed = urllib.parse.urlparse(clean_url)
+        hostname = parsed.hostname
+        if not hostname:
+            raise UnsafeURLError("URL must contain a valid hostname.")
+
+        hostname_lower = hostname.lower().strip(".")
+        port = parsed.port or (443 if parsed.scheme.lower() == "https" else 80)
+
+        # Check if hostname is an IP literal
+        try:
+            ip_obj = ipaddress.ip_address(hostname_lower)
+            if cls.is_ip_private_or_restricted(ip_obj):
+                raise UnsafeURLError(
+                    f"Access to private, loopback, or non-routable IP address '{hostname}' is prohibited."
+                )
+            pinned_ip = str(ip_obj)
+        except ValueError:
+            # Domain name: resolve via DNS and select first validated public IP
+            resolved_ips = cls.resolve_and_validate_hostname(hostname_lower, port)
+            if not resolved_ips:
+                raise UnsafeURLError(f"DNS resolution returned no valid public IP records for '{hostname}'.")
+            pinned_ip = resolved_ips[0]
+
+        return clean_url, hostname_lower, port, pinned_ip
 
     @classmethod
     def validate_url(cls, url: str) -> str:

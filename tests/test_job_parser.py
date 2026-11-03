@@ -203,6 +203,8 @@ class TestJobParser(unittest.TestCase):
 
         self.assertIn("Operations Coordinator", parsed.job_title)
         self.assertIn("Vanguard Logistics", parsed.company_name)
+        # Undisclosed employment type
+        self.assertIsNone(parsed.employment_type)
         # Undisclosed compensation
         self.assertFalse(parsed.compensation_disclosed)
         self.assertIsNone(parsed.salary_min)
@@ -212,6 +214,39 @@ class TestJobParser(unittest.TestCase):
         self.assertIsNone(parsed.max_years_experience)
         # Undisclosed cutoff
         self.assertIsNone(parsed.min_gpa_or_percentage)
+
+    def test_undisclosed_fields_and_missing_employment_type(self):
+        """Zero fabrication: employment_type defaults to None when unstated, along with salary and experience."""
+        text = """
+        Operations tasks including inventory tracking, logistics coordination, and driver communication.
+        Requires high school diploma or equivalent.
+        """
+        parsed = self.parser.parse_job_description(text, source="test_unstated")
+        self.assertIsNone(parsed.employment_type)
+        self.assertIsNone(parsed.salary_min)
+        self.assertIsNone(parsed.salary_max)
+        self.assertIsNone(parsed.min_years_experience)
+        self.assertEqual(parsed.field_provenance["employment_type"].verification_status, "NOT_FOUND")
+        self.assertEqual(parsed.field_provenance["employment_type"].confidence, 0.0)
+
+    def test_filename_hints_marked_needs_review(self):
+        """Filename-derived hints are not treated as verified facts and receive lower confidence with NEEDS_REVIEW."""
+        text = """
+        Looking for someone to help with daily office administrative duties and answering phones.
+        Requirements: basic computer skills.
+        """
+        parsed = self.parser.parse_job_description(
+            text,
+            hint_title="Executive Assistant",
+            hint_company="Fictional Enterprises",
+            source="upload",
+        )
+        self.assertEqual(parsed.job_title, "Executive Assistant")
+        self.assertEqual(parsed.company_name, "Fictional Enterprises")
+        self.assertEqual(parsed.field_provenance["job_title"].verification_status, "NEEDS_REVIEW")
+        self.assertEqual(parsed.field_provenance["job_title"].confidence, 0.4)
+        self.assertEqual(parsed.field_provenance["company_name"].verification_status, "NEEDS_REVIEW")
+        self.assertEqual(parsed.field_provenance["company_name"].confidence, 0.4)
 
     def test_passive_untrusted_data_prompt_injection_resistance(self):
         """Ensures prompt injections in job descriptions are treated strictly as passive text."""

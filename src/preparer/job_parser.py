@@ -102,7 +102,7 @@ class StructuredJobDescription:
     specific_domain_experience: List[str] = field(default_factory=list)
 
     # Employment & Schedule
-    employment_type: str = "Full-time"
+    employment_type: Optional[str] = None
     internship_duration: Optional[str] = None
     shift_schedule: Optional[str] = None
 
@@ -360,21 +360,46 @@ class JobParser:
 
         # 2. Extract Title and Company
         job_title, company_name = self._extract_identity(clean_text, sections, hint_title, hint_company)
+
+        is_title_from_hint = bool(hint_title and job_title == hint_title.strip())
+        is_company_from_hint = bool(hint_company and company_name == hint_company.strip())
+
+        if not job_title:
+            title_status = VerificationStatus.NOT_FOUND
+            title_conf = 0.0
+        elif is_title_from_hint and (job_title.lower() not in clean_text.lower()):
+            title_status = VerificationStatus.NEEDS_REVIEW
+            title_conf = 0.4
+        else:
+            title_status = VerificationStatus.EXTRACTED_UNVERIFIED
+            title_conf = 0.9
+
         provenance["job_title"] = JobProvenanceField(
             value=job_title,
             source=source,
-            source_section="HEADER" if not hint_title else "HINT_OR_HEADER",
+            source_section="HEADER" if not is_title_from_hint else "FILENAME_OR_HINT",
             source_text=job_title or "",
-            confidence=0.9 if job_title else 0.3,
-            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if job_title else VerificationStatus.NEEDS_REVIEW,
+            confidence=title_conf,
+            verification_status=title_status,
         )
+
+        if not company_name:
+            comp_status = VerificationStatus.NOT_FOUND
+            comp_conf = 0.0
+        elif is_company_from_hint and (company_name.lower() not in clean_text.lower()):
+            comp_status = VerificationStatus.NEEDS_REVIEW
+            comp_conf = 0.4
+        else:
+            comp_status = VerificationStatus.EXTRACTED_UNVERIFIED
+            comp_conf = 0.85
+
         provenance["company_name"] = JobProvenanceField(
             value=company_name,
             source=source,
-            source_section="HEADER" if not hint_company else "HINT_OR_HEADER",
+            source_section="HEADER" if not is_company_from_hint else "FILENAME_OR_HINT",
             source_text=company_name or "",
-            confidence=0.85 if company_name else 0.3,
-            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if company_name else VerificationStatus.NEEDS_REVIEW,
+            confidence=comp_conf,
+            verification_status=comp_status,
         )
 
         # 3. Extract Summary and Responsibilities
@@ -441,24 +466,32 @@ class JobParser:
             source=source,
             source_section="EXPERIENCE",
             source_text=f"min: {min_years}" if min_years is not None else "undisclosed",
-            confidence=0.9 if min_years is not None else 1.0,
-            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED,
+            confidence=0.9 if min_years is not None else 0.0,
+            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if min_years is not None else VerificationStatus.NOT_FOUND,
         )
         provenance["compensation"] = JobProvenanceField(
             value=comp_info["raw_text"],
             source=source,
             source_section="BENEFITS",
             source_text=comp_info["raw_text"] or "Undisclosed",
-            confidence=0.9 if comp_info["disclosed"] else 1.0,
-            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED,
+            confidence=0.9 if comp_info["disclosed"] else 0.0,
+            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if comp_info["disclosed"] else VerificationStatus.NOT_FOUND,
         )
         provenance["location"] = JobProvenanceField(
             value=location,
             source=source,
             source_section="LOCATION",
             source_text=location or "Undisclosed",
-            confidence=0.85 if location else 0.5,
-            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if location else VerificationStatus.NEEDS_REVIEW,
+            confidence=0.85 if location else 0.0,
+            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if location else VerificationStatus.NOT_FOUND,
+        )
+        provenance["employment_type"] = JobProvenanceField(
+            value=emp_type,
+            source=source,
+            source_section="SCHEDULE",
+            source_text=emp_type or "Undisclosed",
+            confidence=0.9 if emp_type else 0.0,
+            verification_status=VerificationStatus.EXTRACTED_UNVERIFIED if emp_type else VerificationStatus.NOT_FOUND,
         )
 
         # Compute overall extraction confidence
@@ -803,13 +836,15 @@ class JobParser:
         self,
         sections: Dict[str, str],
         full_text: str,
-    ) -> Tuple[str, Optional[str], Optional[str]]:
+    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
         """Extracts employment type (full-time, part-time, internship), duration, and shift."""
-        emp_type = "Full-time"
+        emp_type: Optional[str] = None
         if re.search(r"\bintern(?:ship)?\b", full_text, re.IGNORECASE):
             emp_type = "Internship"
         elif re.search(r"\bpart[- ]time\b", full_text, re.IGNORECASE):
             emp_type = "Part-time"
+        elif re.search(r"\bfull[- ]time\b", full_text, re.IGNORECASE):
+            emp_type = "Full-time"
         elif re.search(r"\bcontract(?:or)?\b", full_text, re.IGNORECASE):
             emp_type = "Contract"
         elif re.search(r"\btemporary\b", full_text, re.IGNORECASE):
