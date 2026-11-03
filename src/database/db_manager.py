@@ -1952,6 +1952,80 @@ class DatabaseManager:
             cursor.execute(query, params)
             return [Application(**dict(row)) for row in cursor.fetchall()]
 
+    def get_or_create_application_workspace(
+        self,
+        user_id: int,
+        job_description_id: int,
+        resume_id: Optional[int] = None,
+    ) -> Application:
+        """Finds an existing application for this user and job_description_id or creates a new one,
+        avoiding duplicate application records when reopening preparation.
+        """
+        # Validate JD belongs to user
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT id, user_id, job_title, company_name FROM job_descriptions WHERE id = ?",
+                (job_description_id,),
+            )
+            jd_row = cursor.fetchone()
+            if not jd_row:
+                raise ValidationError(f"JobDescription #{job_description_id} not found.")
+            if jd_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=jd_row["user_id"],
+                    resource=f"JobDescription #{job_description_id}",
+                )
+
+            # Check for existing application
+            cursor.execute(
+                """
+                SELECT * FROM applications
+                WHERE user_id = ? AND job_description_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id, job_description_id),
+            )
+            existing = cursor.fetchone()
+            if existing:
+                app = Application(**dict(existing))
+                # Update resume_id if provided and different
+                if resume_id is not None and app.resume_id != resume_id:
+                    with self.transaction() as tconn:
+                        tcursor = tconn.cursor()
+                        tcursor.execute(
+                            "UPDATE applications SET resume_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+                            (resume_id, app.id, user_id),
+                        )
+                        tcursor.execute("SELECT * FROM applications WHERE id = ?", (app.id,))
+                        return Application(**dict(tcursor.fetchone()))
+                return app
+
+        # Create new application record
+        company = jd_row["company_name"] or "Target Organization"
+        title = jd_row["job_title"] or "Target Role"
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO applications (
+                    user_id, company_name, job_title, job_description_id, resume_id, status
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    company.strip(),
+                    title.strip(),
+                    job_description_id,
+                    resume_id,
+                    ApplicationStatus.UNDER_REVIEW.value,
+                ),
+            )
+            new_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (new_id,))
+            return Application(**dict(cursor.fetchone()))
+
     # -------------------------------------------------------------------------
     # PHASE 2: USER-SCOPED RESUMES
     # -------------------------------------------------------------------------

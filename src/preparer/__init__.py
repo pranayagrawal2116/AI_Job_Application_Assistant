@@ -1,7 +1,19 @@
-"""Preparer package: Resume parsing, job alignment, cover letter generation, question answering, and human approval."""
+"""Preparer package: Universal Resume parsing, job alignment, tailored resumes,
+cover letters, screening questions, document generation, and human approval.
+"""
 
 from src.preparer.approval_gate import ApplicationReviewPacket, HumanApprovalGate
-from src.preparer.cover_letter_generator import CoverLetterGenerator
+from src.preparer.cover_letter_generator import (
+    CareerLevel,
+    CoverLetter,
+    CoverLetterGenerator,
+    LetterTone,
+)
+from src.preparer.document_generator import (
+    DocumentTemplate,
+    GeneratedDocument,
+    UniversalDocumentGenerator,
+)
 from src.preparer.form_prefiller import FormFieldMapping, FormFillPlan, FormPrefiller
 from src.preparer.job_parser import (
     JobParser,
@@ -10,7 +22,13 @@ from src.preparer.job_parser import (
     StructuredJobDescription,
 )
 from src.preparer.profile_updater import ProfileUpdater
-from src.preparer.question_answerer import QuestionAnswerer
+from src.preparer.question_answerer import (
+    AnswerState,
+    QuestionAnswerer,
+    QuestionCategory,
+    ScreeningQAPacket,
+    ScreeningQuestion,
+)
 from src.preparer.resume_matcher import JobAlignment, ResumeJobMatcher
 from src.preparer.resume_parser import (
     EducationEntry,
@@ -18,6 +36,15 @@ from src.preparer.resume_parser import (
     ParsedResume,
     ProjectEntry,
     ResumeParser,
+)
+from src.preparer.tailored_resume_generator import (
+    ClaimProvenance,
+    TailoredBullet,
+    TailoredEducation,
+    TailoredExperience,
+    TailoredProject,
+    TailoredResume,
+    UniversalTailoredResumeGenerator,
 )
 
 __all__ = [
@@ -30,7 +57,14 @@ __all__ = [
     "ResumeJobMatcher",
     "JobAlignment",
     "CoverLetterGenerator",
+    "CoverLetter",
+    "LetterTone",
+    "CareerLevel",
     "QuestionAnswerer",
+    "ScreeningQuestion",
+    "ScreeningQAPacket",
+    "QuestionCategory",
+    "AnswerState",
     "FormPrefiller",
     "FormFieldMapping",
     "FormFillPlan",
@@ -40,4 +74,14 @@ __all__ = [
     "StructuredJobDescription",
     "JobProvenanceField",
     "RequirementClassification",
+    "TailoredResume",
+    "UniversalTailoredResumeGenerator",
+    "ClaimProvenance",
+    "TailoredBullet",
+    "TailoredExperience",
+    "TailoredEducation",
+    "TailoredProject",
+    "UniversalDocumentGenerator",
+    "DocumentTemplate",
+    "GeneratedDocument",
 ]

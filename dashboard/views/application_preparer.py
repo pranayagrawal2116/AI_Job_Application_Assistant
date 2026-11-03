@@ -1,481 +1,596 @@
-"""Application Preparer View: Resume parsing, job alignment, cover letter editing, screening questions, and human approval."""
+"""Application Preparer View: Universal multi-user resume tailoring, cover letter drafting,
+screening question assistance, document generation, and human approval workflow.
+"""
+
+from __future__ import annotations
 
 from pathlib import Path
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
 from src.database.models import ApplicationStatus
+from src.preparer.cover_letter_generator import CareerLevel, LetterTone
+from src.preparer.document_generator import DocumentTemplate
+from src.preparer.question_answerer import AnswerState, ScreeningQAPacket
+from src.preparer.tailored_resume_generator import TailoredResume
+
+
+def get_current_user_id() -> int:
+    """Returns the authenticated user_id from session state."""
+    return st.session_state.get("authenticated_user_id") or st.session_state.get("user_id") or 1
 
 
 def render_application_preparer():
-    """Renders the end-to-end Application Preparation and Human Approval Interface."""
-    st.markdown("## ✍️ Application Preparation & Human Approval Engine")
-    st.caption("Parse verified resumes, align job requirements, customize cover letters, prepare screening answers, and authorize submissions under strict human governance.")
+    """Renders the comprehensive 8-tab Universal Application Preparation & Document Generation Interface."""
+    st.markdown("## ✍️ Universal Application Preparation & Document Generator")
+    st.caption(
+        "Prepare role-specific, ATS-optimized application materials for any profession. "
+        "Strict zero-hallucination policy with claim-level auditability under human governance."
+    )
 
     service = DashboardService.get_instance()
-    df_jobs = service.get_all_jobs_df()
+    user_id = get_current_user_id()
 
-    tab_resume, tab_inputs, tab_align, tab_cover, tab_qa, tab_approval, tab_history = st.tabs([
-        "📄 Resume Management",
-        "📋 Candidate Inputs & Logistics",
-        "🎯 Job-Resume Alignment",
+    # Load candidate's saved job descriptions and resumes
+    user_jds = service.get_user_job_descriptions(user_id=user_id)
+    user_resumes = service.get_user_resumes(user_id=user_id)
+    db_profile = service.db.get_user_candidate_profile(user_id=user_id)
+    candidate_profile = db_profile.get("profile_data", {}) if db_profile else {}
+
+    # Define 8 professional workflow tabs
+    tab_overview, tab_resume, tab_cover, tab_qa, tab_details, tab_attachments, tab_approval, tab_history = st.tabs([
+        "🎯 Overview & Selection",
+        "📄 Tailored Resume",
         "✍️ Tailored Cover Letter",
         "💬 Screening Questions",
-        "🛡️ Human Approval Gate",
-        "📜 Prepared History",
+        "📋 Application Details",
+        "📎 Attachments Manifest",
+        "🛡️ Review & Approval",
+        "📜 Packet History & Downloads",
     ])
 
     # =========================================================================
-    # TAB 1: RESUME MANAGEMENT & PARSER
+    # TAB 1: OVERVIEW & SELECTION
+    # =========================================================================
+    with tab_overview:
+        st.markdown("### 🎯 Application Workspace Setup")
+        st.caption("Select your target job opportunity, source resume, and verified credentials to initialize the workspace.")
+
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            if not user_jds:
+                st.warning("⚠️ No saved job descriptions found. Add a job description in the 'Job Analyzer & Ingestion' view first.")
+                selected_jd_id = None
+            else:
+                jd_options = {jd.id: f"{jd.company_name} — {jd.role_title} (#{jd.id})" for jd in user_jds}
+                selected_jd_id = st.selectbox(
+                    "Select Target Job Opportunity",
+                    options=list(jd_options.keys()),
+                    format_func=lambda x: jd_options[x],
+                    key="prep_selected_jd",
+                )
+
+        with col_s2:
+            if not user_resumes:
+                st.warning("⚠️ No uploaded resumes found. Upload your resume in the 'Candidate Profile' view first.")
+                selected_resume_id = None
+            else:
+                res_options = {
+                    r["id"]: f"{r['original_filename']} ({r.get('label', 'General')}) v{r.get('active_version', 1)}"
+                    for r in user_resumes
+                }
+                selected_resume_id = st.selectbox(
+                    "Select Source Resume Document",
+                    options=list(res_options.keys()),
+                    format_func=lambda x: res_options[x],
+                    key="prep_selected_resume",
+                )
+
+        if not selected_jd_id or not selected_resume_id:
+            st.info("Please select both a target job description and a source resume to begin application preparation.")
+            return
+
+        selected_jd = service.get_job_description(user_id=user_id, jd_id=selected_jd_id)
+        selected_res_meta = next((r for r in user_resumes if r["id"] == selected_resume_id), None)
+
+        # Get or create application workspace
+        app = service.get_or_create_application_workspace(
+            user_id=user_id,
+            job_description_id=selected_jd_id,
+            resume_id=selected_resume_id,
+        )
+
+        st.divider()
+
+        # Workspace Status Dashboard
+        st.markdown(f"#### 💼 Active Application: **{app.job_title}** at **{app.company_name}**")
+        c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+        with c_m1:
+            st.metric("Application ID", f"#{app.id}")
+        with c_m2:
+            st.metric("Lifecycle Status", app.status)
+        with c_m3:
+            prof_status = "VERIFIED" if candidate_profile else "EMPTY"
+            st.metric("Profile Status", prof_status)
+        with c_m4:
+            # Check latest match evaluation
+            match_history = service.get_user_match_history(
+                user_id=user_id,
+                resume_id=selected_resume_id,
+                job_description_id=selected_jd_id,
+            )
+            latest_match = match_history[0] if match_history else None
+            match_score_str = f"{latest_match.match_score:.1f} / 100" if latest_match else "Not Evaluated"
+            st.metric("Phase 5 Match Score", match_score_str)
+
+        # Application Preparation Progress Checklist
+        st.markdown("#### 📋 Application Preparation Progress")
+        ch1 = "✅ Tailored Resume Prepared" if "tailored_resume" in st.session_state else "⏳ Tailored Resume (Tab 2)"
+        ch2 = "✅ Cover Letter Drafted" if "cover_letter" in st.session_state else "⏳ Cover Letter (Tab 3)"
+        ch3 = "✅ Screening Q&A Answered" if "qa_packet" in st.session_state else "⏳ Screening Q&A (Tab 4)"
+        ch4 = "✅ Human Approved" if app.status in [ApplicationStatus.AWAITING_APPROVAL.value, ApplicationStatus.APPLIED.value] else "⏳ Review & Approval (Tab 7)"
+
+        st.write(f"- {ch1}")
+        st.write(f"- {ch2}")
+        st.write(f"- {ch3}")
+        st.write(f"- {ch4}")
+
+    # =========================================================================
+    # TAB 2: TAILORED RESUME
     # =========================================================================
     with tab_resume:
-        st.markdown("### 📄 Resume Repository & Zero-Hallucination Parser")
-        st.caption("Authoritative resume files stored in secure user-isolated directories. Only verified details are extracted.")
+        st.markdown("### 📄 Role-Specific Tailored Resume Generator")
+        st.caption(
+            "Synthesizes an ATS-optimized, factual resume highlighting relevant skills and experiences. "
+            "Never fabricates degrees, metrics, dates, or employers."
+        )
 
-        user_id = st.session_state.get("user_id", 1)
-        available_resumes = service.get_available_resumes(user_id=user_id)
-        c1, c2 = st.columns([2, 1])
+        col_t1, col_t2 = st.columns([2, 1])
+        with col_t1:
+            custom_instructions = st.text_input(
+                "Optional Tailoring Instructions",
+                placeholder="e.g. Highlight healthcare compliance experience, prioritize leadership responsibilities",
+                key="tailor_instructions",
+            )
+        with col_t2:
+            st.write("")
+            st.write("")
+            gen_resume_btn = st.button("⚡ Generate Tailored Resume", type="primary", use_container_width=True)
 
-        with c1:
-            if available_resumes:
-                selected_name = st.selectbox(
-                    "Select Active Resume Document",
-                    options=[f.name for f in available_resumes],
-                    index=0,
-                )
-                selected_path = next((f for f in available_resumes if f.name == selected_name), available_resumes[0])
-
-                col_btn1, col_btn2 = st.columns(2)
-                with col_btn1:
-                    if st.button("⚡ Parse & Synchronize Candidate Profile", type="primary"):
-                        with st.spinner("Extracting resume details..."):
-                            succ, msg, prof = service.sync_resume_file(selected_path, user_id=user_id)
-                            if succ:
-                                st.success(f"{msg} Recorded snapshot in SQLite.")
-                                st.rerun()
-                            else:
-                                st.error(msg)
-                with col_btn2:
-                    st.caption(f"File Size: {selected_path.stat().st_size / 1024:.1f} KB")
-
-            else:
-                st.warning("No resume files found for this account. Please upload a resume below.")
-
-        with c2:
-            st.markdown("#### 📤 Upload New Resume")
-            uploaded_file = st.file_uploader("Upload PDF or DOCX", type=["pdf", "docx"])
-            if uploaded_file is not None:
-                succ, msg, _ = service.upload_user_resume(
+        if gen_resume_btn or "tailored_resume" not in st.session_state:
+            with st.spinner("Analyzing job requirements and tailoring verified credentials..."):
+                jd_dict = {
+                    "id": selected_jd.id if selected_jd else None,
+                    "company_name": selected_jd.company_name if selected_jd else app.company_name,
+                    "role_title": selected_jd.role_title if selected_jd else app.job_title,
+                    "required_skills": selected_jd.required_skills if selected_jd else [],
+                    "preferred_skills": selected_jd.preferred_skills if selected_jd else [],
+                }
+                match_dict = latest_match.to_dict() if latest_match else None
+                tailored: TailoredResume = service.generate_tailored_resume(
                     user_id=user_id,
-                    file_bytes=uploaded_file.getbuffer().tobytes(),
-                    original_filename=uploaded_file.name,
-                    set_as_primary=True,
+                    candidate_profile=candidate_profile,
+                    resume_data=selected_res_meta,
+                    job_description=jd_dict,
+                    match_result=match_dict,
+                    custom_instructions=custom_instructions or None,
                 )
-                if succ:
-                    st.success(f"Uploaded `{uploaded_file.name}`. Click 'Parse & Synchronize' above.")
-                    st.rerun()
-                else:
-                    st.error(msg)
+                st.session_state["tailored_resume"] = tailored
 
-        st.divider()
+        tailored: TailoredResume = st.session_state["tailored_resume"]
 
-        # Display active profile details
-        cand_prof = service.db.get_latest_candidate_profile(user_id=user_id)
-        if cand_prof and cand_prof.profile_data:
-            pdata = cand_prof.profile_data
-            st.markdown(f"### 👤 Verified Candidate Profile (Version #{cand_prof.id})")
-            personal = pdata.get("personal", {})
-            col_p1, col_p2, col_p3 = st.columns(3)
-            with col_p1:
-                st.write(f"**Name:** {personal.get('full_name')}")
-                st.write(f"**Email:** {personal.get('email')}")
-                st.write(f"**Phone:** {personal.get('phone')}")
-            with col_p2:
-                edu = pdata.get("education", [{}])[0]
-                st.write(f"**Institution:** {edu.get('institution')}")
-                st.write(f"**Degree:** {edu.get('degree')}")
-                st.write(f"**Graduation:** {edu.get('expected_graduation_year')} | **CGPA:** {edu.get('current_cgpa')}")
-            with col_p3:
-                meta = pdata.get("resume_metadata", {})
-                st.write(f"**Source Document:** `{meta.get('source_file')}`")
-                st.write(f"**File Hash:** `{meta.get('file_hash', '')[:16]}...`")
-                st.write(f"**Extraction Date:** {meta.get('extraction_timestamp', '')[:19]}")
+        # Display Structured Tailored Resume
+        st.markdown(f"#### 👤 {tailored.personal_info.get('full_name', 'Candidate')} — {tailored.target_role}")
+        st.caption(f"Targeting: **{tailored.target_company}** | Tailored Resume Version: **v{tailored.version}**")
 
-            col_exp, col_proj = st.columns(2)
-            with col_exp:
-                st.markdown("#### 💼 Work Experience")
-                for exp in pdata.get("work_experience", []):
-                    st.markdown(f"- **{exp.get('job_title')}** at *{exp.get('employer')}* ({exp.get('duration')})")
-                    for r in exp.get("responsibilities", []):
-                        st.caption(f"  • {r}")
-            with col_proj:
-                st.markdown("#### 🚀 Selected Projects")
-                for prj in pdata.get("projects", []):
-                    st.markdown(f"- **{prj.get('title')}**")
-                    st.caption(f"  {prj.get('description')} *(Tech: {', '.join(prj.get('technologies', []))})*")
+        if tailored.professional_summary:
+            with st.expander("📝 Professional Summary", expanded=True):
+                st.write(tailored.professional_summary)
+                if tailored.summary_provenance:
+                    st.caption(
+                        f"🔒 Provenance: `{tailored.summary_provenance.source_type}` | "
+                        f"Evidence Status: `{tailored.summary_provenance.evidence_status}` | "
+                        f"Confidence: `{tailored.summary_provenance.confidence * 100:.0f}%`"
+                    )
 
-    # =========================================================================
-    # TAB 2: CANDIDATE INPUTS & LOGISTICS
-    # =========================================================================
-    with tab_inputs:
-        st.markdown("### 📋 Candidate Logistics & Application Preferences")
-        st.caption("Provide explicit candidate preferences. Unanswered fields remain strictly tagged as NEEDS CANDIDATE INPUT.")
+        with st.expander("🛠️ Highlighted Skills & Capabilities", expanded=True):
+            if tailored.matching_skills:
+                st.markdown(f"**🎯 Target Role Focus:** {', '.join(tailored.matching_skills)}")
+            for cat, skl in tailored.skills_by_category.items():
+                if skl:
+                    st.markdown(f"**{cat}:** {', '.join(skl)}")
 
-        cand_rec = service.db.get_latest_candidate_profile()
-        existing_prof = cand_rec.profile_data if cand_rec else {}
-        inputs_data = existing_prof.get("candidate_inputs", {})
+        # Work Experience & Bullet Editor
+        st.markdown("#### 💼 Professional Experience & Bullet Alignment")
+        for e_idx, exp in enumerate(tailored.experience_entries):
+            dur_txt = f" ({exp.duration})" if exp.duration else ""
+            with st.expander(f"🏢 {exp.job_title} at {exp.employer}{dur_txt}", expanded=True):
+                for b_idx, bullet in enumerate(exp.bullets):
+                    c_b1, c_b2 = st.columns([4, 1])
+                    with c_b1:
+                        new_txt = st.text_input(
+                            f"Bullet {b_idx + 1}",
+                            value=bullet.bullet_text,
+                            key=f"bullet_{e_idx}_{b_idx}",
+                        )
+                        if new_txt != bullet.bullet_text:
+                            tailored.update_bullet(e_idx, b_idx, new_txt)
+                            st.session_state["tailored_resume"] = tailored
+                            st.rerun()
+                    with c_b2:
+                        st.caption(f"Score: `{bullet.relevance_score:.1f}`")
+                        st.caption(f"Status: `{bullet.provenance.evidence_status}`")
 
-        col_in1, col_in2 = st.columns(2)
-        with col_in1:
-            in_stipend = st.text_input(
-                "Expected Monthly Stipend (e.g. ₹15,000 /month or Negotiable):",
-                value=inputs_data.get("expected_stipend") or "",
-                placeholder="Leave blank to mark as NEEDS CANDIDATE INPUT",
-            )
-            in_availability = st.text_input(
-                "Internship Availability (e.g. Immediate / Flexible / Summer 2026):",
-                value=inputs_data.get("internship_availability") or "",
-                placeholder="e.g. Flexible / Immediate",
-            )
-            in_hours = st.text_input(
-                "Weekly Working Hours (e.g. 20–25 hours/week):",
-                value=inputs_data.get("weekly_working_hours") or "",
-                placeholder="e.g. 20 hours/week",
-            )
-            in_duration = st.text_input(
-                "Internship Duration Preference (e.g. 3 months / 6 months):",
-                value=inputs_data.get("internship_duration_preference") or "",
-                placeholder="e.g. 3 months",
-            )
-            in_joining = st.text_input(
-                "Earliest Joining Date (e.g. Immediate / June 2025):",
-                value=inputs_data.get("joining_date") or "",
-                placeholder="e.g. Immediate",
-            )
-
-        with col_in2:
-            in_relocation = st.selectbox(
-                "Relocation Willingness:",
-                options=[
-                    "Not Specified (Needs Candidate Input)",
-                    "Remote / Pune only (No relocation)",
-                    "Open to relocate within India for summer internship",
-                    "Open to remote opportunities only",
-                ],
-                index=0 if not inputs_data.get("relocation_willingness") else (
-                    1 if "pune" in str(inputs_data.get("relocation_willingness")).lower() else 2
-                ),
-            )
-            in_work_mode = st.selectbox(
-                "On-site / Hybrid / Remote Preferences:",
-                options=[
-                    "Not Specified (Needs Candidate Input)",
-                    "Remote / Work from home preferred",
-                    "Hybrid preferred (Pune)",
-                    "On-site / In-office acceptable",
-                ],
-                index=0 if not inputs_data.get("work_mode_preference") else (
-                    1 if "remote" in str(inputs_data.get("work_mode_preference")).lower() else 2
-                ),
-            )
-            in_notice = st.text_input(
-                "Notice Period, if applicable (e.g. Immediate / None):",
-                value=inputs_data.get("notice_period") or "",
-                placeholder="e.g. Immediate",
-            )
-            in_github = st.text_input(
-                "Verified GitHub Profile URL:",
-                value=inputs_data.get("github_url") or "",
-                placeholder="https://github.com/username",
-            )
-            in_linkedin = st.text_input(
-                "Verified LinkedIn Profile URL:",
-                value=inputs_data.get("linkedin_url") or "",
-                placeholder="https://linkedin.com/in/username",
-            )
-
-        if st.button("💾 Save Logistics & Candidate Inputs", type="primary"):
-            updated_inputs = {
-                "expected_stipend": in_stipend.strip() or None,
-                "internship_availability": in_availability.strip() or None,
-                "weekly_working_hours": in_hours.strip() or None,
-                "internship_duration_preference": in_duration.strip() or None,
-                "joining_date": in_joining.strip() or None,
-                "relocation_willingness": None if "Not Specified" in in_relocation else in_relocation,
-                "work_mode_preference": None if "Not Specified" in in_work_mode else in_work_mode,
-                "notice_period": in_notice.strip() or None,
-                "github_url": in_github.strip() or None,
-                "linkedin_url": in_linkedin.strip() or None,
-            }
-            existing_prof["candidate_inputs"] = updated_inputs
-            if in_github.strip():
-                existing_prof.setdefault("personal", {})["github"] = in_github.strip()
-            if in_linkedin.strip():
-                existing_prof.setdefault("personal", {})["linkedin"] = in_linkedin.strip()
-
-            succ, msg = service.save_candidate_profile(existing_prof)
-            if succ:
-                st.success("Candidate logistics & inputs updated. Responses and cover letters will reflect these facts.")
-                st.rerun()
+        # Unified Diff Viewer
+        with st.expander("🔍 Inspect Diff Against Original Experience Bullets"):
+            orig_bullets = []
+            for exp in candidate_profile.get("work_experience", []):
+                for r in exp.get("responsibilities", []):
+                    orig_bullets.append(str(r).strip())
+            diff_lines = tailored.diff_with_original(orig_bullets)
+            if diff_lines:
+                st.code("\n".join(diff_lines), language="diff")
             else:
-                st.error(msg)
+                st.info("No text modifications detected from original responsibilities.")
 
     # =========================================================================
-    # TAB 3: JOB-RESUME ALIGNMENT
-    # =========================================================================
-    with tab_align:
-        st.markdown("### 🎯 Job-Resume Alignment & Gap Analysis")
-        st.caption("Examine how your verified experience maps against candidate job postings without fabricating unlisted skills.")
-
-        if df_jobs.empty:
-            st.info("No discovered jobs available.")
-        else:
-            # Let candidate select an opportunity
-            job_options = {
-                f"[{r['match_classification']}] {r['job_title']} at {r['company_name']} (#{r['id']})": r['id']
-                for _, r in df_jobs.iterrows()
-            }
-            selected_label = st.selectbox("Select Target Opportunity", options=list(job_options.keys()))
-            selected_job_id = job_options[selected_label]
-
-            alignment = service.get_job_alignment(selected_job_id)
-            if alignment:
-                col_m1, col_m2, col_m3 = st.columns(3)
-                with col_m1:
-                    st.metric("Technical Match Coverage", f"{alignment.match_percentage:.1f}%")
-                with col_m2:
-                    st.metric("Matching Verified Skills", len(alignment.matching_skills))
-                with col_m3:
-                    st.metric("Identified Employer Gaps", len(alignment.missing_requirements))
-
-                st.markdown("#### 📋 Tailored Alignment Summary")
-                st.info(alignment.alignment_summary)
-
-                c_match, c_missing = st.columns(2)
-                with c_match:
-                    st.markdown("#### ✅ Matching Technical Skills")
-                    if alignment.matching_skills:
-                        for s in alignment.matching_skills:
-                            st.markdown(f"- 🟢 **{s}**")
-                    else:
-                        st.caption("No direct keyword match in verified profile.")
-                with c_missing:
-                    st.markdown("#### ⚠️ Missing Employer Requirements (Transparent Gap)")
-                    if alignment.missing_requirements:
-                        for m in alignment.missing_requirements:
-                            st.markdown(f"- 🟡 **{m}** *(Requires rapid on-the-job adaptation)*")
-                    else:
-                        st.caption("No missing technical requirements detected.")
-
-                st.markdown("#### 🚀 Recommended Focus Projects for this Role")
-                for rp in alignment.relevant_projects:
-                    st.markdown(f"- **{rp['title']}** — {rp['description']}")
-
-    # =========================================================================
-    # TAB 3: TAILORED COVER LETTER EDITOR
+    # TAB 3: TAILORED COVER LETTER
     # =========================================================================
     with tab_cover:
-        st.markdown("### ✍️ Tailored Cover Letter Generator & Editor")
-        st.caption("Generate bespoke, professional, and non-generic cover letters rooted exclusively in verified resume content.")
+        st.markdown("### ✍️ Evidence-Backed Tailored Cover Letter")
+        st.caption("Crafts a compelling, professional cover letter matching your target company and career level.")
 
-        if not df_jobs.empty:
-            c_sel1, c_sel2 = st.columns([3, 1])
-            with c_sel1:
-                target_job_id = st.selectbox(
-                    "Target Opportunity for Cover Letter",
-                    options=list(job_options.keys()),
-                    key="cover_job_select",
-                )
-                chosen_id = job_options[target_job_id]
-            with c_sel2:
-                st.write("")
-                st.write("")
-                gen_clicked = st.button("✨ Draft Tailored Letter", type="primary")
-
-            # Store in session state for editing
-            sess_key = f"cover_letter_{chosen_id}"
-            if gen_clicked or sess_key not in st.session_state:
-                with st.spinner("Generating personalized letter..."):
-                    res = service.generate_cover_letter_for_job(chosen_id)
-                    st.session_state[sess_key] = res["letter_text"]
-
-            edited_letter = st.text_area(
-                "Cover Letter Content (Markdown)",
-                value=st.session_state[sess_key],
-                height=450,
+        c_cl1, c_cl2, c_cl3 = st.columns(3)
+        with c_cl1:
+            selected_tone_name = st.selectbox(
+                "Tone & Style",
+                options=[t.value for t in LetterTone],
+                index=0,
+                key="cl_tone_select",
             )
-            st.session_state[sess_key] = edited_letter
+            selected_tone = next(t for t in LetterTone if t.value == selected_tone_name)
+        with c_cl2:
+            selected_level_name = st.selectbox(
+                "Career Progression Level",
+                options=[c.value for c in CareerLevel],
+                index=1,
+                key="cl_level_select",
+            )
+            selected_level = next(c for c in CareerLevel if c.value == selected_level_name)
+        with c_cl3:
+            st.write("")
+            st.write("")
+            gen_cover_btn = st.button("🚀 Draft Tailored Cover Letter", type="primary", use_container_width=True)
 
-            col_sav1, col_sav2 = st.columns([1, 3])
-            with col_sav1:
-                if st.button("💾 Save Cover Letter Changes"):
-                    out_dir = Path("data/exports/cover_letters")
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    clean_file = out_dir / f"cover_letter_job_{chosen_id}.md"
-                    clean_file.write_text(edited_letter, encoding="utf-8")
-                    service.update_application_notes(chosen_id, f"Custom cover letter saved at {clean_file.name}")
-                    st.success(f"Cover letter saved to `{clean_file.name}`.")
-            with col_sav2:
-                st.download_button(
-                    label="📥 Download Cover Letter (.md)",
-                    data=edited_letter,
-                    file_name=f"cover_letter_job_{chosen_id}.md",
-                    mime="text/markdown",
+        if gen_cover_btn or "cover_letter" not in st.session_state:
+            with st.spinner("Synthesizing personalized cover letter from verified qualifications..."):
+                jd_dict = {
+                    "company_name": selected_jd.company_name if selected_jd else app.company_name,
+                    "role_title": selected_jd.role_title if selected_jd else app.job_title,
+                }
+                match_dict = latest_match.to_dict() if latest_match else None
+                cl = service.generate_universal_cover_letter(
+                    user_id=user_id,
+                    candidate_profile=candidate_profile,
+                    job_description=jd_dict,
+                    resume_data=selected_res_meta,
+                    match_result=match_dict,
+                    tone=selected_tone,
+                    career_level=selected_level,
                 )
+                st.session_state["cover_letter"] = cl
+
+        cl = st.session_state["cover_letter"]
+
+        # Live Editable Cover Letter Text
+        st.markdown("#### 📄 Editable Cover Letter Draft")
+        edited_letter_text = st.text_area(
+            "Review and edit your cover letter before approval:",
+            value=cl.letter_text,
+            height=350,
+            key="cover_letter_editor",
+        )
+        if edited_letter_text != cl.letter_text:
+            cl.letter_text = edited_letter_text
+            st.session_state["cover_letter"] = cl
+
+        # Claim Provenance Inspector
+        with st.expander("🔒 Inspect Claim Provenance & Evidence Sources"):
+            for idx, claim in enumerate(cl.provenance_claims, start=1):
+                st.write(f"**Paragraph {idx} Claim (`{claim.claim_id}`):**")
+                st.caption(f"Source: `{claim.source_type}` ({claim.source_field}) | Status: `{claim.evidence_status}`")
 
     # =========================================================================
-    # TAB 4: SCREENING QUESTIONS & ANSWERS
+    # TAB 4: SCREENING QUESTIONS
     # =========================================================================
     with tab_qa:
-        st.markdown("### 💬 Screening Question Responses")
-        st.caption("Truthful answers grounded strictly in resume facts. Unknown questions are flagged as NEEDS CANDIDATE INPUT.")
+        st.markdown("### 💬 Screening Question Answer Assistant")
+        st.caption(
+            "Drafts truthful responses across 19 standard categories. "
+            "Any subjective, salary, notice period, or missing items are strictly flagged as NEEDS CANDIDATE INPUT."
+        )
 
-        if not df_jobs.empty:
-            target_qa_job = st.selectbox(
-                "Select Opportunity for Question Preparation",
-                options=list(job_options.keys()),
-                key="qa_job_select",
+        with st.form("add_screening_questions_form"):
+            questions_input = st.text_area(
+                "Paste Employer Screening Questions (one per line):",
+                placeholder="What is your expected salary?\nHow many years of experience do you have with Python?\nWhy do you want to join our team?\nAre you willing to relocate?",
+                height=100,
             )
-            qa_job_id = job_options[target_qa_job]
-            questions = service.generate_questions_for_job(qa_job_id)
+            char_limit_input = st.number_input("Character Limit per Answer (0 for none)", min_value=0, max_value=5000, value=0)
+            qa_submit = st.form_submit_button("⚡ Answer Screening Questions", type="primary")
 
-            for key, q_data in questions.items():
-                with st.expander(f"❓ {q_data['question']}", expanded=False):
-                    st.text_area(
-                        f"Response ({q_data['question']})",
-                        value=q_data['answer'],
-                        key=f"qa_{qa_job_id}_{key}",
-                        height=120,
-                    )
-                    st.caption("Status: 🟢 Verified against Resume" if q_data['status'] == "READY" else "🟡 Needs Review")
+        if qa_submit and questions_input.strip():
+            with st.spinner("Classifying and generating evidence-grounded answers..."):
+                jd_dict = {
+                    "company_name": selected_jd.company_name if selected_jd else app.company_name,
+                    "role_title": selected_jd.role_title if selected_jd else app.job_title,
+                }
+                char_lim = int(char_limit_input) if char_limit_input > 0 else None
+                answered_list = service.batch_answer_screening_questions(
+                    questions=questions_input,
+                    user_id=user_id,
+                    candidate_profile=candidate_profile,
+                    resume_data=selected_res_meta,
+                    job_description=jd_dict,
+                    character_limit=char_lim,
+                )
+                qa_packet = ScreeningQAPacket(
+                    user_id=user_id,
+                    job_description_id=selected_jd_id,
+                    questions=answered_list,
+                )
+                st.session_state["qa_packet"] = qa_packet
+                st.success(f"Generated responses for {len(answered_list)} questions!")
 
-            st.divider()
-            st.markdown("#### 🧪 Test Custom Screening Question")
-            user_custom_q = st.text_input("Enter arbitrary employer application question:")
-            if user_custom_q:
-                from src.preparer.question_answerer import QuestionAnswerer
-                qa_engine = QuestionAnswerer()
-                custom_res = qa_engine.answer_custom_question(user_custom_q)
-                if custom_res["status"] == "NEEDS_CANDIDATE_INPUT":
-                    st.warning(custom_res["answer"])
-                else:
-                    st.success(custom_res["answer"])
+        # Initialize default standard questions if empty
+        if "qa_packet" not in st.session_state:
+            default_qs = [
+                f"Why do you want to work at {selected_jd.company_name if selected_jd else app.company_name}?",
+                "What is your expected compensation?",
+                "What is your earliest available start date?",
+                "Are you legally authorized to work in this location?",
+            ]
+            answered_defaults = service.batch_answer_screening_questions(
+                questions=default_qs,
+                user_id=user_id,
+                candidate_profile=candidate_profile,
+                resume_data=selected_res_meta,
+                job_description={"company_name": app.company_name, "role_title": app.job_title},
+            )
+            st.session_state["qa_packet"] = ScreeningQAPacket(
+                user_id=user_id,
+                job_description_id=selected_jd_id,
+                questions=answered_defaults,
+            )
+
+        qa_packet: ScreeningQAPacket = st.session_state["qa_packet"]
+
+        st.markdown(f"#### 📋 Questions ({len(qa_packet.questions)} Total)")
+        for q_idx, q in enumerate(qa_packet.questions):
+            badge = "🟢 READY" if q.state in [AnswerState.GENERATED_DRAFT.value, AnswerState.USER_APPROVED.value] else "🟡 NEEDS INPUT"
+            with st.expander(f"Q{q_idx + 1}: **{q.question_text}** — {badge} [{q.category}]", expanded=(q.state == AnswerState.NEEDS_CANDIDATE_INPUT.value)):
+                st.caption(f"Category: **{q.category}** | Current Review State: `{q.state}`")
+                new_ans = st.text_area(
+                    "Answer",
+                    value=q.answer_text,
+                    key=f"ans_editor_{q_idx}",
+                    height=80,
+                )
+                if q.character_limit:
+                    curr_len = len(new_ans)
+                    st.caption(f"Character Count: {curr_len} / {q.character_limit}")
+
+                col_qa1, col_qa2 = st.columns([2, 2])
+                with col_qa1:
+                    if st.button("💾 Save Answer & Mark Approved", key=f"app_q_{q_idx}"):
+                        q.answer_text = new_ans.strip()
+                        q.state = AnswerState.USER_APPROVED.value
+                        st.session_state["qa_packet"] = qa_packet
+                        st.success("Answer confirmed and approved!")
+                        st.rerun()
 
     # =========================================================================
-    # TAB 5: HUMAN APPROVAL GATE
+    # TAB 5: APPLICATION DETAILS
+    # =========================================================================
+    with tab_details:
+        st.markdown("### 📋 Candidate Logistics & Application Preferences")
+        st.caption("Update confirmed logistics and personal preferences for this opportunity.")
+
+        cand_inputs = candidate_profile.get("candidate_inputs", {})
+        with st.form("candidate_logistics_form"):
+            cl_1, cl_2 = st.columns(2)
+            with cl_1:
+                stipend_val = st.text_input("Expected Compensation / Stipend", value=cand_inputs.get("expected_stipend") or "")
+                avail_val = st.text_input("Earliest Start Date / Availability", value=cand_inputs.get("internship_availability") or "")
+                notice_val = st.text_input("Notice Period", value=cand_inputs.get("notice_period") or "")
+            with cl_2:
+                reloc_val = st.text_input("Relocation Preference", value=cand_inputs.get("relocation_willingness") or "")
+                mode_val = st.text_input("Work Mode Preference (Remote / Hybrid / On-site)", value=cand_inputs.get("work_mode_preference") or "")
+                hours_val = st.text_input("Weekly Available Hours", value=cand_inputs.get("weekly_working_hours") or "")
+
+            save_logistics_btn = st.form_submit_button("💾 Save Logistics to Profile")
+            if save_logistics_btn:
+                updated_inputs = dict(cand_inputs)
+                updated_inputs["expected_stipend"] = stipend_val.strip()
+                updated_inputs["internship_availability"] = avail_val.strip()
+                updated_inputs["notice_period"] = notice_val.strip()
+                updated_inputs["relocation_willingness"] = reloc_val.strip()
+                updated_inputs["work_mode_preference"] = mode_val.strip()
+                updated_inputs["weekly_working_hours"] = hours_val.strip()
+
+                candidate_profile["candidate_inputs"] = updated_inputs
+                service.db.save_user_candidate_profile(user_id=user_id, profile_data=candidate_profile)
+                st.success("Candidate logistics recorded in profile!")
+                st.rerun()
+
+    # =========================================================================
+    # TAB 6: ATTACHMENTS MANIFEST
+    # =========================================================================
+    with tab_attachments:
+        st.markdown("### 📎 Application Attachments Manifest")
+        st.caption("Cryptographically tracks all supporting documents and deliverables for this application packet.")
+
+        attachments = [
+            {"name": f"Original Resume ({selected_res_meta.get('original_filename', 'Resume')})", "type": "Source Document", "format": selected_res_meta.get("file_format", "PDF").upper(), "size_kb": f"{(selected_res_meta.get('file_size_bytes', 0) / 1024):.1f} KB"},
+            {"name": "Tailored Resume (Generated)", "type": "Application Material", "format": "PDF / DOCX", "size_kb": "Auto-calculated"},
+            {"name": "Tailored Cover Letter (Generated)", "type": "Application Material", "format": "PDF / DOCX", "size_kb": "Auto-calculated"},
+            {"name": "Screening Questions & Responses", "type": "Application Material", "format": "PDF / DOCX", "size_kb": "Auto-calculated"},
+        ]
+        st.table(attachments)
+
+    # =========================================================================
+    # TAB 7: REVIEW & APPROVAL GATE
     # =========================================================================
     with tab_approval:
-        st.markdown("### 🛡️ Human-in-the-Loop Application Authorization")
-        st.caption("Strict safety safeguard: Applications are NEVER submitted automatically. Review the complete packet and authorize manually.")
+        st.markdown("### 🛡️ Human Audit & Authorization Gate")
+        st.caption(
+            "Strict human governance: automated agents are strictly forbidden from submitting applications. "
+            "You must inspect all generated documents and authorize this application."
+        )
 
-        if not df_jobs.empty:
-            target_app_job = st.selectbox(
-                "Select Opportunity for Approval Review",
-                options=list(job_options.keys()),
-                key="approval_job_select",
+        # 1. Document Template Selector & Export
+        st.markdown("#### 1. Generate Official PDF & Word DOCX Files")
+        col_tmpl1, col_tmpl2 = st.columns([3, 2])
+        with col_tmpl1:
+            tmpl_name = st.selectbox(
+                "Document Layout & Typography Style",
+                options=[t.value for t in DocumentTemplate],
+                index=0,
+                key="doc_template_select",
             )
-            app_job_id = job_options[target_app_job]
-            job_obj = service.db.get_job_by_id(app_job_id)
-            app_obj = service.db.get_application_by_job_id(app_job_id)
-            current_status = app_obj.status.value if hasattr(app_obj.status, "value") else str(app_obj.status)
+            doc_template = next(t for t in DocumentTemplate if t.value == tmpl_name)
+        with col_tmpl2:
+            st.write("")
+            st.write("")
+            export_docs_btn = st.button("📥 Generate & Validate PDF/DOCX Files", type="primary", use_container_width=True)
 
-            st.info(f"**Current Application Status:** `{current_status}` | **Job ID:** #{app_job_id}")
-
-            with st.container():
-                st.markdown(f"#### 📦 Application Review Packet: {job_obj.company_name} — {job_obj.job_title}")
-                st.write(f"**Official Application Portal:** [{job_obj.job_url}]({job_obj.job_url})")
-
-                primary_res = service.db.get_primary_resume(user_id=user_id)
-                active_res_name = primary_res.get("original_filename", "None selected") if primary_res else "None uploaded"
-                st.write(f"**Active Resume:** `{active_res_name}`")
-
-                # Approval Checklist
-                chk_details = st.checkbox("✅ I have reviewed the job description and confirmed eligibility.")
-                chk_cover = st.checkbox("✅ I have inspected and approved the tailored cover letter.")
-                chk_answers = st.checkbox("✅ I have reviewed the screening question responses.")
-                chk_no_auto = st.checkbox("✅ I understand this system will NOT automatically submit the application.")
-
-                cand_name = st.session_state.get("candidate_name")
-                if not cand_name and cand_prof and cand_prof.profile_data:
-                    cand_name = cand_prof.profile_data.get("personal", {}).get("full_name")
-                approver_input = st.text_input(
-                    "Human Approver Signature (Candidate Full Name):",
-                    value=cand_name or "Authorized Candidate",
+        if export_docs_btn or "generated_docs" not in st.session_state:
+            with st.spinner("Generating ATS-optimized PDF and DOCX files..."):
+                docs = service.export_application_documents(
+                    user_id=user_id,
+                    application_id=app.id,
+                    resume=tailored,
+                    cover_letter=cl,
+                    qa_packet=qa_packet,
+                    template=doc_template,
                 )
+                st.session_state["generated_docs"] = docs
+                st.success("Successfully generated and structurally validated all application documents!")
 
-                col_app1, col_app2 = st.columns(2)
-                with col_app1:
-                    all_checked = chk_details and chk_cover and chk_answers and chk_no_auto
-                    if st.button("🛡️ Grant Human Approval (Set Status -> Awaiting Approval)", type="primary"):
-                        if not all_checked:
-                            st.error("Please confirm all 4 review checklist items above.")
-                        else:
-                            succ, msg = service.authorize_application_packet(
-                                job_id=app_job_id,
-                                approver_name=approver_input,
-                                candidate_confirmed=True,
-                                cover_letter=st.session_state.get(f"cover_letter_{app_job_id}", "Tailored Letter"),
-                                answers=service.generate_questions_for_job(app_job_id),
-                                user_id=user_id,
-                            )
-                            if succ:
-                                st.success(msg)
-                                st.rerun()
-                            else:
-                                st.error(msg)
+        docs = st.session_state.get("generated_docs", {})
 
-                with col_app2:
-                    st.markdown("#### 📬 Final Submission Confirmation")
-                    st.caption("Once you manually complete submission on the employer portal:")
-                    sub_notes = st.text_input("Submission Reference / Portal Confirmation Code:", key="sub_notes_in")
-                    if st.button("✅ Confirm Manual Submission (Set Status -> Applied)"):
-                        succ_sub, msg_sub = service.confirm_manual_submission(
-                            job_id=app_job_id,
-                            approver_name=approver_input,
-                            submission_notes=sub_notes,
-                        )
-                        if succ_sub:
-                            st.success(msg_sub)
-                            st.rerun()
-                        else:
-                            st.error(msg_sub)
+        # 2. Assemble Prepared Packet in SQLite
+        st.markdown("#### 2. Assemble Immutable Prepared Packet")
+        c_pk1, c_pk2 = st.columns([3, 1])
+        with c_pk1:
+            st.caption("Bundles the tailored resume, cover letter, screening answers, and attachment hashes into an immutable version snapshot.")
+        with c_pk2:
+            prep_packet_btn = st.button("📦 Assemble Packet", use_container_width=True)
 
-    # =========================================================================
-    # TAB 6: PREPARED HISTORY
-    # =========================================================================
-    with tab_history:
-        st.markdown("### 📜 Prepared Applications & Audit Trail")
-        st.caption("History of applications prepared, human approvals granted, and audit actions logged in SQLite.")
+        if prep_packet_btn or "prepared_packet" not in st.session_state:
+            with st.spinner("Assembling RFC 8785 canonical packet snapshot..."):
+                res_hash = selected_res_meta.get("file_hash", "")
+                jd_hash = selected_jd.content_hash if selected_jd else "jd_hash"
+                pkt = service.prepare_universal_application_packet(
+                    user_id=user_id,
+                    application_id=app.id,
+                    original_resume_id=selected_resume_id,
+                    original_resume_hash=res_hash,
+                    tailored_resume=tailored,
+                    cover_letter=cl,
+                    qa_packet=qa_packet,
+                    job_description_snapshot_hash=jd_hash,
+                    tailored_resume_doc=docs.get("resume_pdf"),
+                    cover_letter_doc=docs.get("cover_letter_pdf"),
+                )
+                st.session_state["prepared_packet"] = pkt
+                st.success(f"Immutable Packet #{pkt.id} (Version {pkt.version_num}) recorded in SQLite!")
 
-        apps_df = df_jobs[df_jobs["application_status"].isin([
-            ApplicationStatus.APPLICATION_PREPARED.value,
-            ApplicationStatus.AWAITING_APPROVAL.value,
-            ApplicationStatus.APPLIED.value,
-            ApplicationStatus.INTERVIEW.value,
-        ])]
-
-        if apps_df.empty:
-            st.info("No applications currently in 'Application Prepared', 'Awaiting Approval', or 'Applied' status.")
-        else:
-            st.dataframe(
-                apps_df[["id", "company_name", "job_title", "platform", "match_score", "application_status"]],
-                use_container_width=True,
-            )
+        pkt = st.session_state.get("prepared_packet")
+        if pkt:
+            st.info(f"Active Packet Hash (SHA-256): `{pkt.packet_version_hash}`")
 
         st.divider()
-        st.markdown("#### 🛡️ Complete SQLite Audit Trail (`application_logs`)")
-        recent_logs = []
-        for jid in df_jobs["id"].tolist()[:10]:
-            logs = service.db.get_application_logs(jid)
-            for l in logs:
-                recent_logs.append({
-                    "Job ID": l.job_id,
-                    "Action": l.action,
-                    "Timestamp": l.timestamp,
-                    "Details": l.get_details_as_str()[:120],
-                })
-        if recent_logs:
-            st.dataframe(recent_logs, use_container_width=True)
-        else:
-            st.caption("No audit entries logged yet.")
 
+        # 3. Human Authorization Gate Form
+        st.markdown("#### 3. Authorize Application for Submission")
+        with st.form("human_authorization_form"):
+            approver_name_input = st.text_input(
+                "Full Name of Human Approver",
+                value=candidate_profile.get("personal", {}).get("full_name") or "",
+                placeholder="e.g. Alice Smith",
+            )
+            confirm_truthfulness = st.checkbox(
+                "I explicitly confirm that I have reviewed all generated materials, the information is completely truthful, and I authorize this application.",
+                value=False,
+            )
+
+            auth_submit = st.form_submit_button("🛡️ Grant Human Authorization", type="primary")
+
+            if auth_submit:
+                if not confirm_truthfulness:
+                    st.error("You must check the confirmation checkbox to authorize.")
+                elif not approver_name_input.strip():
+                    st.error("Approver full name is required.")
+                else:
+                    # Issue cryptographic single-use ticket
+                    sess = service.get_or_create_candidate_session(candidate_name=approver_name_input.strip(), candidate_id=f"user_{user_id}")
+                    action_ticket = service.issue_approval_ticket(
+                        session_id=sess.session_id,
+                        job_id=app.id,
+                        packet_hash=pkt.packet_version_hash,
+                    )
+                    succ, msg, approval = service.authorize_universal_application_packet(
+                        user_id=user_id,
+                        application_id=app.id,
+                        packet_id=pkt.id,
+                        approver_name=approver_name_input.strip(),
+                        session_id=sess.session_id,
+                        action_ticket=action_ticket,
+                        candidate_confirmed=confirm_truthfulness,
+                    )
+                    if succ:
+                        st.success(f"✅ {msg}")
+                        st.rerun()
+                    else:
+                        st.error(f"Authorization failed: {msg}")
+
+    # =========================================================================
+    # TAB 8: PACKET HISTORY & DOWNLOADS
+    # =========================================================================
+    with tab_history:
+        st.markdown("### 📜 Application Packet Revisions & Downloads")
+        st.caption("Immutable version history of all prepared packets and official downloadable documents.")
+
+        revisions = service.list_application_packets(application_id=app.id, user_id=user_id)
+        if not revisions:
+            st.info("No prepared packet revisions recorded for this application yet.")
+        else:
+            for rev in revisions:
+                is_act = bool(rev.is_active_revision)
+                act_badge = " ⭐ **[ACTIVE REVISION]**" if is_act else ""
+                with st.expander(f"📦 Packet v{rev.version_num} — Created: {rev.created_at}{act_badge}", expanded=is_act):
+                    st.caption(f"Packet SHA-256: `{rev.packet_version_hash}`")
+                    st.caption(f"Original Resume ID: `#{rev.original_resume_id}` (Hash: `{rev.original_resume_hash[:16]}...`)")
+
+                    # Download Buttons for Generated Documents
+                    if is_act and "generated_docs" in st.session_state:
+                        g_docs = st.session_state["generated_docs"]
+                        st.markdown("##### ⬇️ Download Official Documents")
+                        cd1, cd2, cd3, cd4 = st.columns(4)
+                        with cd1:
+                            r_pdf = g_docs.get("resume_pdf")
+                            if r_pdf and Path(r_pdf.file_path).exists():
+                                st.download_button("📄 Resume (PDF)", data=Path(r_pdf.file_path).read_bytes(), file_name=f"Tailored_Resume_{app.company_name}.pdf", mime="application/pdf")
+                        with cd2:
+                            r_docx = g_docs.get("resume_docx")
+                            if r_docx and Path(r_docx.file_path).exists():
+                                st.download_button("📄 Resume (Word)", data=Path(r_docx.file_path).read_bytes(), file_name=f"Tailored_Resume_{app.company_name}.docx", mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+                        with cd3:
+                            c_pdf = g_docs.get("cover_letter_pdf")
+                            if c_pdf and Path(c_pdf.file_path).exists():
+                                st.download_button("✍️ Cover Letter (PDF)", data=Path(c_pdf.file_path).read_bytes(), file_name=f"Cover_Letter_{app.company_name}.pdf", mime="application/pdf")
+                        with cd4:
+                            p_pdf = g_docs.get("packet_pdf")
+                            if p_pdf and Path(p_pdf.file_path).exists():
+                                st.download_button("📦 Full Packet (PDF)", data=Path(p_pdf.file_path).read_bytes(), file_name=f"Application_Packet_{app.company_name}.pdf", mime="application/pdf")

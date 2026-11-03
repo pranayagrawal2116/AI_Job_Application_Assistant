@@ -67,6 +67,8 @@ data/storage/*.sqlite3
 data/exports/*.csv
 data/exports/*.xlsx
 data/exports/*.json
+data/exports/*.md
+data/exports/cover_letters/
 !data/exports/README.md
 
 # Playwright MCP Logs & Snapshots

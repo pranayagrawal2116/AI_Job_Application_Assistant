@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
-from src.config import config
 from src.preparer.profile_updater import ProfileUpdater
 from src.preparer.resume_parser import ResumeParser, VerificationStatus
 
@@ -29,17 +28,12 @@ def render_candidate_profile():
     service = DashboardService.get_instance()
     user_id = get_current_user_id()
 
-    # Load active profile from SQLite or config fallback
+    # Load active profile strictly for the authenticated user from SQLite
     db_record = service.db.get_user_candidate_profile(user_id)
     if db_record and db_record.get("profile_data"):
         prof = db_record["profile_data"]
     else:
-        # Fallback to latest single-candidate snapshot or config
-        legacy_rec = service.db.get_latest_candidate_profile()
-        if legacy_rec and legacy_rec.profile_data:
-            prof = legacy_rec.profile_data
-        else:
-            prof = config.candidate_profile
+        prof = {}
 
     tab_resumes, tab_edit, tab_sync, tab_history = st.tabs([
         "📁 Resumes & Documents",
@@ -233,13 +227,13 @@ def render_candidate_profile():
                     "Graduation Year",
                     min_value=1970,
                     max_value=2035,
-                    value=int(edu_primary.get("expected_graduation_year") or edu_primary.get("graduation_year") or 2028),
+                    value=int(edu_primary.get("expected_graduation_year") or edu_primary.get("graduation_year") or 2024),
                 )
                 cgpa_val = st.number_input(
                     "CGPA / GPA / Score",
                     min_value=0.0,
                     max_value=100.0,
-                    value=float(edu_primary.get("current_cgpa") or edu_primary.get("cgpa") or prof.get("current_cgpa") or 7.6),
+                    value=float(edu_primary.get("current_cgpa") or edu_primary.get("cgpa") or prof.get("current_cgpa") or 0.0),
                     step=0.01,
                 )
 
@@ -386,17 +380,13 @@ def render_candidate_profile():
                 updated_data["is_user_confirmed"] = True
                 updated_data["field_provenance"] = new_prov
 
-                succ, msg = service.save_candidate_profile(updated_data)
                 try:
                     service.db.save_user_candidate_profile(user_id, updated_data)
-                except Exception:
-                    pass
-
-                if succ:
                     st.success("Candidate profile updated and recorded in SQLite!")
                     st.rerun()
-                else:
-                    st.error(msg)
+                except Exception as exc:
+                    service.logger.error("Failed saving candidate profile for user %d: %s", user_id, exc, exc_info=True)
+                    st.error(f"Failed saving candidate profile: {exc}")
 
     # =========================================================================
     # TAB 3: RESUME-PROFILE SYNCHRONIZATION
@@ -461,13 +451,13 @@ def render_candidate_profile():
                                 approved_fields=None,
                                 override_protected=override_check,
                             )
-                            service.save_candidate_profile(synced_profile)
                             try:
                                 service.db.save_user_candidate_profile(user_id, synced_profile)
-                            except Exception:
-                                pass
-                            st.success("Successfully synchronized candidate profile from resume!")
-                            st.rerun()
+                                st.success("Successfully synchronized candidate profile from resume!")
+                                st.rerun()
+                            except Exception as exc:
+                                service.logger.error("Failed synchronizing profile for user %d: %s", user_id, exc, exc_info=True)
+                                st.error(f"Failed to synchronize profile: {exc}")
 
                 except Exception as e:
                     st.error(f"Failed to inspect resume: {e}")
@@ -481,13 +471,7 @@ def render_candidate_profile():
 
         history = service.db.get_user_candidate_profile_history(user_id)
         if not history:
-            # Check legacy snapshots
-            rec = service.db.get_latest_candidate_profile()
-            if rec:
-                st.info(f"Active Snapshot ID: **#{rec.id}** | Updated At: **{rec.last_updated}**")
-                st.json(rec.profile_data)
-            else:
-                st.caption("No historical profile snapshots recorded yet.")
+            st.caption("No historical profile snapshots recorded yet.")
         else:
             for snap in history:
                 is_act = bool(snap.get("is_active", 0))

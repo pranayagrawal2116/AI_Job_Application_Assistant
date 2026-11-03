@@ -282,12 +282,15 @@ class DashboardService:
         """Restores database from backup."""
         return self.db.restore_database(backup_file)
 
-    def save_candidate_profile(self, profile_data: Dict[str, Any]) -> Tuple[bool, str]:
-        """Validates and persists candidate profile in SQLite and local file."""
+    def save_candidate_profile(self, profile_data: Dict[str, Any], user_id: Optional[int] = None) -> Tuple[bool, str]:
+        """Validates and persists candidate profile in SQLite for user or legacy fallback."""
         try:
-            # Save snapshot to SQLite
+            if user_id is not None:
+                self.db.save_user_candidate_profile(user_id, profile_data)
+                return True, "Candidate profile updated and version recorded."
+
+            # Fallback for unauthenticated legacy test fixtures
             self.db.save_candidate_profile(profile_data)
-            # Update local config files
             prof_path = Path("data/profile/candidate_profile.json")
             if prof_path.exists():
                 with open(prof_path, "w", encoding="utf-8") as f:
@@ -297,6 +300,15 @@ class DashboardService:
             return True, "Candidate profile updated and version recorded."
         except Exception as exc:
             self.logger.error("Failed saving candidate profile: %s", exc, exc_info=True)
+            return False, f"Failed saving candidate profile: {exc}"
+
+    def save_user_candidate_profile(self, user_id: int, profile_data: Dict[str, Any]) -> Tuple[bool, str]:
+        """Persists candidate profile specifically for the authenticated user."""
+        try:
+            self.db.save_user_candidate_profile(user_id, profile_data)
+            return True, "Candidate profile updated and version recorded."
+        except Exception as exc:
+            self.logger.error("Failed saving candidate profile for user %d: %s", user_id, exc, exc_info=True)
             return False, f"Failed saving candidate profile: {exc}"
 
     def get_user_resumes(self, user_id: int) -> List[Dict[str, Any]]:
@@ -929,4 +941,190 @@ class DashboardService:
     ) -> Optional[MatchResult]:
         """Retrieves a specific evaluation record with ownership enforcement."""
         return self.db.get_match_result(match_id=match_id, user_id=user_id)
+
+    # -------------------------------------------------------------------------
+    # PHASE 6: UNIVERSAL APPLICATION PREPARATION & EXPORT HELPERS
+    # -------------------------------------------------------------------------
+
+    def get_or_create_application_workspace(
+        self,
+        user_id: int,
+        job_description_id: int,
+        resume_id: Optional[int] = None,
+    ):
+        """Finds or initializes the preparation workspace for an application."""
+        return self.db.get_or_create_application_workspace(
+            user_id=user_id,
+            job_description_id=job_description_id,
+            resume_id=resume_id,
+        )
+
+    def generate_tailored_resume(
+        self,
+        user_id: int,
+        candidate_profile: Dict[str, Any],
+        resume_data: Optional[Dict[str, Any]] = None,
+        job_description: Optional[Dict[str, Any]] = None,
+        match_result: Optional[Dict[str, Any]] = None,
+        custom_instructions: Optional[str] = None,
+    ):
+        """Generates role-specific tailored resume using UniversalTailoredResumeGenerator."""
+        from src.preparer.tailored_resume_generator import UniversalTailoredResumeGenerator
+        generator = UniversalTailoredResumeGenerator()
+        return generator.generate(
+            user_id=user_id,
+            candidate_profile=candidate_profile,
+            resume_data=resume_data,
+            job_description=job_description,
+            match_result=match_result,
+            custom_instructions=custom_instructions,
+        )
+
+    def generate_universal_cover_letter(
+        self,
+        user_id: int,
+        candidate_profile: Dict[str, Any],
+        job_description: Dict[str, Any],
+        resume_data: Optional[Dict[str, Any]] = None,
+        match_result: Optional[Dict[str, Any]] = None,
+        tone: Any = None,
+        career_level: Any = None,
+        custom_instructions: Optional[str] = None,
+    ):
+        """Generates evidence-backed tailored cover letter across any profession."""
+        from src.preparer.cover_letter_generator import (
+            CoverLetterGenerator,
+            LetterTone,
+        )
+        generator = CoverLetterGenerator(candidate_profile=candidate_profile)
+        user_app_dir = Path(f"data/users/{user_id}/applications")
+        selected_tone = tone or LetterTone.PROFESSIONAL_DIRECT
+        return generator.generate_universal_cover_letter(
+            user_id=user_id,
+            candidate_profile=candidate_profile,
+            job_description=job_description,
+            resume_data=resume_data,
+            match_result=match_result,
+            tone=selected_tone,
+            career_level=career_level,
+            custom_instructions=custom_instructions,
+            output_user_dir=user_app_dir,
+        )
+
+    def batch_answer_screening_questions(
+        self,
+        questions: List[str] | str,
+        user_id: int,
+        candidate_profile: Dict[str, Any],
+        resume_data: Optional[Dict[str, Any]] = None,
+        job_description: Optional[Dict[str, Any]] = None,
+        character_limit: Optional[int] = None,
+    ):
+        """Answers screening questions across 19 categories rooted strictly in verified evidence."""
+        from src.preparer.question_answerer import QuestionAnswerer
+        answerer = QuestionAnswerer(candidate_profile=candidate_profile)
+        return answerer.batch_answer_questions(
+            questions=questions,
+            user_id=user_id,
+            candidate_profile=candidate_profile,
+            resume_data=resume_data,
+            job_description=job_description,
+            character_limit=character_limit,
+        )
+
+    def export_application_documents(
+        self,
+        user_id: int,
+        application_id: int,
+        resume: Any,
+        cover_letter: Any,
+        qa_packet: Any,
+        template: Any = None,
+    ) -> Dict[str, Any]:
+        """Generates professional PDF and DOCX files for all application materials."""
+        from src.preparer.document_generator import (
+            DocumentTemplate,
+            UniversalDocumentGenerator,
+        )
+        generator = UniversalDocumentGenerator()
+        app_dir = Path(f"data/users/{user_id}/applications/{application_id}")
+        app_dir.mkdir(parents=True, exist_ok=True)
+        selected_template = template or DocumentTemplate.MODERN
+
+        docs: Dict[str, Any] = {}
+        # 1. Resume PDF & DOCX
+        docs["resume_pdf"] = generator.generate_resume_pdf(resume, app_dir, selected_template)
+        docs["resume_docx"] = generator.generate_resume_docx(resume, app_dir, selected_template)
+
+        # 2. Cover Letter PDF & DOCX
+        docs["cover_letter_pdf"] = generator.generate_cover_letter_pdf(cover_letter, app_dir, selected_template)
+        docs["cover_letter_docx"] = generator.generate_cover_letter_docx(cover_letter, app_dir, selected_template)
+
+        # 3. Screening QA PDF & DOCX
+        docs["screening_qa_pdf"] = generator.generate_screening_qa_pdf(qa_packet, app_dir)
+        docs["screening_qa_docx"] = generator.generate_screening_qa_docx(qa_packet, app_dir)
+
+        # 4. Consolidated Application Packet PDF & DOCX
+        docs["packet_pdf"] = generator.generate_application_packet_pdf(resume, cover_letter, qa_packet, app_dir, selected_template)
+        docs["packet_docx"] = generator.generate_application_packet_docx(resume, cover_letter, qa_packet, app_dir, selected_template)
+
+        return docs
+
+    def prepare_universal_application_packet(
+        self,
+        user_id: int,
+        application_id: int,
+        original_resume_id: int,
+        original_resume_hash: str,
+        tailored_resume: Any,
+        cover_letter: Any,
+        qa_packet: Any,
+        job_description_snapshot_hash: str,
+        tailored_resume_doc: Optional[Any] = None,
+        cover_letter_doc: Optional[Any] = None,
+        attachments_manifest: Optional[List[Dict[str, Any]]] = None,
+    ):
+        """Assembles and stores immutable PreparedPacket revision in SQLite."""
+        from src.preparer.approval_gate import HumanApprovalGate
+        gate = HumanApprovalGate(db_manager=self.db)
+        return gate.prepare_universal_packet(
+            user_id=user_id,
+            application_id=application_id,
+            original_resume_id=original_resume_id,
+            original_resume_hash=original_resume_hash,
+            tailored_resume=tailored_resume,
+            cover_letter=cover_letter,
+            qa_packet=qa_packet,
+            job_description_snapshot_hash=job_description_snapshot_hash,
+            tailored_resume_doc=tailored_resume_doc,
+            cover_letter_doc=cover_letter_doc,
+            attachments_manifest=attachments_manifest,
+        )
+
+    def authorize_universal_application_packet(
+        self,
+        user_id: int,
+        application_id: int,
+        packet_id: int,
+        approver_name: str,
+        session_id: str,
+        action_ticket: str,
+        candidate_confirmed: bool,
+    ):
+        """Authorizes a prepared application packet under strict human governance."""
+        from src.preparer.approval_gate import HumanApprovalGate
+        gate = HumanApprovalGate(db_manager=self.db)
+        return gate.authorize_universal_packet(
+            user_id=user_id,
+            application_id=application_id,
+            packet_id=packet_id,
+            approver_name=approver_name,
+            session_id=session_id,
+            action_ticket=action_ticket,
+            candidate_confirmed=candidate_confirmed,
+        )
+
+    def list_application_packets(self, application_id: int, user_id: int):
+        """Lists historical revisions of prepared packets for an application."""
+        return self.db.list_prepared_packets(application_id=application_id, user_id=user_id)
 
