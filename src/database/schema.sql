@@ -274,19 +274,11 @@ BEGIN
     SELECT RAISE(FAIL, 'application_events records are append-only and cannot be updated.');
 END;
 
-CREATE TABLE IF NOT EXISTS _privacy_erasure_tokens (
-    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    token_nonce TEXT NOT NULL,
-    authorized_at DATETIME DEFAULT CURRENT_TIMESTAMP
-);
-
 CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_delete
 BEFORE DELETE ON application_events
 BEGIN
     SELECT RAISE(FAIL, 'application_events records are immutable and cannot be deleted except via authorized privacy erasure.')
-    WHERE NOT EXISTS (
-        SELECT 1 FROM _privacy_erasure_tokens WHERE user_id = OLD.user_id
-    );
+    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
 END;
 
 -- ---------------------------------------------------------------------

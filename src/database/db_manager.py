@@ -5,7 +5,6 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-import secrets
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
@@ -140,7 +139,25 @@ class DatabaseManager:
         conn.execute("PRAGMA foreign_keys = ON;")
         if self.db_path != ":memory:":
             conn.execute("PRAGMA journal_mode = WAL;")
+        # Register default connection-scoped authorization function rejecting application_events deletions
+        conn.create_function("verify_privacy_erasure_authorization", 1, lambda uid: 0)
         return conn
+
+    @contextmanager
+    def _authorized_privacy_erasure_scope(
+        self, conn: sqlite3.Connection, user_id: int
+    ) -> Generator[None, None, None]:
+        """Activates an ephemeral, connection-scoped authorization granting deletion of application_events
+        strictly for the specified user_id for the duration of the context block.
+        """
+        def _verify_auth(uid: int) -> int:
+            return 1 if uid == user_id else 0
+
+        conn.create_function("verify_privacy_erasure_authorization", 1, _verify_auth)
+        try:
+            yield
+        finally:
+            conn.create_function("verify_privacy_erasure_authorization", 1, lambda uid: 0)
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
@@ -451,11 +468,11 @@ class DatabaseManager:
         Enforces:
         - Strict user_id NOT NULL on applications
         - ON DELETE RESTRICT on job_descriptions and resumes (via composite FKs)
-        - ON DELETE SET NULL on catalog jobs
+        - ON DELETE RESTRICT on prepared_packets in submission_confirmations
         - Status CHECK constraint allowing 12 universal lifecycle statuses + legacy aliases
         - Zero-fabrication legacy status translation (with approval verification for Awaiting Approval)
-        - Creation of application_events (with append-only trigger), submission_confirmations, and application_follow_ups
-        - Preflight verification aborting on NULL user_id or cross-user references
+        - Creation and verification of application_events (with append-only and privacy-erasure triggers)
+        - Preflight verification aborting on NULL user_id or cross-user references under write lock
         """
         cursor = conn.cursor()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='applications'")
@@ -480,144 +497,35 @@ class DatabaseManager:
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_events'")
         has_events = cursor.fetchone() is not None
 
-        if is_user_id_not_null and has_jd_restrict and has_resume_restrict and has_events:
-            return  # Already migrated
+        needs_app_migration = not (is_user_id_not_null and has_jd_restrict and has_resume_restrict and has_events)
+
+        # Check if submission_confirmations needs migration (e.g. existing Phase 7.1 db where packet_id was not RESTRICT)
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='submission_confirmations'")
+        has_sub_conf_table = cursor.fetchone() is not None
+        needs_sub_conf_migration = False
+        if has_sub_conf_table:
+            cursor.execute("PRAGMA foreign_key_list(submission_confirmations)")
+            sub_fks = [dict(r) for r in cursor.fetchall()]
+            has_packet_restrict = any(
+                fk.get("table") == "prepared_packets" and fk.get("on_delete") == "RESTRICT" for fk in sub_fks
+            )
+            if not has_packet_restrict:
+                needs_sub_conf_migration = True
+
+        # Check if legacy privacy erasure table or trigger exists
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='_privacy_erasure_tokens'")
+        has_tokens_table = cursor.fetchone() is not None
+        cursor.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name='trg_prevent_application_events_delete'")
+        trg_row = cursor.fetchone()
+        has_old_trigger = trg_row is not None and ("_privacy_erasure_tokens" in (trg_row[0] or ""))
+        needs_trigger_migration = has_tokens_table or has_old_trigger
+
+        if not needs_app_migration and not needs_sub_conf_migration and not needs_trigger_migration:
+            return  # Already migrated and fully up to date
 
         logger.info("Phase 7.1: Running migration preflight checks for application lifecycle...")
 
-        # Preflight Check 1: Null user_ids in applications
-        cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id IS NULL")
-        null_users = cursor.fetchone()[0]
-        if null_users > 0:
-            raise MigrationPreflightError(
-                f"Migration preflight failed: {null_users} application record(s) have NULL user_id. "
-                "Historical records cannot be arbitrarily misattributed to any user."
-            )
-
-        # Preflight Check 2: Invalid user_ids (not existing in users table)
-        cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id NOT IN (SELECT id FROM users)")
-        invalid_users = cursor.fetchone()[0]
-        if invalid_users > 0:
-            raise MigrationPreflightError(
-                f"Migration preflight failed: {invalid_users} application record(s) reference non-existent user_id."
-            )
-
-        # Preflight Check 3: Cross-user Job Description references
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
-        if cursor.fetchone():
-            cursor.execute("""
-                SELECT COUNT(*) FROM applications a
-                JOIN job_descriptions jd ON a.job_description_id = jd.id
-                WHERE a.job_description_id IS NOT NULL AND a.user_id != jd.user_id
-            """)
-            cross_jd = cursor.fetchone()[0]
-            if cross_jd > 0:
-                raise MigrationPreflightError(
-                    f"Migration preflight failed: {cross_jd} application(s) reference job descriptions owned by another user."
-                )
-
-        # Preflight Check 4: Cross-user Resume references
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='resumes'")
-        if cursor.fetchone():
-            cursor.execute("""
-                SELECT COUNT(*) FROM applications a
-                JOIN resumes r ON a.resume_id = r.id
-                WHERE a.resume_id IS NOT NULL AND a.user_id != r.user_id
-            """)
-            cross_res = cursor.fetchone()[0]
-            if cross_res > 0:
-                raise MigrationPreflightError(
-                    f"Migration preflight failed: {cross_res} application(s) reference resumes owned by another user."
-                )
-
-        # Preflight Check 5: Cross-user Prepared Packet references
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
-        if cursor.fetchone():
-            cursor.execute("""
-                SELECT COUNT(*) FROM prepared_packets p
-                JOIN applications a ON p.application_id = a.id
-                WHERE p.user_id != a.user_id
-            """)
-            cross_pkt = cursor.fetchone()[0]
-            if cross_pkt > 0:
-                raise MigrationPreflightError(
-                    f"Migration preflight failed: {cross_pkt} prepared packet(s) reference applications owned by another user."
-                )
-
-        # Preflight Check 6: Cross-user Approval references
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
-        if cursor.fetchone():
-            cursor.execute("""
-                SELECT COUNT(*) FROM application_approvals ap
-                JOIN applications a ON ap.application_id = a.id
-                WHERE ap.user_id != a.user_id
-            """)
-            cross_appr = cursor.fetchone()[0]
-            if cross_appr > 0:
-                raise MigrationPreflightError(
-                    f"Migration preflight failed: {cross_appr} approval(s) reference applications owned by another user."
-                )
-
-        logger.info("Phase 7.1 preflight passed. Executing atomic table rebuild migration...")
-
-        # Fetch applications to migrate
-        cursor.execute("SELECT * FROM applications")
-        old_apps = [dict(r) for r in cursor.fetchall()]
-
-        # Query approved application IDs for deterministic status mapping
-        approved_app_pairs = set()
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
-        has_approvals = cursor.fetchone() is not None
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
-        has_packets = cursor.fetchone() is not None
-        if has_approvals and has_packets:
-            cursor.execute("""
-                SELECT DISTINCT p.application_id, p.user_id
-                FROM prepared_packets p
-                JOIN application_approvals a ON a.packet_id = p.id
-                    AND a.user_id = p.user_id
-                    AND a.application_id = p.application_id
-                    AND a.packet_version_hash = p.packet_version_hash
-                WHERE a.is_consumed = 0
-                    AND p.is_active_revision = 1
-            """)
-            approved_app_pairs = {(r[0], r[1]) for r in cursor.fetchall()}
-
-        def map_legacy_status(app_id: int, app_user_id: Optional[int], old_status: Optional[str]) -> str:
-            if not old_status:
-                return ApplicationStatus.DRAFT.value
-            s_clean = old_status.strip()
-            s_lower = s_clean.lower()
-            if s_lower in ("discovered", "draft"):
-                return ApplicationStatus.DRAFT.value
-            if s_lower in ("under review", "shortlisted", "preparing"):
-                return ApplicationStatus.PREPARING.value
-            if s_lower in ("application prepared", "ready_for_review"):
-                return ApplicationStatus.READY_FOR_REVIEW.value
-            if s_lower == "awaiting approval":
-                is_approved = (app_id, app_user_id) in approved_app_pairs
-                return ApplicationStatus.APPROVED.value if is_approved else ApplicationStatus.READY_FOR_REVIEW.value
-            if s_lower in ("applied", "submitted"):
-                return ApplicationStatus.SUBMITTED.value
-            if s_lower in ("in_progress", "in progress"):
-                return ApplicationStatus.IN_PROGRESS.value
-            if s_lower == "assessment":
-                return ApplicationStatus.ASSESSMENT.value
-            if s_lower == "interview":
-                return ApplicationStatus.INTERVIEW.value
-            if s_lower == "offer":
-                return ApplicationStatus.OFFER.value
-            if s_lower == "rejected":
-                return ApplicationStatus.REJECTED.value
-            if s_lower == "withdrawn":
-                return ApplicationStatus.WITHDRAWN.value
-            if s_lower == "closed":
-                return ApplicationStatus.CLOSED.value
-            return ApplicationStatus.DRAFT.value
-
-        new_status_map = {app["id"]: map_legacy_status(app["id"], app.get("user_id"), app.get("status")) for app in old_apps}
-
-        # Step 1: Temporarily disable foreign keys and execute atomic table rebuild in explicit transaction
+        # Step 1: Set manual transaction mode, disable FKs, and acquire RESERVED write lock IMMEDIATELY
         old_isolation = conn.isolation_level
         try:
             conn.isolation_level = None  # Manual transaction mode
@@ -625,91 +533,280 @@ class DatabaseManager:
             cursor.execute("PRAGMA foreign_keys = OFF;")
             cursor.execute("BEGIN IMMEDIATE TRANSACTION;")
 
-            cursor.execute("DROP TABLE IF EXISTS applications_v7")
-            cursor.execute("""
-                CREATE TABLE applications_v7 (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
-                    job_description_id INTEGER,
-                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                    resume_id INTEGER,
-                    company_name TEXT NOT NULL,
-                    job_title TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN (
-                        'DRAFT', 'PREPARING', 'READY_FOR_REVIEW', 'APPROVED',
-                        'SUBMITTED', 'IN_PROGRESS', 'ASSESSMENT', 'INTERVIEW',
-                        'OFFER', 'REJECTED', 'WITHDRAWN', 'CLOSED',
-                        'Discovered', 'Under Review', 'Shortlisted', 'Application Prepared',
-                        'Awaiting Approval', 'Applied', 'Interview', 'Rejected', 'Withdrawn'
-                    )),
-                    application_source TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION' CHECK(application_source IN ('JOB_DESCRIPTION', 'MATCH_RESULT', 'PREPARED_PACKET', 'MANUAL')),
-                    external_application_url TEXT,
-                    target_role TEXT,
-                    employment_type TEXT,
-                    location TEXT,
-                    salary_range TEXT,
-                    application_deadline DATETIME,
-                    date_prepared DATETIME,
-                    date_submitted DATETIME,
-                    resume_used TEXT,
-                    cover_letter_reference TEXT,
-                    notes TEXT,
-                    is_archived INTEGER DEFAULT 0 CHECK(is_archived IN (0, 1)),
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(id, user_id),
-                    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT,
-                    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
+            # Preflight Check 1: Null user_ids in applications
+            cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id IS NULL")
+            null_users = cursor.fetchone()[0]
+            if null_users > 0:
+                raise MigrationPreflightError(
+                    f"Migration preflight failed: {null_users} application record(s) have NULL user_id. "
+                    "Historical records cannot be arbitrarily misattributed to any user."
                 )
-            """)
 
-            for app in old_apps:
+            # Preflight Check 2: Invalid user_ids (not existing in users table)
+            cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id NOT IN (SELECT id FROM users)")
+            invalid_users = cursor.fetchone()[0]
+            if invalid_users > 0:
+                raise MigrationPreflightError(
+                    f"Migration preflight failed: {invalid_users} application record(s) reference non-existent user_id."
+                )
+
+            # Preflight Check 3: Cross-user Job Description references
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
+            if cursor.fetchone():
                 cursor.execute("""
-                    INSERT INTO applications_v7 (
-                        id, job_id, job_description_id, user_id, resume_id,
-                        company_name, job_title, status, application_source,
-                        external_application_url, target_role, employment_type,
-                        location, salary_range, application_deadline, date_prepared,
-                        date_submitted, resume_used, cover_letter_reference, notes,
-                        is_archived, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    app["id"],
-                    app.get("job_id"),
-                    app.get("job_description_id"),
-                    app["user_id"],
-                    app.get("resume_id"),
-                    app.get("company_name") or "Unknown",
-                    app.get("job_title") or "Role",
-                    new_status_map[app["id"]],
-                    app.get("application_source") or "JOB_DESCRIPTION",
-                    app.get("external_application_url"),
-                    app.get("target_role"),
-                    app.get("employment_type"),
-                    app.get("location"),
-                    app.get("salary_range"),
-                    app.get("application_deadline"),
-                    app.get("date_prepared"),
-                    app.get("date_submitted"),
-                    app.get("resume_used"),
-                    app.get("cover_letter_reference"),
-                    app.get("notes"),
-                    app.get("is_archived") or 0,
-                    app.get("created_at"),
-                    app.get("updated_at"),
-                ))
+                    SELECT COUNT(*) FROM applications a
+                    JOIN job_descriptions jd ON a.job_description_id = jd.id
+                    WHERE a.job_description_id IS NOT NULL AND a.user_id != jd.user_id
+                """)
+                cross_jd = cursor.fetchone()[0]
+                if cross_jd > 0:
+                    raise MigrationPreflightError(
+                        f"Migration preflight failed: {cross_jd} application(s) reference job descriptions owned by another user."
+                    )
 
-            cursor.execute("DROP TABLE applications")
-            cursor.execute("ALTER TABLE applications_v7 RENAME TO applications")
+            # Preflight Check 4: Cross-user Resume references
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='resumes'")
+            if cursor.fetchone():
+                cursor.execute("""
+                    SELECT COUNT(*) FROM applications a
+                    JOIN resumes r ON a.resume_id = r.id
+                    WHERE a.resume_id IS NOT NULL AND a.user_id != r.user_id
+                """)
+                cross_res = cursor.fetchone()[0]
+                if cross_res > 0:
+                    raise MigrationPreflightError(
+                        f"Migration preflight failed: {cross_res} application(s) reference resumes owned by another user."
+                    )
 
-            # Recreate application indexes
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user_status ON applications(user_id, status)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_archived ON applications(user_id, is_archived)")
-            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
-            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_user_jd ON applications(user_id, job_description_id) WHERE job_description_id IS NOT NULL")
+            # Preflight Check 5: Cross-user Prepared Packet references
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
+            if cursor.fetchone():
+                cursor.execute("""
+                    SELECT COUNT(*) FROM prepared_packets p
+                    JOIN applications a ON p.application_id = a.id
+                    WHERE p.user_id != a.user_id
+                """)
+                cross_pkt = cursor.fetchone()[0]
+                if cross_pkt > 0:
+                    raise MigrationPreflightError(
+                        f"Migration preflight failed: {cross_pkt} prepared packet(s) reference applications owned by another user."
+                    )
+
+            # Preflight Check 6: Cross-user Approval references
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
+            if cursor.fetchone():
+                cursor.execute("""
+                    SELECT COUNT(*) FROM application_approvals ap
+                    JOIN applications a ON ap.application_id = a.id
+                    WHERE ap.user_id != a.user_id
+                """)
+                cross_appr = cursor.fetchone()[0]
+                if cross_appr > 0:
+                    raise MigrationPreflightError(
+                        f"Migration preflight failed: {cross_appr} approval(s) reference applications owned by another user."
+                    )
+
+            logger.info("Phase 7.1 preflight passed under write lock. Executing atomic table rebuild migration...")
+
+            if needs_app_migration:
+                # Fetch applications to migrate
+                cursor.execute("SELECT * FROM applications")
+                old_apps = [dict(r) for r in cursor.fetchall()]
+
+                # Query approved application IDs for deterministic status mapping
+                approved_app_pairs = set()
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
+                has_approvals = cursor.fetchone() is not None
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
+                has_packets = cursor.fetchone() is not None
+                if has_approvals and has_packets:
+                    cursor.execute("""
+                        SELECT DISTINCT p.application_id, p.user_id
+                        FROM prepared_packets p
+                        JOIN application_approvals a ON a.packet_id = p.id
+                            AND a.user_id = p.user_id
+                            AND a.application_id = p.application_id
+                            AND a.packet_version_hash = p.packet_version_hash
+                        WHERE a.is_consumed = 0
+                            AND p.is_active_revision = 1
+                    """)
+                    approved_app_pairs = {(r[0], r[1]) for r in cursor.fetchall()}
+
+                def map_legacy_status(app_id: int, app_user_id: Optional[int], old_status: Optional[str]) -> str:
+                    if not old_status:
+                        return ApplicationStatus.DRAFT.value
+                    s_clean = old_status.strip()
+                    s_lower = s_clean.lower()
+                    if s_lower in ("discovered", "draft"):
+                        return ApplicationStatus.DRAFT.value
+                    if s_lower in ("under review", "shortlisted", "preparing"):
+                        return ApplicationStatus.PREPARING.value
+                    if s_lower in ("application prepared", "ready_for_review"):
+                        return ApplicationStatus.READY_FOR_REVIEW.value
+                    if s_lower == "awaiting approval":
+                        is_approved = (app_id, app_user_id) in approved_app_pairs
+                        return ApplicationStatus.APPROVED.value if is_approved else ApplicationStatus.READY_FOR_REVIEW.value
+                    if s_lower in ("applied", "submitted"):
+                        return ApplicationStatus.SUBMITTED.value
+                    if s_lower in ("in_progress", "in progress"):
+                        return ApplicationStatus.IN_PROGRESS.value
+                    if s_lower == "assessment":
+                        return ApplicationStatus.ASSESSMENT.value
+                    if s_lower == "interview":
+                        return ApplicationStatus.INTERVIEW.value
+                    if s_lower == "offer":
+                        return ApplicationStatus.OFFER.value
+                    if s_lower == "rejected":
+                        return ApplicationStatus.REJECTED.value
+                    if s_lower == "withdrawn":
+                        return ApplicationStatus.WITHDRAWN.value
+                    if s_lower == "closed":
+                        return ApplicationStatus.CLOSED.value
+                    return ApplicationStatus.DRAFT.value
+
+                new_status_map = {app["id"]: map_legacy_status(app["id"], app.get("user_id"), app.get("status")) for app in old_apps}
+
+                cursor.execute("DROP TABLE IF EXISTS applications_v7")
+                cursor.execute("""
+                    CREATE TABLE applications_v7 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+                        job_description_id INTEGER,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        resume_id INTEGER,
+                        company_name TEXT NOT NULL,
+                        job_title TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN (
+                            'DRAFT', 'PREPARING', 'READY_FOR_REVIEW', 'APPROVED',
+                            'SUBMITTED', 'IN_PROGRESS', 'ASSESSMENT', 'INTERVIEW',
+                            'OFFER', 'REJECTED', 'WITHDRAWN', 'CLOSED',
+                            'Discovered', 'Under Review', 'Shortlisted', 'Application Prepared',
+                            'Awaiting Approval', 'Applied', 'Interview', 'Rejected', 'Withdrawn'
+                        )),
+                        application_source TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION' CHECK(application_source IN ('JOB_DESCRIPTION', 'MATCH_RESULT', 'PREPARED_PACKET', 'MANUAL')),
+                        external_application_url TEXT,
+                        target_role TEXT,
+                        employment_type TEXT,
+                        location TEXT,
+                        salary_range TEXT,
+                        application_deadline DATETIME,
+                        date_prepared DATETIME,
+                        date_submitted DATETIME,
+                        resume_used TEXT,
+                        cover_letter_reference TEXT,
+                        notes TEXT,
+                        is_archived INTEGER DEFAULT 0 CHECK(is_archived IN (0, 1)),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(id, user_id),
+                        FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT,
+                        FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
+                    )
+                """)
+
+                for app in old_apps:
+                    cursor.execute("""
+                        INSERT INTO applications_v7 (
+                            id, job_id, job_description_id, user_id, resume_id,
+                            company_name, job_title, status, application_source,
+                            external_application_url, target_role, employment_type,
+                            location, salary_range, application_deadline, date_prepared,
+                            date_submitted, resume_used, cover_letter_reference, notes,
+                            is_archived, created_at, updated_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        app["id"],
+                        app.get("job_id"),
+                        app.get("job_description_id"),
+                        app["user_id"],
+                        app.get("resume_id"),
+                        app.get("company_name") or "Unknown",
+                        app.get("job_title") or "Role",
+                        new_status_map[app["id"]],
+                        app.get("application_source") or "JOB_DESCRIPTION",
+                        app.get("external_application_url"),
+                        app.get("target_role"),
+                        app.get("employment_type"),
+                        app.get("location"),
+                        app.get("salary_range"),
+                        app.get("application_deadline"),
+                        app.get("date_prepared"),
+                        app.get("date_submitted"),
+                        app.get("resume_used"),
+                        app.get("cover_letter_reference"),
+                        app.get("notes"),
+                        app.get("is_archived") or 0,
+                        app.get("created_at"),
+                        app.get("updated_at"),
+                    ))
+
+                cursor.execute("DROP TABLE applications")
+                cursor.execute("ALTER TABLE applications_v7 RENAME TO applications")
+
+                # Recreate application indexes
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user_status ON applications(user_id, status)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_archived ON applications(user_id, is_archived)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_user_jd ON applications(user_id, job_description_id) WHERE job_description_id IS NOT NULL")
+
+            if needs_sub_conf_migration:
+                # Rebuild submission_confirmations with ON DELETE RESTRICT on prepared_packets
+                logger.info("Migrating submission_confirmations to enforce ON DELETE RESTRICT on prepared_packets...")
+                cursor.execute("SELECT * FROM submission_confirmations")
+                old_confs = [dict(r) for r in cursor.fetchall()]
+
+                cursor.execute("DROP TABLE IF EXISTS submission_confirmations_v7")
+                cursor.execute("""
+                    CREATE TABLE submission_confirmations_v7 (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        application_id INTEGER NOT NULL,
+                        user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        packet_id INTEGER,
+                        packet_version_hash TEXT,
+                        submission_timestamp DATETIME NOT NULL,
+                        submission_channel TEXT NOT NULL CHECK(submission_channel IN ('COMPANY_PORTAL', 'LINKEDIN', 'INDEED', 'EMAIL', 'RECRUITER', 'REFERRAL', 'OTHER')),
+                        confirmation_reference TEXT,
+                        confirmation_doc_path TEXT,
+                        confirmation_doc_hash TEXT,
+                        candidate_notes TEXT,
+                        is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
+                        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+                        FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE RESTRICT
+                    )
+                """)
+                for conf_row in old_confs:
+                    cursor.execute("""
+                        INSERT INTO submission_confirmations_v7 (
+                            id, application_id, user_id, packet_id, packet_version_hash,
+                            submission_timestamp, submission_channel, confirmation_reference,
+                            confirmation_doc_path, confirmation_doc_hash, candidate_notes,
+                            is_active_confirmation, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        conf_row["id"],
+                        conf_row["application_id"],
+                        conf_row["user_id"],
+                        conf_row.get("packet_id"),
+                        conf_row.get("packet_version_hash"),
+                        conf_row["submission_timestamp"],
+                        conf_row["submission_channel"],
+                        conf_row.get("confirmation_reference"),
+                        conf_row.get("confirmation_doc_path"),
+                        conf_row.get("confirmation_doc_hash"),
+                        conf_row.get("candidate_notes"),
+                        conf_row.get("is_active_confirmation", 1),
+                        conf_row.get("created_at"),
+                    ))
+
+                cursor.execute("DROP TABLE submission_confirmations")
+                cursor.execute("ALTER TABLE submission_confirmations_v7 RENAME TO submission_confirmations")
+                cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_sub_conf_app ON submission_confirmations(application_id, user_id)")
+                cursor.execute("CREATE INDEX IF NOT EXISTS idx_sub_conf_user_channel ON submission_confirmations(user_id, submission_channel)")
 
             # Create child tables if not existing
             cursor.execute("""
@@ -741,22 +838,17 @@ class DatabaseManager:
                 END
             """)
 
-            cursor.execute("""
-                CREATE TABLE IF NOT EXISTS _privacy_erasure_tokens (
-                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-                    token_nonce TEXT NOT NULL,
-                    authorized_at DATETIME DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
+            # Drop obsolete _privacy_erasure_tokens table if present
+            cursor.execute("DROP TABLE IF EXISTS _privacy_erasure_tokens")
 
+            # Recreate trg_prevent_application_events_delete with connection-scoped UDF
+            cursor.execute("DROP TRIGGER IF EXISTS trg_prevent_application_events_delete")
             cursor.execute("""
                 CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_delete
                 BEFORE DELETE ON application_events
                 BEGIN
                     SELECT RAISE(FAIL, 'application_events records are immutable and cannot be deleted except via authorized privacy erasure.')
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM _privacy_erasure_tokens WHERE user_id = OLD.user_id
-                    );
+                    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
                 END
             """)
 
@@ -808,15 +900,15 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_app ON application_follow_ups(application_id, user_id)")
 
             # Backfill initial events for historical applications without events
-            for app in old_apps:
+            cursor.execute("SELECT id, user_id, status, created_at FROM applications")
+            current_apps = [dict(r) for r in cursor.fetchall()]
+            for app in current_apps:
                 cursor.execute("SELECT COUNT(*) FROM application_events WHERE application_id = ?", (app["id"],))
                 if cursor.fetchone()[0] == 0:
-                    old_status = app.get("status")
-                    migrated_status = new_status_map[app["id"]]
+                    app_status = app.get("status") or "DRAFT"
                     payload = {
                         "migration_version": "7.1",
-                        "migrated_from_legacy_status": old_status,
-                        "migrated_to_status": migrated_status,
+                        "migrated_to_status": app_status,
                     }
                     payload_json = canonical_json_bytes(payload).decode("utf-8")
                     backfill_ts = app.get("created_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -826,9 +918,9 @@ class DatabaseManager:
                         application_id=app["id"],
                         event_payload_json=payload_json,
                         event_type="MIGRATION_INITIALIZED",
-                        new_status=migrated_status,
+                        new_status=app_status,
                         previous_event_hash="GENESIS",
-                        previous_status=old_status,
+                        previous_status=None,
                         sequence_no=1,
                         session_reference=None,
                         user_id=app["user_id"],
@@ -844,7 +936,7 @@ class DatabaseManager:
                         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         app["id"], app["user_id"], 1, "MIGRATION_INITIALIZED",
-                        old_status, migrated_status, "SYSTEM", "system_migration",
+                        None, app_status, "SYSTEM", "system_migration",
                         None, payload_json, "GENESIS", evt_hash, backfill_ts
                     ))
 
@@ -867,7 +959,7 @@ class DatabaseManager:
                 cursor.execute("ROLLBACK;")
             except Exception:
                 pass
-            if isinstance(e, DatabaseMigrationError):
+            if isinstance(e, (DatabaseMigrationError, MigrationPreflightError)):
                 raise
             raise DatabaseMigrationError(f"Phase 7.1 application lifecycle migration failed and was rolled back: {e}") from e
         finally:
@@ -3636,58 +3728,52 @@ class DatabaseManager:
         under an anonymized pseudonym, per privacy and audit integrity specifications.
         """
         pseudonym = f"ANON_USER_{hashlib.sha256(str(user_id).encode()).hexdigest()[:12]}"
-        nonce = secrets.token_hex(16)
         with self.transaction() as conn:
             cursor = conn.cursor()
-            # Authorize privacy erasure of this specific user
+            # Verify user exists
+            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+            if not cursor.fetchone():
+                raise UserNotFoundError(user_id)
+
+            # 1. Anonymize application_logs details for this user (strip PII, retain submission audit)
             cursor.execute(
-                "INSERT OR REPLACE INTO _privacy_erasure_tokens (user_id, token_nonce) VALUES (?, ?)",
-                (user_id, nonce),
+                """
+                UPDATE application_logs
+                SET user_id = NULL,
+                    anonymized_user_pseudonym = ?,
+                    details = json_set(COALESCE(details, '{}'), '$.user_deleted', 1, '$.anonymized_at', CURRENT_TIMESTAMP)
+                WHERE user_id = ?
+                """,
+                (pseudonym, user_id),
             )
-            try:
-                # Verify user exists
-                cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-                if not cursor.fetchone():
-                    raise UserNotFoundError(user_id)
 
-                # 1. Anonymize application_logs details for this user (strip PII, retain submission audit)
-                cursor.execute(
-                    """
-                    UPDATE application_logs
-                    SET user_id = NULL,
-                        anonymized_user_pseudonym = ?,
-                        details = json_set(COALESCE(details, '{}'), '$.user_deleted', 1, '$.anonymized_at', CURRENT_TIMESTAMP)
-                    WHERE user_id = ?
-                    """,
-                    (pseudonym, user_id),
-                )
+            # 2. Anonymize auth_audit_logs metadata
+            cursor.execute(
+                """
+                UPDATE auth_audit_logs
+                SET user_id = NULL,
+                    metadata_json = '{"anonymized": true}'
+                WHERE user_id = ?
+                """,
+                (user_id,),
+            )
 
-                # 2. Anonymize auth_audit_logs metadata
-                cursor.execute(
-                    """
-                    UPDATE auth_audit_logs
-                    SET user_id = NULL,
-                        metadata_json = '{"anonymized": true}'
-                    WHERE user_id = ?
-                    """,
-                    (user_id,),
-                )
+            # 2.5 Delete Phase 7 application lifecycle child tables and historical records in topological order:
+            cursor.execute("DELETE FROM submission_confirmations WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM application_follow_ups WHERE user_id = ?", (user_id,))
 
-                # 2.5 Delete Phase 7 application lifecycle child tables and historical records in topological order:
-                cursor.execute("DELETE FROM submission_confirmations WHERE user_id = ?", (user_id,))
-                cursor.execute("DELETE FROM application_follow_ups WHERE user_id = ?", (user_id,))
+            with self._authorized_privacy_erasure_scope(conn, user_id):
                 cursor.execute("DELETE FROM application_events WHERE user_id = ?", (user_id,))
-                cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
-                cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
-                cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
 
-                # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
-                #    applications, application_approvals, password_reset_tokens)
-                cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-                logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
-                return True
-            finally:
-                cursor.execute("DELETE FROM _privacy_erasure_tokens WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
+
+            # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
+            #    applications, application_approvals, password_reset_tokens)
+            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+            logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
+            return True
 
     # -------------------------------------------------------------------------
     # PHASE 5: MATCH RESULT PERSISTENCE & MULTI-USER AUDIT TRAIL
@@ -4046,14 +4132,6 @@ class DatabaseManager:
                 ),
             )
             event_id = cursor.lastrowid
-
-            # If new_status is provided and different from current status, update application status
-            if new_status and new_status != current_status:
-                cursor.execute(
-                    "UPDATE applications SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
-                    (new_status, application_id, user_id),
-                )
-
             cursor.execute("SELECT * FROM application_events WHERE id = ?", (event_id,))
             return ApplicationEvent(**dict(cursor.fetchone()))
 
@@ -4215,20 +4293,15 @@ class DatabaseManager:
                 if packet_id is None:
                     raise ValidationError("packet_id is required to confirm submission and transition application to SUBMITTED.")
 
-                # Status check: DRAFT, PREPARING, READY_FOR_REVIEW cannot transition to SUBMITTED
-                unapproved_statuses = (
-                    ApplicationStatus.DRAFT.value,
-                    ApplicationStatus.PREPARING.value,
-                    ApplicationStatus.READY_FOR_REVIEW.value,
-                    "discovered",
-                    "under review",
-                    "shortlisted",
-                    "application prepared",
+                # Status check: only APPROVED or legacy 'Awaiting Approval' can transition to SUBMITTED
+                allowed_statuses = (
+                    ApplicationStatus.APPROVED.value.lower(),
+                    "awaiting approval",
                 )
-                if current_status.strip().lower() in [s.lower() for s in unapproved_statuses]:
+                if current_status.strip().lower() not in allowed_statuses:
                     raise SecurityAuthorizationError(
                         f"Cannot transition application #{application_id} in '{current_status}' status to SUBMITTED. "
-                        f"Application must be approved by candidate before submission."
+                        f"Application must be approved by candidate (in APPROVED or Awaiting Approval status) before submission."
                     )
 
                 cursor.execute(
@@ -4270,8 +4343,10 @@ class DatabaseManager:
                     raise SecurityAuthorizationError(
                         f"No valid human approval record found for Application #{application_id} and PreparedPacket #{packet_id}."
                     )
-                if appr_row["is_consumed"] and current_status != ApplicationStatus.SUBMITTED.value:
-                    raise SecurityAuthorizationError("Human approval for this packet has already been consumed.")
+                if appr_row["is_consumed"]:
+                    raise SecurityAuthorizationError(
+                        f"Human approval for PreparedPacket #{packet_id} has already been consumed."
+                    )
 
                 # Consume the approval record
                 cursor.execute(
@@ -4414,6 +4489,88 @@ class DatabaseManager:
 
             cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (conf_id,))
             return SubmissionConfirmation(**dict(cursor.fetchone()))
+
+    def correct_submission_confirmation(
+        self,
+        confirmation_id: int,
+        user_id: int,
+        confirmation_reference: Optional[str] = None,
+        confirmation_doc_path: Optional[str] = None,
+        confirmation_doc_hash: Optional[str] = None,
+        candidate_notes: Optional[str] = None,
+        submission_channel: Optional[str] = None,
+    ) -> SubmissionConfirmation:
+        """Allows candidates to correct or attach confirmation artifacts to an existing submission confirmation
+        without requiring re-submission or re-approving packets. Does not modify application status.
+        """
+        if submission_channel is not None:
+            valid_channels = SubmissionChannel.list()
+            if submission_channel not in valid_channels:
+                raise ValidationError(
+                    f"Invalid submission_channel '{submission_channel}'. Valid options: {valid_channels}"
+                )
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (confirmation_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValidationError(f"SubmissionConfirmation #{confirmation_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"SubmissionConfirmation #{confirmation_id}",
+                )
+
+            cursor.execute(
+                """
+                UPDATE submission_confirmations
+                SET confirmation_reference = COALESCE(?, confirmation_reference),
+                    confirmation_doc_path = COALESCE(?, confirmation_doc_path),
+                    confirmation_doc_hash = COALESCE(?, confirmation_doc_hash),
+                    candidate_notes = COALESCE(?, candidate_notes),
+                    submission_channel = COALESCE(?, submission_channel)
+                WHERE id = ? AND user_id = ?
+                """,
+                (
+                    confirmation_reference,
+                    confirmation_doc_path,
+                    confirmation_doc_hash,
+                    candidate_notes,
+                    submission_channel,
+                    confirmation_id,
+                    user_id,
+                ),
+            )
+            cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (confirmation_id,))
+            updated = SubmissionConfirmation(**dict(cursor.fetchone()))
+
+        # Emit audit event for correction
+        try:
+            self.create_application_event(
+                application_id=updated.application_id,
+                user_id=user_id,
+                event_type="SUBMISSION_CONFIRMATION_UPDATED",
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload={
+                    "confirmation_id": confirmation_id,
+                    "updated_fields": {
+                        k: v for k, v in {
+                            "confirmation_reference": confirmation_reference,
+                            "confirmation_doc_path": confirmation_doc_path,
+                            "confirmation_doc_hash": confirmation_doc_hash,
+                            "candidate_notes": candidate_notes,
+                            "submission_channel": submission_channel,
+                        }.items() if v is not None
+                    },
+                },
+            )
+        except Exception as e:
+            logger.warning("Could not record timeline event for updated confirmation #%d: %s", confirmation_id, e)
+
+        return updated
 
     def get_submission_confirmation(
         self, application_id: int, user_id: int, active_only: bool = True

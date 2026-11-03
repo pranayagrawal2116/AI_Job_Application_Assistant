@@ -499,6 +499,17 @@ In the multi-user architecture (Phase 6–7), public catalog discovery and candi
 | **Event Hashing & Deletion Protection** | Timestamps were omitted from hash; normal users could delete events. | Upgraded hash to `v2` (binding UTC `created_at` timestamp); installed `trg_prevent_application_events_delete` trigger; restricted event deletion to authorized privacy erasure (`_privacy_erasure_tokens`); documented tail deletion limitation. |
 | **Migration Atomicity & Rollback** | Migration lacked explicit transaction wrapping and rollback handling. | Wrapped in `conn.isolation_level = None`, `BEGIN IMMEDIATE TRANSACTION;`, explicit `ROLLBACK;` on error, and verified foreign keys/integrity before `COMMIT;`. |
 
+### 10.3 Phase 7.1.2 Final Database Safety & Migration Hardening Summary
+
+| Area | Issue Identified | Corrective Solution Implemented |
+| :--- | :--- | :--- |
+| **Generic Event Status Immutability** | `create_application_event()` accepted `new_status` and automatically ran `UPDATE applications SET status = ...`, bypassing state transitions. | Removed status update from `create_application_event()`. Event timeline is strictly append-only audit tracking. Status mutations must occur via explicit, validated lifecycle methods. |
+| **Submission Status Allowlist** | Status validation used a blacklist, failing to block invalid non-approved statuses such as `REJECTED`, `WITHDRAWN`, `CLOSED`, `IN_PROGRESS`, etc. | Replaced blacklist with strict allowlist (`APPROVED` and legacy `'Awaiting Approval'`). Any other status raises `SecurityAuthorizationError`. |
+| **Consumed Approval Rejection** | Consumed approvals could previously be bypassed if the application was already `SUBMITTED`. | Unconditionally reject consumed approvals (`is_consumed = 1`) on transition attempts. Added `correct_submission_confirmation()` to update artifacts without re-submitting. |
+| **Existing Phase 7.1 DB Migration** | Existing Phase 7.1 databases with `SET NULL` on `submission_confirmations` were bypassed because `applications` was already migrated. | Added inspection of `submission_confirmations` foreign keys, automatically rebuilding the table with `ON DELETE RESTRICT` while preserving all rows, IDs, and timestamps. |
+| **Migration Lock Ordering** | Preflight checks and application row snapshots occurred before `BEGIN IMMEDIATE TRANSACTION;`, creating race hazards with concurrent writers. | Reordered migration: Set manual isolation -> Disable FKs -> `BEGIN IMMEDIATE TRANSACTION;` acquiring RESERVED write lock -> Preflight checks -> Table rebuilds -> Integrity check -> `COMMIT;`. |
+| **Connection-Scoped Privacy Erasure** | Relying on `_privacy_erasure_tokens` table was vulnerable to token insertion, session leakage, and foreign key hazards. | Dropped `_privacy_erasure_tokens` table. Trigger uses connection-scoped SQLite UDF `verify_privacy_erasure_authorization(OLD.user_id) != 1`. Authorization is granted ephemerally via `_authorized_privacy_erasure_scope(conn, user_id)` strictly for the calling connection. |
+
 ---
 
 ## 11. Proposed Service & API Architecture

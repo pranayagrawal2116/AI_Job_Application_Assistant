@@ -628,7 +628,7 @@ class TestPhase711EventTimestampHashingAndDeletionProtection(unittest.TestCase):
         self.assertIn("application_events records are immutable and cannot be deleted", str(ctx.exception))
 
     def test_authorized_privacy_erasure_deletes_events_cleanly(self):
-        """Authorized account erasure works via _privacy_erasure_tokens and cleans up events cleanly."""
+        """Authorized account erasure works via connection-scoped authorization and cleans up events cleanly."""
         deleted = self.db.delete_user_account_data(self.user_id)
         self.assertTrue(deleted)
         self.assertIsNone(self.db.get_user_by_id(self.user_id))
@@ -646,11 +646,10 @@ class TestPhase711EventTimestampHashingAndDeletionProtection(unittest.TestCase):
         trusted_checkpoint_latest_seq = evt3.sequence_no
         self.assertEqual(trusted_checkpoint_latest_seq, 3)
 
-        # Authorize deletion of event 3 via test token
+        # Authorize deletion of event 3 via authorized privacy erasure scope
         with self.db.transaction() as conn:
-            conn.execute("INSERT OR REPLACE INTO _privacy_erasure_tokens (user_id, token_nonce) VALUES (?, 'nonce_t')", (self.user_id,))
-            conn.execute("DELETE FROM application_events WHERE id = ?", (evt3.id,))
-            conn.execute("DELETE FROM _privacy_erasure_tokens WHERE user_id = ?", (self.user_id,))
+            with self.db._authorized_privacy_erasure_scope(conn, self.user_id):
+                conn.execute("DELETE FROM application_events WHERE id = ?", (evt3.id,))
 
         # Without trusted checkpoint: sequence 1..2 is internally self-consistent
         valid, msg = self.db.verify_application_event_chain(self.app.id, self.user_id)
