@@ -122,7 +122,7 @@ class TestProfileIsolation(unittest.TestCase):
     def test_dashboard_service_save_scoped_by_user(self):
         """DashboardService.save_candidate_profile with user_id persists to that user only."""
         from dashboard.services.dashboard_service import DashboardService
-        service = DashboardService.get_instance()
+        service = DashboardService.get_instance(db_manager=self.db)
         service.db = self.db
 
         prof_data = {

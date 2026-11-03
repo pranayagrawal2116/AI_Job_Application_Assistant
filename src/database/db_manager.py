@@ -1,7 +1,7 @@
 """SQLite Database Manager for AI Job Application Assistant."""
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -14,14 +14,17 @@ from src.database.exceptions import (
     ApplicationNotFoundError,
     CrossUserAccessError,
     DatabaseError,
+    DatabaseMigrationError,
     DuplicateJobDescriptionError,
     DuplicateJobError,
     DuplicateResumeError,
+    EventIntegrityError,
     InvalidFileFormatError,
     InvalidStatusError,
     InvalidStatusTransitionError,
     JobDescriptionNotFoundError,
     JobNotFoundError,
+    MigrationPreflightError,
     ResumeInUseError,
     ResumeNotFoundError,
     SecurityAuthorizationError,
@@ -33,20 +36,26 @@ from src.database.exceptions import (
 from src.database.models import (
     Application,
     ApplicationApproval,
+    ApplicationEvent,
+    ApplicationFollowUp,
     ApplicationLog,
+    ApplicationSource,
     ApplicationStatus,
     CandidateProfileRecord,
     Company,
+    FollowUpType,
     Job,
     JobDescription,
     MatchResult,
     PreparedPacket,
+    SubmissionChannel,
+    SubmissionConfirmation,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
     normalize_job_url,
 )
-from src.utils.canonical_json import canonical_json_hash
+from src.utils.canonical_json import canonical_json_bytes, canonical_json_hash
 from src.utils.logger import setup_logger
 
 logger = setup_logger("DatabaseManager")
@@ -187,6 +196,7 @@ class DatabaseManager:
         add_col_if_missing("job_descriptions", "storage_filename", "TEXT")
         add_col_if_missing("job_descriptions", "parser_version", "TEXT DEFAULT '1.0.0'")
         add_col_if_missing("job_descriptions", "extraction_confidence", "REAL DEFAULT 1.0")
+        add_col_if_missing("job_descriptions", "content_hash", "TEXT")
         add_col_if_missing("job_descriptions", "supersedes_job_description_id", "INTEGER")
         add_col_if_missing("job_descriptions", "snapshot_hash", "TEXT")
         add_col_if_missing("job_descriptions", "is_active", "INTEGER DEFAULT 1")
@@ -221,6 +231,14 @@ class DatabaseManager:
         add_col_if_missing("prepared_packets", "job_description_id", "INTEGER")
         add_col_if_missing("prepared_packets", "template_id", "TEXT")
         add_col_if_missing("prepared_packets", "template_version", "TEXT DEFAULT '1.0.0'")
+        add_col_if_missing("applications", "application_source", "TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION'")
+        add_col_if_missing("applications", "external_application_url", "TEXT")
+        add_col_if_missing("applications", "target_role", "TEXT")
+        add_col_if_missing("applications", "employment_type", "TEXT")
+        add_col_if_missing("applications", "location", "TEXT")
+        add_col_if_missing("applications", "salary_range", "TEXT")
+        add_col_if_missing("applications", "application_deadline", "DATETIME")
+        add_col_if_missing("applications", "is_archived", "INTEGER DEFAULT 0")
 
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
@@ -426,6 +444,391 @@ class DatabaseManager:
 
         logger.info("prepared_packets migration completed successfully.")
 
+    def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
+        """Migrates applications and lifecycle tables to Phase 7 universal architecture.
+
+        Enforces:
+        - Strict user_id NOT NULL on applications
+        - ON DELETE RESTRICT on job_descriptions and resumes (via composite FKs)
+        - ON DELETE SET NULL on catalog jobs
+        - Status CHECK constraint allowing 12 universal lifecycle statuses + legacy aliases
+        - Zero-fabrication legacy status translation (with approval verification for Awaiting Approval)
+        - Creation of application_events (with append-only trigger), submission_confirmations, and application_follow_ups
+        - Preflight verification aborting on NULL user_id or cross-user references
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='applications'")
+        if not cursor.fetchone():
+            return  # Table will be created fresh by schema.sql
+
+        # Check existing schema on applications
+        cursor.execute("PRAGMA table_info(applications)")
+        app_cols = {r["name"]: dict(r) for r in cursor.fetchall()}
+        user_id_col = app_cols.get("user_id")
+        is_user_id_not_null = user_id_col is not None and bool(user_id_col["notnull"])
+
+        cursor.execute("PRAGMA foreign_key_list(applications)")
+        fks = [dict(r) for r in cursor.fetchall()]
+        has_jd_restrict = any(
+            fk.get("table") == "job_descriptions" and fk.get("on_delete") == "RESTRICT" for fk in fks
+        )
+        has_resume_restrict = any(
+            fk.get("table") == "resumes" and fk.get("on_delete") == "RESTRICT" for fk in fks
+        )
+
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_events'")
+        has_events = cursor.fetchone() is not None
+
+        if is_user_id_not_null and has_jd_restrict and has_resume_restrict and has_events:
+            return  # Already migrated
+
+        logger.info("Phase 7.1: Running migration preflight checks for application lifecycle...")
+
+        # Preflight Check 1: Null user_ids in applications
+        cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id IS NULL")
+        null_users = cursor.fetchone()[0]
+        if null_users > 0:
+            raise MigrationPreflightError(
+                f"Migration preflight failed: {null_users} application record(s) have NULL user_id. "
+                "Historical records cannot be arbitrarily misattributed to any user."
+            )
+
+        # Preflight Check 2: Invalid user_ids (not existing in users table)
+        cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id NOT IN (SELECT id FROM users)")
+        invalid_users = cursor.fetchone()[0]
+        if invalid_users > 0:
+            raise MigrationPreflightError(
+                f"Migration preflight failed: {invalid_users} application record(s) reference non-existent user_id."
+            )
+
+        # Preflight Check 3: Cross-user Job Description references
+        cursor.execute("""
+            SELECT COUNT(*) FROM applications a
+            JOIN job_descriptions jd ON a.job_description_id = jd.id
+            WHERE a.job_description_id IS NOT NULL AND a.user_id != jd.user_id
+        """)
+        cross_jd = cursor.fetchone()[0]
+        if cross_jd > 0:
+            raise MigrationPreflightError(
+                f"Migration preflight failed: {cross_jd} application(s) reference job descriptions owned by another user."
+            )
+
+        # Preflight Check 4: Cross-user Resume references
+        cursor.execute("""
+            SELECT COUNT(*) FROM applications a
+            JOIN resumes r ON a.resume_id = r.id
+            WHERE a.resume_id IS NOT NULL AND a.user_id != r.user_id
+        """)
+        cross_res = cursor.fetchone()[0]
+        if cross_res > 0:
+            raise MigrationPreflightError(
+                f"Migration preflight failed: {cross_res} application(s) reference resumes owned by another user."
+            )
+
+        # Preflight Check 5: Cross-user Prepared Packet references
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
+        if cursor.fetchone():
+            cursor.execute("""
+                SELECT COUNT(*) FROM prepared_packets p
+                JOIN applications a ON p.application_id = a.id
+                WHERE p.user_id != a.user_id
+            """)
+            cross_pkt = cursor.fetchone()[0]
+            if cross_pkt > 0:
+                raise MigrationPreflightError(
+                    f"Migration preflight failed: {cross_pkt} prepared packet(s) reference applications owned by another user."
+                )
+
+        # Preflight Check 6: Cross-user Approval references
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
+        if cursor.fetchone():
+            cursor.execute("""
+                SELECT COUNT(*) FROM application_approvals ap
+                JOIN applications a ON ap.application_id = a.id
+                WHERE ap.user_id != a.user_id
+            """)
+            cross_appr = cursor.fetchone()[0]
+            if cross_appr > 0:
+                raise MigrationPreflightError(
+                    f"Migration preflight failed: {cross_appr} approval(s) reference applications owned by another user."
+                )
+
+        logger.info("Phase 7.1 preflight passed. Executing atomic table rebuild migration...")
+
+        # Fetch applications to migrate
+        cursor.execute("SELECT * FROM applications")
+        old_apps = [dict(r) for r in cursor.fetchall()]
+
+        # Query approved application IDs for deterministic status mapping
+        approved_app_ids = set()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
+        has_approvals = cursor.fetchone() is not None
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
+        has_packets = cursor.fetchone() is not None
+        if has_approvals and has_packets:
+            cursor.execute("""
+                SELECT DISTINCT p.application_id
+                FROM prepared_packets p
+                JOIN application_approvals a ON a.packet_id = p.id AND a.user_id = p.user_id
+                WHERE a.is_revoked = 0 AND p.is_active_revision = 1
+            """)
+            approved_app_ids = {r[0] for r in cursor.fetchall()}
+
+        def map_legacy_status(app_id: int, old_status: Optional[str]) -> str:
+            if not old_status:
+                return ApplicationStatus.DRAFT.value
+            s_clean = old_status.strip()
+            s_lower = s_clean.lower()
+            if s_lower in ("discovered", "draft"):
+                return ApplicationStatus.DRAFT.value
+            if s_lower in ("under review", "shortlisted", "preparing"):
+                return ApplicationStatus.PREPARING.value
+            if s_lower in ("application prepared", "ready_for_review"):
+                return ApplicationStatus.READY_FOR_REVIEW.value
+            if s_lower == "awaiting approval":
+                return ApplicationStatus.APPROVED.value if app_id in approved_app_ids else ApplicationStatus.READY_FOR_REVIEW.value
+            if s_lower in ("applied", "submitted"):
+                return ApplicationStatus.SUBMITTED.value
+            if s_lower in ("in_progress", "in progress"):
+                return ApplicationStatus.IN_PROGRESS.value
+            if s_lower == "assessment":
+                return ApplicationStatus.ASSESSMENT.value
+            if s_lower == "interview":
+                return ApplicationStatus.INTERVIEW.value
+            if s_lower == "offer":
+                return ApplicationStatus.OFFER.value
+            if s_lower == "rejected":
+                return ApplicationStatus.REJECTED.value
+            if s_lower == "withdrawn":
+                return ApplicationStatus.WITHDRAWN.value
+            if s_lower == "closed":
+                return ApplicationStatus.CLOSED.value
+            return ApplicationStatus.DRAFT.value
+
+        new_status_map = {app["id"]: map_legacy_status(app["id"], app.get("status")) for app in old_apps}
+
+        # Step 1: Temporarily disable foreign keys on connection for table rebuild
+        cursor.execute("PRAGMA foreign_keys = OFF")
+
+        try:
+            cursor.execute("DROP TABLE IF EXISTS applications_v7")
+            cursor.execute("""
+                CREATE TABLE applications_v7 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+                    job_description_id INTEGER,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    resume_id INTEGER,
+                    company_name TEXT NOT NULL,
+                    job_title TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN (
+                        'DRAFT', 'PREPARING', 'READY_FOR_REVIEW', 'APPROVED',
+                        'SUBMITTED', 'IN_PROGRESS', 'ASSESSMENT', 'INTERVIEW',
+                        'OFFER', 'REJECTED', 'WITHDRAWN', 'CLOSED',
+                        'Discovered', 'Under Review', 'Shortlisted', 'Application Prepared',
+                        'Awaiting Approval', 'Applied', 'Interview', 'Rejected', 'Withdrawn'
+                    )),
+                    application_source TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION' CHECK(application_source IN ('JOB_DESCRIPTION', 'MATCH_RESULT', 'PREPARED_PACKET', 'MANUAL')),
+                    external_application_url TEXT,
+                    target_role TEXT,
+                    employment_type TEXT,
+                    location TEXT,
+                    salary_range TEXT,
+                    application_deadline DATETIME,
+                    date_prepared DATETIME,
+                    date_submitted DATETIME,
+                    resume_used TEXT,
+                    cover_letter_reference TEXT,
+                    notes TEXT,
+                    is_archived INTEGER DEFAULT 0 CHECK(is_archived IN (0, 1)),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(id, user_id),
+                    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT,
+                    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
+                )
+            """)
+
+            for app in old_apps:
+                cursor.execute("""
+                    INSERT INTO applications_v7 (
+                        id, job_id, job_description_id, user_id, resume_id,
+                        company_name, job_title, status, application_source,
+                        external_application_url, target_role, employment_type,
+                        location, salary_range, application_deadline, date_prepared,
+                        date_submitted, resume_used, cover_letter_reference, notes,
+                        is_archived, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    app["id"],
+                    app.get("job_id"),
+                    app.get("job_description_id"),
+                    app["user_id"],
+                    app.get("resume_id"),
+                    app.get("company_name") or "Unknown",
+                    app.get("job_title") or "Role",
+                    new_status_map[app["id"]],
+                    app.get("application_source") or "JOB_DESCRIPTION",
+                    app.get("external_application_url"),
+                    app.get("target_role"),
+                    app.get("employment_type"),
+                    app.get("location"),
+                    app.get("salary_range"),
+                    app.get("application_deadline"),
+                    app.get("date_prepared"),
+                    app.get("date_submitted"),
+                    app.get("resume_used"),
+                    app.get("cover_letter_reference"),
+                    app.get("notes"),
+                    app.get("is_archived") or 0,
+                    app.get("created_at"),
+                    app.get("updated_at"),
+                ))
+
+            cursor.execute("DROP TABLE applications")
+            cursor.execute("ALTER TABLE applications_v7 RENAME TO applications")
+
+            # Recreate application indexes
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_user_status ON applications(user_id, status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_archived ON applications(user_id, is_archived)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_user_jd ON applications(user_id, job_description_id) WHERE job_description_id IS NOT NULL")
+
+            # Create child tables if not existing
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS application_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    sequence_no INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    previous_status TEXT,
+                    new_status TEXT,
+                    actor_type TEXT NOT NULL DEFAULT 'CANDIDATE' CHECK(actor_type IN ('CANDIDATE', 'SYSTEM')),
+                    actor_identifier TEXT NOT NULL,
+                    session_reference TEXT,
+                    event_payload_json TEXT NOT NULL DEFAULT '{}',
+                    previous_event_hash TEXT NOT NULL,
+                    event_hash TEXT NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(application_id, sequence_no),
+                    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE RESTRICT
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_update
+                BEFORE UPDATE ON application_events
+                BEGIN
+                    SELECT RAISE(FAIL, 'application_events records are append-only and cannot be updated.');
+                END
+            """)
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS submission_confirmations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    packet_id INTEGER,
+                    packet_version_hash TEXT,
+                    submission_timestamp DATETIME NOT NULL,
+                    submission_channel TEXT NOT NULL CHECK(submission_channel IN ('COMPANY_PORTAL', 'LINKEDIN', 'INDEED', 'EMAIL', 'RECRUITER', 'REFERRAL', 'OTHER')),
+                    confirmation_reference TEXT,
+                    confirmation_doc_path TEXT,
+                    confirmation_doc_hash TEXT,
+                    candidate_notes TEXT,
+                    is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+                    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE SET NULL
+                )
+            """)
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1")
+
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS application_follow_ups (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    follow_up_date DATE NOT NULL,
+                    follow_up_type TEXT NOT NULL CHECK(follow_up_type IN ('STATUS_INQUIRY', 'THANK_YOU_NOTE', 'PORTFOLIO_UPDATE', 'RECRUITER_CHECKIN', 'PHONE_CALL', 'OTHER')),
+                    description TEXT NOT NULL,
+                    is_completed INTEGER DEFAULT 0 CHECK(is_completed IN (0, 1)),
+                    completed_at DATETIME,
+                    outcome_notes TEXT,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
+                )
+            """)
+
+            # Child table indexes
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_app_events_app_seq ON application_events(application_id, sequence_no)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_app_events_user_type ON application_events(user_id, event_type)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_app_events_created ON application_events(application_id, created_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sub_conf_app ON submission_confirmations(application_id, user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_sub_conf_user_channel ON submission_confirmations(user_id, submission_channel)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_due ON application_follow_ups(user_id, is_completed, follow_up_date)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_app ON application_follow_ups(application_id, user_id)")
+
+            # Backfill initial events for historical applications without events
+            for app in old_apps:
+                cursor.execute("SELECT COUNT(*) FROM application_events WHERE application_id = ?", (app["id"],))
+                if cursor.fetchone()[0] == 0:
+                    old_status = app.get("status")
+                    migrated_status = new_status_map[app["id"]]
+                    payload = {
+                        "migration_version": "7.1",
+                        "migrated_from_legacy_status": old_status,
+                        "migrated_to_status": migrated_status,
+                    }
+                    payload_json = canonical_json_bytes(payload).decode("utf-8")
+                    hash_payload = {
+                        "actor_identifier": "system_migration",
+                        "actor_type": "SYSTEM",
+                        "application_id": app["id"],
+                        "event_payload_json": payload_json,
+                        "event_type": "MIGRATION_INITIALIZED",
+                        "new_status": migrated_status,
+                        "previous_event_hash": "GENESIS",
+                        "previous_status": old_status,
+                        "sequence_no": 1,
+                        "session_reference": None,
+                        "user_id": app["user_id"],
+                    }
+                    evt_hash = canonical_json_hash(hash_payload)
+                    cursor.execute("""
+                        INSERT INTO application_events (
+                            application_id, user_id, sequence_no, event_type,
+                            previous_status, new_status, actor_type, actor_identifier,
+                            session_reference, event_payload_json, previous_event_hash, event_hash,
+                            created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                    """, (
+                        app["id"], app["user_id"], 1, "MIGRATION_INITIALIZED",
+                        old_status, migrated_status, "SYSTEM", "system_migration",
+                        None, payload_json, "GENESIS", evt_hash, app.get("created_at")
+                    ))
+
+        finally:
+            cursor.execute("PRAGMA foreign_keys = ON")
+
+        # Validate post-migration foreign keys and database integrity
+        cursor.execute("PRAGMA foreign_key_check")
+        fk_errors = cursor.fetchall()
+        if fk_errors:
+            raise DatabaseMigrationError(f"Foreign key integrity check failed after Phase 7.1 migration: {fk_errors}")
+
+        cursor.execute("PRAGMA integrity_check")
+        integrity_errors = [r[0] for r in cursor.fetchall() if r[0] != "ok"]
+        if integrity_errors:
+            raise DatabaseMigrationError(f"Database integrity check failed after Phase 7.1 migration: {integrity_errors}")
+
+        logger.info("Phase 7.1 application lifecycle migration completed successfully.")
+
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
         if not self.schema_path.is_file():
@@ -441,6 +844,8 @@ class DatabaseManager:
             self._migrate_match_results_foreign_keys(conn)
             conn.commit()
             self._migrate_prepared_packets_foreign_keys(conn)
+            conn.commit()
+            self._migrate_phase7_lifecycle_tables(conn)
             conn.commit()
             conn.executescript(schema_sql)
             conn.commit()
@@ -615,26 +1020,90 @@ class DatabaseManager:
             job.id = cursor.lastrowid
 
             # Automatically initialize application record
+            cursor.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1")
+            user_row = cursor.fetchone()
+            if user_row:
+                app_user_id = user_row["id"]
+            else:
+                # In legacy test environments without an explicit registered user,
+                # provision a default local system user
+                cursor.execute(
+                    """
+                    INSERT INTO users (email, password_hash, password_salt, full_name)
+                    VALUES ('system@localhost', 'legacy_placeholder_hash', 'legacy_placeholder_salt', 'System Candidate')
+                    """
+                )
+                app_user_id = cursor.lastrowid
+
             cursor.execute(
                 """
-                INSERT INTO applications (job_id, status)
-                VALUES (?, ?)
+                INSERT INTO applications (
+                    user_id, job_id, company_name, job_title, status, application_source
+                ) VALUES (?, ?, ?, ?, ?, 'JOB_DESCRIPTION')
                 """,
-                (job.id, ApplicationStatus.DISCOVERED.value),
+                (
+                    app_user_id,
+                    job.id,
+                    job.company_name.strip(),
+                    job.job_title.strip(),
+                    ApplicationStatus.DISCOVERED.value,
+                ),
             )
             app_id = cursor.lastrowid
 
             # Create initial audit log
             cursor.execute(
                 """
-                INSERT INTO application_logs (job_id, application_id, action, details)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
                     app_id,
+                    app_user_id,
                     "JOB_DISCOVERED",
                     json.dumps({"platform": job.platform, "score": job.match_score}),
+                ),
+            )
+
+            # Record initial timeline event
+            event_payload = {"source": "catalog_job_insert", "job_id": job.id, "platform": job.platform}
+            payload_json = canonical_json_bytes(event_payload).decode("utf-8")
+            hash_payload = {
+                "actor_identifier": "system",
+                "actor_type": "SYSTEM",
+                "application_id": app_id,
+                "event_payload_json": payload_json,
+                "event_type": "APPLICATION_CREATED",
+                "new_status": ApplicationStatus.DISCOVERED.value,
+                "previous_event_hash": "GENESIS",
+                "previous_status": None,
+                "sequence_no": 1,
+                "session_reference": None,
+                "user_id": app_user_id,
+            }
+            evt_hash = canonical_json_hash(hash_payload)
+            cursor.execute(
+                """
+                INSERT INTO application_events (
+                    application_id, user_id, sequence_no, event_type,
+                    previous_status, new_status, actor_type, actor_identifier,
+                    session_reference, event_payload_json, previous_event_hash, event_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    app_id,
+                    app_user_id,
+                    1,
+                    "APPLICATION_CREATED",
+                    None,
+                    ApplicationStatus.DISCOVERED.value,
+                    "SYSTEM",
+                    "system",
+                    None,
+                    payload_json,
+                    "GENESIS",
+                    evt_hash,
                 ),
             )
 
@@ -2030,17 +2499,39 @@ class DatabaseManager:
         job_title: str,
         job_id: Optional[int] = None,
         job_description_id: Optional[int] = None,
-        status: str = ApplicationStatus.DISCOVERED.value,
+        resume_id: Optional[int] = None,
+        status: str = ApplicationStatus.DRAFT.value,
         notes: Optional[str] = None,
+        application_source: str = ApplicationSource.JOB_DESCRIPTION.value,
+        external_application_url: Optional[str] = None,
+        target_role: Optional[str] = None,
+        employment_type: Optional[str] = None,
+        location: Optional[str] = None,
+        salary_range: Optional[str] = None,
+        application_deadline: Optional[str] = None,
+        is_archived: int = 0,
     ) -> Application:
-        """Creates an application owned by a specific user with composite foreign key validation."""
+        """Creates an application owned by a specific user with composite foreign key validation and timeline initialization."""
         if not company_name or not company_name.strip():
             raise ValidationError("company_name cannot be empty.")
         if not job_title or not job_title.strip():
             raise ValidationError("job_title cannot be empty.")
 
+        valid_statuses = ApplicationStatus.list()
+        if status not in valid_statuses:
+            raise InvalidStatusError(status, valid_statuses)
+
+        valid_sources = ApplicationSource.list()
+        if application_source not in valid_sources:
+            raise ValidationError(f"Invalid application_source: '{application_source}'. Valid options: {valid_sources}")
+
         with self.transaction() as conn:
             cursor = conn.cursor()
+
+            # Verify user exists
+            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+            if not cursor.fetchone():
+                raise UserNotFoundError(user_id)
 
             # If job_description_id is provided, verify it belongs to user_id
             if job_description_id is not None:
@@ -2055,15 +2546,90 @@ class DatabaseManager:
                         resource=f"JobDescription #{job_description_id}",
                     )
 
+            # If resume_id is provided, verify it belongs to user_id and is active
+            if resume_id is not None:
+                cursor.execute("SELECT id, user_id, is_active FROM resumes WHERE id = ?", (resume_id,))
+                res_row = cursor.fetchone()
+                if not res_row:
+                    raise ValidationError(f"Resume #{resume_id} not found.")
+                if res_row["user_id"] != user_id:
+                    raise CrossUserAccessError(
+                        user_id=user_id,
+                        target_user_id=res_row["user_id"],
+                        resource=f"Resume #{resume_id}",
+                    )
+                if not res_row["is_active"]:
+                    raise ValidationError(f"Resume #{resume_id} is inactive / archived.")
+
             cursor.execute(
                 """
                 INSERT INTO applications (
-                    user_id, company_name, job_title, job_id, job_description_id, status, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    user_id, company_name, job_title, job_id, job_description_id, resume_id,
+                    status, notes, application_source, external_application_url, target_role,
+                    employment_type, location, salary_range, application_deadline, is_archived
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (user_id, company_name.strip(), job_title.strip(), job_id, job_description_id, status, notes),
+                (
+                    user_id,
+                    company_name.strip(),
+                    job_title.strip(),
+                    job_id,
+                    job_description_id,
+                    resume_id,
+                    status,
+                    notes,
+                    application_source,
+                    external_application_url,
+                    target_role,
+                    employment_type,
+                    location,
+                    salary_range,
+                    application_deadline,
+                    is_archived,
+                ),
             )
             app_id = cursor.lastrowid
+
+            # Emit initial timeline event
+            event_payload = {
+                "source": application_source,
+                "job_id": job_id,
+                "job_description_id": job_description_id,
+                "resume_id": resume_id,
+            }
+            payload_json = canonical_json_bytes(event_payload).decode("utf-8")
+            hash_payload = {
+                "actor_identifier": f"user_{user_id}",
+                "actor_type": "CANDIDATE",
+                "application_id": app_id,
+                "event_payload_json": payload_json,
+                "event_type": "APPLICATION_CREATED",
+                "new_status": status,
+                "previous_event_hash": "GENESIS",
+                "previous_status": None,
+                "sequence_no": 1,
+                "session_reference": None,
+                "user_id": user_id,
+            }
+            evt_hash = canonical_json_hash(hash_payload)
+            cursor.execute(
+                """
+                INSERT INTO application_events (
+                    application_id, user_id, sequence_no, event_type,
+                    previous_status, new_status, actor_type, actor_identifier,
+                    session_reference, event_payload_json, previous_event_hash, event_hash
+                ) VALUES (?, ?, 1, 'APPLICATION_CREATED', NULL, ?, 'CANDIDATE', ?, NULL, ?, 'GENESIS', ?)
+                """,
+                (
+                    app_id,
+                    user_id,
+                    status,
+                    f"user_{user_id}",
+                    payload_json,
+                    evt_hash,
+                ),
+            )
+
             cursor.execute("SELECT * FROM applications WHERE id = ?", (app_id,))
             return Application(**dict(cursor.fetchone()))
 
@@ -2181,6 +2747,46 @@ class DatabaseManager:
                 ),
             )
             new_id = cursor.lastrowid
+
+            # Emit initial event for workspace-created application
+            event_payload = {
+                "source": "workspace_created",
+                "job_description_id": job_description_id,
+                "resume_id": resume_id,
+            }
+            payload_json = canonical_json_bytes(event_payload).decode("utf-8")
+            hash_payload = {
+                "actor_identifier": f"user_{user_id}",
+                "actor_type": "CANDIDATE",
+                "application_id": new_id,
+                "event_payload_json": payload_json,
+                "event_type": "APPLICATION_CREATED",
+                "new_status": ApplicationStatus.UNDER_REVIEW.value,
+                "previous_event_hash": "GENESIS",
+                "previous_status": None,
+                "sequence_no": 1,
+                "session_reference": None,
+                "user_id": user_id,
+            }
+            evt_hash = canonical_json_hash(hash_payload)
+            cursor.execute(
+                """
+                INSERT INTO application_events (
+                    application_id, user_id, sequence_no, event_type,
+                    previous_status, new_status, actor_type, actor_identifier,
+                    session_reference, event_payload_json, previous_event_hash, event_hash
+                ) VALUES (?, ?, 1, 'APPLICATION_CREATED', NULL, ?, 'CANDIDATE', ?, NULL, ?, 'GENESIS', ?)
+                """,
+                (
+                    new_id,
+                    user_id,
+                    ApplicationStatus.UNDER_REVIEW.value,
+                    f"user_{user_id}",
+                    payload_json,
+                    evt_hash,
+                ),
+            )
+
             cursor.execute("SELECT * FROM applications WHERE id = ?", (new_id,))
             return Application(**dict(cursor.fetchone()))
 
@@ -3001,9 +3607,13 @@ class DatabaseManager:
                 (user_id,),
             )
 
-            # 2.5 Delete user match_results and prepared_packets to prevent ON DELETE RESTRICT from blocking cascade deletion of resumes/JDs
+            # 2.5 Delete Phase 7 application lifecycle child tables and historical records in topological order:
+            cursor.execute("DELETE FROM submission_confirmations WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM application_follow_ups WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM application_events WHERE user_id = ?", (user_id,))
             cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
             cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
 
             # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
             #    applications, application_approvals, password_reset_tokens)
@@ -3218,4 +3828,635 @@ class DatabaseManager:
             details_json=row["details_json"] if "details_json" in keys else None,
             evaluated_at=row["evaluated_at"],
         )
+
+    # -------------------------------------------------------------------------
+    # PHASE 7: APPLICATION LIFECYCLE, EVENTS, SUBMISSION CONFIRMATION & FOLLOW-UPS
+    # -------------------------------------------------------------------------
+
+    def create_application_event(
+        self,
+        application_id: int,
+        user_id: int,
+        event_type: str,
+        new_status: Optional[str] = None,
+        previous_status: Optional[str] = None,
+        actor_type: str = "CANDIDATE",
+        actor_identifier: Optional[str] = None,
+        session_reference: Optional[str] = None,
+        event_payload: Optional[Dict[str, Any]] = None,
+    ) -> ApplicationEvent:
+        """Appends an immutable event to the application timeline with RFC 8785 canonical hash linkage."""
+        if actor_type not in ("CANDIDATE", "SYSTEM"):
+            raise ValidationError(f"Invalid actor_type '{actor_type}'. Must be 'CANDIDATE' or 'SYSTEM'.")
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+
+            # Verify user exists
+            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+            if not cursor.fetchone():
+                raise UserNotFoundError(user_id)
+
+            # Verify application exists and belongs to user
+            cursor.execute("SELECT id, user_id, status FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+            if app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            # Query max sequence_no and last event_hash
+            cursor.execute(
+                """
+                SELECT sequence_no, event_hash FROM application_events
+                WHERE application_id = ? AND user_id = ?
+                ORDER BY sequence_no DESC LIMIT 1
+                """,
+                (application_id, user_id),
+            )
+            last_event = cursor.fetchone()
+            if not last_event:
+                sequence_no = 1
+                previous_event_hash = "GENESIS"
+            else:
+                sequence_no = last_event["sequence_no"] + 1
+                previous_event_hash = last_event["event_hash"]
+
+            current_status = app_row["status"]
+            prev_status = previous_status if previous_status is not None else current_status
+
+            # Canonical serialization of event payload
+            payload_dict = event_payload or {}
+            event_payload_json = canonical_json_bytes(payload_dict).decode("utf-8")
+            actor_ident = (actor_identifier or f"user_{user_id}").strip()
+
+            # Deterministic RFC 8785 canonical hash calculation
+            hash_payload = {
+                "actor_identifier": actor_ident,
+                "actor_type": actor_type,
+                "application_id": application_id,
+                "event_payload_json": event_payload_json,
+                "event_type": event_type,
+                "new_status": new_status,
+                "previous_event_hash": previous_event_hash,
+                "previous_status": prev_status,
+                "sequence_no": sequence_no,
+                "session_reference": session_reference,
+                "user_id": user_id,
+            }
+            event_hash = canonical_json_hash(hash_payload)
+
+            cursor.execute(
+                """
+                INSERT INTO application_events (
+                    application_id, user_id, sequence_no, event_type,
+                    previous_status, new_status, actor_type, actor_identifier,
+                    session_reference, event_payload_json, previous_event_hash, event_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    application_id,
+                    user_id,
+                    sequence_no,
+                    event_type,
+                    prev_status,
+                    new_status,
+                    actor_type,
+                    actor_ident,
+                    session_reference,
+                    event_payload_json,
+                    previous_event_hash,
+                    event_hash,
+                ),
+            )
+            event_id = cursor.lastrowid
+
+            # If new_status is provided and different from current status, update application status
+            if new_status and new_status != current_status:
+                cursor.execute(
+                    "UPDATE applications SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+                    (new_status, application_id, user_id),
+                )
+
+            cursor.execute("SELECT * FROM application_events WHERE id = ?", (event_id,))
+            return ApplicationEvent(**dict(cursor.fetchone()))
+
+    def get_application_events(self, application_id: int, user_id: int) -> List[ApplicationEvent]:
+        """Fetches all timeline events for an application, enforcing user ownership."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+            if app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            cursor.execute(
+                """
+                SELECT * FROM application_events
+                WHERE application_id = ? AND user_id = ?
+                ORDER BY sequence_no ASC
+                """,
+                (application_id, user_id),
+            )
+            return [ApplicationEvent(**dict(row)) for row in cursor.fetchall()]
+
+    def verify_application_event_chain(
+        self, application_id: int, user_id: int, raise_on_error: bool = False
+    ) -> Tuple[bool, str]:
+        """Independently verifies the cryptographic hash chain and sequence continuity of an application's event timeline.
+
+        If raise_on_error is True, raises EventIntegrityError on any sequence or cryptographic hash failure.
+        """
+        events = self.get_application_events(application_id, user_id)
+        if not events:
+            return True, "No events found for this application."
+
+        expected_seq = 1
+        expected_prev_hash = "GENESIS"
+
+        for evt in events:
+            if evt.sequence_no != expected_seq:
+                msg = f"Sequence discontinuity: expected sequence {expected_seq}, found {evt.sequence_no} (Event #{evt.id})"
+                if raise_on_error:
+                    raise EventIntegrityError(msg)
+                return False, msg
+
+            if evt.previous_event_hash != expected_prev_hash:
+                msg = f"Broken hash linkage at sequence {evt.sequence_no}: expected previous_event_hash '{expected_prev_hash}', found '{evt.previous_event_hash}'"
+                if raise_on_error:
+                    raise EventIntegrityError(msg)
+                return False, msg
+
+            hash_payload = {
+                "actor_identifier": evt.actor_identifier,
+                "actor_type": evt.actor_type,
+                "application_id": evt.application_id,
+                "event_payload_json": evt.event_payload_json,
+                "event_type": evt.event_type,
+                "new_status": evt.new_status,
+                "previous_event_hash": evt.previous_event_hash,
+                "previous_status": evt.previous_status,
+                "sequence_no": evt.sequence_no,
+                "session_reference": evt.session_reference,
+                "user_id": evt.user_id,
+            }
+            recomputed = canonical_json_hash(hash_payload)
+            if recomputed != evt.event_hash:
+                msg = f"Event tamper detected at sequence {evt.sequence_no}: stored hash '{evt.event_hash}' != recomputed hash '{recomputed}'"
+                if raise_on_error:
+                    raise EventIntegrityError(msg)
+                return False, msg
+
+            expected_seq += 1
+            expected_prev_hash = evt.event_hash
+
+        return True, f"All {len(events)} events verified successfully."
+
+    def create_submission_confirmation(
+        self,
+        application_id: int,
+        user_id: int,
+        submission_channel: str,
+        submission_timestamp: Optional[str] = None,
+        packet_id: Optional[int] = None,
+        confirmation_reference: Optional[str] = None,
+        confirmation_doc_path: Optional[str] = None,
+        confirmation_doc_hash: Optional[str] = None,
+        candidate_notes: Optional[str] = None,
+    ) -> SubmissionConfirmation:
+        """Records an authoritative candidate-confirmed submission, superseding any prior active confirmation."""
+        valid_channels = SubmissionChannel.list()
+        if submission_channel not in valid_channels:
+            raise ValidationError(
+                f"Invalid submission_channel '{submission_channel}'. Valid options: {valid_channels}"
+            )
+
+        ts = submission_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+
+            # Verify user exists
+            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+            if not cursor.fetchone():
+                raise UserNotFoundError(user_id)
+
+            # Verify application exists and belongs to user
+            cursor.execute("SELECT id, user_id, status FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+            if app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            packet_hash = None
+            if packet_id is not None:
+                cursor.execute(
+                    "SELECT id, user_id, application_id, packet_version_hash FROM prepared_packets WHERE id = ?",
+                    (packet_id,),
+                )
+                pkt_row = cursor.fetchone()
+                if not pkt_row:
+                    raise ValidationError(f"PreparedPacket #{packet_id} not found.")
+                if pkt_row["user_id"] != user_id:
+                    raise CrossUserAccessError(
+                        user_id=user_id,
+                        target_user_id=pkt_row["user_id"],
+                        resource=f"PreparedPacket #{packet_id}",
+                    )
+                if pkt_row["application_id"] != application_id:
+                    raise ValidationError(
+                        f"PreparedPacket #{packet_id} belongs to Application #{pkt_row['application_id']}, "
+                        f"not Application #{application_id}."
+                    )
+                packet_hash = pkt_row["packet_version_hash"]
+
+            # Supersede prior active confirmations for this application
+            cursor.execute(
+                """
+                UPDATE submission_confirmations
+                SET is_active_confirmation = 0
+                WHERE application_id = ? AND user_id = ? AND is_active_confirmation = 1
+                """,
+                (application_id, user_id),
+            )
+
+            # Insert new confirmation
+            cursor.execute(
+                """
+                INSERT INTO submission_confirmations (
+                    application_id, user_id, packet_id, packet_version_hash,
+                    submission_timestamp, submission_channel, confirmation_reference,
+                    confirmation_doc_path, confirmation_doc_hash, candidate_notes,
+                    is_active_confirmation
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                """,
+                (
+                    application_id,
+                    user_id,
+                    packet_id,
+                    packet_hash,
+                    ts,
+                    submission_channel,
+                    confirmation_reference,
+                    confirmation_doc_path,
+                    confirmation_doc_hash,
+                    candidate_notes,
+                ),
+            )
+            conf_id = cursor.lastrowid
+
+            # Update application status to SUBMITTED and date_submitted
+            cursor.execute(
+                """
+                UPDATE applications
+                SET status = ?, date_submitted = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (ApplicationStatus.SUBMITTED.value, ts, application_id, user_id),
+            )
+
+            # Emit timeline event for submission
+            conf_payload = {
+                "submission_channel": submission_channel,
+                "confirmation_reference": confirmation_reference,
+                "packet_id": packet_id,
+                "packet_version_hash": packet_hash,
+                "confirmation_doc_hash": confirmation_doc_hash,
+            }
+            payload_json = canonical_json_bytes(conf_payload).decode("utf-8")
+
+            cursor.execute(
+                """
+                SELECT sequence_no, event_hash FROM application_events
+                WHERE application_id = ? AND user_id = ?
+                ORDER BY sequence_no DESC LIMIT 1
+                """,
+                (application_id, user_id),
+            )
+            last_event = cursor.fetchone()
+            seq = (last_event["sequence_no"] + 1) if last_event else 1
+            prev_hash = last_event["event_hash"] if last_event else "GENESIS"
+
+            hash_payload = {
+                "actor_identifier": f"user_{user_id}",
+                "actor_type": "CANDIDATE",
+                "application_id": application_id,
+                "event_payload_json": payload_json,
+                "event_type": "SUBMISSION_CONFIRMED",
+                "new_status": ApplicationStatus.SUBMITTED.value,
+                "previous_event_hash": prev_hash,
+                "previous_status": app_row["status"],
+                "sequence_no": seq,
+                "session_reference": None,
+                "user_id": user_id,
+            }
+            evt_hash = canonical_json_hash(hash_payload)
+
+            cursor.execute(
+                """
+                INSERT INTO application_events (
+                    application_id, user_id, sequence_no, event_type,
+                    previous_status, new_status, actor_type, actor_identifier,
+                    session_reference, event_payload_json, previous_event_hash, event_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    application_id,
+                    user_id,
+                    seq,
+                    "SUBMISSION_CONFIRMED",
+                    app_row["status"],
+                    ApplicationStatus.SUBMITTED.value,
+                    "CANDIDATE",
+                    f"user_{user_id}",
+                    None,
+                    payload_json,
+                    prev_hash,
+                    evt_hash,
+                ),
+            )
+
+            cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (conf_id,))
+            return SubmissionConfirmation(**dict(cursor.fetchone()))
+
+    def get_submission_confirmation(
+        self, application_id: int, user_id: int, active_only: bool = True
+    ) -> Optional[SubmissionConfirmation]:
+        """Retrieves submission confirmation for an application, enforcing cross-user isolation."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+            if app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            query = "SELECT * FROM submission_confirmations WHERE application_id = ? AND user_id = ?"
+            params: List[Any] = [application_id, user_id]
+            if active_only:
+                query += " AND is_active_confirmation = 1"
+            query += " ORDER BY id DESC LIMIT 1"
+
+            cursor.execute(query, params)
+            row = cursor.fetchone()
+            return SubmissionConfirmation(**dict(row)) if row else None
+
+    def list_submission_confirmations(
+        self, user_id: int, application_id: Optional[int] = None
+    ) -> List[SubmissionConfirmation]:
+        """Lists submission confirmations for a user, optionally filtered by application."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM submission_confirmations WHERE user_id = ?"
+            params: List[Any] = [user_id]
+            if application_id is not None:
+                query += " AND application_id = ?"
+                params.append(application_id)
+            query += " ORDER BY submission_timestamp DESC"
+
+            cursor.execute(query, params)
+            return [SubmissionConfirmation(**dict(row)) for row in cursor.fetchall()]
+
+    def create_application_follow_up(
+        self,
+        application_id: int,
+        user_id: int,
+        follow_up_date: str,
+        follow_up_type: str,
+        description: str,
+        outcome_notes: Optional[str] = None,
+    ) -> ApplicationFollowUp:
+        """Schedules a candidate-controlled follow-up task."""
+        valid_types = FollowUpType.list()
+        if follow_up_type not in valid_types:
+            raise ValidationError(
+                f"Invalid follow_up_type '{follow_up_type}'. Valid options: {valid_types}"
+            )
+        if not description or not description.strip():
+            raise ValidationError("Follow-up description cannot be empty.")
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+
+            # Verify application exists and belongs to user
+            cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+            if app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO application_follow_ups (
+                    application_id, user_id, follow_up_date, follow_up_type,
+                    description, outcome_notes
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    application_id,
+                    user_id,
+                    follow_up_date,
+                    follow_up_type,
+                    description.strip(),
+                    outcome_notes,
+                ),
+            )
+            follow_up_id = cursor.lastrowid
+
+            cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
+            created = ApplicationFollowUp(**dict(cursor.fetchone()))
+
+        # Emit timeline event outside or in transaction
+        try:
+            self.create_application_event(
+                application_id=application_id,
+                user_id=user_id,
+                event_type="FOLLOW_UP_SCHEDULED",
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload={
+                    "follow_up_id": follow_up_id,
+                    "follow_up_date": follow_up_date,
+                    "follow_up_type": follow_up_type,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Could not record timeline event for follow-up #{follow_up_id}: {e}")
+
+        return created
+
+    def get_application_follow_up(
+        self, follow_up_id: int, user_id: int
+    ) -> Optional[ApplicationFollowUp]:
+        """Fetches a follow-up record, enforcing user ownership."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"ApplicationFollowUp #{follow_up_id}",
+                )
+            return ApplicationFollowUp(**dict(row))
+
+    def list_application_follow_ups(
+        self,
+        user_id: int,
+        application_id: Optional[int] = None,
+        is_completed: Optional[bool] = None,
+    ) -> List[ApplicationFollowUp]:
+        """Lists follow-up reminders for a user, optionally filtered by application and completion."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM application_follow_ups WHERE user_id = ?"
+            params: List[Any] = [user_id]
+            if application_id is not None:
+                query += " AND application_id = ?"
+                params.append(application_id)
+            if is_completed is not None:
+                query += " AND is_completed = ?"
+                params.append(1 if is_completed else 0)
+            query += " ORDER BY follow_up_date ASC"
+
+            cursor.execute(query, params)
+            return [ApplicationFollowUp(**dict(row)) for row in cursor.fetchall()]
+
+    def complete_application_follow_up(
+        self, follow_up_id: int, user_id: int, outcome_notes: Optional[str] = None
+    ) -> ApplicationFollowUp:
+        """Marks a candidate-scheduled follow-up as completed."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValidationError(f"ApplicationFollowUp #{follow_up_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"ApplicationFollowUp #{follow_up_id}",
+                )
+
+            cursor.execute(
+                """
+                UPDATE application_follow_ups
+                SET is_completed = 1,
+                    completed_at = CURRENT_TIMESTAMP,
+                    outcome_notes = COALESCE(?, outcome_notes),
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (outcome_notes, follow_up_id, user_id),
+            )
+            cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
+            completed = ApplicationFollowUp(**dict(cursor.fetchone()))
+
+        # Emit timeline event
+        try:
+            self.create_application_event(
+                application_id=completed.application_id,
+                user_id=user_id,
+                event_type="FOLLOW_UP_COMPLETED",
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload={
+                    "follow_up_id": follow_up_id,
+                    "outcome_notes": outcome_notes,
+                },
+            )
+        except Exception as e:
+            logger.warning(f"Could not record timeline event for completed follow-up #{follow_up_id}: {e}")
+
+        return completed
+
+    def delete_application_follow_up(self, follow_up_id: int, user_id: int) -> bool:
+        """Deletes a candidate follow-up record, enforcing ownership."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM application_follow_ups WHERE id = ?", (follow_up_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValidationError(f"ApplicationFollowUp #{follow_up_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"ApplicationFollowUp #{follow_up_id}",
+                )
+
+            cursor.execute("DELETE FROM application_follow_ups WHERE id = ? AND user_id = ?", (follow_up_id, user_id))
+            return True
+
+    def archive_user_application(
+        self, application_id: int, user_id: int, archive_reason: Optional[str] = None
+    ) -> Application:
+        """Soft-archives an application, preserving all historical timeline events, packets, and confirmations."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+            if app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            cursor.execute(
+                """
+                UPDATE applications
+                SET is_archived = 1, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
+                """,
+                (application_id, user_id),
+            )
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
+            archived = Application(**dict(cursor.fetchone()))
+
+        # Emit timeline event
+        try:
+            self.create_application_event(
+                application_id=application_id,
+                user_id=user_id,
+                event_type="APPLICATION_ARCHIVED",
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload={"archive_reason": archive_reason},
+            )
+        except Exception as e:
+            logger.warning(f"Could not record timeline event for archived application #{application_id}: {e}")
+
+        return archived
 

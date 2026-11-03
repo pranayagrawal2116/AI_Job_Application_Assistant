@@ -269,3 +269,22 @@ class MatchResultNotFoundError(DatabaseError):
     """Raised when a requested match result record cannot be found."""
     pass
 
+
+# -----------------------------------------------------------------------------
+# PHASE 7: APPLICATION LIFECYCLE & TRACKING EXCEPTIONS
+# -----------------------------------------------------------------------------
+
+class MigrationPreflightError(DatabaseError):
+    """Raised when database migration preflight checks detect unresolvable data ownership or integrity errors."""
+    pass
+
+
+class DatabaseMigrationError(DatabaseError):
+    """Raised when an atomic database migration fails validation or integrity checks."""
+    pass
+
+
+class EventIntegrityError(DatabaseError):
+    """Raised when an application timeline event fails cryptographic hash or chain verification."""
+    pass
+

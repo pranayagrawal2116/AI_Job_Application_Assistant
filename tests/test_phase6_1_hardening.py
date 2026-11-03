@@ -147,7 +147,7 @@ class TestPhase61Hardening(unittest.TestCase):
     def test_dashboard_service_get_candidate_session_matches_user_id(self):
         """get_or_create_candidate_session matches target user_id and does not leak other users' sessions."""
         from dashboard.services.dashboard_service import DashboardService
-        service = DashboardService.get_instance()
+        service = DashboardService.get_instance(db_manager=self.db)
         service.db = self.db
 
         # User A session

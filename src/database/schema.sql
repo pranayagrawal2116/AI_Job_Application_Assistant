@@ -212,32 +212,107 @@ CREATE TABLE IF NOT EXISTS match_results (
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     job_description_id INTEGER,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
     resume_id INTEGER,
-    company_name TEXT,
-    job_title TEXT,
-    status TEXT NOT NULL DEFAULT 'Discovered' CHECK (status IN (
-        'Discovered',
-        'Under Review',
-        'Shortlisted',
-        'Application Prepared',
-        'Awaiting Approval',
-        'Applied',
-        'Interview',
-        'Rejected',
-        'Withdrawn'
+    company_name TEXT NOT NULL,
+    job_title TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN (
+        'DRAFT', 'PREPARING', 'READY_FOR_REVIEW', 'APPROVED',
+        'SUBMITTED', 'IN_PROGRESS', 'ASSESSMENT', 'INTERVIEW',
+        'OFFER', 'REJECTED', 'WITHDRAWN', 'CLOSED',
+        -- Legacy status compatibility
+        'Discovered', 'Under Review', 'Shortlisted', 'Application Prepared',
+        'Awaiting Approval', 'Applied', 'Interview', 'Rejected', 'Withdrawn'
     )),
+    application_source TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION' CHECK (application_source IN ('JOB_DESCRIPTION', 'MATCH_RESULT', 'PREPARED_PACKET', 'MANUAL')),
+    external_application_url TEXT,
+    target_role TEXT,
+    employment_type TEXT,
+    location TEXT,
+    salary_range TEXT,
+    application_deadline DATETIME,
     date_prepared DATETIME,
     date_submitted DATETIME,
     resume_used TEXT,
     cover_letter_reference TEXT,
     notes TEXT,
+    is_archived INTEGER DEFAULT 0 CHECK(is_archived IN (0, 1)),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id, user_id),
-    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE CASCADE
+    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
+);
+
+-- ---------------------------------------------------------------------
+-- 8.1 APPLICATION EVENTS (Append-Only Audit Timeline)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS application_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sequence_no INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    previous_status TEXT,
+    new_status TEXT,
+    actor_type TEXT NOT NULL DEFAULT 'CANDIDATE' CHECK(actor_type IN ('CANDIDATE', 'SYSTEM')),
+    actor_identifier TEXT NOT NULL,
+    session_reference TEXT,
+    event_payload_json TEXT NOT NULL DEFAULT '{}',
+    previous_event_hash TEXT NOT NULL,
+    event_hash TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(application_id, sequence_no),
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE RESTRICT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_update
+BEFORE UPDATE ON application_events
+BEGIN
+    SELECT RAISE(FAIL, 'application_events records are append-only and cannot be updated.');
+END;
+
+-- ---------------------------------------------------------------------
+-- 8.2 SUBMISSION CONFIRMATIONS
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS submission_confirmations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    packet_id INTEGER,
+    packet_version_hash TEXT,
+    submission_timestamp DATETIME NOT NULL,
+    submission_channel TEXT NOT NULL CHECK(submission_channel IN ('COMPANY_PORTAL', 'LINKEDIN', 'INDEED', 'EMAIL', 'RECRUITER', 'REFERRAL', 'OTHER')),
+    confirmation_reference TEXT,
+    confirmation_doc_path TEXT,
+    confirmation_doc_hash TEXT,
+    candidate_notes TEXT,
+    is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1;
+
+-- ---------------------------------------------------------------------
+-- 8.3 APPLICATION FOLLOW-UPS (Candidate-Controlled Reminders)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS application_follow_ups (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    application_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    follow_up_date DATE NOT NULL,
+    follow_up_type TEXT NOT NULL CHECK(follow_up_type IN ('STATUS_INQUIRY', 'THANK_YOU_NOTE', 'PORTFOLIO_UPDATE', 'RECRUITER_CHECKIN', 'PHONE_CALL', 'OTHER')),
+    description TEXT NOT NULL,
+    is_completed INTEGER DEFAULT 0 CHECK(is_completed IN (0, 1)),
+    completed_at DATETIME,
+    outcome_notes TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
 );
 
 -- ---------------------------------------------------------------------
@@ -357,8 +432,17 @@ CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_resume ON match_results(user_id, resume_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_jd ON match_results(user_id, job_description_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
+CREATE INDEX IF NOT EXISTS idx_applications_user_status ON applications(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id);
+CREATE INDEX IF NOT EXISTS idx_applications_archived ON applications(user_id, is_archived);
 CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);
+CREATE INDEX IF NOT EXISTS idx_app_events_app_seq ON application_events(application_id, sequence_no);
+CREATE INDEX IF NOT EXISTS idx_app_events_user_type ON application_events(user_id, event_type);
+CREATE INDEX IF NOT EXISTS idx_app_events_created ON application_events(application_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_sub_conf_app ON submission_confirmations(application_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_sub_conf_user_channel ON submission_confirmations(user_id, submission_channel);
+CREATE INDEX IF NOT EXISTS idx_follow_ups_due ON application_follow_ups(user_id, is_completed, follow_up_date);
+CREATE INDEX IF NOT EXISTS idx_follow_ups_app ON application_follow_ups(application_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_prepared_packets_app ON prepared_packets(application_id, user_id);
 CREATE INDEX IF NOT EXISTS idx_prepared_packets_hash ON prepared_packets(packet_version_hash);
 CREATE INDEX IF NOT EXISTS idx_approvals_packet ON application_approvals(packet_id, user_id);

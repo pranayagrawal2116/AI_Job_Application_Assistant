@@ -7,27 +7,103 @@ from typing import Any, Dict, List, Optional
 
 
 class ApplicationStatus(str, Enum):
-    """Permitted application lifecycle statuses."""
+    """Permitted application lifecycle statuses, covering both Phase 7 universal statuses
+    and legacy Phase 2-6 compatibility statuses."""
+    # Phase 7 Universal Lifecycle Statuses
+    DRAFT = "DRAFT"
+    PREPARING = "PREPARING"
+    READY_FOR_REVIEW = "READY_FOR_REVIEW"
+    APPROVED = "APPROVED"
+    SUBMITTED = "SUBMITTED"
+    IN_PROGRESS = "IN_PROGRESS"
+    ASSESSMENT = "ASSESSMENT"
+    INTERVIEW = "INTERVIEW"
+    OFFER = "OFFER"
+    REJECTED = "REJECTED"
+    WITHDRAWN = "WITHDRAWN"
+    CLOSED = "CLOSED"
+
+    # Legacy Phase 2-6 Compatibility Aliases
     DISCOVERED = "Discovered"
     UNDER_REVIEW = "Under Review"
     SHORTLISTED = "Shortlisted"
     APPLICATION_PREPARED = "Application Prepared"
     AWAITING_APPROVAL = "Awaiting Approval"
     APPLIED = "Applied"
-    INTERVIEW = "Interview"
-    REJECTED = "Rejected"
-    WITHDRAWN = "Withdrawn"
+    LEGACY_INTERVIEW = "Interview"
+    LEGACY_REJECTED = "Rejected"
+    LEGACY_WITHDRAWN = "Withdrawn"
 
     @classmethod
     def list(cls) -> List[str]:
         return [c.value for c in cls]
 
     @classmethod
+    def universal_statuses(cls) -> List[str]:
+        """Returns the 12 primary universal lifecycle statuses."""
+        return [
+            cls.DRAFT.value,
+            cls.PREPARING.value,
+            cls.READY_FOR_REVIEW.value,
+            cls.APPROVED.value,
+            cls.SUBMITTED.value,
+            cls.IN_PROGRESS.value,
+            cls.ASSESSMENT.value,
+            cls.INTERVIEW.value,
+            cls.OFFER.value,
+            cls.REJECTED.value,
+            cls.WITHDRAWN.value,
+            cls.CLOSED.value,
+        ]
+
+    @classmethod
     def from_str(cls, val: str) -> "ApplicationStatus":
+        clean = (val or "").strip()
         for item in cls:
-            if item.value.lower() == val.strip().lower():
+            if item.value.lower() == clean.lower() or item.name.lower() == clean.lower():
                 return item
         raise ValueError(f"Unknown status '{val}'. Valid options: {cls.list()}")
+
+
+class SubmissionChannel(str, Enum):
+    """Controlled channels for external application submission."""
+    COMPANY_PORTAL = "COMPANY_PORTAL"
+    LINKEDIN = "LINKEDIN"
+    INDEED = "INDEED"
+    EMAIL = "EMAIL"
+    RECRUITER = "RECRUITER"
+    REFERRAL = "REFERRAL"
+    OTHER = "OTHER"
+
+    @classmethod
+    def list(cls) -> List[str]:
+        return [c.value for c in cls]
+
+
+class FollowUpType(str, Enum):
+    """Controlled categories for candidate-scheduled follow-up tasks."""
+    STATUS_INQUIRY = "STATUS_INQUIRY"
+    THANK_YOU_NOTE = "THANK_YOU_NOTE"
+    PORTFOLIO_UPDATE = "PORTFOLIO_UPDATE"
+    RECRUITER_CHECKIN = "RECRUITER_CHECKIN"
+    PHONE_CALL = "PHONE_CALL"
+    OTHER = "OTHER"
+
+    @classmethod
+    def list(cls) -> List[str]:
+        return [c.value for c in cls]
+
+
+class ApplicationSource(str, Enum):
+    """Source origin of an application record."""
+    JOB_DESCRIPTION = "JOB_DESCRIPTION"
+    MATCH_RESULT = "MATCH_RESULT"
+    PREPARED_PACKET = "PREPARED_PACKET"
+    MANUAL = "MANUAL"
+
+    @classmethod
+    def list(cls) -> List[str]:
+        return [c.value for c in cls]
 
 
 @dataclass
@@ -111,12 +187,12 @@ class Job:
 
 @dataclass
 class Application:
+    company_name: str = "Unknown"
+    job_title: str = "Role"
     job_id: Optional[int] = None
     job_description_id: Optional[int] = None
     user_id: Optional[int] = None
     resume_id: Optional[int] = None
-    company_name: str = "Unknown"
-    job_title: str = "Role"
     status: str = ApplicationStatus.DISCOVERED.value
     id: Optional[int] = None
     date_prepared: Optional[str] = None
@@ -124,6 +200,76 @@ class Application:
     resume_used: Optional[str] = None
     cover_letter_reference: Optional[str] = None
     notes: Optional[str] = None
+    application_source: str = ApplicationSource.JOB_DESCRIPTION.value
+    external_application_url: Optional[str] = None
+    target_role: Optional[str] = None
+    employment_type: Optional[str] = None
+    location: Optional[str] = None
+    salary_range: Optional[str] = None
+    application_deadline: Optional[str] = None
+    is_archived: int = 0
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ApplicationEvent:
+    """Immutable, append-only timeline event in the application lifecycle."""
+    application_id: int
+    user_id: int
+    sequence_no: int
+    event_type: str
+    previous_status: Optional[str] = None
+    new_status: Optional[str] = None
+    actor_type: str = "CANDIDATE"
+    actor_identifier: str = "Candidate"
+    session_reference: Optional[str] = None
+    event_payload_json: str = "{}"
+    previous_event_hash: str = "GENESIS"
+    event_hash: str = ""
+    id: Optional[int] = None
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class SubmissionConfirmation:
+    """Authoritative record of a confirmed manual job application submission."""
+    application_id: int
+    user_id: int
+    submission_timestamp: str
+    submission_channel: str
+    packet_id: Optional[int] = None
+    packet_version_hash: Optional[str] = None
+    confirmation_reference: Optional[str] = None
+    confirmation_doc_path: Optional[str] = None
+    confirmation_doc_hash: Optional[str] = None
+    candidate_notes: Optional[str] = None
+    is_active_confirmation: int = 1
+    id: Optional[int] = None
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class ApplicationFollowUp:
+    """Candidate-scheduled reminder or follow-up task."""
+    application_id: int
+    user_id: int
+    follow_up_date: str
+    follow_up_type: str
+    description: str
+    is_completed: int = 0
+    completed_at: Optional[str] = None
+    outcome_notes: Optional[str] = None
+    id: Optional[int] = None
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 

@@ -4,7 +4,7 @@
 **Architecture Version:** v2.1.1  
 **Project:** Universal AI Job Application Assistant  
 **Document:** `docs/PHASE_7_APPLICATION_LIFECYCLE_ARCHITECTURE.md`  
-**Current Commit:** `89c4ebce71b8aa5bccf5d4665131c997b5788ea8` (Verified HEAD)  
+**Current Commit:** `5e9587891d636403594047652bf3da2e5943ec15` (Verified Base Commit for Phase 7.1)
 **Branch:** `main`  
 **Scope:** Stage 1 — Architecture Audit, Threat Model, Database Design & Implementation Blueprint.  
 **Execution Mode:** Pure Architectural Blueprint (Zero production code changes; zero database modifications).
@@ -278,31 +278,31 @@ Candidate Dashboard (Application in 'APPROVED' state)
 
 ---
 
-## 9. Proposed Database Schema
+## 9. Implemented Database Schema (Phase 7.1 Verified Foundation)
 
-To support the full application lifecycle, audit timeline, and follow-up management while preserving existing Phase 1–6 data, Phase 7 introduces three new tables and augments the existing `applications` table:
+To support the full application lifecycle, audit timeline, and follow-up management while preserving existing Phase 1–6 data, Phase 7 introduces three new tables and augments the existing `applications` table with strict composite ownership:
 
 ### 9.1 Augmented `applications` Table
 Existing applications table is preserved and extended to support manual creation, rich metadata, and archival:
 
 ```sql
--- Upgraded applications table with full Phase 7 lifecycle support
-CREATE TABLE IF NOT EXISTS applications_v7 (
+CREATE TABLE IF NOT EXISTS applications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    job_description_id INTEGER,
     job_id INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
-    active_resume_id INTEGER,
+    job_description_id INTEGER,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resume_id INTEGER,
     company_name TEXT NOT NULL,
     job_title TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK (status IN (
+    status TEXT NOT NULL DEFAULT 'DRAFT' CHECK(status IN (
         'DRAFT', 'PREPARING', 'READY_FOR_REVIEW', 'APPROVED',
         'SUBMITTED', 'IN_PROGRESS', 'ASSESSMENT', 'INTERVIEW',
         'OFFER', 'REJECTED', 'WITHDRAWN', 'CLOSED',
         -- Legacy status compatibility
-        'Discovered', 'Under Review', 'Shortlisted', 'Application Prepared', 'Awaiting Approval', 'Applied'
+        'Discovered', 'Under Review', 'Shortlisted', 'Application Prepared',
+        'Awaiting Approval', 'Applied', 'Interview', 'Rejected', 'Withdrawn'
     )),
-    application_source TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION' CHECK (application_source IN ('JOB_DESCRIPTION', 'MATCH_RESULT', 'PREPARED_PACKET', 'MANUAL')),
+    application_source TEXT NOT NULL DEFAULT 'JOB_DESCRIPTION' CHECK(application_source IN ('JOB_DESCRIPTION', 'MATCH_RESULT', 'PREPARED_PACKET', 'MANUAL')),
     external_application_url TEXT,
     target_role TEXT,
     employment_type TEXT,
@@ -318,60 +318,84 @@ CREATE TABLE IF NOT EXISTS applications_v7 (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id, user_id),
-    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE SET NULL,
-    FOREIGN KEY (active_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE SET NULL
+    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
 );
 ```
 
-### 9.2 New `application_events` Table (Append-Only Audit Timeline)
-Tracks all lifecycle milestones, state transitions, and user actions:
+#### Composite Foreign Key Deletion Behavior:
+- **`job_descriptions` and `resumes`:** Enforced as `ON DELETE RESTRICT`. A composite foreign key referencing `(id, user_id)` cannot use `ON DELETE SET NULL` because `user_id` is a required primary owner field that cannot be NULL. Physical deletion of active source resumes or job descriptions linked to applications is blocked (`ResumeInUseError` or soft-archival `is_active = 0`), preserving historical relationship integrity.
+- **`job_id`:** Single-column reference to global scraped catalog jobs using `ON DELETE SET NULL` (catalog cleanups do not delete candidate applications).
+- **`user_id`:** Enforced as `NOT NULL REFERENCES users(id) ON DELETE CASCADE`.
+
+### 9.2 `application_events` Table (Append-Only Audit Timeline)
+Tracks all lifecycle milestones, state transitions, and user actions with cryptographic hash linkage:
 
 ```sql
 CREATE TABLE IF NOT EXISTS application_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     application_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sequence_no INTEGER NOT NULL,
     event_type TEXT NOT NULL,
     previous_status TEXT,
     new_status TEXT,
     actor_type TEXT NOT NULL DEFAULT 'CANDIDATE' CHECK(actor_type IN ('CANDIDATE', 'SYSTEM')),
-    actor_name TEXT NOT NULL,
-    session_id TEXT,
-    event_payload_json TEXT,
+    actor_identifier TEXT NOT NULL,
+    session_reference TEXT,
+    event_payload_json TEXT NOT NULL DEFAULT '{}',
+    previous_event_hash TEXT NOT NULL,
     event_hash TEXT NOT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
+    UNIQUE(application_id, sequence_no),
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE RESTRICT
 );
 
-CREATE INDEX IF NOT EXISTS idx_app_events_app_user ON application_events(application_id, user_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_app_events_user_type ON application_events(user_id, event_type);
+CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_update
+BEFORE UPDATE ON application_events
+BEGIN
+    SELECT RAISE(FAIL, 'application_events records are append-only and cannot be updated.');
+END;
 ```
 
-### 9.3 New `submission_confirmations` Table
+#### Event Immutability & Retention Guarantees:
+- **Append-Only Trigger:** `trg_prevent_application_events_update` aborts any direct `UPDATE` statement on `application_events`.
+- **Application Deletion Invariant:** `FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE RESTRICT` ensures normal application deletions are prevented when event history exists; applications must be archived (`is_archived = 1`) rather than physically deleted.
+- **Cryptographic Hash Chain:** Each event computes `event_hash = SHA256(RFC8785_canonical_json(hash_payload))` where `hash_payload` covers `sequence_no`, `application_id`, `user_id`, `event_type`, `previous_status`, `new_status`, `actor_type`, `actor_identifier`, `session_reference`, `event_payload_json`, and `previous_event_hash` (`'GENESIS'` for sequence 1).
+- **Honest Security Scope:** The SHA-256 chain provides deterministic tamper evidence against tampering and out-of-order mutations when verified via `verify_application_event_chain`. It does not claim database administrator prevention without external ledger anchoring.
+- **Account Erasure Exception:** When a user explicitly requests GDPR/privacy account deletion (`delete_user_account_data`), child tables are deleted in controlled topological order (`submission_confirmations` -> `application_follow_ups` -> `application_events` -> `match_results` -> `prepared_packets` -> `applications` -> `users`), cleanly avoiding deletion blocks without allowing random row tampering.
+
+### 9.3 `submission_confirmations` Table
 Captures authoritative proof and metadata for candidate-submitted applications:
 
 ```sql
 CREATE TABLE IF NOT EXISTS submission_confirmations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    application_id INTEGER NOT NULL UNIQUE,
+    application_id INTEGER NOT NULL,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     packet_id INTEGER,
     packet_version_hash TEXT,
     submission_timestamp DATETIME NOT NULL,
-    submission_channel TEXT NOT NULL CHECK(submission_channel IN ('COMPANY_PORTAL', 'LINKEDIN', 'INDEEP', 'EMAIL', 'RECRUITER', 'REFERRAL', 'OTHER')),
+    submission_channel TEXT NOT NULL CHECK(submission_channel IN ('COMPANY_PORTAL', 'LINKEDIN', 'INDEED', 'EMAIL', 'RECRUITER', 'REFERRAL', 'OTHER')),
     confirmation_reference TEXT,
     confirmation_doc_path TEXT,
     confirmation_doc_hash TEXT,
     candidate_notes TEXT,
+    is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
     FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE SET NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_sub_conf_app ON submission_confirmations(application_id, user_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1;
 ```
 
-### 9.4 New `application_follow_ups` Table
+#### Submission Safeguard Invariants:
+- `submission_channel` is controlled (`COMPANY_PORTAL`, `LINKEDIN`, `INDEED`, `EMAIL`, `RECRUITER`, `REFERRAL`, `OTHER`).
+- Partial unique index `idx_sub_conf_active_app` allows complete historical submission re-attempts while guaranteeing at most one active confirmation per application (`is_active_confirmation = 1`).
+- Candidate-provided evidence is recorded truthfully without presenting unverified candidate entries as employer-verified receipts.
+
+### 9.4 `application_follow_ups` Table
 Enables candidate-controlled reminder and follow-up scheduling:
 
 ```sql
@@ -389,40 +413,44 @@ CREATE TABLE IF NOT EXISTS application_follow_ups (
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
 );
-
-CREATE INDEX IF NOT EXISTS idx_follow_ups_user_due ON application_follow_ups(user_id, is_completed, follow_up_date);
-CREATE INDEX IF NOT EXISTS idx_follow_ups_app ON application_follow_ups(application_id, user_id);
 ```
 
 ---
 
-## 10. Proposed Migration Strategy
+## 10. Implemented Migration Strategy (`_migrate_phase7_lifecycle_tables`)
 
-A 10-step zero-downtime, idempotent SQLite migration `_migrate_phase7_lifecycle_tables()` in `src/database/db_manager.py`:
+A 12-step zero-downtime, idempotent SQLite migration `_migrate_phase7_lifecycle_tables()` in `src/database/db_manager.py`:
 
-1. **Verify Database Integrity:** Execute `PRAGMA foreign_key_check` and `PRAGMA integrity_check` before starting.
-2. **Begin Atomic Transaction:** All migration steps wrapped inside `with self.transaction()`.
-3. **Inspect Existing `applications` Columns:** Check `PRAGMA table_info(applications)` to see if Phase 7 columns (`external_application_url`, `application_source`, `is_archived`) already exist.
-4. **Table Rebuild (if needed for CHECK constraints):**
-   - Create `applications_v7` with expanded status CHECK constraint and composite foreign keys (`ON DELETE SET NULL` on `job_descriptions` and `resumes`).
-   - Copy existing records: `INSERT INTO applications_v7 SELECT ... FROM applications`.
+1. **Verify Database Integrity:** Inspect `applications` table existence, column nullability, and foreign key definitions.
+2. **Preflight Ownership & Integrity Safeguards:** Abort with `MigrationPreflightError` if:
+   - Any application has `user_id IS NULL`. Historical applications are never arbitrarily assigned.
+   - Any application has invalid non-existent `user_id`.
+   - Cross-user reference detected on `job_descriptions` (`applications.user_id != job_descriptions.user_id`).
+   - Cross-user reference detected on `resumes` (`applications.user_id != resumes.user_id`).
+   - Cross-user reference detected on `prepared_packets` or `application_approvals`.
+3. **Deterministic Legacy Status Mapping:**
+   - `Discovered` -> `DRAFT`
+   - `Under Review` / `Shortlisted` -> `PREPARING`
+   - `Application Prepared` -> `READY_FOR_REVIEW`
+   - `Awaiting Approval` -> `APPROVED` (if active valid approval exists in `application_approvals` for an active packet in `prepared_packets`), else `READY_FOR_REVIEW`.
+   - `Applied` -> `SUBMITTED` (without fabricating false submission confirmations).
+   - `Interview` -> `INTERVIEW`, `Rejected` -> `REJECTED`, `Withdrawn` -> `WITHDRAWN`.
+4. **Dedicated Connection & Foreign Keys Boundary:** Foreign key enforcement (`PRAGMA foreign_keys = OFF`) is toggled on a dedicated connection strictly outside any active transaction.
+5. **Table Rebuild Execution:**
+   - Create replacement table `applications_v7` with strict composite constraints and status CHECK constraints.
+   - Copy existing rows using explicit column lists, preserving application IDs, company names, job titles, and timestamps.
    - Drop old `applications` table and rename `applications_v7` to `applications`.
-5. **Create Child Tables:**
-   - Execute `CREATE TABLE IF NOT EXISTS application_events`.
-   - Execute `CREATE TABLE IF NOT EXISTS submission_confirmations`.
-   - Execute `CREATE TABLE IF NOT EXISTS application_follow_ups`.
-6. **Create Performance & Security Indexes:**
-   - Index on `(application_id, user_id, created_at)` for fast timeline rendering.
-   - Index on `(user_id, is_completed, follow_up_date)` for fast follow-up notifications.
-7. **Backfill Initial Events for Historical Applications:**
-   - For applications with `date_prepared IS NOT NULL`, insert `APPLICATION_PREPARED` event.
-   - For applications with `status = 'Applied'` or `date_submitted IS NOT NULL`, insert `SUBMISSION_CONFIRMED` event.
-8. **Re-enable Foreign Keys & Validate:**
-   - Execute `PRAGMA foreign_key_check` to guarantee zero dangling references.
-9. **Log Migration Success:**
-   - Record migration record in `auth_audit_logs` or application log.
-10. **Idempotence Check:**
-    - Subsequent runs detect existing tables and columns, exiting cleanly with zero side-effects.
+6. **Recreate Dependent Indexes:**
+   - `idx_applications_user`, `idx_applications_user_status`, `idx_applications_job_id`, `idx_applications_archived`, `idx_applications_status`, `uq_applications_id_user`, `uq_applications_user_jd`.
+7. **Ensure Child Tables Exist:**
+   - `application_events`, `submission_confirmations`, `application_follow_ups`, and trigger `trg_prevent_application_events_update`.
+8. **Backfill Initial Events for Historical Applications:**
+   - For every migrated application without an event, insert `MIGRATION_INITIALIZED` event with `sequence_no = 1`, `previous_event_hash = "GENESIS"`, and canonical JSON payload preserving the legacy status.
+9. **Restore Foreign Keys & Verification:**
+   - Execute `PRAGMA foreign_keys = ON;`.
+   - Run `PRAGMA foreign_key_check` and `PRAGMA integrity_check`. Raise `DatabaseMigrationError` on any discrepancy.
+10. **Idempotence Guarantee:**
+    - Subsequent executions detect existing tables, constraints, and events, returning immediately with zero side-effects.
 
 ---
 
