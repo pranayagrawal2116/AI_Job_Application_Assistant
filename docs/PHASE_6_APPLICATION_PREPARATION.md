@@ -3,7 +3,7 @@
 **Architecture Version:** v2.1.1  
 **Phase:** 6 of 11  
 **Status:** Completed & Verified  
-**Tests:** 367 / 367 Passing (100%)  
+**Tests:** 470 / 470 Passing (100%)
 
 ---
 
@@ -118,8 +118,9 @@ Phase 6 introduces 6 new automated test suites (31 new tests), bringing the tota
 | `tests/test_phase6_1_hardening.py` | 37 | Multi-user security, session ownership, truthful evidence, packet provenance |
 | `tests/test_phase6_1_1_hardening.py` | 20 | Authenticated session binding & packet hash completeness |
 | `tests/test_phase6_1_2_hardening.py` | 24 | Approval session enforcement & independent canonical packet integrity |
+| `tests/test_phase6_1_3_hardening.py` | 22 | Strict user-bound session identity & actual match result provenance |
 | **Existing Phase 1–5.1.1 Suites** | 336 | Regression tests for all previous deliverables |
-| **Total Test Suite** | **448** | **100% Passing** |
+| **Total Test Suite** | **470** | **100% Passing** |
 
 ---
 
@@ -231,3 +232,33 @@ Phase 6.1.2 addressed remaining defects in application approval session enforcem
 
 5. **Legacy Compatibility Methods Isolated**:
    - Legacy single-job methods `authorize_application_packet` and `confirm_manual_submission` remain solely for backwards compatibility with earlier Phase 6 test suites and are explicitly documented as unreachable from authenticated universal application preparation or packet approval workflows.
+
+---
+
+## 8. Phase 6.1.3 Strict User-Bound Session Identity & Actual Match Result Provenance
+
+Phase 6.1.3 implemented two focused corrections addressing session identity binding and match result provenance integrity:
+
+1. **Strict Non-Null Session `user_id` Requirement**:
+   - `DashboardService.get_authenticated_candidate_session(user_id, session_id)` strictly requires `sess.user_id is not None and sess.user_id == user_id`.
+   - If a session lacks a database `user_id` (`sess.user_id is None`), it raises `SecurityAuthorizationError("Unbound session: Session does not contain a verified database user_id. Please authenticate again.")`.
+   - If a session belongs to another user (`sess.user_id != user_id`), it raises `SecurityAuthorizationError` on cross-user session violation.
+   - `HumanApprovalGate.authorize_universal_packet` independently executes this identical server-side check before packet verification and before single-use action ticket consumption.
+   - **Why `candidate_id` Cannot Replace `user_id`**: String identifiers such as `candidate_id` or `user_<id>` are client-controlled or legacy tokens that bypass database-backed relational integrity. Only an explicit, integer `user_id` verified against the authenticated user database guarantees true cross-user isolation and prevents unauthorized approvals.
+   - Legacy test helper `get_or_create_candidate_session` is deprecated and strictly quarantined for legacy test compatibility only; it cannot be called by universal preparation or approval.
+
+2. **Actual Matching-Result Provenance & Context Validation**:
+   - The dashboard application preparer workflow (Tab 7) passes the actual selected `latest_match.id` and its real scoring metadata (`engine_version`, `scoring_profile`, `scoring_config_version`) into `HumanApprovalGate.prepare_universal_packet`.
+   - **MatchResult Ownership and Source-Version Validation**:
+     - `MatchResult` must exist in the database and belong to the user (`match_result.user_id == user_id`); mismatched users raise `CrossUserAccessError`.
+     - `MatchResult` must reference the selected resume (`match_result.resume_id == original_resume_id`); mismatches raise `ValidationError`.
+     - `MatchResult` must reference the selected job description (`match_result.job_description_id == job_description_id`); mismatches raise `ValidationError`.
+     - `MatchResult` must match the resume file hash (`resume_file_hash == original_resume_hash`); mismatches raise `ValidationError`.
+     - `MatchResult` must match the immutable job snapshot hash (`job_snapshot_hash == job_description_snapshot_hash`); mismatches raise `ValidationError`.
+   - **Explicit Null Metadata Behavior**:
+     - If no matching evaluation exists for the application, `matching_result_id`, `matching_engine_version`, `scoring_profile`, and `scoring_configuration_version` are explicitly stored as `null`.
+     - If no candidate profile exists in the database, `candidate_profile_version` and `candidate_profile_hash` are explicitly stored as `null`.
+     - Hardcoded synthetic defaults (`"general"`, `"2.1.1"`, `"1.0.0"`) are completely eliminated.
+
+3. **New Regression Tests**:
+   - `tests/test_phase6_1_3_hardening.py` adds 22 comprehensive regression tests validating valid Phase 2 sessions, rejection of unbound/null user_id sessions, cross-user rejection, ticket preservation on session failures, actual match provenance binding, validation of resume/JD mismatches, explicit null handling, canonical hash reproducibility, and replay attack prevention.

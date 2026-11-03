@@ -590,6 +590,18 @@ def render_application_preparer():
             with st.spinner("Assembling RFC 8785 canonical packet snapshot..."):
                 res_hash = selected_res_meta.get("file_hash", "")
                 jd_hash = selected_jd.snapshot_hash if (selected_jd and selected_jd.snapshot_hash) else getattr(selected_jd, 'content_hash', '')
+
+                valid_match = None
+                if latest_match:
+                    if (
+                        latest_match.user_id == user_id
+                        and latest_match.resume_id == selected_resume_id
+                        and latest_match.job_description_id == selected_jd_id
+                        and (not latest_match.job_snapshot_hash or latest_match.job_snapshot_hash == jd_hash)
+                        and (not latest_match.resume_file_hash or latest_match.resume_file_hash == res_hash)
+                    ):
+                        valid_match = latest_match
+
                 pkt = service.prepare_universal_application_packet(
                     user_id=user_id,
                     application_id=app.id,
@@ -602,15 +614,16 @@ def render_application_preparer():
                     tailored_resume_doc=docs.get("resume_pdf"),
                     cover_letter_doc=docs.get("cover_letter_pdf"),
                     attachments_manifest=real_manifest,
-                    candidate_profile_version=db_profile.get("version", 1) if db_profile else 1,
-                    candidate_profile_hash=db_profile.get("profile_hash", "") if db_profile else "",
+                    candidate_profile_version=db_profile.get("version") if db_profile else None,
+                    candidate_profile_hash=db_profile.get("profile_hash") if db_profile else None,
                     template_id=doc_template.value if 'doc_template' in locals() else "modern",
                     template_version="1.0.0",
                     original_resume_version_num=selected_res_meta.get("active_version", 1),
                     job_description_id=selected_jd.id if selected_jd else None,
-                    matching_engine_version="2.1.1",
-                    scoring_configuration_version="1.0.0",
-                    scoring_profile="general",
+                    matching_result_id=valid_match.id if valid_match else None,
+                    matching_engine_version=valid_match.engine_version if valid_match else None,
+                    scoring_configuration_version=valid_match.scoring_config_version if valid_match else None,
+                    scoring_profile=valid_match.scoring_profile if valid_match else None,
                     generated_docs=docs,
                 )
                 st.session_state["prepared_packet"] = pkt

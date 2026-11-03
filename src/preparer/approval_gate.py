@@ -13,6 +13,7 @@ from src.database.exceptions import (
     CrossUserAccessError,
     InvalidSessionError,
     SessionExpiredError,
+    ValidationError,
 )
 from src.database.models import ApplicationApproval, ApplicationStatus, Job, PreparedPacket
 from src.preparer.cover_letter_generator import CoverLetter
@@ -138,10 +139,81 @@ class HumanApprovalGate:
                         candidate_profile_version = p_row["version"]
                     if candidate_profile_hash is None:
                         candidate_profile_hash = p_row["profile_hash"]
+                else:
+                    candidate_profile_version = None
+                    candidate_profile_hash = None
 
-        matching_eng_ver = matching_engine_version or ("2.1.1" if matching_result_id is not None else None)
-        scoring_cfg_ver = scoring_config_version or scoring_configuration_version or ("1.0.0" if matching_result_id is not None else None)
-        scoring_prof = scoring_profile or ("general" if matching_result_id is not None else None)
+            matching_eng_ver = None
+            scoring_prof = None
+            scoring_cfg_ver = None
+
+            if matching_result_id is not None:
+                cursor.execute("SELECT * FROM match_results WHERE id = ?", (matching_result_id,))
+                m_row = cursor.fetchone()
+                if m_row:
+                    m_dict = dict(m_row)
+
+                    # 1. Verify it belongs to the authenticated user
+                    if m_dict.get("user_id") != user_id:
+                        raise CrossUserAccessError(
+                            user_id=user_id,
+                            target_user_id=int(m_dict.get("user_id") or 0),
+                            resource=f"MatchResult #{matching_result_id}",
+                        )
+
+                    # 2. Verify it references the selected resume
+                    if original_resume_id is not None and m_dict.get("resume_id") != original_resume_id:
+                        raise ValidationError(
+                            f"MatchResult #{matching_result_id} resume_id ({m_dict.get('resume_id')}) "
+                            f"does not match selected resume #{original_resume_id}."
+                        )
+
+                    # 3. Verify it references the selected job description
+                    if job_description_id is not None and m_dict.get("job_description_id") != job_description_id:
+                        raise ValidationError(
+                            f"MatchResult #{matching_result_id} job_description_id ({m_dict.get('job_description_id')}) "
+                            f"does not match selected job description #{job_description_id}."
+                        )
+
+                    # 4. Verify resume hash if available
+                    if (
+                        original_resume_hash
+                        and m_dict.get("resume_file_hash")
+                        and m_dict.get("resume_file_hash") != original_resume_hash
+                    ):
+                        raise ValidationError(
+                            f"MatchResult #{matching_result_id} resume_file_hash mismatch: "
+                            f"{m_dict.get('resume_file_hash')} != {original_resume_hash}."
+                        )
+
+                    # 5. Verify job snapshot hash if available
+                    if (
+                        job_description_snapshot_hash
+                        and m_dict.get("job_snapshot_hash")
+                        and m_dict.get("job_snapshot_hash") != job_description_snapshot_hash
+                    ):
+                        raise ValidationError(
+                            f"MatchResult #{matching_result_id} job snapshot hash mismatch: "
+                            f"{m_dict.get('job_snapshot_hash')} != {job_description_snapshot_hash}."
+                        )
+
+                    matching_eng_ver = matching_engine_version or m_dict.get("engine_version")
+                    scoring_prof = scoring_profile or m_dict.get("scoring_profile")
+                    scoring_cfg_ver = (
+                        scoring_config_version
+                        or scoring_configuration_version
+                        or m_dict.get("scoring_config_version")
+                    )
+                else:
+                    # MatchResult ID passed directly (e.g. test harness with explicit metadata)
+                    matching_eng_ver = matching_engine_version
+                    scoring_prof = scoring_profile
+                    scoring_cfg_ver = scoring_config_version or scoring_configuration_version
+            else:
+                matching_result_id = None
+                matching_eng_ver = None
+                scoring_prof = None
+                scoring_cfg_ver = None
         tmpl_id = template_id or "modern"
         tmpl_ver = template_version or "1.0.0"
         gen_time = generation_timestamp or getattr(tailored_resume, "created_at", None) or datetime.now(timezone.utc).isoformat()
@@ -383,10 +455,10 @@ class HumanApprovalGate:
         except (InvalidSessionError, SessionExpiredError) as exc:
             return False, f"Approval rejected: {exc}", None
 
-        if sess.user_id is not None and sess.user_id != user_id:
+        if sess.user_id is None:
+            return False, "Approval rejected: Session does not contain a verified database user_id. Re-authentication required.", None
+        if sess.user_id != user_id:
             return False, f"Approval rejected: Session belongs to User #{sess.user_id}, not User #{user_id}.", None
-        if sess.candidate_id and sess.candidate_id not in (str(user_id), f"user_{user_id}") and sess.user_id is None:
-            return False, "Approval rejected: Session candidate identity does not match authenticated user.", None
 
         # 2. Retrieve & Independently Verify Packet Ownership, Active Status, and Hash Integrity
         valid_integrity, integrity_msg, packet = self.verify_prepared_packet_integrity(

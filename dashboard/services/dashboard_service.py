@@ -498,15 +498,16 @@ class DashboardService:
         answerer = QuestionAnswerer()
         return answerer.generate_standard_answers(job)
 
-    def get_or_create_candidate_session(
+    def _legacy_get_or_create_candidate_session_for_tests(
         self,
         candidate_name: str = "Authorized Candidate",
         candidate_id: Optional[str] = None,
         user_id: Optional[int] = None,
     ):
-        """Retrieves or initializes the server-side authenticated candidate session bound to user_id.
+        """INTERNAL TEST-ONLY COMPATIBILITY METHOD: Legacy single-candidate session retrieval.
 
-        Never returns sessions belonging to a different user.
+        FORBIDDEN IN PRODUCTION: Must never be called from universal application preparation
+        or packet approval workflows. Universal workflows strictly use get_authenticated_candidate_session().
         """
         from src.security.session_manager import SessionManager
         session_mgr = SessionManager.get_instance()
@@ -534,6 +535,22 @@ class DashboardService:
             candidate_name=candidate_name,
             user_id=target_uid,
             email=f"candidate_{target_uid or 1}@assistant.local",
+        )
+
+    def get_or_create_candidate_session(
+        self,
+        candidate_name: str = "Authorized Candidate",
+        candidate_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ):
+        """DEPRECATED (Test Compatibility Only): Use get_authenticated_candidate_session() instead.
+
+        FORBIDDEN: Must never be called from universal application preparation or packet approval workflows.
+        """
+        return self._legacy_get_or_create_candidate_session_for_tests(
+            candidate_name=candidate_name,
+            candidate_id=candidate_id,
+            user_id=user_id,
         )
 
     def get_authenticated_candidate_session(
@@ -574,13 +591,15 @@ class DashboardService:
         if not sess.is_active:
             raise InvalidSessionError("Session is revoked or deactivated. Please sign in again.")
 
-        if sess.user_id is not None and sess.user_id != user_id:
+        if sess.user_id is None:
+            raise SecurityAuthorizationError(
+                "Unbound session: Session does not contain a verified database user_id. Please authenticate again."
+            )
+
+        if sess.user_id != user_id:
             raise SecurityAuthorizationError(
                 f"Cross-user session violation: Session belongs to User #{sess.user_id}, not User #{user_id}."
             )
-
-        if sess.candidate_id and sess.candidate_id not in (str(user_id), f"user_{user_id}") and sess.user_id is None:
-            raise SecurityAuthorizationError("Session candidate identity does not match authenticated user.")
 
         return sess
 
@@ -684,7 +703,7 @@ class DashboardService:
                 return False, f"Approval rejected: {e}"
         else:
             try:
-                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Authorized Candidate")
+                sess = self._legacy_get_or_create_candidate_session_for_tests(candidate_name=approver_name or "Authorized Candidate")
             except Exception as e:
                 self.logger.error("Failed to create candidate session for authorization (Job #%d): %s", job_id, e, exc_info=True)
                 return False, f"Approval rejected: {e}"
@@ -744,7 +763,7 @@ class DashboardService:
                 return False, f"Submission rejected: {e}"
         else:
             try:
-                sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Authorized Candidate")
+                sess = self._legacy_get_or_create_candidate_session_for_tests(candidate_name=approver_name or "Authorized Candidate")
             except Exception as e:
                 self.logger.error("Failed to create candidate session for submission (Job #%d): %s", job_id, e, exc_info=True)
                 return False, f"Submission rejected: {e}"

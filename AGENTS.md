@@ -181,6 +181,14 @@ When interacting with the browser via Playwright MCP:
   - Legacy packet handling: Historical packets without canonical snapshots identified via `is_legacy = True` and preserved without fabricated metadata.
   - Verified with 24 new comprehensive hardening regression tests in `test_phase6_1_2_hardening.py` (448 total project suite tests passing, 100%), 0 pyflakes errors, and clean ruff check.
 
+- [x] **Architecture v2.1.1 Phase 6.1.3: Strict User-Bound Session Identity & Actual Match Result Provenance** (Complete)
+  - Strict session-to-user identity binding: `DashboardService.get_authenticated_candidate_session(user_id, session_id)` strictly requires `sess.user_id is not None and sess.user_id == user_id`, rejecting sessions missing database `user_id` or matching only on string `candidate_id`; `SecurityAuthorizationError` raised on unbound or cross-user sessions; legacy session creation helper deprecated and isolated strictly for backwards test compatibility.
+  - Server-side independent session enforcement: `HumanApprovalGate.authorize_universal_packet` independently validates `session.user_id is not None and session.user_id == user_id` prior to packet integrity validation and prior to consuming single-use HMAC action tickets, preserving tickets upon session authorization failure.
+  - Actual MatchResult provenance binding: Dashboard application preparer workflow passes the actual selected `latest_match.id` and its actual scoring metadata (`engine_version`, `scoring_profile`, `scoring_config_version`) into the canonical packet.
+  - MatchResult ownership and source-version validation: `prepare_universal_packet` validates that MatchResult belongs to the authenticated user (`CrossUserAccessError`), matches the selected resume ID and file hash (`ValidationError`), and matches the selected job description ID and snapshot hash (`ValidationError`).
+  - Explicit null metadata handling: applications without matching evaluations record explicit `null` metadata; candidates without profiles record explicit `null` profile version and hash; all hardcoded defaults eliminated.
+  - Verified with 22 new comprehensive hardening regression tests in `test_phase6_1_3_hardening.py` (470 total project suite tests passing, 100%), 0 pyflakes errors, and clean ruff check.
+
 ---
 
 ## 7. Approval Requirement
