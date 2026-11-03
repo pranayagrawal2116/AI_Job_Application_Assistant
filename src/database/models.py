@@ -327,3 +327,56 @@ class ResumeVersionRecord:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+
+@dataclass
+class MatchResult:
+    """User-owned immutable match evaluation record between a resume/profile and a job description."""
+    user_id: int
+    match_score: float
+    match_classification: str
+    eligibility_status: str  # 'ELIGIBLE', 'INELIGIBLE', 'UNKNOWN'
+    score_breakdown: str     # JSON string of dimensional breakdown
+    explanation: str         # Summary / text explanation
+    id: Optional[int] = None
+    resume_id: Optional[int] = None
+    resume_version_num: int = 1
+    resume_file_hash: Optional[str] = None
+    candidate_profile_version: int = 1
+    job_id: Optional[int] = None
+    job_description_id: Optional[int] = None
+    job_snapshot_hash: Optional[str] = None
+    scoring_profile: str = "general_baseline"
+    scoring_config_version: str = "1.0.0"
+    assessment_confidence: float = 1.0
+    engine_version: str = "2.1.1"
+    matching_skills: Optional[str] = None      # JSON list/dict
+    related_skills: Optional[str] = None       # JSON list/dict
+    partial_matches: Optional[str] = None      # JSON list/dict
+    missing_skills: Optional[str] = None       # JSON list/dict
+    education_analysis: Optional[str] = None   # JSON dict
+    experience_analysis: Optional[str] = None  # JSON dict
+    certification_analysis: Optional[str] = None  # JSON dict
+    eligibility_reasons: Optional[str] = None  # JSON list
+    scoring_explanations: Optional[str] = None # JSON dict
+    recommendations: Optional[str] = None      # JSON list
+    details_json: Optional[str] = None         # Canonical RFC 8785 JSON of full evaluation details
+    evaluated_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        for json_field in (
+            "score_breakdown", "matching_skills", "related_skills",
+            "partial_matches", "missing_skills", "education_analysis",
+            "experience_analysis", "certification_analysis",
+            "eligibility_reasons", "scoring_explanations", "recommendations",
+            "details_json",
+        ):
+            val = data.get(json_field)
+            if isinstance(val, str):
+                try:
+                    data[json_field] = json.loads(val)
+                except Exception:
+                    pass
+        return data
+
+

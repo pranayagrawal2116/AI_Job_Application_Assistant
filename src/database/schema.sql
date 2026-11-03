@@ -181,6 +181,25 @@ CREATE TABLE IF NOT EXISTS match_results (
     eligibility_status TEXT NOT NULL CHECK(eligibility_status IN ('ELIGIBLE', 'INELIGIBLE', 'UNKNOWN')),
     score_breakdown TEXT NOT NULL,
     explanation TEXT NOT NULL,
+    resume_version_num INTEGER DEFAULT 1,
+    resume_file_hash TEXT,
+    candidate_profile_version INTEGER DEFAULT 1,
+    job_snapshot_hash TEXT,
+    scoring_profile TEXT DEFAULT 'general_baseline',
+    scoring_config_version TEXT DEFAULT '1.0.0',
+    assessment_confidence REAL DEFAULT 1.0,
+    engine_version TEXT DEFAULT '2.1.1',
+    matching_skills TEXT,
+    related_skills TEXT,
+    partial_matches TEXT,
+    missing_skills TEXT,
+    education_analysis TEXT,
+    experience_analysis TEXT,
+    certification_analysis TEXT,
+    eligibility_reasons TEXT,
+    scoring_explanations TEXT,
+    recommendations TEXT,
+    details_json TEXT,
     evaluated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE CASCADE,
     FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE CASCADE
@@ -322,6 +341,8 @@ CREATE INDEX IF NOT EXISTS idx_job_descriptions_user_content ON job_descriptions
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_snapshot_hash ON job_descriptions(user_id, snapshot_hash);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_supersedes ON job_descriptions(supersedes_job_description_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
+CREATE INDEX IF NOT EXISTS idx_match_results_resume ON match_results(user_id, resume_id);
+CREATE INDEX IF NOT EXISTS idx_match_results_jd ON match_results(user_id, job_description_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
 CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id);
 CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status);

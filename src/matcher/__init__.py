@@ -9,7 +9,30 @@ from src.matcher.explanation import ExplanationGenerator, MatchExplanation
 from src.matcher.job_matcher import EvaluationResult, JobMatcher
 from src.matcher.location_matcher import LocationMatcher, LocationMatchResult
 from src.matcher.score_calculator import ScoreCalculationResult, ScoreCalculator
+from src.matcher.scoring_profiles import (
+    SCORING_PROFILES,
+    ScoringProfileConfig,
+    get_scoring_profile,
+    recommend_scoring_profile,
+)
 from src.matcher.skill_matcher import SkillMatcher, SkillMatchResult
+from src.matcher.universal_matcher import (
+    CandidateFactNormalizer,
+    CertificationLicensingEvaluator,
+    EducationCompatibilityEvaluator,
+    ExperienceEvaluator,
+    JobRequirementNormalizer,
+    LocationWorkModeEvaluator,
+    MatchResultPersistenceService,
+    ResponsibilityAlignmentEvaluator,
+    SkillAssessment,
+    UniversalEligibilityEvaluator,
+    UniversalExplanationGenerator,
+    UniversalMatchResult,
+    UniversalMatcher,
+    UniversalScoringEngine,
+    UniversalSkillMatcher,
+)
 
 __all__ = [
     "JobMatcher",
@@ -33,4 +56,24 @@ __all__ = [
     "ScoreCalculationResult",
     "ExplanationGenerator",
     "MatchExplanation",
+    # Phase 5 Universal Matcher
+    "UniversalMatcher",
+    "UniversalMatchResult",
+    "CandidateFactNormalizer",
+    "JobRequirementNormalizer",
+    "UniversalSkillMatcher",
+    "SkillAssessment",
+    "EducationCompatibilityEvaluator",
+    "ExperienceEvaluator",
+    "CertificationLicensingEvaluator",
+    "ResponsibilityAlignmentEvaluator",
+    "LocationWorkModeEvaluator",
+    "UniversalEligibilityEvaluator",
+    "UniversalScoringEngine",
+    "UniversalExplanationGenerator",
+    "MatchResultPersistenceService",
+    "SCORING_PROFILES",
+    "ScoringProfileConfig",
+    "get_scoring_profile",
+    "recommend_scoring_profile",
 ]

@@ -259,3 +259,13 @@ class URLFetchRestrictedError(DatabaseError):
         super().__init__(message)
         self.official_url = official_url
         self.restriction_type = restriction_type
+
+
+# -----------------------------------------------------------------------------
+# PHASE 5: UNIVERSAL RESUME-TO-JOB MATCHING EXCEPTIONS
+# -----------------------------------------------------------------------------
+
+class MatchResultNotFoundError(DatabaseError):
+    """Raised when a requested match result record cannot be found."""
+    pass
+

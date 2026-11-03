@@ -20,8 +20,10 @@ from src.database.exceptions import (
     SecurityAuthorizationError,
     ValidationError,
 )
-from src.database.models import ApplicationStatus, JobDescription
+from src.database.models import ApplicationStatus, JobDescription, MatchResult
 from src.matcher.job_matcher import JobMatcher
+from src.matcher.scoring_profiles import SCORING_PROFILES, recommend_scoring_profile
+from src.matcher.universal_matcher import UniversalMatchResult, UniversalMatcher
 from src.scraper.discovery.search_coordinator import DiscoverySummary, SearchCoordinator
 from src.utils.logger import setup_logger
 
@@ -817,3 +819,100 @@ class DashboardService:
         except Exception as e:
             self.logger.warning("Failed to get JD history for #%d (user %d): %s", jd_id, user_id, e)
             return []
+
+    # -------------------------------------------------------------------------
+    # PHASE 5: UNIVERSAL RESUME-TO-JOB MATCHING SERVICES
+    # -------------------------------------------------------------------------
+
+    def get_available_scoring_profiles(self) -> List[Dict[str, Any]]:
+        """Returns metadata for all available scoring profiles."""
+        profiles = []
+        for pid, conf in SCORING_PROFILES.items():
+            profiles.append({
+                "id": conf.profile_id,
+                "name": conf.name,
+                "description": conf.description,
+                "weights": conf.weights,
+                "dimension_labels": conf.dimension_labels,
+                "version": conf.version,
+            })
+        return profiles
+
+    def recommend_scoring_profile(
+        self,
+        user_id: int,
+        resume_id: int,
+        job_description_id: int,
+    ) -> Tuple[str, str]:
+        """Inspects resume and job description to recommend best matching scoring profile."""
+        resume = self.db.get_user_resume(resume_id, user_id=user_id)
+        jd = self.db.get_job_description(jd_id=job_description_id, user_id=user_id)
+        if not resume or not jd:
+            return "general_baseline", "Standard evaluation profile."
+
+        cand_level = resume.get("label") or "entry"
+        years_exp = None
+        parsed_resume = resume.get("parsed_data")
+        if isinstance(parsed_resume, str):
+            try:
+                parsed_resume = json.loads(parsed_resume)
+            except Exception:
+                parsed_resume = {}
+        if isinstance(parsed_resume, dict):
+            cand_level = parsed_resume.get("career_level") or cand_level
+
+        parsed_jd = jd.to_dict().get("parsed_data") or {}
+        if isinstance(parsed_jd, str):
+            try:
+                parsed_jd = json.loads(parsed_jd)
+            except Exception:
+                parsed_jd = {}
+
+        is_intern = bool("intern" in jd.job_title.lower() or parsed_jd.get("internship_duration"))
+
+        return recommend_scoring_profile(
+            candidate_level=cand_level,
+            job_industry=jd.company_name or parsed_jd.get("industry"),
+            job_title=jd.job_title,
+            is_internship=is_intern,
+            years_experience=years_exp,
+        )
+
+    def run_match_evaluation(
+        self,
+        user_id: int,
+        resume_id: int,
+        job_description_id: int,
+        scoring_profile_id: Optional[str] = None,
+    ) -> UniversalMatchResult:
+        """Executes full universal match evaluation and stores immutable record."""
+        matcher = UniversalMatcher(db_manager=self.db)
+        return matcher.evaluate(
+            user_id=user_id,
+            resume_id=resume_id,
+            job_description_id=job_description_id,
+            scoring_profile_id=scoring_profile_id,
+            persist=True,
+        )
+
+    def get_user_match_history(
+        self,
+        user_id: int,
+        resume_id: Optional[int] = None,
+        job_description_id: Optional[int] = None,
+    ) -> List[MatchResult]:
+        """Retrieves past evaluation history for user."""
+        return self.db.get_user_match_results(
+            user_id=user_id,
+            resume_id=resume_id,
+            job_description_id=job_description_id,
+        )
+
+    def get_match_evaluation_detail(
+        self,
+        user_id: int,
+        match_id: int,
+    ) -> Optional[MatchResult]:
+        """Retrieves a specific evaluation record with ownership enforcement."""
+        return self.db.get_match_result(match_id=match_id, user_id=user_id)
+

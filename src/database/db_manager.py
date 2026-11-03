@@ -39,6 +39,7 @@ from src.database.models import (
     Company,
     Job,
     JobDescription,
+    MatchResult,
     PreparedPacket,
 )
 from src.database.url_normalizer import (
@@ -185,6 +186,25 @@ class DatabaseManager:
         add_col_if_missing("job_descriptions", "supersedes_job_description_id", "INTEGER")
         add_col_if_missing("job_descriptions", "snapshot_hash", "TEXT")
         add_col_if_missing("job_descriptions", "is_active", "INTEGER DEFAULT 1")
+        add_col_if_missing("match_results", "resume_version_num", "INTEGER DEFAULT 1")
+        add_col_if_missing("match_results", "resume_file_hash", "TEXT")
+        add_col_if_missing("match_results", "candidate_profile_version", "INTEGER DEFAULT 1")
+        add_col_if_missing("match_results", "job_snapshot_hash", "TEXT")
+        add_col_if_missing("match_results", "scoring_profile", "TEXT DEFAULT 'general_baseline'")
+        add_col_if_missing("match_results", "scoring_config_version", "TEXT DEFAULT '1.0.0'")
+        add_col_if_missing("match_results", "assessment_confidence", "REAL DEFAULT 1.0")
+        add_col_if_missing("match_results", "engine_version", "TEXT DEFAULT '2.1.1'")
+        add_col_if_missing("match_results", "matching_skills", "TEXT")
+        add_col_if_missing("match_results", "related_skills", "TEXT")
+        add_col_if_missing("match_results", "partial_matches", "TEXT")
+        add_col_if_missing("match_results", "missing_skills", "TEXT")
+        add_col_if_missing("match_results", "education_analysis", "TEXT")
+        add_col_if_missing("match_results", "experience_analysis", "TEXT")
+        add_col_if_missing("match_results", "certification_analysis", "TEXT")
+        add_col_if_missing("match_results", "eligibility_reasons", "TEXT")
+        add_col_if_missing("match_results", "scoring_explanations", "TEXT")
+        add_col_if_missing("match_results", "recommendations", "TEXT")
+        add_col_if_missing("match_results", "details_json", "TEXT")
 
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
@@ -2575,3 +2595,209 @@ class DatabaseManager:
             cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
             logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
             return True
+
+    # -------------------------------------------------------------------------
+    # PHASE 5: MATCH RESULT PERSISTENCE & MULTI-USER AUDIT TRAIL
+    # -------------------------------------------------------------------------
+
+    def save_match_result(self, result: MatchResult) -> int:
+        """Persists an immutable match evaluation result with strict composite ownership validation.
+        
+        Raises:
+            CrossUserAccessError: If resume or job description belongs to a different user.
+            ResumeNotFoundError: If specified resume does not exist.
+            JobDescriptionNotFoundError: If specified job description does not exist.
+            JobNotFoundError: If specified catalog job does not exist.
+        """
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+
+            # 1. Verify user exists
+            cursor.execute("SELECT id FROM users WHERE id = ?", (result.user_id,))
+            if not cursor.fetchone():
+                raise UserNotFoundError(result.user_id)
+
+            # 2. Verify resume ownership
+            if result.resume_id is not None:
+                cursor.execute("SELECT id, user_id FROM resumes WHERE id = ?", (result.resume_id,))
+                res_row = cursor.fetchone()
+                if not res_row:
+                    raise ResumeNotFoundError(f"Resume #{result.resume_id} not found.")
+                if res_row["user_id"] != result.user_id:
+                    raise CrossUserAccessError(
+                        user_id=result.user_id,
+                        target_user_id=res_row["user_id"],
+                        resource=f"Resume #{result.resume_id}",
+                    )
+
+            # 3. Verify job description ownership
+            if result.job_description_id is not None:
+                cursor.execute(
+                    "SELECT id, user_id FROM job_descriptions WHERE id = ?",
+                    (result.job_description_id,),
+                )
+                jd_row = cursor.fetchone()
+                if not jd_row:
+                    raise JobDescriptionNotFoundError(f"Job Description #{result.job_description_id} not found.")
+                if jd_row["user_id"] != result.user_id:
+                    raise CrossUserAccessError(
+                        user_id=result.user_id,
+                        target_user_id=jd_row["user_id"],
+                        resource=f"Job Description #{result.job_description_id}",
+                    )
+
+            # 4. Verify catalog job existence if provided
+            if result.job_id is not None:
+                cursor.execute("SELECT id FROM jobs WHERE id = ?", (result.job_id,))
+                if not cursor.fetchone():
+                    raise JobNotFoundError(result.job_id)
+
+            # 5. Insert immutable evaluation record
+            cursor.execute(
+                """
+                INSERT INTO match_results (
+                    user_id, resume_id, job_id, job_description_id,
+                    match_score, match_classification, eligibility_status,
+                    score_breakdown, explanation,
+                    resume_version_num, resume_file_hash, candidate_profile_version,
+                    job_snapshot_hash, scoring_profile, scoring_config_version,
+                    assessment_confidence, engine_version,
+                    matching_skills, related_skills, partial_matches, missing_skills,
+                    education_analysis, experience_analysis, certification_analysis,
+                    eligibility_reasons, scoring_explanations, recommendations, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    result.user_id,
+                    result.resume_id,
+                    result.job_id,
+                    result.job_description_id,
+                    result.match_score,
+                    result.match_classification,
+                    result.eligibility_status,
+                    result.score_breakdown if isinstance(result.score_breakdown, str) else json.dumps(result.score_breakdown),
+                    result.explanation,
+                    result.resume_version_num,
+                    result.resume_file_hash,
+                    result.candidate_profile_version,
+                    result.job_snapshot_hash,
+                    result.scoring_profile,
+                    result.scoring_config_version,
+                    result.assessment_confidence,
+                    result.engine_version,
+                    result.matching_skills if isinstance(result.matching_skills, str) or result.matching_skills is None else json.dumps(result.matching_skills),
+                    result.related_skills if isinstance(result.related_skills, str) or result.related_skills is None else json.dumps(result.related_skills),
+                    result.partial_matches if isinstance(result.partial_matches, str) or result.partial_matches is None else json.dumps(result.partial_matches),
+                    result.missing_skills if isinstance(result.missing_skills, str) or result.missing_skills is None else json.dumps(result.missing_skills),
+                    result.education_analysis if isinstance(result.education_analysis, str) or result.education_analysis is None else json.dumps(result.education_analysis),
+                    result.experience_analysis if isinstance(result.experience_analysis, str) or result.experience_analysis is None else json.dumps(result.experience_analysis),
+                    result.certification_analysis if isinstance(result.certification_analysis, str) or result.certification_analysis is None else json.dumps(result.certification_analysis),
+                    result.eligibility_reasons if isinstance(result.eligibility_reasons, str) or result.eligibility_reasons is None else json.dumps(result.eligibility_reasons),
+                    result.scoring_explanations if isinstance(result.scoring_explanations, str) or result.scoring_explanations is None else json.dumps(result.scoring_explanations),
+                    result.recommendations if isinstance(result.recommendations, str) or result.recommendations is None else json.dumps(result.recommendations),
+                    result.details_json if isinstance(result.details_json, str) or result.details_json is None else json.dumps(result.details_json),
+                ),
+            )
+            match_id = int(cursor.lastrowid or 0)
+            logger.info("Saved immutable MatchResult #%d for User #%d (Score: %.1f)", match_id, result.user_id, result.match_score)
+            return match_id
+
+    def get_match_result(self, match_id: int, user_id: int) -> Optional[MatchResult]:
+        """Retrieves a match evaluation result with strict cross-user access enforcement."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM match_results WHERE id = ?", (match_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"MatchResult #{match_id}",
+                )
+            return self._row_to_match_result(row)
+
+    def get_user_match_results(
+        self,
+        user_id: int,
+        resume_id: Optional[int] = None,
+        job_description_id: Optional[int] = None,
+        job_id: Optional[int] = None,
+        limit: int = 50,
+    ) -> List[MatchResult]:
+        """Retrieves historical match evaluation results for a user, newest first."""
+        query = "SELECT * FROM match_results WHERE user_id = ?"
+        params: List[Any] = [user_id]
+
+        if resume_id is not None:
+            query += " AND resume_id = ?"
+            params.append(resume_id)
+        if job_description_id is not None:
+            query += " AND job_description_id = ?"
+            params.append(job_description_id)
+        if job_id is not None:
+            query += " AND job_id = ?"
+            params.append(job_id)
+
+        query += " ORDER BY evaluated_at DESC, id DESC LIMIT ?"
+        params.append(limit)
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return [self._row_to_match_result(row) for row in cursor.fetchall()]
+
+    def get_latest_match_result(
+        self,
+        user_id: int,
+        resume_id: Optional[int] = None,
+        job_description_id: Optional[int] = None,
+        job_id: Optional[int] = None,
+    ) -> Optional[MatchResult]:
+        """Retrieves the most recent evaluation for given candidate/job combination."""
+        results = self.get_user_match_results(
+            user_id=user_id,
+            resume_id=resume_id,
+            job_description_id=job_description_id,
+            job_id=job_id,
+            limit=1,
+        )
+        return results[0] if results else None
+
+    def _row_to_match_result(self, row: sqlite3.Row) -> MatchResult:
+        """Maps an SQLite row to a MatchResult domain model."""
+        keys = row.keys()
+        return MatchResult(
+            id=row["id"],
+            user_id=row["user_id"],
+            resume_id=row["resume_id"],
+            job_id=row["job_id"],
+            job_description_id=row["job_description_id"],
+            match_score=float(row["match_score"]),
+            match_classification=row["match_classification"],
+            eligibility_status=row["eligibility_status"],
+            score_breakdown=row["score_breakdown"],
+            explanation=row["explanation"],
+            resume_version_num=row["resume_version_num"] if "resume_version_num" in keys and row["resume_version_num"] is not None else 1,
+            resume_file_hash=row["resume_file_hash"] if "resume_file_hash" in keys else None,
+            candidate_profile_version=row["candidate_profile_version"] if "candidate_profile_version" in keys and row["candidate_profile_version"] is not None else 1,
+            job_snapshot_hash=row["job_snapshot_hash"] if "job_snapshot_hash" in keys else None,
+            scoring_profile=row["scoring_profile"] if "scoring_profile" in keys and row["scoring_profile"] else "general_baseline",
+            scoring_config_version=row["scoring_config_version"] if "scoring_config_version" in keys and row["scoring_config_version"] else "1.0.0",
+            assessment_confidence=float(row["assessment_confidence"]) if "assessment_confidence" in keys and row["assessment_confidence"] is not None else 1.0,
+            engine_version=row["engine_version"] if "engine_version" in keys and row["engine_version"] else "2.1.1",
+            matching_skills=row["matching_skills"] if "matching_skills" in keys else None,
+            related_skills=row["related_skills"] if "related_skills" in keys else None,
+            partial_matches=row["partial_matches"] if "partial_matches" in keys else None,
+            missing_skills=row["missing_skills"] if "missing_skills" in keys else None,
+            education_analysis=row["education_analysis"] if "education_analysis" in keys else None,
+            experience_analysis=row["experience_analysis"] if "experience_analysis" in keys else None,
+            certification_analysis=row["certification_analysis"] if "certification_analysis" in keys else None,
+            eligibility_reasons=row["eligibility_reasons"] if "eligibility_reasons" in keys else None,
+            scoring_explanations=row["scoring_explanations"] if "scoring_explanations" in keys else None,
+            recommendations=row["recommendations"] if "recommendations" in keys else None,
+            details_json=row["details_json"] if "details_json" in keys else None,
+            evaluated_at=row["evaluated_at"],
+        )
+
