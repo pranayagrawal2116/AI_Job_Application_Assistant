@@ -55,6 +55,13 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         doc.save(str(cls.docx_path))
 
         # Register sample test job once
+        with cls.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, password_hash, password_salt, full_name) VALUES ('prep_tester@test.com', 'h', 's', 'Prep Tester')"
+            )
+            cls.user_id = cursor.lastrowid
+
         cls.test_job = cls.db.add_job(
             Job(
                 company_name="NeuralEdge Dynamics",
@@ -67,7 +74,8 @@ class TestApplicationPreparationEngine(unittest.TestCase):
                 match_score=94.0,
                 match_classification="Excellent",
                 is_eligible=True,
-            )
+            ),
+            user_id=cls.user_id,
         )
 
     @classmethod

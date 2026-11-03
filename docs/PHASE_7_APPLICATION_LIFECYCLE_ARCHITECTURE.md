@@ -356,14 +356,30 @@ BEFORE UPDATE ON application_events
 BEGIN
     SELECT RAISE(FAIL, 'application_events records are append-only and cannot be updated.');
 END;
+
+CREATE TABLE IF NOT EXISTS _privacy_erasure_tokens (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    token_nonce TEXT NOT NULL,
+    authorized_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_delete
+BEFORE DELETE ON application_events
+BEGIN
+    SELECT RAISE(FAIL, 'application_events records are immutable and cannot be deleted except via authorized privacy erasure.')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM _privacy_erasure_tokens WHERE user_id = OLD.user_id
+    );
+END;
 ```
 
 #### Event Immutability & Retention Guarantees:
 - **Append-Only Trigger:** `trg_prevent_application_events_update` aborts any direct `UPDATE` statement on `application_events`.
+- **Deletion Prevention Trigger:** `trg_prevent_application_events_delete` blocks any direct `DELETE` statement on `application_events` during normal database operations.
 - **Application Deletion Invariant:** `FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE RESTRICT` ensures normal application deletions are prevented when event history exists; applications must be archived (`is_archived = 1`) rather than physically deleted.
-- **Cryptographic Hash Chain:** Each event computes `event_hash = SHA256(RFC8785_canonical_json(hash_payload))` where `hash_payload` covers `sequence_no`, `application_id`, `user_id`, `event_type`, `previous_status`, `new_status`, `actor_type`, `actor_identifier`, `session_reference`, `event_payload_json`, and `previous_event_hash` (`'GENESIS'` for sequence 1).
-- **Honest Security Scope:** The SHA-256 chain provides deterministic tamper evidence against tampering and out-of-order mutations when verified via `verify_application_event_chain`. It does not claim database administrator prevention without external ledger anchoring.
-- **Account Erasure Exception:** When a user explicitly requests GDPR/privacy account deletion (`delete_user_account_data`), child tables are deleted in controlled topological order (`submission_confirmations` -> `application_follow_ups` -> `application_events` -> `match_results` -> `prepared_packets` -> `applications` -> `users`), cleanly avoiding deletion blocks without allowing random row tampering.
+- **Cryptographic Hash Chain (v2 with Timestamp Binding):** Each event computes `event_hash = SHA256(RFC8785_canonical_json(hash_payload))` where `hash_payload` covers `sequence_no`, `application_id`, `user_id`, `event_type`, `previous_status`, `new_status`, `actor_type`, `actor_identifier`, `session_reference`, `event_payload_json`, `created_at` (UTC timestamp string), and `previous_event_hash` (`'GENESIS'` for sequence 1). Binding `created_at` prevents retroactive timestamp forgery. Backward compatibility maintains verification of legacy v1 hashes.
+- **Honest Security Scope & Tail-Deletion Limitation:** The SHA-256 chain provides deterministic tamper evidence against tampering, payload altering, timestamp forging, and out-of-order mutations when verified via `verify_application_event_chain`. However, a database administrator who truncates or drops the final event (tail deletion) cannot be detected by internal chain hashing alone without an external trusted checkpoint (such as a signed external ledger or immutable application status checkpoint).
+- **Authorized Privacy Erasure (GDPR):** When a user explicitly exercises their right to be forgotten via `delete_user_account_data`, an ephemeral authorization token is inserted into `_privacy_erasure_tokens` within the atomic transaction, permitting `application_events` deletion before deleting the user and cleaning up the token.
 
 ### 9.3 `submission_confirmations` Table
 Captures authoritative proof and metadata for candidate-submitted applications:
@@ -384,7 +400,7 @@ CREATE TABLE IF NOT EXISTS submission_confirmations (
     is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
-    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE SET NULL
+    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1;
@@ -393,6 +409,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirma
 #### Submission Safeguard Invariants:
 - `submission_channel` is controlled (`COMPANY_PORTAL`, `LINKEDIN`, `INDEED`, `EMAIL`, `RECRUITER`, `REFERRAL`, `OTHER`).
 - Partial unique index `idx_sub_conf_active_app` allows complete historical submission re-attempts while guaranteeing at most one active confirmation per application (`is_active_confirmation = 1`).
+- `FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE RESTRICT`: Hardened in Phase 7.1.1 from `ON DELETE SET NULL` to `ON DELETE RESTRICT` to guarantee that prepared packet audit records cannot be deleted while referenced by active or historical submission records.
+- **Storage-Only vs. Status Transition Boundary:**
+  - `transition_status=False` (default): Purely stores external confirmation metadata without mutating application status.
+  - `transition_status=True`: Strictly validates that `packet_id` is supplied, that the application is in an approved state (`APPROVED`), that an active revision packet exists with an unconsumed human approval record in `application_approvals`, consumes the approval ticket atomically (`is_consumed = 1`, `consumed_at = CURRENT_TIMESTAMP`), advances status to `SUBMITTED`, sets `date_submitted`, and emits `SUBMISSION_CONFIRMED`.
 - Candidate-provided evidence is recorded truthfully without presenting unverified candidate entries as employer-verified receipts.
 
 ### 9.4 `application_follow_ups` Table
@@ -419,23 +439,29 @@ CREATE TABLE IF NOT EXISTS application_follow_ups (
 
 ## 10. Implemented Migration Strategy (`_migrate_phase7_lifecycle_tables`)
 
-A 12-step zero-downtime, idempotent SQLite migration `_migrate_phase7_lifecycle_tables()` in `src/database/db_manager.py`:
+A 12-step zero-downtime, idempotent, fully transactional SQLite migration `_migrate_phase7_lifecycle_tables()` in `src/database/db_manager.py`:
 
-1. **Verify Database Integrity:** Inspect `applications` table existence, column nullability, and foreign key definitions.
+1. **Verify Database Integrity:** Inspect `applications` table existence, column nullability, and foreign key definitions. If already migrated with NOT NULL `user_id` and RESTRICT constraints, returns immediately.
 2. **Preflight Ownership & Integrity Safeguards:** Abort with `MigrationPreflightError` if:
    - Any application has `user_id IS NULL`. Historical applications are never arbitrarily assigned.
    - Any application has invalid non-existent `user_id`.
    - Cross-user reference detected on `job_descriptions` (`applications.user_id != job_descriptions.user_id`).
    - Cross-user reference detected on `resumes` (`applications.user_id != resumes.user_id`).
    - Cross-user reference detected on `prepared_packets` or `application_approvals`.
-3. **Deterministic Legacy Status Mapping:**
+3. **Deterministic Legacy Status Mapping (Real Schema Query):**
+   - Queries `application_approvals` joined with `prepared_packets` using actual Phase 6.1.3 schema:
+     `a.is_consumed = 0 AND p.is_active_revision = 1 AND a.packet_version_hash = p.packet_version_hash AND a.application_id = p.application_id AND a.user_id = p.user_id`.
    - `Discovered` -> `DRAFT`
    - `Under Review` / `Shortlisted` -> `PREPARING`
    - `Application Prepared` -> `READY_FOR_REVIEW`
-   - `Awaiting Approval` -> `APPROVED` (if active valid approval exists in `application_approvals` for an active packet in `prepared_packets`), else `READY_FOR_REVIEW`.
+   - `Awaiting Approval` -> `APPROVED` if and only if an active unconsumed human approval matches the active packet; otherwise maps conservatively to `READY_FOR_REVIEW`.
    - `Applied` -> `SUBMITTED` (without fabricating false submission confirmations).
    - `Interview` -> `INTERVIEW`, `Rejected` -> `REJECTED`, `Withdrawn` -> `WITHDRAWN`.
-4. **Dedicated Connection & Foreign Keys Boundary:** Foreign key enforcement (`PRAGMA foreign_keys = OFF`) is toggled on a dedicated connection strictly outside any active transaction.
+4. **Explicit Transactional Boundary & Atomic Rollback:**
+   - Uses manual isolation mode (`conn.isolation_level = None`).
+   - Disables foreign keys (`PRAGMA foreign_keys = OFF;`) and starts an immediate transaction (`BEGIN IMMEDIATE TRANSACTION;`).
+   - All steps (table rebuild, row copy, table swap, index creation, child table creation, trigger installation, event backfill) execute within this atomic transaction.
+   - If any exception occurs at any point, `ROLLBACK;` is cleanly executed and `conn.isolation_level` and foreign keys are restored in `finally`, leaving the legacy database 100% intact.
 5. **Table Rebuild Execution:**
    - Create replacement table `applications_v7` with strict composite constraints and status CHECK constraints.
    - Copy existing rows using explicit column lists, preserving application IDs, company names, job titles, and timestamps.
@@ -443,14 +469,35 @@ A 12-step zero-downtime, idempotent SQLite migration `_migrate_phase7_lifecycle_
 6. **Recreate Dependent Indexes:**
    - `idx_applications_user`, `idx_applications_user_status`, `idx_applications_job_id`, `idx_applications_archived`, `idx_applications_status`, `uq_applications_id_user`, `uq_applications_user_jd`.
 7. **Ensure Child Tables Exist:**
-   - `application_events`, `submission_confirmations`, `application_follow_ups`, and trigger `trg_prevent_application_events_update`.
+   - `application_events`, `submission_confirmations`, `application_follow_ups`, `_privacy_erasure_tokens`, and triggers `trg_prevent_application_events_update` & `trg_prevent_application_events_delete`.
 8. **Backfill Initial Events for Historical Applications:**
-   - For every migrated application without an event, insert `MIGRATION_INITIALIZED` event with `sequence_no = 1`, `previous_event_hash = "GENESIS"`, and canonical JSON payload preserving the legacy status.
-9. **Restore Foreign Keys & Verification:**
-   - Execute `PRAGMA foreign_keys = ON;`.
-   - Run `PRAGMA foreign_key_check` and `PRAGMA integrity_check`. Raise `DatabaseMigrationError` on any discrepancy.
+   - For every migrated application without an event, insert `MIGRATION_INITIALIZED` event with `sequence_no = 1`, `previous_event_hash = "GENESIS"`, `hash_version = "v2"`, UTC timestamp binding, and canonical JSON payload preserving the legacy status.
+9. **Post-Migration Verification & Commit:**
+   - Validate integrity before commit: `PRAGMA foreign_key_check;` and `PRAGMA integrity_check;`.
+   - On discrepancy, executes `ROLLBACK;` and raises `DatabaseMigrationError`.
+   - On clean check, executes `COMMIT;`.
 10. **Idempotence Guarantee:**
     - Subsequent executions detect existing tables, constraints, and events, returning immediately with zero side-effects.
+
+### 10.1 Discovered Catalogue Job Insertion vs. User Application Tracking
+
+In Phase 1–5, the platform operated as a single-candidate tool, meaning discovered scraper jobs in the catalog were automatically treated as applications for that single candidate (`ApplicationStatus.DISCOVERED`).
+
+In the multi-user architecture (Phase 6–7), public catalog discovery and candidate-owned applications are cleanly separated:
+- **`insert_job()`:** Inserts public job listings into the `jobs` catalog. It **never** assigns jobs to arbitrary users (no `SELECT id FROM users LIMIT 1`) and **never** creates placeholder system users (`system@localhost`).
+- **`insert_job(job, user_id=...)` (Backwards Compatibility):** When an explicit, validated `user_id` is passed, it validates that the user exists and creates an application record and `APPLICATION_CREATED` event specifically for that candidate.
+- **Candidate Application Creation:** Candidates track catalog or manual opportunities via `create_user_application(user_id=..., job_id=...)`, preserving strict ownership boundaries.
+
+### 10.2 Phase 7.1.1 Corrective Hardening Summary
+
+| Area | Issue Identified | Corrective Solution Implemented |
+| :--- | :--- | :--- |
+| **Approval Migration Query** | Queried non-existent `is_revoked = 0` column. | Queried real Phase 6.1.3 schema: `a.is_consumed = 0` joined on `(application_id, user_id, packet_version_hash)` where `is_active_revision = 1`. |
+| **Submission Confirmation FK** | Used `ON DELETE SET NULL` on composite `(packet_id, user_id)`. | Hardened to `ON DELETE RESTRICT` preventing deletion of prepared packets referenced in active or historical submission records. |
+| **Approval-to-Submission Boundary** | `create_submission_confirmation` lacked clear operational distinction. | Strict separation: `transition_status=False` is storage-only; `transition_status=True` validates preconditions, approved status, active unconsumed approval, atomically consumes ticket, updates status to `SUBMITTED`, and emits `SUBMISSION_CONFIRMED`. |
+| **Catalogue Job Insertion** | `insert_job` auto-assigned jobs to `SELECT id FROM users LIMIT 1` or `system@localhost`. | Removed arbitrary user guessing and placeholder candidate creation. Added explicit, validated `user_id` parameter for backwards-compatible test workflows. |
+| **Event Hashing & Deletion Protection** | Timestamps were omitted from hash; normal users could delete events. | Upgraded hash to `v2` (binding UTC `created_at` timestamp); installed `trg_prevent_application_events_delete` trigger; restricted event deletion to authorized privacy erasure (`_privacy_erasure_tokens`); documented tail deletion limitation. |
+| **Migration Atomicity & Rollback** | Migration lacked explicit transaction wrapping and rollback handling. | Wrapped in `conn.isolation_level = None`, `BEGIN IMMEDIATE TRANSACTION;`, explicit `ROLLBACK;` on error, and verified foreign keys/integrity before `COMMIT;`. |
 
 ---
 

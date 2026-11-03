@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import secrets
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 
@@ -502,28 +503,32 @@ class DatabaseManager:
             )
 
         # Preflight Check 3: Cross-user Job Description references
-        cursor.execute("""
-            SELECT COUNT(*) FROM applications a
-            JOIN job_descriptions jd ON a.job_description_id = jd.id
-            WHERE a.job_description_id IS NOT NULL AND a.user_id != jd.user_id
-        """)
-        cross_jd = cursor.fetchone()[0]
-        if cross_jd > 0:
-            raise MigrationPreflightError(
-                f"Migration preflight failed: {cross_jd} application(s) reference job descriptions owned by another user."
-            )
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
+        if cursor.fetchone():
+            cursor.execute("""
+                SELECT COUNT(*) FROM applications a
+                JOIN job_descriptions jd ON a.job_description_id = jd.id
+                WHERE a.job_description_id IS NOT NULL AND a.user_id != jd.user_id
+            """)
+            cross_jd = cursor.fetchone()[0]
+            if cross_jd > 0:
+                raise MigrationPreflightError(
+                    f"Migration preflight failed: {cross_jd} application(s) reference job descriptions owned by another user."
+                )
 
         # Preflight Check 4: Cross-user Resume references
-        cursor.execute("""
-            SELECT COUNT(*) FROM applications a
-            JOIN resumes r ON a.resume_id = r.id
-            WHERE a.resume_id IS NOT NULL AND a.user_id != r.user_id
-        """)
-        cross_res = cursor.fetchone()[0]
-        if cross_res > 0:
-            raise MigrationPreflightError(
-                f"Migration preflight failed: {cross_res} application(s) reference resumes owned by another user."
-            )
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='resumes'")
+        if cursor.fetchone():
+            cursor.execute("""
+                SELECT COUNT(*) FROM applications a
+                JOIN resumes r ON a.resume_id = r.id
+                WHERE a.resume_id IS NOT NULL AND a.user_id != r.user_id
+            """)
+            cross_res = cursor.fetchone()[0]
+            if cross_res > 0:
+                raise MigrationPreflightError(
+                    f"Migration preflight failed: {cross_res} application(s) reference resumes owned by another user."
+                )
 
         # Preflight Check 5: Cross-user Prepared Packet references
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
@@ -560,21 +565,25 @@ class DatabaseManager:
         old_apps = [dict(r) for r in cursor.fetchall()]
 
         # Query approved application IDs for deterministic status mapping
-        approved_app_ids = set()
+        approved_app_pairs = set()
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
         has_approvals = cursor.fetchone() is not None
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
         has_packets = cursor.fetchone() is not None
         if has_approvals and has_packets:
             cursor.execute("""
-                SELECT DISTINCT p.application_id
+                SELECT DISTINCT p.application_id, p.user_id
                 FROM prepared_packets p
-                JOIN application_approvals a ON a.packet_id = p.id AND a.user_id = p.user_id
-                WHERE a.is_revoked = 0 AND p.is_active_revision = 1
+                JOIN application_approvals a ON a.packet_id = p.id
+                    AND a.user_id = p.user_id
+                    AND a.application_id = p.application_id
+                    AND a.packet_version_hash = p.packet_version_hash
+                WHERE a.is_consumed = 0
+                    AND p.is_active_revision = 1
             """)
-            approved_app_ids = {r[0] for r in cursor.fetchall()}
+            approved_app_pairs = {(r[0], r[1]) for r in cursor.fetchall()}
 
-        def map_legacy_status(app_id: int, old_status: Optional[str]) -> str:
+        def map_legacy_status(app_id: int, app_user_id: Optional[int], old_status: Optional[str]) -> str:
             if not old_status:
                 return ApplicationStatus.DRAFT.value
             s_clean = old_status.strip()
@@ -586,7 +595,8 @@ class DatabaseManager:
             if s_lower in ("application prepared", "ready_for_review"):
                 return ApplicationStatus.READY_FOR_REVIEW.value
             if s_lower == "awaiting approval":
-                return ApplicationStatus.APPROVED.value if app_id in approved_app_ids else ApplicationStatus.READY_FOR_REVIEW.value
+                is_approved = (app_id, app_user_id) in approved_app_pairs
+                return ApplicationStatus.APPROVED.value if is_approved else ApplicationStatus.READY_FOR_REVIEW.value
             if s_lower in ("applied", "submitted"):
                 return ApplicationStatus.SUBMITTED.value
             if s_lower in ("in_progress", "in progress"):
@@ -605,12 +615,16 @@ class DatabaseManager:
                 return ApplicationStatus.CLOSED.value
             return ApplicationStatus.DRAFT.value
 
-        new_status_map = {app["id"]: map_legacy_status(app["id"], app.get("status")) for app in old_apps}
+        new_status_map = {app["id"]: map_legacy_status(app["id"], app.get("user_id"), app.get("status")) for app in old_apps}
 
-        # Step 1: Temporarily disable foreign keys on connection for table rebuild
-        cursor.execute("PRAGMA foreign_keys = OFF")
-
+        # Step 1: Temporarily disable foreign keys and execute atomic table rebuild in explicit transaction
+        old_isolation = conn.isolation_level
         try:
+            conn.isolation_level = None  # Manual transaction mode
+            cursor = conn.cursor()
+            cursor.execute("PRAGMA foreign_keys = OFF;")
+            cursor.execute("BEGIN IMMEDIATE TRANSACTION;")
+
             cursor.execute("DROP TABLE IF EXISTS applications_v7")
             cursor.execute("""
                 CREATE TABLE applications_v7 (
@@ -728,6 +742,25 @@ class DatabaseManager:
             """)
 
             cursor.execute("""
+                CREATE TABLE IF NOT EXISTS _privacy_erasure_tokens (
+                    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                    token_nonce TEXT NOT NULL,
+                    authorized_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_delete
+                BEFORE DELETE ON application_events
+                BEGIN
+                    SELECT RAISE(FAIL, 'application_events records are immutable and cannot be deleted except via authorized privacy erasure.')
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM _privacy_erasure_tokens WHERE user_id = OLD.user_id
+                    );
+                END
+            """)
+
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS submission_confirmations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     application_id INTEGER NOT NULL,
@@ -743,7 +776,7 @@ class DatabaseManager:
                     is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
                     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
-                    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE SET NULL
+                    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE RESTRICT
                 )
             """)
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1")
@@ -786,46 +819,62 @@ class DatabaseManager:
                         "migrated_to_status": migrated_status,
                     }
                     payload_json = canonical_json_bytes(payload).decode("utf-8")
-                    hash_payload = {
-                        "actor_identifier": "system_migration",
-                        "actor_type": "SYSTEM",
-                        "application_id": app["id"],
-                        "event_payload_json": payload_json,
-                        "event_type": "MIGRATION_INITIALIZED",
-                        "new_status": migrated_status,
-                        "previous_event_hash": "GENESIS",
-                        "previous_status": old_status,
-                        "sequence_no": 1,
-                        "session_reference": None,
-                        "user_id": app["user_id"],
-                    }
-                    evt_hash = canonical_json_hash(hash_payload)
+                    backfill_ts = app.get("created_at") or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                    evt_hash = DatabaseManager.compute_event_hash(
+                        actor_identifier="system_migration",
+                        actor_type="SYSTEM",
+                        application_id=app["id"],
+                        event_payload_json=payload_json,
+                        event_type="MIGRATION_INITIALIZED",
+                        new_status=migrated_status,
+                        previous_event_hash="GENESIS",
+                        previous_status=old_status,
+                        sequence_no=1,
+                        session_reference=None,
+                        user_id=app["user_id"],
+                        created_at=backfill_ts,
+                        hash_version="v2",
+                    )
                     cursor.execute("""
                         INSERT INTO application_events (
                             application_id, user_id, sequence_no, event_type,
                             previous_status, new_status, actor_type, actor_identifier,
                             session_reference, event_payload_json, previous_event_hash, event_hash,
                             created_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP))
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """, (
                         app["id"], app["user_id"], 1, "MIGRATION_INITIALIZED",
                         old_status, migrated_status, "SYSTEM", "system_migration",
-                        None, payload_json, "GENESIS", evt_hash, app.get("created_at")
+                        None, payload_json, "GENESIS", evt_hash, backfill_ts
                     ))
 
+            # Validate post-migration foreign keys and database integrity before commit
+            cursor.execute("PRAGMA foreign_key_check;")
+            fk_errors = cursor.fetchall()
+            if fk_errors:
+                cursor.execute("ROLLBACK;")
+                raise DatabaseMigrationError(f"Foreign key integrity check failed after Phase 7.1 migration: {fk_errors}")
+
+            cursor.execute("PRAGMA integrity_check;")
+            integrity_errors = [r[0] for r in cursor.fetchall() if r[0] != "ok"]
+            if integrity_errors:
+                cursor.execute("ROLLBACK;")
+                raise DatabaseMigrationError(f"Database integrity check failed after Phase 7.1 migration: {integrity_errors}")
+
+            cursor.execute("COMMIT;")
+        except Exception as e:
+            try:
+                cursor.execute("ROLLBACK;")
+            except Exception:
+                pass
+            if isinstance(e, DatabaseMigrationError):
+                raise
+            raise DatabaseMigrationError(f"Phase 7.1 application lifecycle migration failed and was rolled back: {e}") from e
         finally:
-            cursor.execute("PRAGMA foreign_keys = ON")
-
-        # Validate post-migration foreign keys and database integrity
-        cursor.execute("PRAGMA foreign_key_check")
-        fk_errors = cursor.fetchall()
-        if fk_errors:
-            raise DatabaseMigrationError(f"Foreign key integrity check failed after Phase 7.1 migration: {fk_errors}")
-
-        cursor.execute("PRAGMA integrity_check")
-        integrity_errors = [r[0] for r in cursor.fetchall() if r[0] != "ok"]
-        if integrity_errors:
-            raise DatabaseMigrationError(f"Database integrity check failed after Phase 7.1 migration: {integrity_errors}")
+            try:
+                cursor.execute("PRAGMA foreign_keys = ON;")
+            finally:
+                conn.isolation_level = old_isolation
 
         logger.info("Phase 7.1 application lifecycle migration completed successfully.")
 
@@ -941,8 +990,19 @@ class DatabaseManager:
 
         return (False, None, None)
 
-    def insert_job(self, job: Job, auto_create_company: bool = True) -> Job:
-        """Inserts a new job posting with duplicate checking and initial application registration."""
+    def insert_job(
+        self,
+        job: Job,
+        auto_create_company: bool = True,
+        user_id: Optional[int] = None,
+    ) -> Job:
+        """Inserts a new job posting with duplicate checking and optional user application registration.
+
+        If user_id is provided, validates that the user exists and creates an application record
+        bound to that candidate with an initial APPLICATION_CREATED event.
+        If user_id is None, the job is registered purely in the global catalog without creating
+        applications or defaulting to placeholder users.
+        """
         if not job.company_name or not job.company_name.strip():
             raise ValidationError("Job must have a valid company_name.")
         if not job.job_title or not job.job_title.strip():
@@ -1019,93 +1079,84 @@ class DatabaseManager:
             )
             job.id = cursor.lastrowid
 
-            # Automatically initialize application record
-            cursor.execute("SELECT id FROM users ORDER BY id ASC LIMIT 1")
-            user_row = cursor.fetchone()
-            if user_row:
-                app_user_id = user_row["id"]
-            else:
-                # In legacy test environments without an explicit registered user,
-                # provision a default local system user
+            if user_id is not None:
+                cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+                if not cursor.fetchone():
+                    raise UserNotFoundError(f"User ID {user_id}")
+
                 cursor.execute(
                     """
-                    INSERT INTO users (email, password_hash, password_salt, full_name)
-                    VALUES ('system@localhost', 'legacy_placeholder_hash', 'legacy_placeholder_salt', 'System Candidate')
-                    """
+                    INSERT INTO applications (
+                        user_id, job_id, company_name, job_title, status, application_source
+                    ) VALUES (?, ?, ?, ?, ?, 'JOB_DESCRIPTION')
+                    """,
+                    (
+                        user_id,
+                        job.id,
+                        job.company_name.strip(),
+                        job.job_title.strip(),
+                        ApplicationStatus.DISCOVERED.value,
+                    ),
                 )
-                app_user_id = cursor.lastrowid
+                app_id = cursor.lastrowid
 
-            cursor.execute(
-                """
-                INSERT INTO applications (
-                    user_id, job_id, company_name, job_title, status, application_source
-                ) VALUES (?, ?, ?, ?, ?, 'JOB_DESCRIPTION')
-                """,
-                (
-                    app_user_id,
-                    job.id,
-                    job.company_name.strip(),
-                    job.job_title.strip(),
-                    ApplicationStatus.DISCOVERED.value,
-                ),
-            )
-            app_id = cursor.lastrowid
+                cursor.execute(
+                    """
+                    INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        job.id,
+                        app_id,
+                        user_id,
+                        "JOB_DISCOVERED",
+                        json.dumps({"platform": job.platform, "score": job.match_score}),
+                    ),
+                )
 
-            # Create initial audit log
-            cursor.execute(
-                """
-                INSERT INTO application_logs (job_id, application_id, user_id, action, details)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    job.id,
-                    app_id,
-                    app_user_id,
-                    "JOB_DISCOVERED",
-                    json.dumps({"platform": job.platform, "score": job.match_score}),
-                ),
-            )
-
-            # Record initial timeline event
-            event_payload = {"source": "catalog_job_insert", "job_id": job.id, "platform": job.platform}
-            payload_json = canonical_json_bytes(event_payload).decode("utf-8")
-            hash_payload = {
-                "actor_identifier": "system",
-                "actor_type": "SYSTEM",
-                "application_id": app_id,
-                "event_payload_json": payload_json,
-                "event_type": "APPLICATION_CREATED",
-                "new_status": ApplicationStatus.DISCOVERED.value,
-                "previous_event_hash": "GENESIS",
-                "previous_status": None,
-                "sequence_no": 1,
-                "session_reference": None,
-                "user_id": app_user_id,
-            }
-            evt_hash = canonical_json_hash(hash_payload)
-            cursor.execute(
-                """
-                INSERT INTO application_events (
-                    application_id, user_id, sequence_no, event_type,
-                    previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    app_id,
-                    app_user_id,
-                    1,
-                    "APPLICATION_CREATED",
-                    None,
-                    ApplicationStatus.DISCOVERED.value,
-                    "SYSTEM",
-                    "system",
-                    None,
-                    payload_json,
-                    "GENESIS",
-                    evt_hash,
-                ),
-            )
+                now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                event_payload = {"source": "catalog_job_insert", "job_id": job.id, "platform": job.platform}
+                payload_json = canonical_json_bytes(event_payload).decode("utf-8")
+                evt_hash = DatabaseManager.compute_event_hash(
+                    actor_identifier="system",
+                    actor_type="SYSTEM",
+                    application_id=app_id,
+                    event_payload_json=payload_json,
+                    event_type="APPLICATION_CREATED",
+                    new_status=ApplicationStatus.DISCOVERED.value,
+                    previous_event_hash="GENESIS",
+                    previous_status=None,
+                    sequence_no=1,
+                    session_reference=None,
+                    user_id=user_id,
+                    created_at=now_iso,
+                    hash_version="v2",
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO application_events (
+                        application_id, user_id, sequence_no, event_type,
+                        previous_status, new_status, actor_type, actor_identifier,
+                        session_reference, event_payload_json, previous_event_hash, event_hash,
+                        created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        app_id,
+                        user_id,
+                        1,
+                        "APPLICATION_CREATED",
+                        None,
+                        ApplicationStatus.DISCOVERED.value,
+                        "SYSTEM",
+                        "system",
+                        None,
+                        payload_json,
+                        "GENESIS",
+                        evt_hash,
+                        now_iso,
+                    ),
+                )
 
             # Retrieve inserted job with timestamps
             cursor.execute("SELECT * FROM jobs WHERE id = ?", (job.id,))
@@ -2598,27 +2649,30 @@ class DatabaseManager:
                 "resume_id": resume_id,
             }
             payload_json = canonical_json_bytes(event_payload).decode("utf-8")
-            hash_payload = {
-                "actor_identifier": f"user_{user_id}",
-                "actor_type": "CANDIDATE",
-                "application_id": app_id,
-                "event_payload_json": payload_json,
-                "event_type": "APPLICATION_CREATED",
-                "new_status": status,
-                "previous_event_hash": "GENESIS",
-                "previous_status": None,
-                "sequence_no": 1,
-                "session_reference": None,
-                "user_id": user_id,
-            }
-            evt_hash = canonical_json_hash(hash_payload)
+            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            evt_hash = DatabaseManager.compute_event_hash(
+                actor_identifier=f"user_{user_id}",
+                actor_type="CANDIDATE",
+                application_id=app_id,
+                event_payload_json=payload_json,
+                event_type="APPLICATION_CREATED",
+                new_status=status,
+                previous_event_hash="GENESIS",
+                previous_status=None,
+                sequence_no=1,
+                session_reference=None,
+                user_id=user_id,
+                created_at=now_ts,
+                hash_version="v2",
+            )
             cursor.execute(
                 """
                 INSERT INTO application_events (
                     application_id, user_id, sequence_no, event_type,
                     previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash
-                ) VALUES (?, ?, 1, 'APPLICATION_CREATED', NULL, ?, 'CANDIDATE', ?, NULL, ?, 'GENESIS', ?)
+                    session_reference, event_payload_json, previous_event_hash, event_hash,
+                    created_at
+                ) VALUES (?, ?, 1, 'APPLICATION_CREATED', NULL, ?, 'CANDIDATE', ?, NULL, ?, 'GENESIS', ?, ?)
                 """,
                 (
                     app_id,
@@ -2627,6 +2681,7 @@ class DatabaseManager:
                     f"user_{user_id}",
                     payload_json,
                     evt_hash,
+                    now_ts,
                 ),
             )
 
@@ -2755,27 +2810,30 @@ class DatabaseManager:
                 "resume_id": resume_id,
             }
             payload_json = canonical_json_bytes(event_payload).decode("utf-8")
-            hash_payload = {
-                "actor_identifier": f"user_{user_id}",
-                "actor_type": "CANDIDATE",
-                "application_id": new_id,
-                "event_payload_json": payload_json,
-                "event_type": "APPLICATION_CREATED",
-                "new_status": ApplicationStatus.UNDER_REVIEW.value,
-                "previous_event_hash": "GENESIS",
-                "previous_status": None,
-                "sequence_no": 1,
-                "session_reference": None,
-                "user_id": user_id,
-            }
-            evt_hash = canonical_json_hash(hash_payload)
+            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+            evt_hash = DatabaseManager.compute_event_hash(
+                actor_identifier=f"user_{user_id}",
+                actor_type="CANDIDATE",
+                application_id=new_id,
+                event_payload_json=payload_json,
+                event_type="APPLICATION_CREATED",
+                new_status=ApplicationStatus.UNDER_REVIEW.value,
+                previous_event_hash="GENESIS",
+                previous_status=None,
+                sequence_no=1,
+                session_reference=None,
+                user_id=user_id,
+                created_at=now_ts,
+                hash_version="v2",
+            )
             cursor.execute(
                 """
                 INSERT INTO application_events (
                     application_id, user_id, sequence_no, event_type,
                     previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash
-                ) VALUES (?, ?, 1, 'APPLICATION_CREATED', NULL, ?, 'CANDIDATE', ?, NULL, ?, 'GENESIS', ?)
+                    session_reference, event_payload_json, previous_event_hash, event_hash,
+                    created_at
+                ) VALUES (?, ?, 1, 'APPLICATION_CREATED', NULL, ?, 'CANDIDATE', ?, NULL, ?, 'GENESIS', ?, ?)
                 """,
                 (
                     new_id,
@@ -2784,6 +2842,7 @@ class DatabaseManager:
                     f"user_{user_id}",
                     payload_json,
                     evt_hash,
+                    now_ts,
                 ),
             )
 
@@ -3577,49 +3636,58 @@ class DatabaseManager:
         under an anonymized pseudonym, per privacy and audit integrity specifications.
         """
         pseudonym = f"ANON_USER_{hashlib.sha256(str(user_id).encode()).hexdigest()[:12]}"
+        nonce = secrets.token_hex(16)
         with self.transaction() as conn:
             cursor = conn.cursor()
-            # Verify user exists
-            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-            if not cursor.fetchone():
-                raise UserNotFoundError(user_id)
-
-            # 1. Anonymize application_logs details for this user (strip PII, retain submission audit)
+            # Authorize privacy erasure of this specific user
             cursor.execute(
-                """
-                UPDATE application_logs
-                SET user_id = NULL,
-                    anonymized_user_pseudonym = ?,
-                    details = json_set(COALESCE(details, '{}'), '$.user_deleted', 1, '$.anonymized_at', CURRENT_TIMESTAMP)
-                WHERE user_id = ?
-                """,
-                (pseudonym, user_id),
+                "INSERT OR REPLACE INTO _privacy_erasure_tokens (user_id, token_nonce) VALUES (?, ?)",
+                (user_id, nonce),
             )
+            try:
+                # Verify user exists
+                cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+                if not cursor.fetchone():
+                    raise UserNotFoundError(user_id)
 
-            # 2. Anonymize auth_audit_logs metadata
-            cursor.execute(
-                """
-                UPDATE auth_audit_logs
-                SET user_id = NULL,
-                    metadata_json = '{"anonymized": true}'
-                WHERE user_id = ?
-                """,
-                (user_id,),
-            )
+                # 1. Anonymize application_logs details for this user (strip PII, retain submission audit)
+                cursor.execute(
+                    """
+                    UPDATE application_logs
+                    SET user_id = NULL,
+                        anonymized_user_pseudonym = ?,
+                        details = json_set(COALESCE(details, '{}'), '$.user_deleted', 1, '$.anonymized_at', CURRENT_TIMESTAMP)
+                    WHERE user_id = ?
+                    """,
+                    (pseudonym, user_id),
+                )
 
-            # 2.5 Delete Phase 7 application lifecycle child tables and historical records in topological order:
-            cursor.execute("DELETE FROM submission_confirmations WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM application_follow_ups WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM application_events WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
+                # 2. Anonymize auth_audit_logs metadata
+                cursor.execute(
+                    """
+                    UPDATE auth_audit_logs
+                    SET user_id = NULL,
+                        metadata_json = '{"anonymized": true}'
+                    WHERE user_id = ?
+                    """,
+                    (user_id,),
+                )
 
-            # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
-            #    applications, application_approvals, password_reset_tokens)
-            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
-            logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
-            return True
+                # 2.5 Delete Phase 7 application lifecycle child tables and historical records in topological order:
+                cursor.execute("DELETE FROM submission_confirmations WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM application_follow_ups WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM application_events WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
+
+                # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
+                #    applications, application_approvals, password_reset_tokens)
+                cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
+                return True
+            finally:
+                cursor.execute("DELETE FROM _privacy_erasure_tokens WHERE user_id = ?", (user_id,))
 
     # -------------------------------------------------------------------------
     # PHASE 5: MATCH RESULT PERSISTENCE & MULTI-USER AUDIT TRAIL
@@ -3833,6 +3901,47 @@ class DatabaseManager:
     # PHASE 7: APPLICATION LIFECYCLE, EVENTS, SUBMISSION CONFIRMATION & FOLLOW-UPS
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def compute_event_hash(
+        actor_identifier: str,
+        actor_type: str,
+        application_id: int,
+        event_payload_json: str,
+        event_type: str,
+        new_status: Optional[str],
+        previous_event_hash: str,
+        previous_status: Optional[str],
+        sequence_no: int,
+        session_reference: Optional[str],
+        user_id: int,
+        created_at: Optional[str] = None,
+        hash_version: str = "v2",
+    ) -> str:
+        """Computes deterministic RFC 8785 canonical hash for an application event.
+
+        hash_version 'v2' (Phase 7.1.1+) binds the exact UTC created_at timestamp.
+        hash_version 'v1' (Phase 7.1 legacy compatibility) omits created_at.
+        """
+        hash_payload = {
+            "actor_identifier": actor_identifier,
+            "actor_type": actor_type,
+            "application_id": application_id,
+            "event_payload_json": event_payload_json,
+            "event_type": event_type,
+            "new_status": new_status,
+            "previous_event_hash": previous_event_hash,
+            "previous_status": previous_status,
+            "sequence_no": sequence_no,
+            "session_reference": session_reference,
+            "user_id": user_id,
+        }
+        if hash_version == "v2":
+            if not created_at:
+                raise ValueError("created_at timestamp is mandatory for v2 event hashing.")
+            hash_payload["created_at"] = created_at
+
+        return canonical_json_hash(hash_payload)
+
     def create_application_event(
         self,
         application_id: int,
@@ -3893,30 +4002,32 @@ class DatabaseManager:
             payload_dict = event_payload or {}
             event_payload_json = canonical_json_bytes(payload_dict).decode("utf-8")
             actor_ident = (actor_identifier or f"user_{user_id}").strip()
+            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
-            # Deterministic RFC 8785 canonical hash calculation
-            hash_payload = {
-                "actor_identifier": actor_ident,
-                "actor_type": actor_type,
-                "application_id": application_id,
-                "event_payload_json": event_payload_json,
-                "event_type": event_type,
-                "new_status": new_status,
-                "previous_event_hash": previous_event_hash,
-                "previous_status": prev_status,
-                "sequence_no": sequence_no,
-                "session_reference": session_reference,
-                "user_id": user_id,
-            }
-            event_hash = canonical_json_hash(hash_payload)
+            event_hash = DatabaseManager.compute_event_hash(
+                actor_identifier=actor_ident,
+                actor_type=actor_type,
+                application_id=application_id,
+                event_payload_json=event_payload_json,
+                event_type=event_type,
+                new_status=new_status,
+                previous_event_hash=previous_event_hash,
+                previous_status=prev_status,
+                sequence_no=sequence_no,
+                session_reference=session_reference,
+                user_id=user_id,
+                created_at=now_ts,
+                hash_version="v2",
+            )
 
             cursor.execute(
                 """
                 INSERT INTO application_events (
                     application_id, user_id, sequence_no, event_type,
                     previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    session_reference, event_payload_json, previous_event_hash, event_hash,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     application_id,
@@ -3931,6 +4042,7 @@ class DatabaseManager:
                     event_payload_json,
                     previous_event_hash,
                     event_hash,
+                    now_ts,
                 ),
             )
             event_id = cursor.lastrowid
@@ -3997,25 +4109,43 @@ class DatabaseManager:
                     raise EventIntegrityError(msg)
                 return False, msg
 
-            hash_payload = {
-                "actor_identifier": evt.actor_identifier,
-                "actor_type": evt.actor_type,
-                "application_id": evt.application_id,
-                "event_payload_json": evt.event_payload_json,
-                "event_type": evt.event_type,
-                "new_status": evt.new_status,
-                "previous_event_hash": evt.previous_event_hash,
-                "previous_status": evt.previous_status,
-                "sequence_no": evt.sequence_no,
-                "session_reference": evt.session_reference,
-                "user_id": evt.user_id,
-            }
-            recomputed = canonical_json_hash(hash_payload)
+            # Try v2 (with created_at)
+            recomputed = DatabaseManager.compute_event_hash(
+                actor_identifier=evt.actor_identifier,
+                actor_type=evt.actor_type,
+                application_id=evt.application_id,
+                event_payload_json=evt.event_payload_json,
+                event_type=evt.event_type,
+                new_status=evt.new_status,
+                previous_event_hash=evt.previous_event_hash,
+                previous_status=evt.previous_status,
+                sequence_no=evt.sequence_no,
+                session_reference=evt.session_reference,
+                user_id=evt.user_id,
+                created_at=evt.created_at,
+                hash_version="v2",
+            )
             if recomputed != evt.event_hash:
-                msg = f"Event tamper detected at sequence {evt.sequence_no}: stored hash '{evt.event_hash}' != recomputed hash '{recomputed}'"
-                if raise_on_error:
-                    raise EventIntegrityError(msg)
-                return False, msg
+                # Fallback to v1 for legacy events created before Phase 7.1.1
+                recomputed_v1 = DatabaseManager.compute_event_hash(
+                    actor_identifier=evt.actor_identifier,
+                    actor_type=evt.actor_type,
+                    application_id=evt.application_id,
+                    event_payload_json=evt.event_payload_json,
+                    event_type=evt.event_type,
+                    new_status=evt.new_status,
+                    previous_event_hash=evt.previous_event_hash,
+                    previous_status=evt.previous_status,
+                    sequence_no=evt.sequence_no,
+                    session_reference=evt.session_reference,
+                    user_id=evt.user_id,
+                    hash_version="v1",
+                )
+                if recomputed_v1 != evt.event_hash:
+                    msg = f"Event tamper detected at sequence {evt.sequence_no}: stored hash '{evt.event_hash}' != recomputed hash '{recomputed}'"
+                    if raise_on_error:
+                        raise EventIntegrityError(msg)
+                    return False, msg
 
             expected_seq += 1
             expected_prev_hash = evt.event_hash
@@ -4033,8 +4163,22 @@ class DatabaseManager:
         confirmation_doc_path: Optional[str] = None,
         confirmation_doc_hash: Optional[str] = None,
         candidate_notes: Optional[str] = None,
+        transition_status: bool = False,
     ) -> SubmissionConfirmation:
-        """Records an authoritative candidate-confirmed submission, superseding any prior active confirmation."""
+        """Records an authoritative candidate-confirmed submission, superseding any prior active confirmation.
+
+        If transition_status=True:
+        - packet_id is mandatory.
+        - Application status cannot be DRAFT, PREPARING, or READY_FOR_REVIEW.
+        - Packet must belong to user, application, and be the active revision.
+        - A valid, active, unconsumed human approval must exist for this packet.
+        - The approval record is atomically consumed.
+        - Application status is updated to SUBMITTED and date_submitted is recorded.
+
+        If transition_status=False (storage-only mode):
+        - Confirmation record is persisted and an audit event is appended.
+        - Application status is NOT modified.
+        """
         valid_channels = SubmissionChannel.list()
         if submission_channel not in valid_channels:
             raise ValidationError(
@@ -4063,10 +4207,32 @@ class DatabaseManager:
                     resource=f"Application #{application_id}",
                 )
 
+            current_status = app_row["status"]
+
+            # If transition_status requested, enforce strict preconditions
             packet_hash = None
-            if packet_id is not None:
+            if transition_status:
+                if packet_id is None:
+                    raise ValidationError("packet_id is required to confirm submission and transition application to SUBMITTED.")
+
+                # Status check: DRAFT, PREPARING, READY_FOR_REVIEW cannot transition to SUBMITTED
+                unapproved_statuses = (
+                    ApplicationStatus.DRAFT.value,
+                    ApplicationStatus.PREPARING.value,
+                    ApplicationStatus.READY_FOR_REVIEW.value,
+                    "discovered",
+                    "under review",
+                    "shortlisted",
+                    "application prepared",
+                )
+                if current_status.strip().lower() in [s.lower() for s in unapproved_statuses]:
+                    raise SecurityAuthorizationError(
+                        f"Cannot transition application #{application_id} in '{current_status}' status to SUBMITTED. "
+                        f"Application must be approved by candidate before submission."
+                    )
+
                 cursor.execute(
-                    "SELECT id, user_id, application_id, packet_version_hash FROM prepared_packets WHERE id = ?",
+                    "SELECT id, user_id, application_id, packet_version_hash, is_active_revision FROM prepared_packets WHERE id = ?",
                     (packet_id,),
                 )
                 pkt_row = cursor.fetchone()
@@ -4083,7 +4249,57 @@ class DatabaseManager:
                         f"PreparedPacket #{packet_id} belongs to Application #{pkt_row['application_id']}, "
                         f"not Application #{application_id}."
                     )
+                if not pkt_row["is_active_revision"]:
+                    raise SecurityAuthorizationError(
+                        f"PreparedPacket #{packet_id} is not the active revision. Outdated packet revisions cannot be submitted."
+                    )
+
                 packet_hash = pkt_row["packet_version_hash"]
+
+                # Verify valid active unconsumed human approval exists
+                cursor.execute(
+                    """
+                    SELECT id, is_consumed FROM application_approvals
+                    WHERE application_id = ? AND user_id = ? AND packet_id = ? AND packet_version_hash = ?
+                    ORDER BY approved_at DESC LIMIT 1
+                    """,
+                    (application_id, user_id, packet_id, packet_hash),
+                )
+                appr_row = cursor.fetchone()
+                if not appr_row:
+                    raise SecurityAuthorizationError(
+                        f"No valid human approval record found for Application #{application_id} and PreparedPacket #{packet_id}."
+                    )
+                if appr_row["is_consumed"] and current_status != ApplicationStatus.SUBMITTED.value:
+                    raise SecurityAuthorizationError("Human approval for this packet has already been consumed.")
+
+                # Consume the approval record
+                cursor.execute(
+                    "UPDATE application_approvals SET is_consumed = 1, consumed_at = ? WHERE id = ?",
+                    (ts, appr_row["id"]),
+                )
+            else:
+                # Storage-only mode: if packet_id is provided, validate ownership
+                if packet_id is not None:
+                    cursor.execute(
+                        "SELECT id, user_id, application_id, packet_version_hash FROM prepared_packets WHERE id = ?",
+                        (packet_id,),
+                    )
+                    pkt_row = cursor.fetchone()
+                    if not pkt_row:
+                        raise ValidationError(f"PreparedPacket #{packet_id} not found.")
+                    if pkt_row["user_id"] != user_id:
+                        raise CrossUserAccessError(
+                            user_id=user_id,
+                            target_user_id=pkt_row["user_id"],
+                            resource=f"PreparedPacket #{packet_id}",
+                        )
+                    if pkt_row["application_id"] != application_id:
+                        raise ValidationError(
+                            f"PreparedPacket #{packet_id} belongs to Application #{pkt_row['application_id']}, "
+                            f"not Application #{application_id}."
+                        )
+                    packet_hash = pkt_row["packet_version_hash"]
 
             # Supersede prior active confirmations for this application
             cursor.execute(
@@ -4120,15 +4336,16 @@ class DatabaseManager:
             )
             conf_id = cursor.lastrowid
 
-            # Update application status to SUBMITTED and date_submitted
-            cursor.execute(
-                """
-                UPDATE applications
-                SET status = ?, date_submitted = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND user_id = ?
-                """,
-                (ApplicationStatus.SUBMITTED.value, ts, application_id, user_id),
-            )
+            # Only transition application status if transition_status=True
+            if transition_status:
+                cursor.execute(
+                    """
+                    UPDATE applications
+                    SET status = ?, date_submitted = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (ApplicationStatus.SUBMITTED.value, ts, application_id, user_id),
+                )
 
             # Emit timeline event for submission
             conf_payload = {
@@ -4137,6 +4354,7 @@ class DatabaseManager:
                 "packet_id": packet_id,
                 "packet_version_hash": packet_hash,
                 "confirmation_doc_hash": confirmation_doc_hash,
+                "transition_status": transition_status,
             }
             payload_json = canonical_json_bytes(conf_payload).decode("utf-8")
 
@@ -4152,42 +4370,45 @@ class DatabaseManager:
             seq = (last_event["sequence_no"] + 1) if last_event else 1
             prev_hash = last_event["event_hash"] if last_event else "GENESIS"
 
-            hash_payload = {
-                "actor_identifier": f"user_{user_id}",
-                "actor_type": "CANDIDATE",
-                "application_id": application_id,
-                "event_payload_json": payload_json,
-                "event_type": "SUBMISSION_CONFIRMED",
-                "new_status": ApplicationStatus.SUBMITTED.value,
-                "previous_event_hash": prev_hash,
-                "previous_status": app_row["status"],
-                "sequence_no": seq,
-                "session_reference": None,
-                "user_id": user_id,
-            }
-            evt_hash = canonical_json_hash(hash_payload)
+            new_status_val = ApplicationStatus.SUBMITTED.value if transition_status else current_status
+            event_type_val = "SUBMISSION_CONFIRMED" if transition_status else "SUBMISSION_CONFIRMATION_RECORDED"
 
+            evt_hash = DatabaseManager.compute_event_hash(
+                actor_identifier=f"user_{user_id}",
+                actor_type="CANDIDATE",
+                application_id=application_id,
+                event_payload_json=payload_json,
+                event_type=event_type_val,
+                new_status=new_status_val,
+                previous_event_hash=prev_hash,
+                previous_status=current_status,
+                sequence_no=seq,
+                session_reference=None,
+                user_id=user_id,
+                created_at=ts,
+                hash_version="v2",
+            )
             cursor.execute(
                 """
                 INSERT INTO application_events (
                     application_id, user_id, sequence_no, event_type,
                     previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    session_reference, event_payload_json, previous_event_hash, event_hash,
+                    created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, 'CANDIDATE', ?, NULL, ?, ?, ?, ?)
                 """,
                 (
                     application_id,
                     user_id,
                     seq,
-                    "SUBMISSION_CONFIRMED",
-                    app_row["status"],
-                    ApplicationStatus.SUBMITTED.value,
-                    "CANDIDATE",
+                    event_type_val,
+                    current_status,
+                    new_status_val,
                     f"user_{user_id}",
-                    None,
                     payload_json,
                     prev_hash,
                     evt_hash,
+                    ts,
                 ),
             )
 

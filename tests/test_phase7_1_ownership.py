@@ -7,7 +7,7 @@ import unittest
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import CrossUserAccessError, UserNotFoundError
-from src.database.models import ApplicationStatus, FollowUpType, SubmissionChannel
+from src.database.models import FollowUpType, SubmissionChannel
 
 
 class TestPhase71Ownership(unittest.TestCase):
@@ -268,7 +268,7 @@ class TestPhase71Ownership(unittest.TestCase):
         # Verify User B's application, events, follow-ups, and confirmations are 100% intact
         app_b_fresh = self.db.get_user_application(self.app_b.id, self.user_b_id)
         self.assertIsNotNone(app_b_fresh)
-        self.assertEqual(app_b_fresh.status, ApplicationStatus.SUBMITTED.value)
+        self.assertEqual(app_b_fresh.status, self.app_b.status)
 
         events_b = self.db.get_application_events(self.app_b.id, self.user_b_id)
         self.assertGreaterEqual(len(events_b), 2)  # APPLICATION_CREATED + SUBMISSION_CONFIRMED + FOLLOW_UP_SCHEDULED

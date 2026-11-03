@@ -1,11 +1,9 @@
 """Unit tests for Phase 6 Streamlit Dashboard Services, Metrics, Analytics, and Governance."""
 
-from datetime import datetime
 from pathlib import Path
 import tempfile
 import unittest
 
-import pandas as pd
 import plotly.graph_objects as go
 
 from dashboard.services.analytics_service import AnalyticsService
@@ -24,6 +22,13 @@ class TestDashboardArchitecture(unittest.TestCase):
         self.service = DashboardService(db_manager=self.db)
         self.analytics = AnalyticsService(db_manager=self.db)
 
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, password_hash, password_salt, full_name) VALUES ('dashboard_user@test.com', 'h', 's', 'Dashboard User')"
+            )
+            self.user_id = cursor.lastrowid
+
         # Seed test jobs with varying scores and statuses
         self.j1 = self.db.add_job(
             Job(
@@ -37,7 +42,8 @@ class TestDashboardArchitecture(unittest.TestCase):
                 match_classification="Excellent",
                 is_eligible=True,
                 job_description="Python, PyTorch, Deep Learning, computer vision models.",
-            )
+            ),
+            user_id=self.user_id,
         )
         self.j2 = self.db.add_job(
             Job(
@@ -51,7 +57,8 @@ class TestDashboardArchitecture(unittest.TestCase):
                 match_classification="Good",
                 is_eligible=True,
                 job_description="Python, Scikit-learn, Pandas, NLP pipelines.",
-            )
+            ),
+            user_id=self.user_id,
         )
         self.j3 = self.db.add_job(
             Job(
@@ -65,7 +72,8 @@ class TestDashboardArchitecture(unittest.TestCase):
                 match_classification="Low",
                 is_eligible=False,
                 job_description="French work authorization strictly required. Machine learning.",
-            )
+            ),
+            user_id=self.user_id,
         )
 
     def tearDown(self):

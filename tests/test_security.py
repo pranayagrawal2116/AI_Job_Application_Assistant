@@ -10,8 +10,6 @@ Tests:
 7. Audit log immutability and metadata integrity.
 """
 
-from datetime import datetime, timezone
-import hashlib
 import json
 from pathlib import Path
 import secrets
@@ -23,14 +21,11 @@ from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
     InvalidSessionError,
     InvalidStatusTransitionError,
-    SecurityAuthorizationError,
     SessionExpiredError,
-    UnconfirmedSubmissionError,
-    ValidationError,
 )
 from src.database.models import ApplicationStatus, Job
-from src.preparer.approval_gate import ApplicationReviewPacket, HumanApprovalGate
-from src.security.session_manager import CandidateSession, SessionManager
+from src.preparer.approval_gate import HumanApprovalGate
+from src.security.session_manager import SessionManager
 
 
 class TestSecurityAndAuthorization(unittest.TestCase):
@@ -43,6 +38,13 @@ class TestSecurityAndAuthorization(unittest.TestCase):
         cls.db = DatabaseManager(db_path=cls.db_path)
         cls.session_mgr = SessionManager()
 
+        with cls.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, password_hash, password_salt, full_name) VALUES ('sec_user@test.com', 'h', 's', 'Sec User')"
+            )
+            cls.user_id = cursor.lastrowid
+
         # Create two test jobs
         cls.job_a = cls.db.add_job(
             Job(
@@ -53,7 +55,8 @@ class TestSecurityAndAuthorization(unittest.TestCase):
                 location="Pune / Remote",
                 match_score=92.0,
                 is_eligible=True,
-            )
+            ),
+            user_id=cls.user_id,
         )
         cls.job_b = cls.db.add_job(
             Job(
@@ -64,7 +67,8 @@ class TestSecurityAndAuthorization(unittest.TestCase):
                 location="Bengaluru / Remote",
                 match_score=88.0,
                 is_eligible=True,
-            )
+            ),
+            user_id=cls.user_id,
         )
 
     @classmethod
@@ -96,7 +100,8 @@ class TestSecurityAndAuthorization(unittest.TestCase):
                 location="Pune / Remote",
                 match_score=92.0,
                 is_eligible=True,
-            )
+            ),
+            user_id=self.user_id,
         )
         self.db.update_application_status(self.job_a.id, ApplicationStatus.UNDER_REVIEW)
         self.db.update_application_status(self.job_a.id, ApplicationStatus.SHORTLISTED)
@@ -367,7 +372,8 @@ class TestSecurityAndAuthorization(unittest.TestCase):
                 location="Remote",
                 match_score=95.0,
                 is_eligible=True,
-            )
+            ),
+            user_id=self.user_id,
         )
         app_c = self.db.get_application_by_job_id(job_c.id)
         self.assertEqual(app_c.status, ApplicationStatus.DISCOVERED.value)

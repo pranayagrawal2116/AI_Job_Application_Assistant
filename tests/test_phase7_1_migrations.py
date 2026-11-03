@@ -184,25 +184,23 @@ class TestPhase71Migrations(unittest.TestCase):
             )
         """)
 
-        # Application approvals table
+        # Application approvals table (Actual Phase 6.1.3 schema)
         cursor.execute("""
             CREATE TABLE application_approvals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                packet_id INTEGER NOT NULL,
                 application_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-                ticket_nonce TEXT NOT NULL UNIQUE,
-                key_id TEXT NOT NULL,
+                packet_id INTEGER,
+                user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
                 packet_version_hash TEXT NOT NULL,
-                candidate_session_id TEXT NOT NULL,
-                authorized_by_identity TEXT NOT NULL,
-                approval_timestamp DATETIME NOT NULL,
-                is_revoked INTEGER DEFAULT 0,
-                revocation_reason TEXT,
-                revoked_at DATETIME,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE CASCADE,
-                FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
+                ticket_nonce TEXT NOT NULL UNIQUE,
+                key_id TEXT NOT NULL DEFAULT 'v1',
+                approver_name TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                approved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                consumed_at DATETIME,
+                is_consumed INTEGER DEFAULT 0 CHECK(is_consumed IN (0, 1)),
+                FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+                FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE CASCADE
             )
         """)
 
@@ -254,9 +252,9 @@ class TestPhase71Migrations(unittest.TestCase):
         cursor.execute(
             """
             INSERT INTO application_approvals (
-                packet_id, application_id, user_id, ticket_nonce, key_id,
-                packet_version_hash, candidate_session_id, authorized_by_identity, approval_timestamp, is_revoked
-            ) VALUES (101, 5, 1, 'nonce_5', 'key_1', 'hash_5', 'sess_1', 'cand@test.com', CURRENT_TIMESTAMP, 0)
+                packet_id, application_id, user_id, packet_version_hash,
+                ticket_nonce, key_id, approver_name, session_id, approved_at, is_consumed
+            ) VALUES (101, 5, 1, 'hash_5', 'nonce_5', 'v1', 'Human Candidate', 'sess_1', CURRENT_TIMESTAMP, 0)
             """
         )
 
@@ -312,6 +310,116 @@ class TestPhase71Migrations(unittest.TestCase):
             self.assertEqual(events[0].previous_event_hash, "GENESIS")
             valid, msg = db.verify_application_event_chain(app_id, 1)
             self.assertTrue(valid, msg)
+
+    def test_approval_migration_exhaustive_scenarios(self):
+        """Verifies the 7 explicit approval migration scenarios under realistic Phase 6 schema."""
+        conn = self._create_legacy_database()
+        cursor = conn.cursor()
+
+        # Seed two users
+        cursor.execute("INSERT INTO users (id, email, password_hash, password_salt, full_name) VALUES (1, 'u1@test.com', 'h', 's', 'User 1')")
+        cursor.execute("INSERT INTO users (id, email, password_hash, password_salt, full_name) VALUES (2, 'u2@test.com', 'h', 's', 'User 2')")
+
+        # 7 applications in 'Awaiting Approval'
+        for app_id in range(1, 8):
+            cursor.execute(
+                "INSERT INTO applications (id, user_id, company_name, job_title, status) VALUES (?, 1, 'Corp', 'Role', 'Awaiting Approval')",
+                (app_id,),
+            )
+        # Application for User 2 (Scenario 4)
+        cursor.execute(
+            "INSERT INTO applications (id, user_id, company_name, job_title, status) VALUES (8, 2, 'Corp 2', 'Role', 'Awaiting Approval')"
+        )
+
+        # 1. Genuine approved packet and corresponding human approval record (App 1) -> APPROVED
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (1, 1, 1, 1, 'hash_1', 'rh', 'jdh', '{}', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO application_approvals (id, application_id, packet_id, user_id, packet_version_hash, ticket_nonce, approver_name, session_id, is_consumed) VALUES (1, 1, 1, 1, 'hash_1', 'nonce_1', 'Cand', 's1', 0)"
+        )
+
+        # 2. Application awaiting approval without an approval record (App 2) -> READY_FOR_REVIEW
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (2, 2, 1, 1, 'hash_2', 'rh', 'jdh', '{}', 1)"
+        )
+        # (No approval inserted for App 2)
+
+        # 3. An approval belonging to another application (App 3) -> READY_FOR_REVIEW
+        cursor.execute(
+            "INSERT INTO applications (id, user_id, company_name, job_title, status) VALUES (9, 1, 'Corp 9', 'Role', 'Discovered')"
+        )
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (3, 3, 1, 1, 'hash_3', 'rh', 'jdh', '{}', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO application_approvals (id, application_id, packet_id, user_id, packet_version_hash, ticket_nonce, approver_name, session_id, is_consumed) VALUES (3, 9, 3, 1, 'hash_3', 'nonce_3', 'Cand', 's3', 0)"
+        )
+
+        # 4. An approval belonging to another user (User 1 has approved App 10 with matching hash, but User 2's App 8 has no approval) -> READY_FOR_REVIEW
+        cursor.execute(
+            "INSERT INTO applications (id, user_id, company_name, job_title, status) VALUES (10, 1, 'Corp 10', 'Role', 'Awaiting Approval')"
+        )
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (10, 10, 1, 1, 'hash_shared', 'rh', 'jdh', '{}', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO application_approvals (id, application_id, packet_id, user_id, packet_version_hash, ticket_nonce, approver_name, session_id, is_consumed) VALUES (10, 10, 10, 1, 'hash_shared', 'nonce_10', 'Cand', 's10', 0)"
+        )
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (4, 8, 2, 1, 'hash_shared', 'rh', 'jdh', '{}', 1)"
+        )
+
+        # 5. Inactive packet revision (App 5) -> READY_FOR_REVIEW
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (5, 5, 1, 1, 'hash_5', 'rh', 'jdh', '{}', 0)"
+        )
+        cursor.execute(
+            "INSERT INTO application_approvals (id, application_id, packet_id, user_id, packet_version_hash, ticket_nonce, approver_name, session_id, is_consumed) VALUES (5, 5, 5, 1, 'hash_5', 'nonce_5', 'Cand', 's5', 0)"
+        )
+
+        # 6. A consumed approval (App 6) -> READY_FOR_REVIEW
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (6, 6, 1, 1, 'hash_6', 'rh', 'jdh', '{}', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO application_approvals (id, application_id, packet_id, user_id, packet_version_hash, ticket_nonce, approver_name, session_id, is_consumed) VALUES (6, 6, 6, 1, 'hash_6', 'nonce_6', 'Cand', 's6', 1)"
+        )
+
+        # 7. An approval with a mismatching packet version hash (App 7) -> READY_FOR_REVIEW
+        cursor.execute(
+            "INSERT INTO prepared_packets (id, application_id, user_id, version_num, packet_version_hash, original_resume_hash, job_description_snapshot_hash, screening_answers_json, is_active_revision) VALUES (7, 7, 1, 1, 'hash_7_pkt', 'rh', 'jdh', '{}', 1)"
+        )
+        cursor.execute(
+            "INSERT INTO application_approvals (id, application_id, packet_id, user_id, packet_version_hash, ticket_nonce, approver_name, session_id, is_consumed) VALUES (7, 7, 7, 1, 'hash_7_mismatch', 'nonce_7', 'Cand', 's7', 0)"
+        )
+
+        conn.commit()
+        conn.close()
+
+        # Run migration successfully
+        db = DatabaseManager(db_path=self.db_path)
+
+        # Scenario 1: Genuine approved -> APPROVED
+        self.assertEqual(db.get_user_application(1, 1).status, ApplicationStatus.APPROVED.value)
+
+        # Scenario 2: No approval -> READY_FOR_REVIEW
+        self.assertEqual(db.get_user_application(2, 1).status, ApplicationStatus.READY_FOR_REVIEW.value)
+
+        # Scenario 3: Approval for another application -> READY_FOR_REVIEW
+        self.assertEqual(db.get_user_application(3, 1).status, ApplicationStatus.READY_FOR_REVIEW.value)
+
+        # Scenario 4: Approval packet user mismatch (pkt is user 1, app is user 2) -> READY_FOR_REVIEW
+        self.assertEqual(db.get_user_application(8, 2).status, ApplicationStatus.READY_FOR_REVIEW.value)
+
+        # Scenario 5: Inactive revision -> READY_FOR_REVIEW
+        self.assertEqual(db.get_user_application(5, 1).status, ApplicationStatus.READY_FOR_REVIEW.value)
+
+        # Scenario 6: Consumed approval -> READY_FOR_REVIEW
+        self.assertEqual(db.get_user_application(6, 1).status, ApplicationStatus.READY_FOR_REVIEW.value)
+
+        # Scenario 7: Hash mismatch -> READY_FOR_REVIEW
+        self.assertEqual(db.get_user_application(7, 1).status, ApplicationStatus.READY_FOR_REVIEW.value)
 
     def test_preflight_aborts_on_null_user_id(self):
         """Migration must abort with MigrationPreflightError if any application has NULL user_id."""

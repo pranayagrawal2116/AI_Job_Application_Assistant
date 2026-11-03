@@ -1,6 +1,5 @@
 """Comprehensive unit tests for the SQLite Database & Job Management Engine (Phase 2)."""
 
-import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -10,18 +9,13 @@ import pandas as pd
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
-    ApplicationNotFoundError,
-    CompanyNotFoundError,
-    DatabaseError,
     DuplicateJobError,
     InvalidStatusError,
     InvalidStatusTransitionError,
-    JobNotFoundError,
     UnconfirmedSubmissionError,
     ValidationError,
 )
-from src.database.models import ApplicationStatus, Company, Job
-from src.database.url_normalizer import normalize_job_url
+from src.database.models import ApplicationStatus, Job
 
 
 class TestDatabaseManager(unittest.TestCase):
@@ -32,6 +26,13 @@ class TestDatabaseManager(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test_job_assistant.db"
         self.db = DatabaseManager(db_path=self.db_path)
+
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, password_hash, password_salt, full_name) VALUES ('tester@example.com', 'h', 's', 'Tester')"
+            )
+            self.user_id = cursor.lastrowid
 
     def tearDown(self):
         """Cleans up temporary resources."""
@@ -98,7 +99,9 @@ class TestDatabaseManager(unittest.TestCase):
 
     # 3. Inserting Jobs
     def test_insert_job_and_auto_application(self):
-        """Checks inserting a job, auto-creating company, and auto-creating application with status 'Discovered'."""
+        """Checks inserting a job, auto-creating company, URL normalization,
+        verifying NO auto-application is created, and allowing explicit user application creation.
+        """
         sample_job = self._create_sample_job()
         inserted = self.db.insert_job(sample_job)
 
@@ -108,15 +111,20 @@ class TestDatabaseManager(unittest.TestCase):
         # URL must be normalized (tracking params stripped)
         self.assertEqual(inserted.job_url, "https://careers.deepmind.com/jobs/ml-intern-2028")
 
-        # Verify application created automatically
-        app = self.db.get_application_by_job_id(inserted.id)
+        # Verify NO application created automatically for global job insertion
+        self.assertIsNone(self.db.get_application_by_job_id(inserted.id))
+
+        # Explicitly create an application for this job by an authenticated candidate
+        app = self.db.create_user_application(
+            user_id=self.user_id,
+            job_id=inserted.id,
+            company_name=inserted.company_name,
+            job_title=inserted.job_title,
+            status=ApplicationStatus.DISCOVERED.value,
+        )
         self.assertIsNotNone(app)
         self.assertEqual(app.status, ApplicationStatus.DISCOVERED.value)
-
-        # Verify audit log recorded
-        logs = self.db.get_application_logs(inserted.id)
-        self.assertGreaterEqual(len(logs), 1)
-        self.assertEqual(logs[0].action, "JOB_DISCOVERED")
+        self.assertEqual(self.db.get_application_by_job_id(inserted.id).id, app.id)
 
     # 4. Updating Jobs
     def test_update_job(self):
@@ -133,9 +141,18 @@ class TestDatabaseManager(unittest.TestCase):
 
     # 5. Deleting Jobs & Cascading Foreign Keys
     def test_delete_job_cascades(self):
-        """Checks that deleting a job cascades and removes its applications and application logs."""
+        """Checks that deleting a job clears job references on applications."""
         inserted = self.db.insert_job(self._create_sample_job())
         job_id = inserted.id
+
+        # Explicitly create user application linked to this job
+        _ = self.db.create_user_application(
+            user_id=self.user_id,
+            job_id=job_id,
+            company_name=inserted.company_name,
+            job_title=inserted.job_title,
+            status=ApplicationStatus.DISCOVERED.value,
+        )
 
         # Verify app exists
         self.assertIsNotNone(self.db.get_application_by_job_id(job_id))
@@ -143,10 +160,9 @@ class TestDatabaseManager(unittest.TestCase):
         # Delete job
         self.assertTrue(self.db.delete_job(job_id))
 
-        # Job, Application, and Logs must no longer exist
+        # Job must no longer exist, and application job_id is set to NULL (ON DELETE SET NULL)
         self.assertIsNone(self.db.get_job_by_id(job_id))
         self.assertIsNone(self.db.get_application_by_job_id(job_id))
-        self.assertEqual(len(self.db.get_application_logs(job_id)), 0)
 
     # 6. Duplicate Detection
     def test_duplicate_url_detection(self):
@@ -188,6 +204,15 @@ class TestDatabaseManager(unittest.TestCase):
         """Checks valid status transitions and audit log recording."""
         inserted = self.db.insert_job(self._create_sample_job())
         job_id = inserted.id
+
+        # Explicitly create user application for the job
+        self.db.create_user_application(
+            user_id=self.user_id,
+            job_id=job_id,
+            company_name=inserted.company_name,
+            job_title=inserted.job_title,
+            status=ApplicationStatus.DISCOVERED.value,
+        )
 
         # Discovered -> Under Review
         app1 = self.db.update_application_status(job_id, ApplicationStatus.UNDER_REVIEW)
@@ -233,6 +258,15 @@ class TestDatabaseManager(unittest.TestCase):
         inserted = self.db.insert_job(self._create_sample_job())
         job_id = inserted.id
 
+        # Explicitly create user application for the job
+        self.db.create_user_application(
+            user_id=self.user_id,
+            job_id=job_id,
+            company_name=inserted.company_name,
+            job_title=inserted.job_title,
+            status=ApplicationStatus.DISCOVERED.value,
+        )
+
         # 1. Direct illegal transition from Discovered to Applied MUST fail
         with self.assertRaises(InvalidStatusTransitionError):
             self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True)
@@ -270,6 +304,13 @@ class TestDatabaseManager(unittest.TestCase):
     def test_invalid_status_rejection(self):
         """Checks that invalid status strings are rejected."""
         inserted = self.db.insert_job(self._create_sample_job())
+        self.db.create_user_application(
+            user_id=self.user_id,
+            job_id=inserted.id,
+            company_name=inserted.company_name,
+            job_title=inserted.job_title,
+            status=ApplicationStatus.DISCOVERED.value,
+        )
         with self.assertRaises(InvalidStatusError):
             self.db.update_application_status(inserted.id, "RandomFakeStatus")
 

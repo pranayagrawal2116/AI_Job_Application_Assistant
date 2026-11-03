@@ -274,6 +274,21 @@ BEGIN
     SELECT RAISE(FAIL, 'application_events records are append-only and cannot be updated.');
 END;
 
+CREATE TABLE IF NOT EXISTS _privacy_erasure_tokens (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    token_nonce TEXT NOT NULL,
+    authorized_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_application_events_delete
+BEFORE DELETE ON application_events
+BEGIN
+    SELECT RAISE(FAIL, 'application_events records are immutable and cannot be deleted except via authorized privacy erasure.')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM _privacy_erasure_tokens WHERE user_id = OLD.user_id
+    );
+END;
+
 -- ---------------------------------------------------------------------
 -- 8.2 SUBMISSION CONFIRMATIONS
 -- ---------------------------------------------------------------------
@@ -292,7 +307,7 @@ CREATE TABLE IF NOT EXISTS submission_confirmations (
     is_active_confirmation INTEGER DEFAULT 1 CHECK(is_active_confirmation IN (0, 1)),
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
-    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE SET NULL
+    FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE RESTRICT
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_conf_active_app ON submission_confirmations(application_id) WHERE is_active_confirmation = 1;
