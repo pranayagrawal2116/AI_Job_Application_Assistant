@@ -510,6 +510,15 @@ In the multi-user architecture (Phase 6–7), public catalog discovery and candi
 | **Migration Lock Ordering** | Preflight checks and application row snapshots occurred before `BEGIN IMMEDIATE TRANSACTION;`, creating race hazards with concurrent writers. | Reordered migration: Set manual isolation -> Disable FKs -> `BEGIN IMMEDIATE TRANSACTION;` acquiring RESERVED write lock -> Preflight checks -> Table rebuilds -> Integrity check -> `COMMIT;`. |
 | **Connection-Scoped Privacy Erasure** | Relying on `_privacy_erasure_tokens` table was vulnerable to token insertion, session leakage, and foreign key hazards. | Dropped `_privacy_erasure_tokens` table. Trigger uses connection-scoped SQLite UDF `verify_privacy_erasure_authorization(OLD.user_id) != 1`. Authorization is granted ephemerally via `_authorized_privacy_erasure_scope(conn, user_id)` strictly for the calling connection. |
 
+### 10.4 Phase 7.1.3 Submission Confirmation Audit Consistency & Timestamp Integrity Summary
+
+| Area | Issue Identified | Corrective Solution Implemented |
+| :--- | :--- | :--- |
+| **Atomic Confirmation Correction** | `correct_submission_confirmation()` committed confirmation updates in one transaction and emitted audit events in a separate, swallowed `try...except` block, risking un-audited state mutation. | Made confirmation metadata updates and `SUBMISSION_CONFIRMATION_UPDATED` timeline event insertion atomic within the same SQLite transaction. Failure at any point triggers complete rollback of both. |
+| **Timestamp Separation** | `create_submission_confirmation()` substituted the candidate's reported `submission_timestamp` for `application_events.created_at`, compromising audit trail chronometry. | Separated candidate-reported submission time (`submission_confirmations.submission_timestamp`, `applications.date_submitted`) from server event creation time (`application_events.created_at`). Server UTC time is bound into the v2 hash and verified independently. |
+| **Audit Event Semantics** | Inconsistent event type naming obscured whether an application transition occurred. | Enforced clear audit event semantics: `SUBMISSION_CONFIRMATION_RECORDED` for storage-only confirmations without status transitions, `SUBMISSION_CONFIRMED` for transitions to `SUBMITTED`, and `SUBMISSION_CONFIRMATION_UPDATED` for metadata corrections. |
+| **Centralized Event Helper** | Duplicated event sequence, hashing, and insertion logic across multiple methods. | Implemented `_insert_application_event_internal(cursor, ...)` to encapsulate sequence calculation, hash computation, timestamp binding, and insertion on an existing connection/cursor without status mutation. |
+
 ---
 
 ## 11. Proposed Service & API Architecture
@@ -534,6 +543,22 @@ All operations will be housed in `DashboardService` and backed by `DatabaseManag
    |   create_application_follow_up(application_id, user_id, ...)      |
    |   complete_application_follow_up(follow_up_id, user_id, ...)     |
    +-------------------------------------------------------------------+
+```
+
+### 11.1 Phase 7.2 Service-Layer Security Contract
+
+When Phase 7.2 exposes application lifecycle management and submission workflows, the service layer must strictly enforce the following ten security requirements:
+
+1. **Session-Derived User Resolution:** The authenticated candidate `user_id` must be resolved exclusively from the verified active login session.
+2. **Rejection of Client-Supplied User IDs:** The service layer must never accept, trust, or act upon a `user_id` passed directly from client requests, URL query parameters, or form payloads.
+3. **Strict Session Verification:** Use `DashboardService.get_authenticated_candidate_session(user_id, session_id)`, which fails closed immediately on missing, invalid, expired, or cross-user sessions.
+4. **Session-to-User Binding Enforcement:** Reject any request where `session.user_id != user_id`.
+5. **Mandatory Candidate Intent for Submissions:** Transitioning an application to `SUBMITTED` requires an explicit, deliberate candidate confirmation action in the UI (e.g. interactive confirmation modal with required channel selection).
+6. **Single-Use Action Tickets:** Submission confirmation should consume a single-use action ticket (e.g. `MANUAL_SUBMISSION`) bound to `(application_id, packet_id, user_id)` to prevent replay attacks and race conditions.
+7. **Packet Integrity & Ownership Verification:** Ensure the target prepared packet is the active revision, belongs to the candidate and application, and has a cryptographic `packet_version_hash` matching the unconsumed human approval record.
+8. **Protected Database Submission Invocation:** Call `DatabaseManager.create_submission_confirmation(transition_status=True, ...)`, relying on its strict allowlist (`APPROVED` / `'Awaiting Approval'`) and unconditional consumed-approval rejection.
+9. **Outbound Navigation Non-Equivalence:** Clicking, previewing, or opening an external job portal URL must NEVER be treated as a submission action or automatically advance an application to `SUBMITTED`.
+10. **Zero Automated Final Submission:** The platform must strictly maintain its zero-automation boundary. Final submission is performed manually by the candidate on the employer's portal; the assistant only provides preparation assistance and records candidate confirmation.
              |
              +---------------------------+
              |                           |

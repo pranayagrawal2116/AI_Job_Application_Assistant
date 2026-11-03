@@ -1190,7 +1190,7 @@ class DatabaseManager:
                         ApplicationStatus.DISCOVERED.value,
                     ),
                 )
-                app_id = cursor.lastrowid
+                app_id = int(cursor.lastrowid or 0)
 
                 cursor.execute(
                     """
@@ -2731,7 +2731,7 @@ class DatabaseManager:
                     is_archived,
                 ),
             )
-            app_id = cursor.lastrowid
+            app_id = int(cursor.lastrowid or 0)
 
             # Emit initial timeline event
             event_payload = {
@@ -2893,7 +2893,7 @@ class DatabaseManager:
                     ApplicationStatus.UNDER_REVIEW.value,
                 ),
             )
-            new_id = cursor.lastrowid
+            new_id = int(cursor.lastrowid or 0)
 
             # Emit initial event for workspace-created application
             event_payload = {
@@ -4028,6 +4028,116 @@ class DatabaseManager:
 
         return canonical_json_hash(hash_payload)
 
+    def _insert_application_event_internal(
+        self,
+        cursor: sqlite3.Cursor,
+        application_id: int,
+        user_id: int,
+        event_type: str,
+        new_status: Optional[str] = None,
+        previous_status: Optional[str] = None,
+        actor_type: str = "CANDIDATE",
+        actor_identifier: Optional[str] = None,
+        session_reference: Optional[str] = None,
+        event_payload: Optional[Dict[str, Any]] = None,
+        created_at: Optional[str] = None,
+    ) -> ApplicationEvent:
+        """Appends an immutable event to application_events on the provided cursor/connection.
+
+        Does NOT manage transaction boundaries or mutate applications.status, enabling callers
+        to execute atomic multi-table updates and event audit logging within a single transaction.
+        """
+        if actor_type not in ("CANDIDATE", "SYSTEM"):
+            raise ValidationError(f"Invalid actor_type '{actor_type}'. Must be 'CANDIDATE' or 'SYSTEM'.")
+
+        # Verify user exists
+        cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
+        if not cursor.fetchone():
+            raise UserNotFoundError(user_id)
+
+        # Verify application exists and belongs to user
+        cursor.execute("SELECT id, user_id, status FROM applications WHERE id = ?", (application_id,))
+        app_row = cursor.fetchone()
+        if not app_row:
+            raise ApplicationNotFoundError(application_id)
+        if app_row["user_id"] != user_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=app_row["user_id"],
+                resource=f"Application #{application_id}",
+            )
+
+        # Query max sequence_no and last event_hash
+        cursor.execute(
+            """
+            SELECT sequence_no, event_hash FROM application_events
+            WHERE application_id = ? AND user_id = ?
+            ORDER BY sequence_no DESC LIMIT 1
+            """,
+            (application_id, user_id),
+        )
+        last_event = cursor.fetchone()
+        if not last_event:
+            sequence_no = 1
+            previous_event_hash = "GENESIS"
+        else:
+            sequence_no = last_event["sequence_no"] + 1
+            previous_event_hash = last_event["event_hash"]
+
+        current_status = app_row["status"]
+        prev_status = previous_status if previous_status is not None else current_status
+
+        # Canonical serialization of event payload
+        payload_dict = event_payload or {}
+        event_payload_json = canonical_json_bytes(payload_dict).decode("utf-8")
+        actor_ident = (actor_identifier or f"user_{user_id}").strip()
+        event_ts = created_at or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+        event_hash = DatabaseManager.compute_event_hash(
+            actor_identifier=actor_ident,
+            actor_type=actor_type,
+            application_id=application_id,
+            event_payload_json=event_payload_json,
+            event_type=event_type,
+            new_status=new_status,
+            previous_event_hash=previous_event_hash,
+            previous_status=prev_status,
+            sequence_no=sequence_no,
+            session_reference=session_reference,
+            user_id=user_id,
+            created_at=event_ts,
+            hash_version="v2",
+        )
+
+        cursor.execute(
+            """
+            INSERT INTO application_events (
+                application_id, user_id, sequence_no, event_type,
+                previous_status, new_status, actor_type, actor_identifier,
+                session_reference, event_payload_json, previous_event_hash, event_hash,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                application_id,
+                user_id,
+                sequence_no,
+                event_type,
+                prev_status,
+                new_status,
+                actor_type,
+                actor_ident,
+                session_reference,
+                event_payload_json,
+                previous_event_hash,
+                event_hash,
+                event_ts,
+            ),
+        )
+        event_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM application_events WHERE id = ?", (event_id,))
+        return ApplicationEvent(**dict(cursor.fetchone()))
+
     def create_application_event(
         self,
         application_id: int,
@@ -4041,99 +4151,20 @@ class DatabaseManager:
         event_payload: Optional[Dict[str, Any]] = None,
     ) -> ApplicationEvent:
         """Appends an immutable event to the application timeline with RFC 8785 canonical hash linkage."""
-        if actor_type not in ("CANDIDATE", "SYSTEM"):
-            raise ValidationError(f"Invalid actor_type '{actor_type}'. Must be 'CANDIDATE' or 'SYSTEM'.")
-
         with self.transaction() as conn:
             cursor = conn.cursor()
-
-            # Verify user exists
-            cursor.execute("SELECT id FROM users WHERE id = ?", (user_id,))
-            if not cursor.fetchone():
-                raise UserNotFoundError(user_id)
-
-            # Verify application exists and belongs to user
-            cursor.execute("SELECT id, user_id, status FROM applications WHERE id = ?", (application_id,))
-            app_row = cursor.fetchone()
-            if not app_row:
-                raise ApplicationNotFoundError(application_id)
-            if app_row["user_id"] != user_id:
-                raise CrossUserAccessError(
-                    user_id=user_id,
-                    target_user_id=app_row["user_id"],
-                    resource=f"Application #{application_id}",
-                )
-
-            # Query max sequence_no and last event_hash
-            cursor.execute(
-                """
-                SELECT sequence_no, event_hash FROM application_events
-                WHERE application_id = ? AND user_id = ?
-                ORDER BY sequence_no DESC LIMIT 1
-                """,
-                (application_id, user_id),
-            )
-            last_event = cursor.fetchone()
-            if not last_event:
-                sequence_no = 1
-                previous_event_hash = "GENESIS"
-            else:
-                sequence_no = last_event["sequence_no"] + 1
-                previous_event_hash = last_event["event_hash"]
-
-            current_status = app_row["status"]
-            prev_status = previous_status if previous_status is not None else current_status
-
-            # Canonical serialization of event payload
-            payload_dict = event_payload or {}
-            event_payload_json = canonical_json_bytes(payload_dict).decode("utf-8")
-            actor_ident = (actor_identifier or f"user_{user_id}").strip()
-            now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-
-            event_hash = DatabaseManager.compute_event_hash(
-                actor_identifier=actor_ident,
-                actor_type=actor_type,
+            return self._insert_application_event_internal(
+                cursor=cursor,
                 application_id=application_id,
-                event_payload_json=event_payload_json,
+                user_id=user_id,
                 event_type=event_type,
                 new_status=new_status,
-                previous_event_hash=previous_event_hash,
-                previous_status=prev_status,
-                sequence_no=sequence_no,
+                previous_status=previous_status,
+                actor_type=actor_type,
+                actor_identifier=actor_identifier,
                 session_reference=session_reference,
-                user_id=user_id,
-                created_at=now_ts,
-                hash_version="v2",
+                event_payload=event_payload,
             )
-
-            cursor.execute(
-                """
-                INSERT INTO application_events (
-                    application_id, user_id, sequence_no, event_type,
-                    previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    application_id,
-                    user_id,
-                    sequence_no,
-                    event_type,
-                    prev_status,
-                    new_status,
-                    actor_type,
-                    actor_ident,
-                    session_reference,
-                    event_payload_json,
-                    previous_event_hash,
-                    event_hash,
-                    now_ts,
-                ),
-            )
-            event_id = cursor.lastrowid
-            cursor.execute("SELECT * FROM application_events WHERE id = ?", (event_id,))
-            return ApplicationEvent(**dict(cursor.fetchone()))
 
     def get_application_events(self, application_id: int, user_id: int) -> List[ApplicationEvent]:
         """Fetches all timeline events for an application, enforcing user ownership."""
@@ -4263,7 +4294,9 @@ class DatabaseManager:
                 f"Invalid submission_channel '{submission_channel}'. Valid options: {valid_channels}"
             )
 
-        ts = submission_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        # Distinguish candidate-provided submission time from server UTC event recording time
+        sub_ts = submission_timestamp or datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+        now_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
         with self.transaction() as conn:
             cursor = conn.cursor()
@@ -4348,10 +4381,10 @@ class DatabaseManager:
                         f"Human approval for PreparedPacket #{packet_id} has already been consumed."
                     )
 
-                # Consume the approval record
+                # Consume the approval record with current server timestamp
                 cursor.execute(
                     "UPDATE application_approvals SET is_consumed = 1, consumed_at = ? WHERE id = ?",
-                    (ts, appr_row["id"]),
+                    (now_ts, appr_row["id"]),
                 )
             else:
                 # Storage-only mode: if packet_id is provided, validate ownership
@@ -4401,7 +4434,7 @@ class DatabaseManager:
                     user_id,
                     packet_id,
                     packet_hash,
-                    ts,
+                    sub_ts,
                     submission_channel,
                     confirmation_reference,
                     confirmation_doc_path,
@@ -4419,10 +4452,10 @@ class DatabaseManager:
                     SET status = ?, date_submitted = ?, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ? AND user_id = ?
                     """,
-                    (ApplicationStatus.SUBMITTED.value, ts, application_id, user_id),
+                    (ApplicationStatus.SUBMITTED.value, sub_ts, application_id, user_id),
                 )
 
-            # Emit timeline event for submission
+            # Emit timeline event for submission atomically within the same transaction
             conf_payload = {
                 "submission_channel": submission_channel,
                 "confirmation_reference": confirmation_reference,
@@ -4430,61 +4463,22 @@ class DatabaseManager:
                 "packet_version_hash": packet_hash,
                 "confirmation_doc_hash": confirmation_doc_hash,
                 "transition_status": transition_status,
+                "submission_timestamp": sub_ts,
             }
-            payload_json = canonical_json_bytes(conf_payload).decode("utf-8")
-
-            cursor.execute(
-                """
-                SELECT sequence_no, event_hash FROM application_events
-                WHERE application_id = ? AND user_id = ?
-                ORDER BY sequence_no DESC LIMIT 1
-                """,
-                (application_id, user_id),
-            )
-            last_event = cursor.fetchone()
-            seq = (last_event["sequence_no"] + 1) if last_event else 1
-            prev_hash = last_event["event_hash"] if last_event else "GENESIS"
 
             new_status_val = ApplicationStatus.SUBMITTED.value if transition_status else current_status
             event_type_val = "SUBMISSION_CONFIRMED" if transition_status else "SUBMISSION_CONFIRMATION_RECORDED"
 
-            evt_hash = DatabaseManager.compute_event_hash(
-                actor_identifier=f"user_{user_id}",
-                actor_type="CANDIDATE",
+            self._insert_application_event_internal(
+                cursor=cursor,
                 application_id=application_id,
-                event_payload_json=payload_json,
+                user_id=user_id,
                 event_type=event_type_val,
                 new_status=new_status_val,
-                previous_event_hash=prev_hash,
                 previous_status=current_status,
-                sequence_no=seq,
-                session_reference=None,
-                user_id=user_id,
-                created_at=ts,
-                hash_version="v2",
-            )
-            cursor.execute(
-                """
-                INSERT INTO application_events (
-                    application_id, user_id, sequence_no, event_type,
-                    previous_status, new_status, actor_type, actor_identifier,
-                    session_reference, event_payload_json, previous_event_hash, event_hash,
-                    created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'CANDIDATE', ?, NULL, ?, ?, ?, ?)
-                """,
-                (
-                    application_id,
-                    user_id,
-                    seq,
-                    event_type_val,
-                    current_status,
-                    new_status_val,
-                    f"user_{user_id}",
-                    payload_json,
-                    prev_hash,
-                    evt_hash,
-                    ts,
-                ),
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload=conf_payload,
             )
 
             cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (conf_id,))
@@ -4502,6 +4496,9 @@ class DatabaseManager:
     ) -> SubmissionConfirmation:
         """Allows candidates to correct or attach confirmation artifacts to an existing submission confirmation
         without requiring re-submission or re-approving packets. Does not modify application status.
+
+        The confirmation update and its corresponding SUBMISSION_CONFIRMATION_UPDATED timeline event
+        are executed atomically within the same database transaction.
         """
         if submission_channel is not None:
             valid_channels = SubmissionChannel.list()
@@ -4546,31 +4543,30 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (confirmation_id,))
             updated = SubmissionConfirmation(**dict(cursor.fetchone()))
 
-        # Emit audit event for correction
-        try:
-            self.create_application_event(
+            # Emit timeline event atomically within the same transaction
+            corr_payload = {
+                "confirmation_id": confirmation_id,
+                "updated_fields": {
+                    k: v for k, v in {
+                        "confirmation_reference": confirmation_reference,
+                        "confirmation_doc_path": confirmation_doc_path,
+                        "confirmation_doc_hash": confirmation_doc_hash,
+                        "candidate_notes": candidate_notes,
+                        "submission_channel": submission_channel,
+                    }.items() if v is not None
+                },
+            }
+            self._insert_application_event_internal(
+                cursor=cursor,
                 application_id=updated.application_id,
                 user_id=user_id,
                 event_type="SUBMISSION_CONFIRMATION_UPDATED",
                 actor_type="CANDIDATE",
                 actor_identifier=f"user_{user_id}",
-                event_payload={
-                    "confirmation_id": confirmation_id,
-                    "updated_fields": {
-                        k: v for k, v in {
-                            "confirmation_reference": confirmation_reference,
-                            "confirmation_doc_path": confirmation_doc_path,
-                            "confirmation_doc_hash": confirmation_doc_hash,
-                            "candidate_notes": candidate_notes,
-                            "submission_channel": submission_channel,
-                        }.items() if v is not None
-                    },
-                },
+                event_payload=corr_payload,
             )
-        except Exception as e:
-            logger.warning("Could not record timeline event for updated confirmation #%d: %s", confirmation_id, e)
 
-        return updated
+            return updated
 
     def get_submission_confirmation(
         self, application_id: int, user_id: int, active_only: bool = True

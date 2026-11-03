@@ -208,6 +208,14 @@ When interacting with the browser via Playwright MCP:
   - Hardened connection-scoped privacy erasure: Replaced table-based token authorizations (`_privacy_erasure_tokens`) with ephemeral, connection-scoped SQLite user-defined function `verify_privacy_erasure_authorization(OLD.user_id)` strictly authorized via context manager `_authorized_privacy_erasure_scope(conn, user_id)` during account deletion. Blocks unauthorized, concurrent, cross-user, or forged event deletions.
   - Verified with 13 new comprehensive hardening regression tests in `test_phase7_1_2_final_safety.py` (527 total project suite tests passing, 100%), 0 pyflakes errors, and clean ruff check.
 
+- [x] **Architecture v2.1.1 Phase 7.1.3: Submission Confirmation Audit Consistency & Timestamp Integrity** (Complete)
+  - Atomic confirmation corrections: Merged submission confirmation updates and `SUBMISSION_CONFIRMATION_UPDATED` timeline event logging into a single SQLite transaction. Failure at any point triggers atomic rollback of confirmation metadata and preserves original event chains intact without partial events.
+  - Strict submission time vs audit event time separation: Separated candidate-reported external submission time (`submission_confirmations.submission_timestamp`, `applications.date_submitted`) from server UTC event recording time (`application_events.created_at`). Preserves historical submission dates while strictly binding actual server creation timestamps into RFC 8785 v2 event hashes.
+  - Distinct audit event semantics: Enforced precise event type categorization across workflows: `SUBMISSION_CONFIRMATION_RECORDED` for storage-only records without state transition, `SUBMISSION_CONFIRMED` for transitions to `SUBMITTED`, and `SUBMISSION_CONFIRMATION_UPDATED` for metadata updates.
+  - Centralized internal event helper: Added `_insert_application_event_internal(cursor, ...)` to encapsulate sequence numbering, RFC 8785 canonical hash computation, and event insertion on existing connections without transaction overhead or implicit status mutation.
+  - Phase 7.2 service-layer security contract: Formulated explicit 10-point security contract in architecture documentation governing session-bound user resolution, action tickets, packet integrity, allowlist enforcement, and zero-automation final submission.
+  - Verified with 11 new comprehensive automated tests in `test_phase7_1_3_audit_consistency.py` (538 total project suite tests passing, 100%), 0 pyflakes errors, 0 ruff errors, and clean git diff.
+
 ---
 
 ## 7. Approval Requirement
