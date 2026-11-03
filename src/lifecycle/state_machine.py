@@ -4,7 +4,7 @@ Defines the authoritative lifecycle transition matrix, validates status transiti
 enforces terminal state rules, handles legacy status aliases, and determines audit event types.
 """
 
-from typing import Dict, List, Set, Tuple, Union
+from typing import Any, Dict, List, Set, Tuple, Union
 
 from src.database.exceptions import (
     InvalidStatusError,
@@ -116,15 +116,15 @@ class ApplicationStateMachine:
             ApplicationStatus.WITHDRAWN,
         },
         ApplicationStatus.REJECTED: {
-            ApplicationStatus.CLOSED,
-            ApplicationStatus.IN_PROGRESS,  # Re-opening
+            ApplicationStatus.CLOSED,       # Terminal progression: administrative closure/archiving
+            ApplicationStatus.IN_PROGRESS,  # Re-opening: requires mandatory candidate rationale
         },
         ApplicationStatus.WITHDRAWN: {
-            ApplicationStatus.CLOSED,
-            ApplicationStatus.IN_PROGRESS,  # Re-opening
+            ApplicationStatus.CLOSED,       # Terminal progression: administrative closure/archiving
+            ApplicationStatus.IN_PROGRESS,  # Re-opening: requires mandatory candidate rationale
         },
         ApplicationStatus.CLOSED: {
-            ApplicationStatus.IN_PROGRESS,  # Re-opening
+            ApplicationStatus.IN_PROGRESS,  # Re-opening: requires mandatory candidate rationale
         },
     }
 
@@ -182,11 +182,14 @@ class ApplicationStateMachine:
         cls,
         current_status: Union[str, ApplicationStatus],
         new_status: Union[str, ApplicationStatus],
-        is_gate_authorized: bool = False,
+        **kwargs: Any,
     ) -> bool:
-        """Returns True if the transition from current_status to new_status is permitted."""
+        """Returns True if the transition from current_status to new_status is permitted.
+
+        Note: Gate-protected statuses (APPROVED, SUBMITTED) return False for generic transitions.
+        """
         try:
-            cls.validate_transition(current_status, new_status, is_gate_authorized=is_gate_authorized)
+            cls.validate_transition(current_status, new_status, **kwargs)
             return True
         except (InvalidStatusError, InvalidStatusTransitionError, SecurityAuthorizationError):
             return False
@@ -196,15 +199,21 @@ class ApplicationStateMachine:
         cls,
         current_status: Union[str, ApplicationStatus],
         new_status: Union[str, ApplicationStatus],
-        is_gate_authorized: bool = False,
+        **kwargs: Any,
     ) -> None:
         """Validates that a transition from current_status to new_status is permitted.
+
+        CRITICAL SECURITY INVARIANT:
+        Caller-supplied booleans (e.g., is_gate_authorized=True) are strictly rejected as proof of authorization.
+        Generic status transitions to GATE_PROTECTED_TARGETS (APPROVED, SUBMITTED) are prohibited.
+        They must be performed exclusively through their dedicated trusted workflows:
+        - APPROVED: HumanApprovalGate.authorize_universal_packet()
+        - SUBMITTED: DatabaseManager.create_submission_confirmation() / DashboardService.record_candidate_manual_submission()
 
         Raises:
             InvalidStatusError: If current or new status is unrecognized.
             InvalidStatusTransitionError: If the transition is not present in the transition matrix.
-            SecurityAuthorizationError: If attempting to transition to a gate-protected status
-                (APPROVED or SUBMITTED) without gate authorization.
+            SecurityAuthorizationError: If attempting to transition to a gate-protected status.
         """
         curr = cls.normalize_status(current_status)
         target = cls.normalize_status(new_status)
@@ -219,29 +228,34 @@ class ApplicationStateMachine:
         if target not in allowed:
             raise InvalidStatusTransitionError(curr.value, target.value, allowed_str_list)
 
-        # Gate-protected statuses require dedicated workflow authorization
-        if target in cls.GATE_PROTECTED_TARGETS and not is_gate_authorized:
+        # Gate-protected statuses cannot be bypassed by caller-supplied booleans
+        if target in cls.GATE_PROTECTED_TARGETS:
             if target == ApplicationStatus.APPROVED:
                 raise SecurityAuthorizationError(
-                    f"Transition to '{target.value}' requires explicit human packet approval via HumanApprovalGate, "
-                    "not generic status updates."
+                    f"Transition to '{target.value}' is gate-protected and cannot be performed via generic status transitions. "
+                    "Use HumanApprovalGate.authorize_universal_packet(). Caller-supplied flags cannot bypass this gate."
                 )
             if target == ApplicationStatus.SUBMITTED:
                 raise SecurityAuthorizationError(
-                    f"Transition to '{target.value}' requires candidate manual submission confirmation with "
-                    "an action ticket, not generic status updates."
+                    f"Transition to '{target.value}' is gate-protected and cannot be performed via generic status transitions. "
+                    "Use candidate manual submission confirmation with an action ticket. Caller-supplied flags cannot bypass this gate."
                 )
 
     @classmethod
     def get_allowed_transitions(
         cls,
         current_status: Union[str, ApplicationStatus],
-        is_gate_authorized: bool = False,
+        include_gate_protected: bool = False,
+        **kwargs: Any,
     ) -> List[str]:
-        """Returns the list of valid next status strings for the given current status."""
+        """Returns the list of valid next status strings for the given current status.
+
+        By default, gate-protected statuses (APPROVED, SUBMITTED) are excluded because they
+        cannot be transitioned via generic status updates.
+        """
         curr = cls.normalize_status(current_status)
         targets = cls.ALLOWED_TRANSITIONS.get(curr, set())
-        if not is_gate_authorized:
+        if not include_gate_protected:
             targets = {t for t in targets if t not in cls.GATE_PROTECTED_TARGETS}
         return sorted([s.value for s in targets])
 

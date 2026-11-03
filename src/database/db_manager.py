@@ -185,6 +185,27 @@ class DatabaseManager:
         finally:
             conn.close()
 
+    @contextmanager
+    def immediate_transaction(self) -> Generator[sqlite3.Connection, None, None]:
+        """Context manager providing an atomic database transaction with an immediate write lock (BEGIN IMMEDIATE).
+
+        Prevents concurrent read-before-write races by acquiring SQLite's RESERVED write lock
+        at the beginning of the transaction before any SELECT or inspection statements.
+        Commits on normal block exit, rolls back on any exception, and closes connection.
+        """
+        conn = self.get_connection()
+        conn.isolation_level = None  # Autocommit mode to allow explicit BEGIN IMMEDIATE
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+            conn.execute("COMMIT")
+        except Exception as e:
+            conn.execute("ROLLBACK")
+            logger.error("Immediate transaction failed and was rolled back: %s", e)
+            raise
+        finally:
+            conn.close()
+
     def _ensure_backward_compatible_columns(self, cursor: sqlite3.Cursor) -> None:
         """Ensures newly added columns exist in older database tables before schema indexes are applied."""
         def add_col_if_missing(table: str, col: str, col_def: str) -> None:
@@ -2867,24 +2888,65 @@ class DatabaseManager:
         actor_identifier: Optional[str] = None,
         session_reference: Optional[str] = None,
         transition_metadata: Optional[Dict[str, Any]] = None,
-        is_gate_authorized: bool = False,
+        reopen_rationale: Optional[str] = None,
+        **kwargs: Any,
     ) -> Application:
-        """Atomically transitions an application's lifecycle status and appends a timeline event.
+        """Atomically transitions an application's lifecycle status and appends an immutable timeline event.
 
         Enforces:
-        1. Single SQLite transaction enclosing status update and timeline event insertion.
-        2. Strict user ownership (application_id + user_id).
-        3. ApplicationStateMachine transition validation (rejects invalid transitions).
-        4. Stale-state detection if expected_current_status is provided.
-        5. Gate authorization enforcement (blocks unauthorized transitions to APPROVED or SUBMITTED).
-        6. Conditional UPDATE preventing concurrent overwrite races.
-        7. Complete rollback of status mutation and timeline event if any step fails.
+        1. Immediate SQLite write lock (BEGIN IMMEDIATE) acquired before reading current state.
+        2. Strict candidate ownership verification (application_id + user_id).
+        3. Stale-state detection if expected_current_status is provided.
+        4. ApplicationStateMachine transition validation (rejects invalid transitions).
+        5. Gate protection: Generic transitions to APPROVED or SUBMITTED are strictly prohibited
+           and cannot be bypassed by caller-supplied booleans (e.g. is_gate_authorized=True).
+        6. Reopening rationale: Reopening from terminal states to IN_PROGRESS requires a mandatory,
+           non-empty, non-whitespace rationale string.
+        7. Audit payload protection: Reserved audit fields cannot be overridden by transition_metadata.
+        8. Conditional UPDATE preventing concurrent overwrite races.
+        9. Complete atomic rollback of status mutation and timeline event if any step fails.
         """
         from src.lifecycle.state_machine import ApplicationStateMachine
 
         target_status = ApplicationStateMachine.normalize_status(new_status)
 
-        with self.transaction() as conn:
+        # Gate-protected statuses cannot be set via generic status transitions
+        if target_status in ApplicationStateMachine.GATE_PROTECTED_TARGETS:
+            if target_status == ApplicationStatus.APPROVED:
+                raise SecurityAuthorizationError(
+                    f"Transition to '{target_status.value}' is gate-protected and cannot be performed via generic status transitions. "
+                    "Transition to 'APPROVED' requires explicit human packet approval via HumanApprovalGate, not generic status updates."
+                )
+            if target_status == ApplicationStatus.SUBMITTED:
+                raise SecurityAuthorizationError(
+                    f"Transition to '{target_status.value}' is gate-protected and cannot be performed via generic status transitions. "
+                    "Transition to 'SUBMITTED' requires candidate manual submission confirmation with an action ticket, not generic status updates."
+                )
+
+        # Reject attempts to overwrite reserved audit payload fields
+        RESERVED_AUDIT_KEYS = {
+            "previous_status",
+            "new_status",
+            "application_id",
+            "user_id",
+            "actor_type",
+            "session_reference",
+            "reopen_rationale",
+            "created_at",
+            "sequence_no",
+            "event_hash",
+            "prev_event_hash",
+            "event_type",
+        }
+        if transition_metadata:
+            for key in transition_metadata:
+                if key in RESERVED_AUDIT_KEYS:
+                    raise ValidationError(
+                        f"transition_metadata cannot override reserved audit payload field '{key}'."
+                    )
+
+        # Acquire SQLite RESERVED write lock BEFORE reading current state to prevent concurrency races
+        with self.immediate_transaction() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
             app_row = cursor.fetchone()
@@ -2912,8 +2974,15 @@ class DatabaseManager:
             ApplicationStateMachine.validate_transition(
                 current_status=current_status,
                 new_status=target_status,
-                is_gate_authorized=is_gate_authorized,
             )
+
+            is_reopening = ApplicationStateMachine.is_reopening_transition(current_status, target_status)
+            if is_reopening:
+                if not reopen_rationale or not reopen_rationale.strip():
+                    raise ValidationError(
+                        f"A non-empty reopening rationale is required when reopening an application from "
+                        f"'{current_status.value}' to '{target_status.value}'."
+                    )
 
             # Conditional UPDATE to prevent concurrency races
             cursor.execute(
@@ -2931,11 +3000,16 @@ class DatabaseManager:
                 )
 
             event_type = ApplicationStateMachine.get_transition_event_type(current_status, target_status)
-            payload = {
-                "previous_status": current_status.value,
-                "new_status": target_status.value,
-                **(transition_metadata or {}),
-            }
+            payload = dict(transition_metadata or {})
+            payload["previous_status"] = current_status.value
+            payload["new_status"] = target_status.value
+            payload["application_id"] = application_id
+            payload["user_id"] = user_id
+            payload["actor_type"] = actor_type
+            if session_reference is not None:
+                payload["session_reference"] = session_reference
+            if is_reopening and reopen_rationale:
+                payload["reopen_rationale"] = reopen_rationale.strip()
 
             self._insert_application_event_internal(
                 cursor=cursor,

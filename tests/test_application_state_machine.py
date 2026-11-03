@@ -81,20 +81,23 @@ class TestApplicationStateMachine(unittest.TestCase):
             self.assertIn("Invalid status", str(ctx.exception))
 
     def test_all_allowed_transitions_succeed(self):
-        """Every explicitly allowed transition succeeds when authorized."""
+        """Every non-gate-protected allowed transition succeeds in generic validation."""
         for current_status, allowed_targets in ApplicationStateMachine.ALLOWED_TRANSITIONS.items():
             for target_status in allowed_targets:
-                # With gate authorization
-                self.assertTrue(
-                    ApplicationStateMachine.is_valid_transition(
-                        current_status, target_status, is_gate_authorized=True
-                    ),
-                    f"Expected {current_status.value} -> {target_status.value} to be valid",
-                )
-                # validate_transition should not raise
-                ApplicationStateMachine.validate_transition(
-                    current_status, target_status, is_gate_authorized=True
-                )
+                if target_status in ApplicationStateMachine.GATE_PROTECTED_TARGETS:
+                    # Gate-protected statuses strictly reject generic transition
+                    self.assertFalse(
+                        ApplicationStateMachine.is_valid_transition(current_status, target_status),
+                        f"Expected {current_status.value} -> {target_status.value} to be gate-protected",
+                    )
+                    with self.assertRaises(SecurityAuthorizationError):
+                        ApplicationStateMachine.validate_transition(current_status, target_status)
+                else:
+                    self.assertTrue(
+                        ApplicationStateMachine.is_valid_transition(current_status, target_status),
+                        f"Expected {current_status.value} -> {target_status.value} to be valid",
+                    )
+                    ApplicationStateMachine.validate_transition(current_status, target_status)
 
     def test_disallowed_transitions_across_full_matrix(self):
         """Every transition not in ALLOWED_TRANSITIONS must be rejected."""
@@ -104,60 +107,64 @@ class TestApplicationStateMachine(unittest.TestCase):
             for target in all_statuses:
                 if target not in allowed:
                     self.assertFalse(
-                        ApplicationStateMachine.is_valid_transition(curr, target, is_gate_authorized=True),
+                        ApplicationStateMachine.is_valid_transition(curr, target),
                         f"Expected {curr.value} -> {target.value} to be invalid",
                     )
                     with self.assertRaises(InvalidStatusTransitionError) as ctx:
-                        ApplicationStateMachine.validate_transition(curr, target, is_gate_authorized=True)
+                        ApplicationStateMachine.validate_transition(curr, target)
                     self.assertIn(f"from '{curr.value}' to '{target.value}'", str(ctx.exception))
 
     def test_gate_protected_transition_to_approved(self):
-        """Transition to APPROVED succeeds only with is_gate_authorized=True."""
-        # READY_FOR_REVIEW -> APPROVED is allowed, but gate-protected
+        """Transition to APPROVED cannot be bypassed by boolean flags."""
+        # READY_FOR_REVIEW -> APPROVED is structurally in matrix, but gate-protected
         self.assertFalse(
             ApplicationStateMachine.is_valid_transition(
-                ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED, is_gate_authorized=False
+                ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED
             )
         )
         with self.assertRaises(SecurityAuthorizationError) as ctx:
             ApplicationStateMachine.validate_transition(
-                ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED, is_gate_authorized=False
+                ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED
             )
-        self.assertIn("requires explicit human packet approval", str(ctx.exception))
+        self.assertIn("gate-protected", str(ctx.exception).lower())
 
-        # Authorized succeeds
-        self.assertTrue(
+        # Passing is_gate_authorized=True CANNOT bypass the gate!
+        self.assertFalse(
             ApplicationStateMachine.is_valid_transition(
                 ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED, is_gate_authorized=True
             )
         )
-        ApplicationStateMachine.validate_transition(
-            ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED, is_gate_authorized=True
-        )
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            ApplicationStateMachine.validate_transition(
+                ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED, is_gate_authorized=True
+            )
+        self.assertIn("cannot bypass", str(ctx.exception).lower())
 
     def test_gate_protected_transition_to_submitted(self):
-        """Transition to SUBMITTED succeeds only with is_gate_authorized=True."""
-        # APPROVED -> SUBMITTED is allowed, but gate-protected
+        """Transition to SUBMITTED cannot be bypassed by boolean flags."""
+        # APPROVED -> SUBMITTED is structurally in matrix, but gate-protected
         self.assertFalse(
             ApplicationStateMachine.is_valid_transition(
-                ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED, is_gate_authorized=False
+                ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED
             )
         )
         with self.assertRaises(SecurityAuthorizationError) as ctx:
             ApplicationStateMachine.validate_transition(
-                ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED, is_gate_authorized=False
+                ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED
             )
-        self.assertIn("requires candidate manual submission confirmation", str(ctx.exception))
+        self.assertIn("gate-protected", str(ctx.exception).lower())
 
-        # Authorized succeeds
-        self.assertTrue(
+        # Passing is_gate_authorized=True CANNOT bypass the gate!
+        self.assertFalse(
             ApplicationStateMachine.is_valid_transition(
                 ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED, is_gate_authorized=True
             )
         )
-        ApplicationStateMachine.validate_transition(
-            ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED, is_gate_authorized=True
-        )
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            ApplicationStateMachine.validate_transition(
+                ApplicationStatus.APPROVED, ApplicationStatus.SUBMITTED, is_gate_authorized=True
+            )
+        self.assertIn("cannot bypass", str(ctx.exception).lower())
 
     def test_terminal_statuses(self):
         """REJECTED, WITHDRAWN, and CLOSED are correctly identified as terminal statuses."""
@@ -216,32 +223,32 @@ class TestApplicationStateMachine(unittest.TestCase):
                 )
 
     def test_get_allowed_transitions_filtering(self):
-        """get_allowed_transitions filters gate-protected statuses when is_gate_authorized=False."""
+        """get_allowed_transitions filters gate-protected statuses unless include_gate_protected=True."""
         # READY_FOR_REVIEW without gate authorization excludes APPROVED
         allowed_unauth = ApplicationStateMachine.get_allowed_transitions(
-            ApplicationStatus.READY_FOR_REVIEW, is_gate_authorized=False
+            ApplicationStatus.READY_FOR_REVIEW
         )
         self.assertNotIn("APPROVED", allowed_unauth)
         self.assertIn("PREPARING", allowed_unauth)
         self.assertIn("WITHDRAWN", allowed_unauth)
 
-        # READY_FOR_REVIEW with gate authorization includes APPROVED
+        # READY_FOR_REVIEW with include_gate_protected=True includes APPROVED
         allowed_auth = ApplicationStateMachine.get_allowed_transitions(
-            ApplicationStatus.READY_FOR_REVIEW, is_gate_authorized=True
+            ApplicationStatus.READY_FOR_REVIEW, include_gate_protected=True
         )
         self.assertIn("APPROVED", allowed_auth)
 
         # APPROVED without gate authorization excludes SUBMITTED
         appr_unauth = ApplicationStateMachine.get_allowed_transitions(
-            ApplicationStatus.APPROVED, is_gate_authorized=False
+            ApplicationStatus.APPROVED
         )
         self.assertNotIn("SUBMITTED", appr_unauth)
         self.assertIn("READY_FOR_REVIEW", appr_unauth)
         self.assertIn("WITHDRAWN", appr_unauth)
 
-        # APPROVED with gate authorization includes SUBMITTED
+        # APPROVED with include_gate_protected=True includes SUBMITTED
         appr_auth = ApplicationStateMachine.get_allowed_transitions(
-            ApplicationStatus.APPROVED, is_gate_authorized=True
+            ApplicationStatus.APPROVED, include_gate_protected=True
         )
         self.assertIn("SUBMITTED", appr_auth)
 

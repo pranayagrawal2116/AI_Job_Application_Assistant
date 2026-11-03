@@ -891,6 +891,12 @@ class DashboardService:
             if not res:
                 raise ValidationError(f"Resume #{resume_id} not found or unauthorized.")
 
+        # Validate job_url if provided
+        validated_job_url: Optional[str] = None
+        if job_url:
+            from src.security.url_validator import URLSafetyValidator
+            validated_job_url = URLSafetyValidator.validate_url(job_url, skip_dns=True)
+
         # Initial status validation
         initial_status = ApplicationStatus.DRAFT.value
         if status:
@@ -908,7 +914,7 @@ class DashboardService:
             status=initial_status,
             resume_id=resume_id,
             job_description_id=job_description_id,
-            external_application_url=job_url,
+            external_application_url=validated_job_url,
             employment_type=employment_type,
             location=location,
             salary_range=salary_range,
@@ -958,11 +964,13 @@ class DashboardService:
         new_status: Union[str, ApplicationStatus],
         expected_current_status: Optional[Union[str, ApplicationStatus]] = None,
         transition_metadata: Optional[Dict[str, Any]] = None,
+        reopen_rationale: Optional[str] = None,
         client_user_id: Optional[int] = None,
     ) -> Application:
         """Transitions an application status through the core service layer.
 
         Generic transition attempts to APPROVED or SUBMITTED are strictly rejected.
+        Reopening from terminal statuses to IN_PROGRESS requires a mandatory, non-empty reopen_rationale.
         """
         user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
         return self.db.transition_application_status(
@@ -974,7 +982,7 @@ class DashboardService:
             actor_identifier=f"user_{user_id}",
             session_reference=sess.session_id,
             transition_metadata=transition_metadata,
-            is_gate_authorized=False,
+            reopen_rationale=reopen_rationale,
         )
 
     def get_application_timeline(
@@ -1181,6 +1189,32 @@ class DashboardService:
 
         return confirmation
 
+    @staticmethod
+    def _redact_sensitive_url(url: str) -> str:
+        """Removes credentials and redacts sensitive query parameter values (tokens, secrets, keys)."""
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(url)
+        netloc = parsed.netloc
+        if "@" in netloc:
+            netloc = netloc.split("@")[-1]
+
+        sensitive_substrings = (
+            "token", "secret", "auth", "key", "password", "pass", "pwd",
+            "session", "jwt", "code", "sig", "bearer", "credential"
+        )
+        query_params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+        redacted_params = []
+        for k, v in query_params:
+            k_lower = k.lower()
+            if any(s in k_lower for s in sensitive_substrings):
+                redacted_params.append((k, "REDACTED"))
+            else:
+                redacted_params.append((k, v))
+
+        new_query = urllib.parse.urlencode(redacted_params)
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, new_query, parsed.fragment))
+
     def log_external_application_url_opened(
         self,
         application_id: int,
@@ -1191,14 +1225,25 @@ class DashboardService:
         """Appends an EXTERNAL_APPLICATION_URL_OPENED audit event when a candidate opens an employer link.
 
         CRITICAL SAFETY INVARIANT: Strictly preserves existing application status without mutating it to SUBMITTED.
+        Validates the URL using URLSafetyValidator before appending any audit event.
+        Redacts sensitive query parameters and tokens from the audit payload.
         """
+        from src.security.url_validator import URLSafetyValidator
         from src.database.exceptions import ApplicationNotFoundError
+
+        # 1. URL Safety Validation (throws UnsafeURLError on unsafe URLs, schemes, private IPs, credentials)
+        validated_url = URLSafetyValidator.validate_url(url, skip_dns=True)
+
+        # 2. Authenticate session and candidate
         user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
         app = self.db.get_user_application(application_id=application_id, user_id=user_id)
         if not app:
             raise ApplicationNotFoundError(application_id)
 
-        # Emits audit event with URL payload; status is strictly preserved
+        # 3. Redact sensitive query parameters for privacy and audit security
+        sanitized_url = self._redact_sensitive_url(validated_url)
+
+        # 4. Emit audit event with sanitized URL payload; status is strictly preserved
         self.db.create_application_event(
             application_id=application_id,
             user_id=user_id,
@@ -1207,7 +1252,7 @@ class DashboardService:
             actor_identifier=f"user_{user_id}",
             session_reference=sess.session_id,
             event_payload={
-                "opened_url": url,
+                "opened_url": sanitized_url,
                 "application_status_preserved": app.status,
             },
         )

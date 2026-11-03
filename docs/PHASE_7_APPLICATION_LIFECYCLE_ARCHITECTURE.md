@@ -913,3 +913,39 @@ Phase 7.2 implements the application state machine, transactional status transit
   16. Returns updated application model and confirmation record.
 - **External Portal Audit**: `log_external_application_url_opened()` validates external URLs via `URLSafetyValidator` and records `EXTERNAL_PORTAL_OPENED` timeline events without mutating application status.
 - **Strict Zero-Automation Safeguard**: No browser automation tools or automated form fillers are invoked. Candidate manually completes external submission and provides submission details.
+
+---
+
+## 23. Phase 7.2.1 Security Hardening & State Transition Authorization
+
+Phase 7.2.1 addresses key security and integrity findings identified during independent source review of Phase 7.2:
+
+### 23.1 Removal of Boolean-Based Gate Authorization Bypass
+- **Eliminated Caller-Supplied Flags**: Caller-supplied booleans (e.g. `is_gate_authorized=True`) are completely rejected as proof of authorization.
+- **Dedicated Workflow Enforcement**:
+  - `APPROVED` status can **only** be achieved through `HumanApprovalGate.authorize_universal_packet()`, which requires an active session, user identity binding, active packet integrity verification, candidate confirmation, and valid single-use HMAC `HUMAN_APPROVAL` action ticket consumption.
+  - `SUBMITTED` status can **only** be achieved through `DatabaseManager.create_submission_confirmation()` / `DashboardService.record_candidate_manual_submission()`, which requires an active unconsumed human approval record, active packet integrity, candidate confirmation, and valid single-use HMAC `MANUAL_SUBMISSION` action ticket consumption.
+- **Generic Transition Prohibition**: Both `DatabaseManager.transition_application_status()` and `DashboardService.transition_application_status()` unconditionally reject transitions to `APPROVED` or `SUBMITTED`, raising `SecurityAuthorizationError`.
+
+### 23.2 Mandatory Reopening Rationale Enforcement & Terminal State Rules
+- **Non-Empty Rationale Mandatory**: Reopening an application from terminal statuses (`REJECTED`, `WITHDRAWN`, `CLOSED`) to `IN_PROGRESS` strictly requires a non-empty, non-whitespace rationale string passed via `reopen_rationale`. Attempts to pass `None`, empty string `""`, whitespace, or bypass via unrelated metadata keys are rejected with `ValidationError`.
+- **Immutable Reopening Audit Event**: Emits `APPLICATION_REOPENED` with `previous_status`, `new_status: IN_PROGRESS`, `reopen_rationale`, `actor_type`, and `session_reference` recorded in the append-only event log.
+- **Terminal Progression vs. Reopening**:
+  - `REJECTED -> CLOSED` and `WITHDRAWN -> CLOSED` are valid terminal progressions (administrative archiving/closure of a finalized cycle) and do not require reopening rationale.
+  - Arbitrary transitions out of terminal states (e.g. `CLOSED -> REJECTED`, `CLOSED -> WITHDRAWN`, `REJECTED -> ASSESSMENT`) are strictly prohibited by the transition matrix.
+
+### 23.3 External URL Safety Validation & Query Parameter Redaction
+- **SSRF Defense via `URLSafetyValidator`**: Validates URLs upon application creation (`job_url`) and external URL opening (`log_external_application_url_opened()`), strictly rejecting unsafe schemes (`javascript:`, `file:`, `ftp:`), loopback/private addresses (`localhost`, `127.0.0.1`, `10.0.0.0/8`, `169.254.169.254`), embedded credentials (`user:pass@host`), and malformed URLs.
+- **Audit Privacy & Sensitive Query Redaction**: `DashboardService._redact_sensitive_url()` redacts tokens, secrets, passwords, api keys, auth codes, and session identifiers (`REDACTED`) before persisting URLs into `EXTERNAL_APPLICATION_URL_OPENED` event payloads.
+- **Status Invariance**: External link access and logging strictly preserves current application status without mutating it to `SUBMITTED`.
+
+### 23.4 SQLite Immediate Write-Lock & Concurrency Hardening
+- **`immediate_transaction()`**: Acquires SQLite's RESERVED write lock via `BEGIN IMMEDIATE` at the start of the transaction, prior to any SELECT or state inspection, eliminating concurrent read-before-write race conditions.
+- **Atomic Rollback & Optimistic Concurrency**: Stale expected status checks (`expected_current_status`) and conditional `UPDATE` rowcount verification prevent race conditions, rolling back status mutation and event logging atomically on failure.
+
+### 23.5 Protection of Reserved Audit Payload Fields
+- **Reserved Field Allowlist**: Protects reserved audit fields (`previous_status`, `new_status`, `application_id`, `user_id`, `actor_type`, `session_reference`, `reopen_rationale`, `created_at`, `sequence_no`, `event_hash`, `prev_event_hash`, `event_type`) against caller tampering.
+- **Validation**: Any attempt to pass reserved keys in `transition_metadata` raises `ValidationError`, guaranteeing that event payloads never contradict canonical database columns.
+
+### 23.6 Action Ticket In-Memory Lifetime Limitation
+- **Architectural Scope**: Action ticket nonces and rotation keys are maintained in-memory by `SessionManager`. Replay protection operates across the active process lifetime. Process restarts or distributed worker deployments require ticket re-issuance.

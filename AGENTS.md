@@ -234,6 +234,15 @@ When interacting with the browser via Playwright MCP:
     - Strict zero-automation boundary: zero browser automation or submission scripting in lifecycle modules; candidate retains complete control over external submissions.
   - Verified with 50 new automated tests across 3 new test suites (`test_application_state_machine.py` [11 tests], `test_application_lifecycle_service.py` [21 tests], `test_phase_7_2_submission_security.py` [18 tests]), totaling 594 passing tests across the entire repository (100% pass rate). 0 pyflakes errors, 0 ruff errors, and clean git diff.
 
+- [x] **Architecture v2.1.1 Phase 7.2.1: State Transition Authorization & Lifecycle Security Hardening** (Complete)
+  - Removal of boolean gate bypass: eliminated caller-supplied booleans (`is_gate_authorized=True`) as proof of authorization; generic database and service layer transitions to `APPROVED` and `SUBMITTED` unconditionally raise `SecurityAuthorizationError`; `APPROVED` transitions strictly routed through `HumanApprovalGate.authorize_universal_packet()`; `SUBMITTED` transitions strictly routed through manual submission confirmation with active unconsumed human approvals and action tickets.
+  - Mandatory reopening rationale enforcement: transition from terminal states (`REJECTED`, `WITHDRAWN`, `CLOSED`) to `IN_PROGRESS` strictly requires a non-empty, non-whitespace rationale string passed via `reopen_rationale`; attempts to supply empty strings or bypass via metadata keys raise `ValidationError`; emits `APPLICATION_REOPENED` event with rationale and actor provenance.
+  - Terminal transition matrix reconciliation: `REJECTED -> CLOSED` and `WITHDRAWN -> CLOSED` documented and validated as administrative finalization progressions without requiring reopening rationale; arbitrary non-reopening exits from terminal states rejected.
+  - External URL safety & audit redaction: integrated `URLSafetyValidator` in `create_candidate_application()` and `log_external_application_url_opened()`, blocking SSRF, unsafe schemes (`javascript:`, `file:`), loopback/private IPs, and embedded credentials; `_redact_sensitive_url()` redacts tokens, secrets, API keys, passwords, and auth codes in timeline event payloads; status strictly preserved.
+  - SQLite immediate write-lock & concurrency hardening: added `DatabaseManager.immediate_transaction()` acquiring SQLite's RESERVED write lock via `BEGIN IMMEDIATE` before reading application state, preventing concurrent write collisions; failure triggers complete atomic rollback.
+  - Reserved audit payload protection: protected reserved fields (`previous_status`, `new_status`, `application_id`, `user_id`, `actor_type`, `session_reference`, `reopen_rationale`, `created_at`, `sequence_no`, `event_hash`, etc.) against caller override, raising `ValidationError` on conflict.
+  - Verified with 19 new comprehensive automated hardening tests in `test_phase_7_2_1_security_hardening.py` (613 total project suite tests passing, 100%), 0 pyflakes errors, 0 ruff errors, and clean git diff.
+
 ---
 
 ## 7. Approval Requirement

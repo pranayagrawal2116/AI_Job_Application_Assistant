@@ -512,9 +512,13 @@ class HumanApprovalGate:
                 session_id=session_id,
                 packet_id=packet.id,
             )
-            # Advance application status to Awaiting Approval
+            # Advance application status to Awaiting Approval and append PACKET_HUMAN_APPROVED event
             with self.db.transaction() as conn:
                 cursor = conn.cursor()
+                cursor.execute("SELECT status FROM applications WHERE id = ?", (application_id,))
+                prev_row = cursor.fetchone()
+                prev_status = prev_row["status"] if prev_row else "READY_FOR_REVIEW"
+
                 cursor.execute(
                     """
                     UPDATE applications
@@ -522,6 +526,23 @@ class HumanApprovalGate:
                     WHERE id = ? AND user_id = ?
                     """,
                     (ApplicationStatus.AWAITING_APPROVAL.value, application_id, user_id),
+                )
+                self.db._insert_application_event_internal(
+                    cursor=cursor,
+                    application_id=application_id,
+                    user_id=user_id,
+                    event_type="PACKET_HUMAN_APPROVED",
+                    new_status=ApplicationStatus.AWAITING_APPROVAL.value,
+                    previous_status=prev_status,
+                    actor_type="CANDIDATE",
+                    actor_identifier=cleaned_approver,
+                    session_reference=session_id,
+                    event_payload={
+                        "approver": cleaned_approver,
+                        "packet_id": packet.id,
+                        "packet_version_hash": packet.packet_version_hash,
+                        "ticket_nonce": nonce,
+                    },
                 )
         except Exception as exc:
             logger.error("Error creating application approval: %s", exc, exc_info=True)
