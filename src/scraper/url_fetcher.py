@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import json
 import re
 import socket
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 import urllib.parse
 
 from bs4 import BeautifulSoup
@@ -216,11 +216,15 @@ class URLJobFetcher:
         read_timeout: float = DEFAULT_READ_TIMEOUT,
         max_redirects: int = MAX_JOB_URL_REDIRECTS,
         max_bytes: int = MAX_RESPONSE_BYTES,
+        resolver: Optional[Callable[[str, int], List[str]]] = None,
+        ca_bundle: Optional[str] = None,
     ):
         self.connect_timeout = connect_timeout
         self.read_timeout = read_timeout
         self.max_redirects = max_redirects
         self.max_bytes = max_bytes
+        self.resolver = resolver
+        self.ca_bundle = ca_bundle
 
     def fetch_job_url(self, target_url: str) -> FetchedJobContent:
         """Safely fetches a job listing URL with complete SSRF defense, connection pinning, and anti-bot handling.
@@ -238,7 +242,10 @@ class URLJobFetcher:
             InvalidFileFormatError: If response is a binary/unsupported media type.
         """
         # 1. Pre-validate and resolve initial target URL to pinned IP
-        current_url, hostname, port, pinned_ip = URLSafetyValidator.validate_and_resolve_destination(target_url)
+        current_url, hostname, port, pinned_ip = URLSafetyValidator.validate_and_resolve_destination(
+            target_url,
+            resolver=self.resolver,
+        )
 
         headers = {
             "User-Agent": USER_AGENT,
@@ -252,6 +259,8 @@ class URLJobFetcher:
         with requests.Session() as session:
             # Guarantee no ambient proxy interference (prevent proxy bypass of SSRF validation)
             session.trust_env = False
+            if self.ca_bundle:
+                session.verify = self.ca_bundle
 
             while redirect_count <= self.max_redirects:
                 # Mount pinned adapter for the validated IP
@@ -268,6 +277,12 @@ class URLJobFetcher:
                         stream=True,
                     )
                 except requests.RequestException as exc:
+                    # Unwrap UnsafeURLError if caused by peer IP validation or SSRF defense
+                    cause: Optional[BaseException] = exc
+                    while cause:
+                        if isinstance(cause, UnsafeURLError):
+                            raise cause
+                        cause = getattr(cause, "__cause__", None) or getattr(cause, "__context__", None)
                     logger.warning(f"Network error fetching '{current_url}': {exc}")
                     raise URLFetchRestrictedError(
                         f"Unable to reach job URL ({exc}). Please verify the link or paste the text directly.",
@@ -278,6 +293,10 @@ class URLJobFetcher:
                 # Check for redirect status codes
                 if resp.status_code in (301, 302, 303, 307, 308):
                     resp.close()  # Immediately close redirect response
+                    # Close previous adapters to avoid reusing connection pools pinned to previous IP
+                    for old_adapter in list(session.adapters.values()):
+                        old_adapter.close()
+
                     redirect_count += 1
                     if redirect_count > self.max_redirects:
                         raise UnsafeURLError(f"Too many redirects (exceeded limit of {self.max_redirects}).")
@@ -289,86 +308,90 @@ class URLJobFetcher:
                     resolved_url = urllib.parse.urljoin(current_url, location)
                     logger.info(f"Validating redirect #{redirect_count} from '{current_url}' to '{resolved_url}'")
                     # Validate redirect target and resolve new pinned IP
-                    current_url, hostname, port, pinned_ip = URLSafetyValidator.validate_and_resolve_destination(resolved_url)
+                    current_url, hostname, port, pinned_ip = URLSafetyValidator.validate_and_resolve_destination(
+                        resolved_url,
+                        resolver=self.resolver,
+                    )
                     continue
 
                 final_response = resp
                 break
 
-        if final_response is None:
-            raise UnsafeURLError("Failed to establish safe HTTP connection.")
+            if final_response is None:
+                raise UnsafeURLError("Failed to establish safe HTTP connection.")
 
-        try:
-            # 2. Check HTTP status code for anti-bot / permissions
-            status_code = final_response.status_code
-            if status_code in (401, 403, 429):
-                reason = {
-                    401: "Authentication Required",
-                    403: "Access Forbidden / Bot Protection Active",
-                    429: "Rate Limit Exceeded",
-                }.get(status_code, "Access Restricted")
-
-                logger.warning(f"Access restricted (HTTP {status_code}) on '{current_url}': {reason}")
-                raise URLFetchRestrictedError(
-                    f"Automated access was restricted by the host (HTTP {status_code}: {reason}). "
-                    "Please inspect the job listing in your browser and paste the job description text directly.",
-                    official_url=current_url,
-                    restriction_type=f"HTTP_{status_code}",
-                )
-            elif status_code >= 400:
-                raise URLFetchRestrictedError(
-                    f"Job posting page returned HTTP error {status_code}. "
-                    "Please verify the URL or paste the job description text manually.",
-                    official_url=current_url,
-                    restriction_type=f"HTTP_{status_code}",
-                )
-
-            # 3. Validate Content-Type
-            content_type_header = final_response.headers.get("Content-Type", "").lower()
-            if not any(allowed in content_type_header for allowed in ALLOWED_CONTENT_TYPES):
-                logger.warning(f"Unsupported content type '{content_type_header}' from '{current_url}'")
-                raise InvalidFileFormatError(
-                    f"URL returned unsupported content type '{content_type_header}'. "
-                    "Expected HTML, plain text, or JSON."
-                )
-
-            # 4. Stream response body enforcing max size limit
-            chunks: List[bytes] = []
-            downloaded_bytes = 0
-
-            for chunk in final_response.iter_content(chunk_size=8192):
-                if chunk:
-                    chunks.append(chunk)
-                    downloaded_bytes += len(chunk)
-                    if downloaded_bytes > self.max_bytes:
-                        raise FileTooLargeError(
-                            f"Job page content exceeds maximum allowed download limit of {self.max_bytes // (1024 * 1024)} MB."
-                        )
-
-            raw_bytes = b"".join(chunks)
-
-            # Determine encoding
-            encoding = final_response.encoding or "utf-8"
             try:
-                body_text = raw_bytes.decode(encoding, errors="replace")
-            except Exception:
-                body_text = raw_bytes.decode("utf-8", errors="replace")
+                # 2. Check HTTP status code for anti-bot / permissions
+                status_code = final_response.status_code
+                if status_code in (401, 403, 429):
+                    reason = {
+                        401: "Authentication Required",
+                        403: "Access Forbidden / Bot Protection Active",
+                        429: "Rate Limit Exceeded",
+                    }.get(status_code, "Access Restricted")
 
-            # 5. Check response content for anti-bot signatures and login walls
-            for pattern, label in RESTRICTION_SIGNATURES:
-                if pattern.search(body_text):
-                    logger.warning(f"Anti-bot restriction detected on '{current_url}': {label}")
+                    logger.warning(f"Access restricted (HTTP {status_code}) on '{current_url}': {reason}")
                     raise URLFetchRestrictedError(
-                        f"Job page triggered automated protection ({label}). "
-                        "Please open the URL in your browser and paste the job description text directly.",
+                        f"Automated access was restricted by the host (HTTP {status_code}: {reason}). "
+                        "Please inspect the job listing in your browser and paste the job description text directly.",
                         official_url=current_url,
-                        restriction_type=label,
+                        restriction_type=f"HTTP_{status_code}",
+                    )
+                elif status_code >= 400:
+                    raise URLFetchRestrictedError(
+                        f"Job posting page returned HTTP error {status_code}. "
+                        "Please verify the URL or paste the job description text manually.",
+                        official_url=current_url,
+                        restriction_type=f"HTTP_{status_code}",
                     )
 
-            # 6. Parse structured metadata and extract visible job text
-            return self._extract_job_content(current_url, body_text, content_type_header, status_code)
-        finally:
-            final_response.close()
+                # 3. Validate Content-Type
+                content_type_header = final_response.headers.get("Content-Type", "").lower()
+                if not any(allowed in content_type_header for allowed in ALLOWED_CONTENT_TYPES):
+                    logger.warning(f"Unsupported content type '{content_type_header}' from '{current_url}'")
+                    raise InvalidFileFormatError(
+                        f"URL returned unsupported content type '{content_type_header}'. "
+                        "Expected HTML, plain text, or JSON."
+                    )
+
+                # 4. Stream response body enforcing max size limit
+                chunks: List[bytes] = []
+                downloaded_bytes = 0
+
+                for chunk in final_response.iter_content(chunk_size=8192):
+                    if chunk:
+                        chunks.append(chunk)
+                        downloaded_bytes += len(chunk)
+                        if downloaded_bytes > self.max_bytes:
+                            raise FileTooLargeError(
+                                f"Job page content exceeds maximum allowed download limit of {self.max_bytes // (1024 * 1024)} MB."
+                            )
+
+                raw_bytes = b"".join(chunks)
+
+                # Determine encoding
+                encoding = final_response.encoding or "utf-8"
+                try:
+                    body_text = raw_bytes.decode(encoding, errors="replace")
+                except Exception:
+                    body_text = raw_bytes.decode("utf-8", errors="replace")
+
+                # 5. Check response content for anti-bot signatures and login walls
+                for pattern, label in RESTRICTION_SIGNATURES:
+                    if pattern.search(body_text):
+                        logger.warning(f"Anti-bot restriction detected on '{current_url}': {label}")
+                        raise URLFetchRestrictedError(
+                            f"Job page triggered automated protection ({label}). "
+                            "Please open the URL in your browser and paste the job description text directly.",
+                            official_url=current_url,
+                            restriction_type=label,
+                        )
+
+                # 6. Parse structured metadata and extract visible job text
+                return self._extract_job_content(current_url, body_text, content_type_header, status_code)
+            finally:
+                final_response.close()
+                session.close()
 
     def _extract_job_content(
         self,

@@ -5,10 +5,11 @@ routable destinations and prevent Server-Side Request Forgery (SSRF),
 DNS rebinding, internal service discovery, and protocol abuse.
 """
 
+from contextlib import contextmanager
 import ipaddress
 import re
 import socket
-from typing import List
+from typing import Callable, Generator, List, Optional, Set
 import urllib.parse
 
 from src.database.exceptions import UnsafeURLError
@@ -61,9 +62,26 @@ EXTRA_BLOCKED_NETWORKS = [
 class URLSafetyValidator:
     """Validates destination safety against SSRF and private network access."""
 
+    _test_allowed_ips: Set[str] = set()
+
+    @classmethod
+    @contextmanager
+    def allow_test_ip(cls, ip_str: str) -> Generator[None, None, None]:
+        """Context manager to temporarily allow a controlled local test IP during integration tests."""
+        clean = ip_str.strip()
+        cls._test_allowed_ips.add(clean)
+        try:
+            yield
+        finally:
+            cls._test_allowed_ips.discard(clean)
+
     @classmethod
     def is_ip_private_or_restricted(cls, ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
         """Determines whether an IP address is private, loopback, link-local, or restricted."""
+        # Controlled test IP bypass for integration testing
+        if cls._test_allowed_ips and str(ip) in cls._test_allowed_ips:
+            return False
+
         # Check global routability first
         if not ip.is_global:
             return True
@@ -102,18 +120,46 @@ class URLSafetyValidator:
         """
         if not ip_str or not isinstance(ip_str, str):
             return True
+        clean = ip_str.strip()
+        if cls._test_allowed_ips and clean in cls._test_allowed_ips:
+            return False
         try:
-            ip_obj = ipaddress.ip_address(ip_str.strip())
+            ip_obj = ipaddress.ip_address(clean)
             return cls.is_ip_private_or_restricted(ip_obj)
         except ValueError:
             return True
 
     @classmethod
-    def resolve_and_validate_hostname(cls, hostname: str, port: int = 80) -> List[str]:
+    def resolve_and_validate_hostname(
+        cls,
+        hostname: str,
+        port: int = 80,
+        resolver: Optional[Callable[[str, int], List[str]]] = None,
+    ) -> List[str]:
         """Resolves hostname via DNS and asserts that all returned IP addresses are public.
         
         Prevents DNS rebinding and private IP resolution.
         """
+        if resolver is not None:
+            resolved_raw = resolver(hostname, port)
+            if not resolved_raw:
+                raise UnsafeURLError(f"DNS resolution returned no records for domain '{hostname}'.")
+            resolved_ips: List[str] = []
+            for ip_entry in resolved_raw:
+                ip_str = str(ip_entry).strip()
+                try:
+                    ip_obj = ipaddress.ip_address(ip_str)
+                except ValueError:
+                    raise UnsafeURLError(f"Invalid resolved IP address: {ip_str}")
+
+                if cls.is_ip_private_or_restricted(ip_obj):
+                    raise UnsafeURLError(
+                        f"Access denied: Domain '{hostname}' resolves to private/restricted IP '{ip_str}'."
+                    )
+                if ip_str not in resolved_ips:
+                    resolved_ips.append(ip_str)
+            return resolved_ips
+
         try:
             # socket.getaddrinfo returns list of (family, type, proto, canonname, sockaddr)
             addr_info = socket.getaddrinfo(hostname, port, proto=socket.IPPROTO_TCP)
@@ -123,7 +169,7 @@ class URLSafetyValidator:
         if not addr_info:
             raise UnsafeURLError(f"DNS resolution returned no records for domain '{hostname}'.")
 
-        resolved_ips: List[str] = []
+        resolved_ips = []
         for entry in addr_info:
             sockaddr = entry[4]
             ip_str = str(sockaddr[0])
@@ -142,7 +188,11 @@ class URLSafetyValidator:
         return resolved_ips
 
     @classmethod
-    def validate_and_resolve_destination(cls, url: str) -> tuple[str, str, int, str]:
+    def validate_and_resolve_destination(
+        cls,
+        url: str,
+        resolver: Optional[Callable[[str, int], List[str]]] = None,
+    ) -> tuple[str, str, int, str]:
         """Validates a user-supplied URL and pre-resolves it to a validated public IP.
 
         Enforces SSRF boundary checks, port restrictions, hostname validation, and
@@ -154,7 +204,7 @@ class URLSafetyValidator:
         Raises:
             UnsafeURLError: If the URL or any resolved IP violates security constraints.
         """
-        clean_url = cls.validate_url(url)
+        clean_url = cls.validate_url(url, resolver=resolver, skip_dns=True)
         parsed = urllib.parse.urlparse(clean_url)
         hostname = parsed.hostname
         if not hostname:
@@ -173,7 +223,7 @@ class URLSafetyValidator:
             pinned_ip = str(ip_obj)
         except ValueError:
             # Domain name: resolve via DNS and select first validated public IP
-            resolved_ips = cls.resolve_and_validate_hostname(hostname_lower, port)
+            resolved_ips = cls.resolve_and_validate_hostname(hostname_lower, port, resolver=resolver)
             if not resolved_ips:
                 raise UnsafeURLError(f"DNS resolution returned no valid public IP records for '{hostname}'.")
             pinned_ip = resolved_ips[0]
@@ -181,7 +231,12 @@ class URLSafetyValidator:
         return clean_url, hostname_lower, port, pinned_ip
 
     @classmethod
-    def validate_url(cls, url: str) -> str:
+    def validate_url(
+        cls,
+        url: str,
+        resolver: Optional[Callable[[str, int], List[str]]] = None,
+        skip_dns: bool = False,
+    ) -> str:
         """Validates a user-supplied URL for scheme, format, destination safety, and SSRF defense.
         
         Returns:
@@ -243,12 +298,16 @@ class URLSafetyValidator:
 
         # 4. Port Check
         port = parsed.port
-        if port is not None and port not in (80, 443, 8080, 8443):
-            # Restrict to standard web ports
+        if port is not None and port not in (80, 443, 8080, 8443) and not cls._test_allowed_ips:
+            # Restrict to standard web ports (unless in integration test mode)
             raise UnsafeURLError(f"Non-standard web port '{port}' is prohibited.")
 
         # 5. DNS Resolution & Rebinding Check for domain names
-        if not is_literal_ip:
-            cls.resolve_and_validate_hostname(hostname_lower, port or (443 if parsed.scheme == "https" else 80))
+        if not is_literal_ip and not skip_dns:
+            cls.resolve_and_validate_hostname(
+                hostname_lower,
+                port or (443 if parsed.scheme == "https" else 80),
+                resolver=resolver,
+            )
 
         return clean_url
