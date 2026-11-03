@@ -610,6 +610,8 @@ def render_application_preparer():
                     job_description_id=selected_jd.id if selected_jd else None,
                     matching_engine_version="2.1.1",
                     scoring_configuration_version="1.0.0",
+                    scoring_profile="general",
+                    generated_docs=docs,
                 )
                 st.session_state["prepared_packet"] = pkt
                 st.success(f"Immutable Packet #{pkt.id} (Version {pkt.version_num}) recorded in SQLite!")
@@ -661,7 +663,7 @@ def render_application_preparer():
                     # Resolve active authenticated session from login state (never create sessions during approval)
                     auth_session_id = st.session_state.get("authenticated_session_id") or st.session_state.get("session_id")
                     if not auth_session_id:
-                        st.error("🔒 **Authentication Required**: No active authenticated session found. Please sign in to authorize this application.")
+                        st.error("Your login session is missing or expired. Please sign in again before approving this packet.")
                     else:
                         sess = None
                         try:
@@ -669,8 +671,8 @@ def render_application_preparer():
                                 user_id=user_id,
                                 session_id=auth_session_id,
                             )
-                        except Exception as auth_err:
-                            st.error(f"🔒 **Authentication Failed**: {auth_err}. Please sign in again.")
+                        except Exception:
+                            st.error("Your login session is missing or expired. Please sign in again before approving this packet.")
 
                         if sess:
                             action_ticket = service.issue_approval_ticket(

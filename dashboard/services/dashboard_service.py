@@ -616,7 +616,11 @@ class DashboardService:
         action_ticket: Optional[str] = None,
         user_id: Optional[int] = None,
     ) -> Tuple[bool, str]:
-        """Authorizes an application packet through the strict HumanApprovalGate."""
+        """Legacy compatibility method for Phase 6 single-job review tests.
+
+        NOTE: Not reachable from authenticated application preparation or universal packet approval.
+        Universal workflows strictly use authorize_universal_application_packet().
+        """
         from src.preparer.approval_gate import HumanApprovalGate
         from src.preparer.resume_parser import ResumeParser
 
@@ -709,7 +713,10 @@ class DashboardService:
         submission_ticket: Optional[str] = None,
         packet_version_hash: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        """Confirms candidate's manual application submission with authenticated session and ticket."""
+        """Legacy compatibility method for Phase 6 single-job manual submission confirmation.
+
+        NOTE: Not reachable from authenticated universal application preparation or packet approval.
+        """
         from src.preparer.approval_gate import HumanApprovalGate
         gate = HumanApprovalGate(db_manager=self.db)
 
@@ -1171,6 +1178,13 @@ class DashboardService:
         job_description_id: Optional[int] = None,
         matching_engine_version: Optional[str] = None,
         scoring_configuration_version: Optional[str] = None,
+        scoring_profile: Optional[str] = None,
+        scoring_config_version: Optional[str] = None,
+        generated_docs: Optional[Dict[str, Any]] = None,
+        tailored_resume_pdf_doc: Optional[Any] = None,
+        tailored_resume_docx_doc: Optional[Any] = None,
+        cover_letter_pdf_doc: Optional[Any] = None,
+        cover_letter_docx_doc: Optional[Any] = None,
         generation_timestamp: Optional[str] = None,
     ):
         """Assembles and stores immutable PreparedPacket revision in SQLite."""
@@ -1197,7 +1211,29 @@ class DashboardService:
             job_description_id=job_description_id,
             matching_engine_version=matching_engine_version,
             scoring_configuration_version=scoring_configuration_version,
+            scoring_profile=scoring_profile,
+            scoring_config_version=scoring_config_version,
+            generated_docs=generated_docs,
+            tailored_resume_pdf_doc=tailored_resume_pdf_doc,
+            tailored_resume_docx_doc=tailored_resume_docx_doc,
+            cover_letter_pdf_doc=cover_letter_pdf_doc,
+            cover_letter_docx_doc=cover_letter_docx_doc,
             generation_timestamp=generation_timestamp,
+        )
+
+    def verify_prepared_packet_integrity(
+        self,
+        packet_id: int,
+        user_id: int,
+        expected_application_id: Optional[int] = None,
+    ) -> Tuple[bool, str, Optional[Any]]:
+        """Independently verifies prepared packet integrity and active revision status before approval."""
+        from src.preparer.approval_gate import HumanApprovalGate
+        gate = HumanApprovalGate(db_manager=self.db)
+        return gate.verify_prepared_packet_integrity(
+            packet_id=packet_id,
+            user_id=user_id,
+            expected_application_id=expected_application_id,
         )
 
     def authorize_universal_application_packet(

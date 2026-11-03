@@ -116,14 +116,16 @@ Phase 6 introduces 6 new automated test suites (31 new tests), bringing the tota
 | `tests/test_document_generation.py` | 6 | PDF and DOCX generation, 7 templates, and structural validation |
 | `tests/test_application_packet_integrity.py` | 5 | Packet versioning, RFC 8785 canonical hashing, ticket replay protection |
 | `tests/test_phase6_1_hardening.py` | 37 | Multi-user security, session ownership, truthful evidence, packet provenance |
+| `tests/test_phase6_1_1_hardening.py` | 20 | Authenticated session binding & packet hash completeness |
+| `tests/test_phase6_1_2_hardening.py` | 24 | Approval session enforcement & independent canonical packet integrity |
 | **Existing Phase 1–5.1.1 Suites** | 336 | Regression tests for all previous deliverables |
-| **Total Test Suite** | **424** | **100% Passing** |
+| **Total Test Suite** | **448** | **100% Passing** |
 
 ---
 
 ## 4. Stopping Protocol Compliance
 
-Phase 6, 6.1, and 6.1.1 implement complete application preparation, document generation, and provenance hardening. In strict accordance with `AGENTS.md` and Phase 6 specifications:
+Phase 6, 6.1, 6.1.1, and 6.1.2 implement complete application preparation, document generation, and provenance hardening. In strict accordance with `AGENTS.md` and Phase 6 specifications:
 - No automatic submission actions are executed.
 - No Playwright browser automation or external employer portal interactions are invoked.
 - Application status stops cleanly at `Awaiting Approval` under strict human governance.
@@ -195,3 +197,37 @@ Phase 6.1.1 completed final hardening for authenticated approval sessions and ca
    - `prepared_packets` foreign key migrated to `FOREIGN KEY (original_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT`.
    - `delete_user_resume`: If a resume is referenced by historical prepared packets or match results, it is safely archived (`is_active = 0, is_primary = 0`), preserving historical packet versions, original file hashes, and disk files intact.
    - Explicit user account privacy erasure (`delete_user_account_data`) deletes prepared packets prior to users table cascade, cleanly distinguishing normal resume archival from user account deletion.
+
+---
+
+## 7. Phase 6.1.2 Approval Session Enforcement & Complete Canonical Packet Integrity
+
+Phase 6.1.2 addressed remaining defects in application approval session enforcement and complete canonical snapshot integrity:
+
+1. **Elimination of Session Creation from Approval Workflow**:
+   - The application approval form in Streamlit (`application_preparer.py`) strictly retrieves the authenticated login session established during Phase 2 authentication (`st.session_state["authenticated_session_id"]` or `st.session_state["session_id"]`).
+   - If the login session is missing, invalid, or expired, the UI displays:
+     `"Your login session is missing or expired. Please sign in again before approving this packet."`
+   - Neither `authenticate_candidate()` nor `create_user_session()` is invoked from the approval workflow.
+   - All approval attempts strictly depend on `DashboardService.get_authenticated_candidate_session(user_id, session_id)`, which validates active, unexpired session existence without ever creating a session.
+
+2. **Complete Immutable Canonical Snapshot Payload**:
+   - The RFC 8785 canonical JSON payload assembled before hashing covers all persisted source provenance and generated artifact fields:
+     - **Identity & Versions**: `user_id`, `application_id`, `packet_version`, `original_resume_id`, `original_resume_version_num`, `original_resume_file_hash`, `candidate_profile_version`, `candidate_profile_hash`, `job_description_id`, `job_description_snapshot_hash`, `matching_result_id`, `matching_engine_version`, `scoring_profile`, `scoring_config_version`. Optional source metadata is explicitly represented as `null` when unavailable.
+     - **Generated Content**: Complete tailored resume data, claim provenance map, `tailored_resume_pdf_hash`, `tailored_resume_docx_hash`, complete cover letter text, provenance claims, `cover_letter_pdf_hash`, `cover_letter_docx_hash`, screening questions with states, review states, edits, claim provenance, and character limit indicators.
+     - **Actual Attachment Manifest**: Artifact types, stored filenames, document formats, file sizes in bytes, SHA-256 content hashes, source versions, and timestamps.
+     - **Rendering Metadata**: `template_id`, `template_version`, `document_generation_engine`, `generation_timestamp`.
+   - Invariant strictly maintained:
+     `SHA256(canonical_snapshot_json.encode("utf-8")) == packet_version_hash`.
+
+3. **Independent Integrity Verification Before Ticket Consumption**:
+   - Implemented `verify_prepared_packet_integrity(packet_id, user_id, expected_application_id)` on `HumanApprovalGate` and `DashboardService`.
+   - The verifier retrieves the packet by authenticated `user_id`, recalculates SHA-256 directly from the UTF-8 bytes of `canonical_snapshot_json`, compares with `packet_version_hash`, checks active revision status, and validates user and application binding.
+   - `HumanApprovalGate.authorize_universal_packet` executes this verification immediately prior to consuming the single-use HMAC action ticket; any hash mismatch or tampering fails closed.
+
+4. **Legacy Packet Handling**:
+   - Existing historical packets created prior to complete snapshot persistence are marked as `is_legacy = True` (`canonical_snapshot_json is None`).
+   - The system preserves legacy historical records without inventing fabricated metadata or recalculating partial hashes. Newly initiated approvals require assembling a complete verified packet.
+
+5. **Legacy Compatibility Methods Isolated**:
+   - Legacy single-job methods `authorize_application_packet` and `confirm_manual_submission` remain solely for backwards compatibility with earlier Phase 6 test suites and are explicitly documented as unreachable from authenticated universal application preparation or packet approval workflows.

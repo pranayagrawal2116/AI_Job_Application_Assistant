@@ -267,6 +267,7 @@ CREATE TABLE IF NOT EXISTS prepared_packets (
     matching_result_id INTEGER,
     matching_engine_version TEXT,
     scoring_configuration_version TEXT,
+    scoring_profile TEXT,
     original_resume_version_num INTEGER,
     job_description_id INTEGER,
     template_id TEXT,

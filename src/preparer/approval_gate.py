@@ -97,6 +97,13 @@ class HumanApprovalGate:
         job_description_id: Optional[int] = None,
         matching_engine_version: Optional[str] = None,
         scoring_configuration_version: Optional[str] = None,
+        scoring_profile: Optional[str] = None,
+        scoring_config_version: Optional[str] = None,
+        generated_docs: Optional[Dict[str, Any]] = None,
+        tailored_resume_pdf_doc: Optional[GeneratedDocument] = None,
+        tailored_resume_docx_doc: Optional[GeneratedDocument] = None,
+        cover_letter_pdf_doc: Optional[GeneratedDocument] = None,
+        cover_letter_docx_doc: Optional[GeneratedDocument] = None,
         generation_timestamp: Optional[str] = None,
     ) -> PreparedPacket:
         """Assembles and stores an immutable PreparedPacket revision in SQLite."""
@@ -133,15 +140,60 @@ class HumanApprovalGate:
                         candidate_profile_hash = p_row["profile_hash"]
 
         matching_eng_ver = matching_engine_version or ("2.1.1" if matching_result_id is not None else None)
-        scoring_cfg_ver = scoring_configuration_version or ("1.0.0" if matching_result_id is not None else None)
+        scoring_cfg_ver = scoring_config_version or scoring_configuration_version or ("1.0.0" if matching_result_id is not None else None)
+        scoring_prof = scoring_profile or ("general" if matching_result_id is not None else None)
         tmpl_id = template_id or "modern"
         tmpl_ver = template_version or "1.0.0"
         gen_time = generation_timestamp or getattr(tailored_resume, "created_at", None) or datetime.now(timezone.utc).isoformat()
 
-        tailored_path = tailored_resume_doc.file_path if tailored_resume_doc else None
-        tailored_hash = tailored_resume_doc.file_hash if tailored_resume_doc else None
-        cover_path = cover_letter_doc.file_path if cover_letter_doc else cover_letter.file_path
-        cover_hash = cover_letter_doc.file_hash if cover_letter_doc else None
+        # Resolve document hashes for PDF and DOCX
+        res_pdf_hash: Optional[str] = None
+        res_docx_hash: Optional[str] = None
+        cl_pdf_hash: Optional[str] = None
+        cl_docx_hash: Optional[str] = None
+
+        if tailored_resume_pdf_doc:
+            res_pdf_hash = tailored_resume_pdf_doc.file_hash
+        if tailored_resume_docx_doc:
+            res_docx_hash = tailored_resume_docx_doc.file_hash
+        if tailored_resume_doc:
+            fmt = getattr(tailored_resume_doc, "file_format", "").lower()
+            if fmt == "pdf" and not res_pdf_hash:
+                res_pdf_hash = tailored_resume_doc.file_hash
+            elif fmt == "docx" and not res_docx_hash:
+                res_docx_hash = tailored_resume_doc.file_hash
+
+        if cover_letter_pdf_doc:
+            cl_pdf_hash = cover_letter_pdf_doc.file_hash
+        if cover_letter_docx_doc:
+            cl_docx_hash = cover_letter_docx_doc.file_hash
+        if cover_letter_doc:
+            fmt = getattr(cover_letter_doc, "file_format", "").lower()
+            if fmt == "pdf" and not cl_pdf_hash:
+                cl_pdf_hash = cover_letter_doc.file_hash
+            elif fmt == "docx" and not cl_docx_hash:
+                cl_docx_hash = cover_letter_doc.file_hash
+
+        if generated_docs:
+            if "resume_pdf" in generated_docs and generated_docs["resume_pdf"]:
+                res_pdf_hash = getattr(generated_docs["resume_pdf"], "file_hash", res_pdf_hash)
+            if "resume_docx" in generated_docs and generated_docs["resume_docx"]:
+                res_docx_hash = getattr(generated_docs["resume_docx"], "file_hash", res_docx_hash)
+            if "cover_letter_pdf" in generated_docs and generated_docs["cover_letter_pdf"]:
+                cl_pdf_hash = getattr(generated_docs["cover_letter_pdf"], "file_hash", cl_pdf_hash)
+            if "cover_letter_docx" in generated_docs and generated_docs["cover_letter_docx"]:
+                cl_docx_hash = getattr(generated_docs["cover_letter_docx"], "file_hash", cl_docx_hash)
+
+        tailored_path = (
+            (tailored_resume_pdf_doc.file_path if tailored_resume_pdf_doc else None)
+            or (tailored_resume_doc.file_path if tailored_resume_doc else None)
+        )
+        tailored_hash = res_pdf_hash or res_docx_hash or (tailored_resume_doc.file_hash if tailored_resume_doc else None)
+        cover_path = (
+            (cover_letter_pdf_doc.file_path if cover_letter_pdf_doc else None)
+            or (cover_letter_doc.file_path if cover_letter_doc else cover_letter.file_path)
+        )
+        cover_hash = cl_pdf_hash or cl_docx_hash or (cover_letter_doc.file_hash if cover_letter_doc else None)
 
         # 1. Compute RFC 8785 canonical bytes and hash of all constituent materials
         complete_snapshot_payload = {
@@ -152,13 +204,19 @@ class HumanApprovalGate:
             "original_resume_version_num": original_resume_version_num,
             "original_resume_file_hash": original_resume_hash,
             "candidate_profile_version": candidate_profile_version,
+            "candidate_profile_hash": candidate_profile_hash,
             "candidate_profile_snapshot_hash": candidate_profile_hash,
             "job_description_id": job_description_id,
             "job_description_snapshot_hash": job_description_snapshot_hash,
             "matching_result_id": matching_result_id,
             "matching_engine_version": matching_eng_ver,
+            "scoring_profile": scoring_prof,
+            "scoring_config_version": scoring_cfg_ver,
             "scoring_configuration_version": scoring_cfg_ver,
             "tailored_resume": tailored_resume.to_dict(),
+            "tailored_resume_claims": getattr(tailored_resume, "claim_provenance", {}),
+            "tailored_resume_pdf_hash": res_pdf_hash,
+            "tailored_resume_docx_hash": res_docx_hash,
             "tailored_resume_document_hash": tailored_hash,
             "cover_letter": {
                 "letter_text": cover_letter.letter_text,
@@ -167,6 +225,9 @@ class HumanApprovalGate:
                 "tone": cover_letter.tone,
                 "career_level": cover_letter.career_level,
             },
+            "cover_letter_claims": [c.to_dict() for c in cover_letter.provenance_claims],
+            "cover_letter_pdf_hash": cl_pdf_hash,
+            "cover_letter_docx_hash": cl_docx_hash,
             "cover_letter_document_hash": cover_hash,
             "screening_questions": [q.to_dict() for q in qa_packet.questions],
             "attachments_manifest": attachments_manifest or [],
@@ -200,6 +261,7 @@ class HumanApprovalGate:
             matching_result_id=matching_result_id,
             matching_engine_version=matching_eng_ver,
             scoring_configuration_version=scoring_cfg_ver,
+            scoring_profile=scoring_prof,
             original_resume_version_num=original_resume_version_num,
             job_description_id=job_description_id,
             template_id=tmpl_id,
@@ -234,6 +296,50 @@ class HumanApprovalGate:
             application_id,
         )
         return packet
+
+    def verify_prepared_packet_integrity(
+        self,
+        packet_id: int,
+        user_id: int,
+        expected_application_id: Optional[int] = None,
+    ) -> Tuple[bool, str, Optional[PreparedPacket]]:
+        """Independently verifies the integrity and active revision status of a prepared packet.
+
+        Retrieves the packet using authenticated user_id, re-computes SHA-256 directly from
+        the UTF-8 bytes of stored canonical_snapshot_json, compares against packet_version_hash,
+        confirms active revision status, and validates user and application identity.
+        """
+        try:
+            packet = self.db.get_prepared_packet(packet_id=packet_id, user_id=user_id)
+        except CrossUserAccessError as exc:
+            return False, f"Integrity check failed: {exc}", None
+
+        if not packet:
+            return False, f"Prepared packet #{packet_id} not found.", None
+
+        if packet.user_id != user_id:
+            return False, f"Integrity check failed: Packet belongs to User #{packet.user_id}, not User #{user_id}.", None
+
+        if expected_application_id is not None and packet.application_id != expected_application_id:
+            return False, (
+                f"Integrity check failed: Packet belongs to Application #{packet.application_id}, "
+                f"not expected Application #{expected_application_id}."
+            ), None
+
+        if not packet.is_active_revision:
+            return False, "Integrity check failed: Packet is an outdated historical revision. Please use the active revision.", packet
+
+        if packet.is_legacy or not packet.canonical_snapshot_json:
+            return False, "Integrity check failed: Legacy packet record. Canonical snapshot JSON is unavailable.", packet
+
+        recomputed_hash = hashlib.sha256(packet.canonical_snapshot_json.encode("utf-8")).hexdigest()
+        if recomputed_hash != packet.packet_version_hash:
+            return False, (
+                f"Integrity check failed: Recomputed hash ({recomputed_hash}) does not match "
+                f"stored packet version hash ({packet.packet_version_hash}). Possible tampering detected."
+            ), packet
+
+        return True, "Prepared packet integrity verified successfully.", packet
 
     def verify_packet_integrity(self, packet: PreparedPacket) -> Tuple[bool, str]:
         """Independently verifies that a PreparedPacket's stored canonical snapshot matches its version hash."""
@@ -282,27 +388,13 @@ class HumanApprovalGate:
         if sess.candidate_id and sess.candidate_id not in (str(user_id), f"user_{user_id}") and sess.user_id is None:
             return False, "Approval rejected: Session candidate identity does not match authenticated user.", None
 
-        # 2. Retrieve & Verify Packet Ownership & Active Status
-        try:
-            packet = self.db.get_prepared_packet(packet_id=packet_id, user_id=user_id)
-        except CrossUserAccessError as exc:
-            return False, f"Approval rejected: {exc}", None
-
-        if not packet:
-            return False, f"Prepared packet #{packet_id} not found.", None
-
-        if packet.user_id != user_id:
-            return False, f"Approval rejected: Packet belongs to User #{packet.user_id}, not #{user_id}.", None
-
-        if packet.application_id != application_id:
-            return False, f"Approval rejected: Packet #{packet_id} belongs to Application #{packet.application_id}, not #{application_id}.", None
-
-        if not packet.is_active_revision:
-            return False, "Approval rejected: This packet version is outdated. Please approve the active revision.", None
-
-        # 2.2. Recompute and verify packet integrity from stored canonical snapshot
-        valid_integrity, integrity_msg = self.verify_packet_integrity(packet)
-        if not valid_integrity:
+        # 2. Retrieve & Independently Verify Packet Ownership, Active Status, and Hash Integrity
+        valid_integrity, integrity_msg, packet = self.verify_prepared_packet_integrity(
+            packet_id=packet_id,
+            user_id=user_id,
+            expected_application_id=application_id,
+        )
+        if not valid_integrity or not packet:
             return False, f"Approval rejected: {integrity_msg}", None
 
         # 2.5. Verify Screening Answers Readiness

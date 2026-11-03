@@ -216,6 +216,7 @@ class DatabaseManager:
         add_col_if_missing("prepared_packets", "matching_result_id", "INTEGER")
         add_col_if_missing("prepared_packets", "matching_engine_version", "TEXT")
         add_col_if_missing("prepared_packets", "scoring_configuration_version", "TEXT")
+        add_col_if_missing("prepared_packets", "scoring_profile", "TEXT")
         add_col_if_missing("prepared_packets", "original_resume_version_num", "INTEGER")
         add_col_if_missing("prepared_packets", "job_description_id", "INTEGER")
         add_col_if_missing("prepared_packets", "template_id", "TEXT")
@@ -377,6 +378,7 @@ class DatabaseManager:
                 matching_result_id INTEGER,
                 matching_engine_version TEXT,
                 scoring_configuration_version TEXT,
+                scoring_profile TEXT,
                 original_resume_version_num INTEGER,
                 job_description_id INTEGER,
                 template_id TEXT,
@@ -401,7 +403,7 @@ class DatabaseManager:
             "attachments_manifest_hash", "canonical_snapshot_json",
             "candidate_profile_version", "candidate_profile_hash",
             "matching_result_id", "matching_engine_version",
-            "scoring_configuration_version", "original_resume_version_num",
+            "scoring_configuration_version", "scoring_profile", "original_resume_version_num",
             "job_description_id", "template_id", "template_version",
             "is_active_revision", "created_at",
         ]
@@ -2781,6 +2783,7 @@ class DatabaseManager:
         template_version: Optional[str] = None,
         matching_engine_version: Optional[str] = None,
         scoring_configuration_version: Optional[str] = None,
+        scoring_profile: Optional[str] = None,
         original_resume_version_num: Optional[int] = None,
         job_description_id: Optional[int] = None,
     ) -> PreparedPacket:
@@ -2855,10 +2858,11 @@ class DatabaseManager:
                     canonical_snapshot_json, candidate_profile_version,
                     candidate_profile_hash, matching_result_id,
                     matching_engine_version, scoring_configuration_version,
+                    scoring_profile,
                     original_resume_version_num, job_description_id,
                     template_id, template_version,
                     is_active_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     application_id,
@@ -2883,6 +2887,7 @@ class DatabaseManager:
                     matching_result_id,
                     matching_engine_version,
                     scoring_configuration_version,
+                    scoring_profile,
                     original_resume_version_num,
                     job_description_id,
                     template_id,

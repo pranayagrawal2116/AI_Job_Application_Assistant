@@ -237,6 +237,7 @@ class PreparedPacket:
     matching_result_id: Optional[int] = None
     matching_engine_version: Optional[str] = None
     scoring_configuration_version: Optional[str] = None
+    scoring_profile: Optional[str] = None
     original_resume_version_num: Optional[int] = None
     job_description_id: Optional[int] = None
     template_id: Optional[str] = None
