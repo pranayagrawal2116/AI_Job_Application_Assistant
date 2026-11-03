@@ -216,6 +216,12 @@ When interacting with the browser via Playwright MCP:
   - Phase 7.2 service-layer security contract: Formulated explicit 10-point security contract in architecture documentation governing session-bound user resolution, action tickets, packet integrity, allowlist enforcement, and zero-automation final submission.
   - Verified with 11 new comprehensive automated tests in `test_phase7_1_3_audit_consistency.py` (538 total project suite tests passing, 100%), 0 pyflakes errors, 0 ruff errors, and clean git diff.
 
+- [x] **Architecture v2.1.1 Phase 7.1.3.1: Transaction Failure-Injection Verification & Audit Review** (Complete)
+  - Comprehensive failure-injection test coverage: Added deterministic test coverage for all five critical failure paths during submission confirmation corrections: Point A (canonicalization failure), Point B (event sequence/prev-hash lookup failure), Point C (event hash computation failure), Point D (SQLite trigger event insertion failure), and Point E (transaction commit failure via connection proxy seam).
+  - Common rollback invariant assertions: Every failure point strictly verifies the 9 invariants: original confirmation reference unchanged, original candidate notes unchanged, original submission channel unchanged, original submission timestamp unchanged, no `SUBMISSION_CONFIRMATION_UPDATED` event appended, event sequence numbers remain contiguous, `verify_application_event_chain()` succeeds, original approval record unchanged, and exceptions propagate cleanly without swallowed errors or false success responses.
+  - Before/after audit event provenance: Upgraded `correct_submission_confirmation()` payload to record both `updated_fields` and `previous_fields` alongside `confirmation_id`, providing complete before/after state provenance for all modified confirmation attributes.
+  - Verified with 6 new deterministic failure-injection and audit review tests in `test_phase7_1_3_audit_consistency.py` (17 tests total in suite, 544 total project suite tests passing, 100%), 0 pyflakes errors, 0 ruff errors, and clean git diff.
+
 ---
 
 ## 7. Approval Requirement

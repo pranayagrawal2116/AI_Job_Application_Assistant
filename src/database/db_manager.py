@@ -4543,18 +4543,23 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (confirmation_id,))
             updated = SubmissionConfirmation(**dict(cursor.fetchone()))
 
-            # Emit timeline event atomically within the same transaction
+            # Emit timeline event atomically within the same transaction with before/after audit tracking
+            new_fields = {
+                k: v for k, v in {
+                    "confirmation_reference": confirmation_reference,
+                    "confirmation_doc_path": confirmation_doc_path,
+                    "confirmation_doc_hash": confirmation_doc_hash,
+                    "candidate_notes": candidate_notes,
+                    "submission_channel": submission_channel,
+                }.items() if v is not None
+            }
+            previous_fields = {
+                k: row[k] for k in new_fields.keys()
+            }
             corr_payload = {
                 "confirmation_id": confirmation_id,
-                "updated_fields": {
-                    k: v for k, v in {
-                        "confirmation_reference": confirmation_reference,
-                        "confirmation_doc_path": confirmation_doc_path,
-                        "confirmation_doc_hash": confirmation_doc_hash,
-                        "candidate_notes": candidate_notes,
-                        "submission_channel": submission_channel,
-                    }.items() if v is not None
-                },
+                "updated_fields": new_fields,
+                "previous_fields": previous_fields,
             }
             self._insert_application_event_internal(
                 cursor=cursor,

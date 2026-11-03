@@ -519,6 +519,17 @@ In the multi-user architecture (Phase 6–7), public catalog discovery and candi
 | **Audit Event Semantics** | Inconsistent event type naming obscured whether an application transition occurred. | Enforced clear audit event semantics: `SUBMISSION_CONFIRMATION_RECORDED` for storage-only confirmations without status transitions, `SUBMISSION_CONFIRMED` for transitions to `SUBMITTED`, and `SUBMISSION_CONFIRMATION_UPDATED` for metadata corrections. |
 | **Centralized Event Helper** | Duplicated event sequence, hashing, and insertion logic across multiple methods. | Implemented `_insert_application_event_internal(cursor, ...)` to encapsulate sequence calculation, hash computation, timestamp binding, and insertion on an existing connection/cursor without status mutation. |
 
+### 10.5 Phase 7.1.3.1 Transaction Failure-Injection Verification & Audit Review Summary
+
+| Failure Point Tested | Injection Mechanism | Rollback & Invariant Guarantees Verified |
+| :--- | :--- | :--- |
+| **Point A: Canonicalization Failure** | Simulated exception during payload canonicalization (`canonical_json_bytes`). | Confirmation updates rolled back; no `SUBMISSION_CONFIRMATION_UPDATED` event persisted; audit chain valid; exception propagated. |
+| **Point B: Sequence Lookup Failure** | Intercepted max sequence number query via connection proxy on active cursor. | Confirmation updates rolled back; contiguous event sequence preserved; no orphan sequence gap; hash chain valid. |
+| **Point C: Event Hash Failure** | Injected exception into `DatabaseManager.compute_event_hash()`. | Exception propagates; confirmation updates rolled back; original approval records unaltered; zero partial events. |
+| **Point D: Event Insertion Failure** | SQLite `BEFORE INSERT` trigger on `application_events` raising `FAIL`. | Native SQLite constraint rolls back multi-table update; confirmation fields retain initial values; zero timeline mutation. |
+| **Point E: Transaction Commit Failure** | Proxy connection intercepting `conn.commit()` post-update/insert. | `DatabaseManager.transaction()` catches exception, executes `conn.rollback()`, connection closed cleanly; neither update nor event persists. |
+| **Audit Event Field Provenance** | `SUBMISSION_CONFIRMATION_UPDATED` event payload inspection. | Records both `updated_fields` (new values) and `previous_fields` (prior values) alongside `confirmation_id`, providing complete before/after audit traceability. |
+
 ---
 
 ## 11. Proposed Service & API Architecture

@@ -8,17 +8,20 @@ Covers:
 5. Audit event semantics (SUBMISSION_CONFIRMATION_RECORDED, SUBMISSION_CONFIRMED, SUBMISSION_CONFIRMATION_UPDATED).
 """
 
+import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from typing import List
+from unittest.mock import patch
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
     CrossUserAccessError,
     ValidationError,
 )
-from src.database.models import Application, ApplicationStatus, SubmissionChannel
+from src.database.models import Application, ApplicationEvent, ApplicationStatus, SubmissionChannel, SubmissionConfirmation
 
 
 class TestPhase713Base(unittest.TestCase):
@@ -224,27 +227,223 @@ class TestAtomicSubmissionConfirmationCorrections(TestPhase713Base):
 
 
 class TestCorrectionFailureInjectionAndRollback(TestPhase713Base):
-    """Verifies that failures during event logging trigger complete rollback of the confirmation update."""
+    """Verifies that failures at any point during submission confirmation correction trigger complete rollback."""
 
-    def test_failure_during_event_insertion_rolls_back_confirmation_update(self):
-        """Simulate realistic database-level failure during event insertion:
-
-        When event insertion fails, the confirmation update must be completely rolled back,
-        leaving original confirmation fields intact and no partial event.
+    def _assert_rollback_invariants(
+        self,
+        app_id: int,
+        conf_id: int,
+        orig_conf: SubmissionConfirmation,
+        events_before: List[ApplicationEvent],
+        approval_id: int = 101,
+    ):
+        """Enforces all 9 common failure-injection assertions from Phase 7.1.3.1 spec:
+        1. Original confirmation_reference remains unchanged.
+        2. Original candidate_notes remains unchanged.
+        3. Original submission_channel remains unchanged.
+        4. Original submission_timestamp remains unchanged.
+        5. No SUBMISSION_CONFIRMATION_UPDATED event was appended.
+        6. Event sequence numbers remain contiguous.
+        7. verify_application_event_chain() succeeds.
+        8. The original approval record remains unchanged.
+        9. No swallowed exception or false success response occurs (verified by caller catching exception).
         """
-        app = self._create_application(self.user_a, status=ApplicationStatus.DRAFT.value)
-        conf = self.db.create_submission_confirmation(
+        # 1-4. Confirmation fields remain unchanged
+        conf_after = self.db.get_submission_confirmation(app_id, self.user_a)
+        self.assertIsNotNone(conf_after)
+        self.assertEqual(conf_after.confirmation_reference, orig_conf.confirmation_reference)
+        self.assertEqual(conf_after.candidate_notes, orig_conf.candidate_notes)
+        self.assertEqual(conf_after.submission_channel, orig_conf.submission_channel)
+        self.assertEqual(conf_after.submission_timestamp, orig_conf.submission_timestamp)
+
+        # 5. No SUBMISSION_CONFIRMATION_UPDATED event was appended
+        events_after = self.db.get_application_events(app_id, self.user_a)
+        self.assertEqual(len(events_after), len(events_before))
+        for evt in events_after:
+            self.assertNotEqual(evt.event_type, "SUBMISSION_CONFIRMATION_UPDATED")
+
+        # 6. Event sequence numbers remain contiguous
+        expected_seq = 1
+        for evt in events_after:
+            self.assertEqual(evt.sequence_no, expected_seq)
+            expected_seq += 1
+
+        # 7. Audit hash chain remains 100% valid
+        valid, msg = self.db.verify_application_event_chain(app_id, self.user_a)
+        self.assertTrue(valid, msg)
+
+        # 8. Original approval record remains unchanged
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT is_consumed FROM application_approvals WHERE id = ?", (approval_id,))
+            row = cursor.fetchone()
+            if row:
+                self.assertEqual(row["is_consumed"], 1)
+
+    def test_failure_point_a_canonicalization_failure(self):
+        """Point A: Simulate an exception while canonicalizing the event payload through canonical_json_bytes.
+        Verifies that confirmation metadata update is rolled back and no partial event is persisted.
+        """
+        app = self._create_application(self.user_a, status=ApplicationStatus.APPROVED.value)
+        self._create_packet_and_approval(app.id, self.user_a, packet_id=101)
+        orig_conf = self.db.create_submission_confirmation(
             application_id=app.id,
             user_id=self.user_a,
             submission_channel=SubmissionChannel.COMPANY_PORTAL.value,
-            confirmation_reference="INITIAL_REF",
-            candidate_notes="Initial notes",
+            packet_id=101,
+            confirmation_reference="INITIAL_REF_A",
+            candidate_notes="Initial notes A",
+            transition_status=True,
         )
-
         events_before = self.db.get_application_events(app.id, self.user_a)
-        event_count_before = len(events_before)
 
-        # Install a SQLite trigger that fails insertion of SUBMISSION_CONFIRMATION_UPDATED
+        with patch("src.database.db_manager.canonical_json_bytes", side_effect=ValueError("Simulated canonicalization failure")):
+            with self.assertRaises(ValueError) as ctx:
+                self.db.correct_submission_confirmation(
+                    confirmation_id=orig_conf.id,
+                    user_id=self.user_a,
+                    confirmation_reference="SHOULD_ROLL_BACK_A",
+                    candidate_notes="Notes that must roll back A",
+                    submission_channel=SubmissionChannel.EMAIL.value,
+                )
+            self.assertIn("Simulated canonicalization failure", str(ctx.exception))
+
+        self._assert_rollback_invariants(app.id, orig_conf.id, orig_conf, events_before, approval_id=101)
+
+    def test_failure_point_b_sequence_lookup_failure(self):
+        """Point B: Inject a failure during event sequence/previous-hash lookup in _insert_application_event_internal().
+        Verifies that confirmation update is rolled back and no partial event is appended.
+        """
+        app = self._create_application(self.user_a, status=ApplicationStatus.APPROVED.value)
+        self._create_packet_and_approval(app.id, self.user_a, packet_id=102)
+        orig_conf = self.db.create_submission_confirmation(
+            application_id=app.id,
+            user_id=self.user_a,
+            submission_channel=SubmissionChannel.COMPANY_PORTAL.value,
+            packet_id=102,
+            confirmation_reference="INITIAL_REF_B",
+            candidate_notes="Initial notes B",
+            transition_status=True,
+        )
+        events_before = self.db.get_application_events(app.id, self.user_a)
+
+        class SequenceLookupFailingProxy:
+            def __init__(self, real_conn):
+                self._conn = real_conn
+                self.lookup_intercepted = False
+
+            def cursor(self):
+                real_cursor = self._conn.cursor()
+                proxy_self = self
+
+                class CursorProxy:
+                    def __init__(self, c):
+                        self._c = c
+
+                    def execute(self, sql, *params):
+                        if "SELECT sequence_no, event_hash FROM application_events" in sql:
+                            proxy_self.lookup_intercepted = True
+                            raise sqlite3.OperationalError("Simulated sequence lookup query failure")
+                        return self._c.execute(sql, *params)
+
+                    def fetchone(self):
+                        return self._c.fetchone()
+
+                    def fetchall(self):
+                        return self._c.fetchall()
+
+                    def __getattr__(self, name):
+                        return getattr(self._c, name)
+
+                return CursorProxy(real_cursor)
+
+            def commit(self):
+                return self._conn.commit()
+
+            def rollback(self):
+                return self._conn.rollback()
+
+            def close(self):
+                return self._conn.close()
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        orig_get_conn = self.db.get_connection
+        proxy_instances = []
+
+        def fault_injecting_get_connection():
+            conn = orig_get_conn()
+            proxy = SequenceLookupFailingProxy(conn)
+            proxy_instances.append(proxy)
+            return proxy
+
+        self.db.get_connection = fault_injecting_get_connection
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                self.db.correct_submission_confirmation(
+                    confirmation_id=orig_conf.id,
+                    user_id=self.user_a,
+                    confirmation_reference="SHOULD_ROLL_BACK_B",
+                    candidate_notes="Notes that must roll back B",
+                    submission_channel=SubmissionChannel.EMAIL.value,
+                )
+            self.assertIn("Simulated sequence lookup query failure", str(ctx.exception))
+        finally:
+            self.db.get_connection = orig_get_conn
+
+        self.assertTrue(len(proxy_instances) > 0)
+        self.assertTrue(proxy_instances[0].lookup_intercepted, "Sequence lookup query was not intercepted")
+        self._assert_rollback_invariants(app.id, orig_conf.id, orig_conf, events_before, approval_id=102)
+
+    def test_failure_point_c_event_hash_computation_failure(self):
+        """Point C: Inject an exception from DatabaseManager.compute_event_hash() during correction event creation.
+        Verifies that exception propagates, confirmation metadata is rolled back, and no event is persisted.
+        """
+        app = self._create_application(self.user_a, status=ApplicationStatus.APPROVED.value)
+        self._create_packet_and_approval(app.id, self.user_a, packet_id=103)
+        orig_conf = self.db.create_submission_confirmation(
+            application_id=app.id,
+            user_id=self.user_a,
+            submission_channel=SubmissionChannel.COMPANY_PORTAL.value,
+            packet_id=103,
+            confirmation_reference="INITIAL_REF_C",
+            candidate_notes="Initial notes C",
+            transition_status=True,
+        )
+        events_before = self.db.get_application_events(app.id, self.user_a)
+
+        with patch.object(DatabaseManager, "compute_event_hash", side_effect=RuntimeError("Simulated event hash computation failure")):
+            with self.assertRaises(RuntimeError) as ctx:
+                self.db.correct_submission_confirmation(
+                    confirmation_id=orig_conf.id,
+                    user_id=self.user_a,
+                    confirmation_reference="SHOULD_ROLL_BACK_C",
+                    candidate_notes="Notes that must roll back C",
+                    submission_channel=SubmissionChannel.EMAIL.value,
+                )
+            self.assertIn("Simulated event hash computation failure", str(ctx.exception))
+
+        self._assert_rollback_invariants(app.id, orig_conf.id, orig_conf, events_before, approval_id=103)
+
+    def test_failure_point_d_event_insertion_failure(self):
+        """Point D: SQLite-trigger-based event insertion failure during SUBMISSION_CONFIRMATION_UPDATED insert.
+        Verifies that database constraint/trigger failure rolls back the confirmation update.
+        """
+        app = self._create_application(self.user_a, status=ApplicationStatus.APPROVED.value)
+        self._create_packet_and_approval(app.id, self.user_a, packet_id=104)
+        orig_conf = self.db.create_submission_confirmation(
+            application_id=app.id,
+            user_id=self.user_a,
+            submission_channel=SubmissionChannel.COMPANY_PORTAL.value,
+            packet_id=104,
+            confirmation_reference="INITIAL_REF_D",
+            candidate_notes="Initial notes D",
+            transition_status=True,
+        )
+        events_before = self.db.get_application_events(app.id, self.user_a)
+
+        # Install SQLite trigger
         with self.db.connection() as conn:
             conn.execute("""
                 CREATE TRIGGER simulate_event_failure_trg
@@ -256,33 +455,135 @@ class TestCorrectionFailureInjectionAndRollback(TestPhase713Base):
             """)
 
         try:
-            # Attempt to correct confirmation: should fail because event insertion fails
             with self.assertRaises(sqlite3.IntegrityError) as ctx:
                 self.db.correct_submission_confirmation(
-                    confirmation_id=conf.id,
+                    confirmation_id=orig_conf.id,
                     user_id=self.user_a,
-                    confirmation_reference="SHOULD_BE_ROLLED_BACK",
-                    candidate_notes="Notes that must roll back",
+                    confirmation_reference="SHOULD_ROLL_BACK_D",
+                    candidate_notes="Notes that must roll back D",
+                    submission_channel=SubmissionChannel.EMAIL.value,
                 )
             self.assertIn("Simulated failure during event insertion", str(ctx.exception))
         finally:
-            # Clean up test trigger
             with self.db.connection() as conn:
                 conn.execute("DROP TRIGGER IF EXISTS simulate_event_failure_trg")
 
-        # 1. Verify confirmation fields were rolled back to their original values!
-        conf_after = self.db.get_submission_confirmation(app.id, self.user_a)
-        self.assertIsNotNone(conf_after)
-        self.assertEqual(conf_after.confirmation_reference, "INITIAL_REF")
-        self.assertEqual(conf_after.candidate_notes, "Initial notes")
+        self._assert_rollback_invariants(app.id, orig_conf.id, orig_conf, events_before, approval_id=104)
 
-        # 2. Verify no partial event was appended
-        events_after = self.db.get_application_events(app.id, self.user_a)
-        self.assertEqual(len(events_after), event_count_before)
-        for evt in events_after:
-            self.assertNotEqual(evt.event_type, "SUBMISSION_CONFIRMATION_UPDATED")
+    # Retain exact legacy test method name as alias for backward compatibility
+    test_failure_during_event_insertion_rolls_back_confirmation_update = test_failure_point_d_event_insertion_failure
 
-        # 3. Verify event chain remains 100% valid
+    def test_failure_point_e_transaction_commit_failure(self):
+        """Point E: Failure during transaction commit in DatabaseManager.transaction().
+        Verifies that when conn.commit() fails after all updates and event inserts have executed,
+        transaction() catches the exception, calls conn.rollback(), and neither update nor event persists.
+        """
+        app = self._create_application(self.user_a, status=ApplicationStatus.APPROVED.value)
+        self._create_packet_and_approval(app.id, self.user_a, packet_id=105)
+        orig_conf = self.db.create_submission_confirmation(
+            application_id=app.id,
+            user_id=self.user_a,
+            submission_channel=SubmissionChannel.COMPANY_PORTAL.value,
+            packet_id=105,
+            confirmation_reference="INITIAL_REF_E",
+            candidate_notes="Initial notes E",
+            transition_status=True,
+        )
+        events_before = self.db.get_application_events(app.id, self.user_a)
+
+        class CommitFailingProxy:
+            def __init__(self, real_conn):
+                self._conn = real_conn
+                self.commit_attempted = False
+
+            def commit(self):
+                self.commit_attempted = True
+                raise sqlite3.OperationalError("Simulated commit failure: disk I/O error or lock conflict")
+
+            def rollback(self):
+                return self._conn.rollback()
+
+            def close(self):
+                return self._conn.close()
+
+            def cursor(self):
+                return self._conn.cursor()
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        orig_get_conn = self.db.get_connection
+        proxy_instances = []
+
+        def fault_injecting_get_connection():
+            conn = orig_get_conn()
+            proxy = CommitFailingProxy(conn)
+            proxy_instances.append(proxy)
+            return proxy
+
+        self.db.get_connection = fault_injecting_get_connection
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                self.db.correct_submission_confirmation(
+                    confirmation_id=orig_conf.id,
+                    user_id=self.user_a,
+                    confirmation_reference="SHOULD_ROLL_BACK_E",
+                    candidate_notes="Notes that must roll back E",
+                    submission_channel=SubmissionChannel.EMAIL.value,
+                )
+            self.assertIn("Simulated commit failure", str(ctx.exception))
+        finally:
+            self.db.get_connection = orig_get_conn
+
+        # Verify that commit was actually attempted by transaction context manager
+        self.assertTrue(len(proxy_instances) > 0)
+        self.assertTrue(proxy_instances[0].commit_attempted)
+
+        self._assert_rollback_invariants(app.id, orig_conf.id, orig_conf, events_before, approval_id=105)
+
+    def test_correction_audit_event_records_before_and_after_fields(self):
+        """Verifies that SUBMISSION_CONFIRMATION_UPDATED records both updated_fields and previous_fields."""
+        app = self._create_application(self.user_a, status=ApplicationStatus.APPROVED.value)
+        self._create_packet_and_approval(app.id, self.user_a, packet_id=106)
+        orig_conf = self.db.create_submission_confirmation(
+            application_id=app.id,
+            user_id=self.user_a,
+            submission_channel=SubmissionChannel.COMPANY_PORTAL.value,
+            packet_id=106,
+            confirmation_reference="ORIG_REF_106",
+            candidate_notes="Original Notes 106",
+            transition_status=True,
+        )
+
+        corrected = self.db.correct_submission_confirmation(
+            confirmation_id=orig_conf.id,
+            user_id=self.user_a,
+            confirmation_reference="NEW_REF_106",
+            candidate_notes="New Notes 106",
+            submission_channel=SubmissionChannel.EMAIL.value,
+        )
+
+        self.assertEqual(corrected.confirmation_reference, "NEW_REF_106")
+        self.assertEqual(corrected.candidate_notes, "New Notes 106")
+        self.assertEqual(corrected.submission_channel, SubmissionChannel.EMAIL.value)
+
+        events = self.db.get_application_events(app.id, self.user_a)
+        corr_evt = events[-1]
+        self.assertEqual(corr_evt.event_type, "SUBMISSION_CONFIRMATION_UPDATED")
+        payload = json.loads(corr_evt.event_payload_json)
+
+        self.assertEqual(payload["confirmation_id"], orig_conf.id)
+        # Verify updated_fields contains new values
+        self.assertEqual(payload["updated_fields"]["confirmation_reference"], "NEW_REF_106")
+        self.assertEqual(payload["updated_fields"]["candidate_notes"], "New Notes 106")
+        self.assertEqual(payload["updated_fields"]["submission_channel"], SubmissionChannel.EMAIL.value)
+
+        # Verify previous_fields contains exact previous values
+        self.assertEqual(payload["previous_fields"]["confirmation_reference"], "ORIG_REF_106")
+        self.assertEqual(payload["previous_fields"]["candidate_notes"], "Original Notes 106")
+        self.assertEqual(payload["previous_fields"]["submission_channel"], SubmissionChannel.COMPANY_PORTAL.value)
+
+        # Verify audit hash chain
         valid, msg = self.db.verify_application_event_chain(app.id, self.user_a)
         self.assertTrue(valid, msg)
 
