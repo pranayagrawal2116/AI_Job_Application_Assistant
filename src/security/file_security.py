@@ -56,6 +56,14 @@ class FileSecurityValidator:
         user_dir.mkdir(parents=True, exist_ok=True)
         return user_dir
 
+    def get_user_job_descriptions_dir(self, user_id: int) -> Path:
+        """Returns the isolated private directory for a user's uploaded job descriptions."""
+        if not user_id or int(user_id) <= 0:
+            raise ValidationError(f"Invalid user_id: {user_id}")
+        user_dir = (self.base_storage_dir / str(user_id) / "job_descriptions").resolve()
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return user_dir
+
     @staticmethod
     def sanitize_filename(filename: str) -> str:
         """Sanitizes original filename for display and metadata storage, stripping path traversal."""
@@ -257,10 +265,10 @@ class FileSecurityValidator:
 
     def get_stored_resume_path(self, user_id: int, storage_filename: str) -> Path:
         """Resolves and validates storage path within user's isolated directory, preventing path traversal."""
-        clean_name = Path(storage_filename).name
-        if ".." in clean_name or "/" in clean_name or "\\" in clean_name:
+        if ".." in storage_filename or "/" in storage_filename or "\\" in storage_filename:
             raise ValidationError(f"Path traversal detected in storage filename: '{storage_filename}'")
 
+        clean_name = Path(storage_filename).name
         user_dir = self.get_user_resumes_dir(user_id)
         target_path = (user_dir / clean_name).resolve()
 
@@ -282,4 +290,89 @@ class FileSecurityValidator:
             return True
         except FileNotFoundError:
             logger.warning("Resume file %s for User #%d was already missing from disk.", storage_filename, user_id)
+            return False
+
+    def save_user_job_description_file(
+        self,
+        user_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        user_base_dir: Optional[Path] = None,
+    ) -> Tuple[str, str, int, str]:
+        """Atomically stores a validated job description file in private user directory using a UUID filename.
+
+        Returns:
+            Tuple[storage_filename: str, file_format: str, file_size_bytes: int, file_hash: str]
+        """
+        detected_format, file_hash = self.validate_file(file_bytes, original_filename)
+        user_dir = user_base_dir or self.get_user_job_descriptions_dir(user_id)
+        user_dir.mkdir(parents=True, exist_ok=True)
+
+        unique_name = f"{uuid.uuid4().hex}.{detected_format}"
+        final_path = user_dir / unique_name
+        temp_path = user_dir / f"{unique_name}.tmp_{secrets.token_hex(4)}"
+
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(file_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temp_path, final_path)
+            logger.info(
+                "Securely persisted job description for User #%d: '%s' -> %s (%d bytes, SHA-256: %s)",
+                user_id,
+                self.sanitize_filename(original_filename),
+                unique_name,
+                len(file_bytes),
+                file_hash[:12],
+            )
+            return unique_name, detected_format, len(file_bytes), file_hash
+        except Exception as e:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except Exception:
+                    pass
+            logger.error("Failed to write job description file atomically: %s", e)
+            raise
+
+    def get_stored_job_description_path(
+        self,
+        user_id: int,
+        storage_filename: str,
+        user_base_dir: Optional[Path] = None,
+    ) -> Path:
+        """Resolves and validates storage path within user's isolated job descriptions directory."""
+        if ".." in storage_filename or "/" in storage_filename or "\\" in storage_filename:
+            raise ValidationError(f"Path traversal detected in storage filename: '{storage_filename}'")
+
+        clean_name = Path(storage_filename).name
+
+        user_dir = user_base_dir or self.get_user_job_descriptions_dir(user_id)
+        user_dir = user_dir.resolve()
+        target_path = (user_dir / clean_name).resolve()
+
+        if not str(target_path).startswith(str(user_dir)):
+            raise ValidationError(f"Storage path escapes user sandbox: '{target_path}'")
+
+        if not target_path.is_file():
+            raise FileNotFoundError(f"Stored job description file not found on disk: {clean_name}")
+
+        return target_path
+
+    def delete_stored_job_description_file(
+        self,
+        user_id: int,
+        storage_filename: str,
+        user_base_dir: Optional[Path] = None,
+    ) -> bool:
+        """Securely deletes a physical job description file from user's storage."""
+        try:
+            path = self.get_stored_job_description_path(user_id, storage_filename, user_base_dir=user_base_dir)
+            path.unlink()
+            logger.info("Deleted physical job description file for User #%d: %s", user_id, storage_filename)
+            return True
+        except FileNotFoundError:
+            logger.warning("Job description file %s for User #%d was already missing from disk.", storage_filename, user_id)
             return False

@@ -120,6 +120,13 @@ When interacting with the browser via Playwright MCP:
   - Strict human-in-the-loop review packet and authorization gate preventing automated submissions (`HumanApprovalGate`).
   - Interactive Streamlit Application Preparer interface (Resume Manager, Alignment Inspector, Cover Letter Editor, Screening QA, Human Approval Gate, and Prepared Application History).
   - Verified with 9 new automated unit tests (73 total suite tests passing) and Playwright MCP browser snapshot & screenshot verification.
+- [x] **Architecture v2.1.1 Phase 4: Multi-User Job Description Ingestion & Parsing** (Complete)
+  - Universal cross-industry job parser (`JobParser`) supporting Tech, Healthcare, Law, Finance, Engineering, Management, Creative, and Education with zero-hallucination guarantees and passive prompt injection resistance.
+  - Three independent ingestion paths: pasted text (preserving bullets & Unicode), PDF/DOCX document upload (10 MB cap, magic bytes & zip-bomb protection, isolated user storage in `data/users/<user_id>/job_descriptions/`), and public job listing URL fetching (`URLJobFetcher`).
+  - Advanced SSRF defense engine (`URLSafetyValidator`) blocking private IPv4/IPv6, carrier-grade NAT, cloud metadata endpoints, loopback, and DNS rebinding; redirect validation loop; response size capping (5 MB); anti-bot and restriction detection (Cloudflare, PerimeterX, LinkedIn authwalls, 403, 429) prompting clean manual text paste fallbacks.
+  - SQLite immutable snapshot management with `supersedes_job_description_id` linking, per-user deduplication via content hash, cross-user duplicate independence, and composite ownership isolation (`UNIQUE(id, user_id)`).
+  - Streamlit Job Analyzer & Ingestion interface (`Job Analyzer & Ingestion` view) with Paste Text, Document Upload, Safe URL Ingestion, Structured Requirements Inspector, Candidate Review & In-Place Correction Form, Version Lineage, and Deletion.
+  - Verified with 29 new automated tests across 5 new test suites (192 total project suite tests passing, 100%), 0 pyflakes errors, and mypy/ruff clean.
 
 ---
 

@@ -3,6 +3,7 @@
 from src.scraper.agent_integration_contract import AgentIntegrationContract, IngestionResult
 from src.scraper.data_validator import DataValidator, ValidationResult
 from src.scraper.extraction_schema import ExtractedJobPayload
+from src.scraper.url_fetcher import FetchedJobContent, URLJobFetcher
 
 __all__ = [
     "ExtractedJobPayload",
@@ -10,4 +11,6 @@ __all__ = [
     "ValidationResult",
     "AgentIntegrationContract",
     "IngestionResult",
+    "URLJobFetcher",
+    "FetchedJobContent",
 ]

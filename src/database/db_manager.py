@@ -14,10 +14,13 @@ from src.database.exceptions import (
     ApplicationNotFoundError,
     CrossUserAccessError,
     DatabaseError,
+    DuplicateJobDescriptionError,
     DuplicateJobError,
     DuplicateResumeError,
+    InvalidFileFormatError,
     InvalidStatusError,
     InvalidStatusTransitionError,
+    JobDescriptionNotFoundError,
     JobNotFoundError,
     ResumeInUseError,
     ResumeNotFoundError,
@@ -173,6 +176,13 @@ class DatabaseManager:
         add_col_if_missing("resumes", "parsing_status", "TEXT DEFAULT 'COMPLETED'")
         add_col_if_missing("resumes", "active_version", "INTEGER DEFAULT 1")
         add_col_if_missing("candidate_profiles", "profile_hash", "TEXT")
+        add_col_if_missing("job_descriptions", "source_url", "TEXT")
+        add_col_if_missing("job_descriptions", "original_filename", "TEXT")
+        add_col_if_missing("job_descriptions", "storage_filename", "TEXT")
+        add_col_if_missing("job_descriptions", "parser_version", "TEXT DEFAULT '1.0.0'")
+        add_col_if_missing("job_descriptions", "extraction_confidence", "REAL DEFAULT 1.0")
+        add_col_if_missing("job_descriptions", "supersedes_job_description_id", "INTEGER")
+        add_col_if_missing("job_descriptions", "is_active", "INTEGER DEFAULT 1")
 
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
@@ -1309,8 +1319,102 @@ class DatabaseManager:
             return cursor.fetchone() is not None
 
     # -------------------------------------------------------------------------
-    # PHASE 2: USER-SCOPED JOB DESCRIPTIONS
+    # PHASE 2 & 4: USER-SCOPED JOB DESCRIPTIONS & SNAPSHOT MANAGEMENT
     # -------------------------------------------------------------------------
+
+    def save_job_description_snapshot(
+        self,
+        user_id: int,
+        company_name: str,
+        job_title: str,
+        raw_content: str,
+        source_type: str = "pasted",
+        content_hash: Optional[str] = None,
+        parsed_data: Optional[Dict[str, Any]] = None,
+        source_url: Optional[str] = None,
+        original_filename: Optional[str] = None,
+        storage_filename: Optional[str] = None,
+        parser_version: str = "1.0.0",
+        extraction_confidence: float = 1.0,
+        supersedes_job_description_id: Optional[int] = None,
+        is_active: bool = True,
+    ) -> JobDescription:
+        """Saves an immutable job description snapshot enforcing deduplication and multi-user isolation."""
+        if not company_name or not company_name.strip():
+            raise ValidationError("company_name cannot be empty.")
+        if not job_title or not job_title.strip():
+            raise ValidationError("job_title cannot be empty.")
+        if not raw_content or not raw_content.strip():
+            raise ValidationError("raw_content cannot be empty.")
+
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError(f"User #{user_id}")
+
+        if not content_hash:
+            content_hash = hashlib.sha256(raw_content.strip().encode("utf-8")).hexdigest()
+
+        # Check deduplication per-user
+        if supersedes_job_description_id is None:
+            with self.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM job_descriptions WHERE user_id = ? AND content_hash = ? AND is_active = 1",
+                    (user_id, content_hash),
+                )
+                existing = cursor.fetchone()
+                if existing:
+                    raise DuplicateJobDescriptionError(
+                        f"Job description with identical content already exists as ID #{existing['id']}.",
+                        existing_id=existing["id"],
+                    )
+
+        # If superseding, verify parent ownership
+        if supersedes_job_description_id is not None:
+            parent = self.get_job_description(supersedes_job_description_id, user_id=user_id)
+            if not parent:
+                raise JobDescriptionNotFoundError(f"Job Description #{supersedes_job_description_id} not found.")
+
+        parsed_json = json.dumps(parsed_data) if parsed_data else None
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+
+            # If superseding, deactivate the superseded record
+            if supersedes_job_description_id is not None:
+                cursor.execute(
+                    "UPDATE job_descriptions SET is_active = 0 WHERE id = ? AND user_id = ?",
+                    (supersedes_job_description_id, user_id),
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO job_descriptions (
+                    user_id, source_type, company_name, job_title, raw_content, content_hash, parsed_data,
+                    source_url, original_filename, storage_filename, parser_version, extraction_confidence,
+                    supersedes_job_description_id, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    source_type,
+                    company_name.strip(),
+                    job_title.strip(),
+                    raw_content.strip(),
+                    content_hash,
+                    parsed_json,
+                    source_url,
+                    original_filename,
+                    storage_filename,
+                    parser_version,
+                    extraction_confidence,
+                    supersedes_job_description_id,
+                    1 if is_active else 0,
+                ),
+            )
+            jd_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM job_descriptions WHERE id = ?", (jd_id,))
+            return JobDescription(**dict(cursor.fetchone()))
 
     def create_job_description(
         self,
@@ -1321,41 +1425,68 @@ class DatabaseManager:
         source_type: str = "pasted",
         content_hash: Optional[str] = None,
         parsed_data: Optional[Dict[str, Any]] = None,
+        source_url: Optional[str] = None,
+        original_filename: Optional[str] = None,
+        storage_filename: Optional[str] = None,
+        parser_version: str = "1.0.0",
+        extraction_confidence: float = 1.0,
+        supersedes_job_description_id: Optional[int] = None,
+        is_active: bool = True,
     ) -> JobDescription:
-        """Creates a user-owned job description record."""
-        if not company_name or not company_name.strip():
-            raise ValidationError("company_name cannot be empty.")
-        if not job_title or not job_title.strip():
-            raise ValidationError("job_title cannot be empty.")
-        if not raw_content or not raw_content.strip():
-            raise ValidationError("raw_content cannot be empty.")
+        """Creates a user-owned job description record (backward-compatible delegate to save_job_description_snapshot)."""
+        return self.save_job_description_snapshot(
+            user_id=user_id,
+            company_name=company_name,
+            job_title=job_title,
+            raw_content=raw_content,
+            source_type=source_type,
+            content_hash=content_hash,
+            parsed_data=parsed_data,
+            source_url=source_url,
+            original_filename=original_filename,
+            storage_filename=storage_filename,
+            parser_version=parser_version,
+            extraction_confidence=extraction_confidence,
+            supersedes_job_description_id=supersedes_job_description_id,
+            is_active=is_active,
+        )
 
-        if not content_hash:
-            content_hash = hashlib.sha256(raw_content.strip().encode("utf-8")).hexdigest()
+    def update_job_description_snapshot(
+        self,
+        user_id: int,
+        jd_id: int,
+        updated_parsed_data: Dict[str, Any],
+        new_job_title: Optional[str] = None,
+        new_company_name: Optional[str] = None,
+        new_raw_content: Optional[str] = None,
+    ) -> JobDescription:
+        """Creates a new immutable job description snapshot linked via supersedes_job_description_id."""
+        existing = self.get_job_description(jd_id, user_id=user_id)
+        if not existing:
+            raise JobDescriptionNotFoundError(f"Job Description #{jd_id} not found.")
 
-        parsed_json = json.dumps(parsed_data) if parsed_data else None
+        title = new_job_title.strip() if new_job_title else existing.job_title
+        company = new_company_name.strip() if new_company_name else existing.company_name
+        raw = new_raw_content.strip() if new_raw_content else existing.raw_content
 
-        with self.transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO job_descriptions (
-                    user_id, source_type, company_name, job_title, raw_content, content_hash, parsed_data
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    source_type,
-                    company_name.strip(),
-                    job_title.strip(),
-                    raw_content.strip(),
-                    content_hash,
-                    parsed_json,
-                ),
-            )
-            jd_id = cursor.lastrowid
-            cursor.execute("SELECT * FROM job_descriptions WHERE id = ?", (jd_id,))
-            return JobDescription(**dict(cursor.fetchone()))
+        confidence = float(updated_parsed_data.get("extraction_confidence", existing.extraction_confidence or 1.0))
+        version = str(updated_parsed_data.get("parser_version", existing.parser_version or "1.0.0"))
+
+        return self.save_job_description_snapshot(
+            user_id=user_id,
+            company_name=company,
+            job_title=title,
+            raw_content=raw,
+            source_type=existing.source_type,
+            source_url=existing.source_url,
+            original_filename=existing.original_filename,
+            storage_filename=existing.storage_filename,
+            parser_version=version,
+            extraction_confidence=confidence,
+            parsed_data=updated_parsed_data,
+            supersedes_job_description_id=existing.id,
+            is_active=True,
+        )
 
     def get_job_description(self, jd_id: int, user_id: int) -> Optional[JobDescription]:
         """Fetches a job description owned by the specified user. Enforces cross-user isolation."""
@@ -1373,15 +1504,159 @@ class DatabaseManager:
                 )
             return JobDescription(**dict(row))
 
-    def list_job_descriptions(self, user_id: int) -> List[JobDescription]:
+    def list_job_descriptions(
+        self,
+        user_id: int,
+        include_superseded: bool = False,
+        active_only: bool = True,
+    ) -> List[JobDescription]:
         """Lists all job descriptions belonging to a user."""
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM job_descriptions WHERE user_id = ? ORDER BY created_at DESC",
-                (user_id,),
-            )
+            if active_only and not include_superseded:
+                cursor.execute(
+                    "SELECT * FROM job_descriptions WHERE user_id = ? AND is_active = 1 ORDER BY created_at DESC",
+                    (user_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM job_descriptions WHERE user_id = ? ORDER BY created_at DESC",
+                    (user_id,),
+                )
             return [JobDescription(**dict(row)) for row in cursor.fetchall()]
+
+    def get_job_description_history(self, user_id: int, jd_id: int) -> List[JobDescription]:
+        """Returns the version lineage for a job description snapshot (from latest to earliest)."""
+        current = self.get_job_description(jd_id, user_id=user_id)
+        if not current:
+            raise JobDescriptionNotFoundError(f"Job Description #{jd_id} not found.")
+
+        history: List[JobDescription] = [current]
+        visited_ids = {current.id}
+
+        while current.supersedes_job_description_id:
+            parent_id = current.supersedes_job_description_id
+            if parent_id in visited_ids:
+                break
+            parent = self.get_job_description(parent_id, user_id=user_id)
+            if not parent:
+                break
+            history.append(parent)
+            visited_ids.add(parent.id)
+            current = parent
+
+        return history
+
+    def delete_job_description(self, jd_id: int, user_id: int) -> bool:
+        """Deletes a user's job description snapshot and removes associated files if safe."""
+        jd = self.get_job_description(jd_id, user_id=user_id)
+        if not jd:
+            raise JobDescriptionNotFoundError(f"Job Description #{jd_id} not found.")
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) as cnt FROM applications WHERE job_id = ?", (jd_id,))
+            linked_apps = cursor.fetchone()["cnt"]
+
+        if linked_apps > 0:
+            with self.transaction() as t_conn:
+                t_cursor = t_conn.cursor()
+                t_cursor.execute("UPDATE job_descriptions SET is_active = 0 WHERE id = ? AND user_id = ?", (jd_id, user_id))
+            return True
+
+        with self.transaction() as t_conn:
+            t_cursor = t_conn.cursor()
+            t_cursor.execute("DELETE FROM job_descriptions WHERE id = ? AND user_id = ?", (jd_id, user_id))
+
+        if jd.storage_filename:
+            try:
+                from src.security.file_security import FileSecurityValidator
+                validator = FileSecurityValidator()
+                validator.delete_stored_job_description_file(user_id, jd.storage_filename)
+            except Exception as e:
+                logger.warning(f"Error removing storage file for JD #{jd_id}: {e}")
+
+        return True
+
+    def upload_user_job_description(
+        self,
+        user_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        user_base_dir: Optional[Path] = None,
+    ) -> JobDescription:
+        """Validates, stores, parses, and persists a user job description document (PDF or DOCX)."""
+        from src.security.file_security import FileSecurityValidator
+        from src.preparer.job_parser import JobParser
+
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError(f"User #{user_id}")
+
+        validator = FileSecurityValidator()
+        validator.validate_file(file_bytes, original_filename)
+
+        ext = Path(original_filename).suffix.lstrip(".").lower()
+        if ext not in ("pdf", "docx"):
+            raise InvalidFileFormatError(f"Unsupported file format '.{ext}'. Only PDF and DOCX documents are accepted.")
+
+        storage_filename, detected_format, _, _ = validator.save_user_job_description_file(
+            user_id=user_id,
+            file_bytes=file_bytes,
+            original_filename=original_filename,
+            user_base_dir=user_base_dir,
+        )
+
+        job_dir = user_base_dir or validator.get_user_job_descriptions_dir(user_id)
+        dest_path = job_dir / storage_filename
+
+        parser = JobParser()
+        if ext == "pdf":
+            raw_text = parser.extract_text_from_pdf(dest_path)
+        else:
+            raw_text = parser.extract_text_from_docx(dest_path)
+
+        stem_name = Path(original_filename).stem.replace("_", " ").replace("-", " ")
+        structured = parser.parse_job_description(
+            raw_text=raw_text,
+            hint_title=stem_name if len(stem_name) > 3 else None,
+            source=f"upload_{ext}",
+        )
+
+        company = structured.company_name or "Unknown Company"
+        title = structured.job_title or stem_name or "Untitled Position"
+
+        return self.save_job_description_snapshot(
+            user_id=user_id,
+            company_name=company,
+            job_title=title,
+            raw_content=raw_text,
+            source_type="upload",
+            original_filename=original_filename,
+            storage_filename=storage_filename,
+            parser_version=structured.parser_version,
+            extraction_confidence=structured.extraction_confidence,
+            parsed_data=structured.to_dict(),
+        )
+
+    def get_job_description_file_path(
+        self,
+        user_id: int,
+        jd_id: int,
+        user_base_dir: Optional[Path] = None,
+    ) -> Optional[Path]:
+        """Returns safe, validated Path to job description document on disk, enforcing sandbox containment."""
+        from src.security.file_security import FileSecurityValidator
+
+        jd = self.get_job_description(jd_id, user_id=user_id)
+        if not jd:
+            raise JobDescriptionNotFoundError(f"Job Description #{jd_id} not found.")
+
+        if not jd.storage_filename:
+            return None
+
+        validator = FileSecurityValidator()
+        return validator.get_stored_job_description_path(user_id, jd.storage_filename, user_base_dir=user_base_dir)
 
     # -------------------------------------------------------------------------
     # PHASE 2: USER-SCOPED APPLICATIONS

@@ -1,5 +1,7 @@
 """Custom exceptions for the SQLite database, security, and authentication engine."""
 
+from typing import Optional
+
 
 class DatabaseError(Exception):
     """Base exception for all database-related operations."""
@@ -226,3 +228,34 @@ class EncryptedFileError(FileSecurityError):
 class ResumeInUseError(DatabaseError):
     """Raised when trying to delete a resume that is locked by submitted applications."""
     pass
+
+
+# -----------------------------------------------------------------------------
+# PHASE 4: JOB DESCRIPTION INGESTION & PARSING EXCEPTIONS
+# -----------------------------------------------------------------------------
+
+class JobDescriptionNotFoundError(DatabaseError):
+    """Raised when a requested job description record cannot be found."""
+    pass
+
+
+class DuplicateJobDescriptionError(DatabaseError):
+    """Raised when a user attempts to upload an identical job description snapshot."""
+
+    def __init__(self, message: str, existing_id: Optional[int] = None):
+        super().__init__(message)
+        self.existing_id = existing_id
+
+
+class UnsafeURLError(SecurityAuthorizationError):
+    """Raised when a submitted job listing URL violates SSRF or network boundary safety rules."""
+    pass
+
+
+class URLFetchRestrictedError(DatabaseError):
+    """Raised when automated fetching of a job URL is blocked by CAPTCHA, login, 403, or bot challenge."""
+
+    def __init__(self, message: str, official_url: Optional[str] = None, restriction_type: Optional[str] = None):
+        super().__init__(message)
+        self.official_url = official_url
+        self.restriction_type = restriction_type

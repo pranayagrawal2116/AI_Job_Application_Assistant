@@ -20,7 +20,7 @@ from src.database.exceptions import (
     SecurityAuthorizationError,
     ValidationError,
 )
-from src.database.models import ApplicationStatus
+from src.database.models import ApplicationStatus, JobDescription
 from src.matcher.job_matcher import JobMatcher
 from src.scraper.discovery.search_coordinator import DiscoverySummary, SearchCoordinator
 from src.utils.logger import setup_logger
@@ -664,3 +664,154 @@ class DashboardService:
             packet_version_hash=p_hash,
             submission_notes=submission_notes,
         )
+
+    # -------------------------------------------------------------------------
+    # PHASE 4: MULTI-USER JOB DESCRIPTION INGESTION & SNAPSHOT MANAGEMENT
+    # -------------------------------------------------------------------------
+
+    def ingest_job_text(
+        self,
+        user_id: int,
+        raw_text: str,
+        hint_title: Optional[str] = None,
+        hint_company: Optional[str] = None,
+        hint_location: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[JobDescription]]:
+        """Parses and saves pasted job description text as an immutable snapshot."""
+        try:
+            from src.preparer.job_parser import JobParser
+
+            parser = JobParser()
+            parsed = parser.parse_job_description(
+                raw_text=raw_text,
+                hint_title=hint_title,
+                hint_company=hint_company,
+                hint_location=hint_location,
+                source="pasted_text",
+            )
+            title = parsed.job_title or hint_title or "Untitled Position"
+            company = parsed.company_name or hint_company or "Unknown Company"
+
+            jd = self.db.save_job_description_snapshot(
+                user_id=user_id,
+                company_name=company,
+                job_title=title,
+                raw_content=raw_text,
+                source_type="pasted",
+                parser_version=parsed.parser_version,
+                extraction_confidence=parsed.extraction_confidence,
+                parsed_data=parsed.to_dict(),
+            )
+            return True, f"Successfully analyzed and saved '{title}' at '{company}'.", jd
+        except Exception as e:
+            self.logger.warning("Failed to ingest pasted job text for user %d: %s", user_id, e)
+            return False, str(e), None
+
+    def ingest_job_file(
+        self,
+        user_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+    ) -> Tuple[bool, str, Optional[JobDescription]]:
+        """Validates, stores, parses, and saves a job description document (PDF or DOCX)."""
+        try:
+            jd = self.db.upload_user_job_description(
+                user_id=user_id,
+                file_bytes=file_bytes,
+                original_filename=original_filename,
+            )
+            return True, f"Successfully uploaded and extracted '{jd.job_title}' from '{original_filename}'.", jd
+        except Exception as e:
+            self.logger.warning("Failed to ingest job file '%s' for user %d: %s", original_filename, user_id, e)
+            return False, str(e), None
+
+    def ingest_job_url(
+        self,
+        user_id: int,
+        target_url: str,
+    ) -> Tuple[bool, str, Optional[JobDescription], Optional[Any]]:
+        """Safely fetches a job listing URL with SSRF defense, parses it, and stores a snapshot."""
+        try:
+            from src.preparer.job_parser import JobParser
+            from src.scraper.url_fetcher import URLJobFetcher
+
+            fetcher = URLJobFetcher()
+            fetched = fetcher.fetch_job_url(target_url)
+
+            parser = JobParser()
+            parsed = parser.parse_job_description(
+                raw_text=fetched.raw_text,
+                hint_title=fetched.title,
+                hint_company=fetched.company_name,
+                hint_location=fetched.location,
+                source="url_fetch",
+            )
+            title = parsed.job_title or fetched.title or "Untitled Position"
+            company = parsed.company_name or fetched.company_name or "Unknown Company"
+
+            jd = self.db.save_job_description_snapshot(
+                user_id=user_id,
+                company_name=company,
+                job_title=title,
+                raw_content=fetched.raw_text,
+                source_type="url",
+                source_url=fetched.url,
+                parser_version=parsed.parser_version,
+                extraction_confidence=parsed.extraction_confidence,
+                parsed_data=parsed.to_dict(),
+            )
+            return True, f"Successfully retrieved and parsed '{title}' at '{company}'.", jd, fetched
+        except Exception as e:
+            self.logger.warning("Failed to ingest job URL '%s' for user %d: %s", target_url, user_id, e)
+            return False, str(e), None, None
+
+    def update_job_snapshot(
+        self,
+        user_id: int,
+        jd_id: int,
+        updated_parsed_data: Dict[str, Any],
+        new_job_title: Optional[str] = None,
+        new_company_name: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[JobDescription]]:
+        """Creates a new immutable snapshot reflecting user reviews or corrections."""
+        try:
+            new_jd = self.db.update_job_description_snapshot(
+                user_id=user_id,
+                jd_id=jd_id,
+                updated_parsed_data=updated_parsed_data,
+                new_job_title=new_job_title,
+                new_company_name=new_company_name,
+            )
+            return True, f"Updated job snapshot created (Snapshot ID #{new_jd.id}).", new_jd
+        except Exception as e:
+            self.logger.warning("Failed to update job snapshot #%d for user %d: %s", jd_id, user_id, e)
+            return False, str(e), None
+
+    def get_user_job_descriptions(
+        self,
+        user_id: int,
+        include_superseded: bool = False,
+    ) -> List[JobDescription]:
+        """Lists job descriptions owned by the user."""
+        return self.db.list_job_descriptions(user_id=user_id, include_superseded=include_superseded)
+
+    def get_job_description(self, user_id: int, jd_id: int) -> Optional[JobDescription]:
+        """Fetches a specific job description verifying user ownership."""
+        return self.db.get_job_description(jd_id=jd_id, user_id=user_id)
+
+    def delete_user_job_description(self, user_id: int, jd_id: int) -> Tuple[bool, str]:
+        """Deletes or archives a user's job description snapshot."""
+        try:
+            self.db.delete_job_description(jd_id=jd_id, user_id=user_id)
+            return True, f"Job description #{jd_id} deleted successfully."
+        except Exception as e:
+            self.logger.warning("Failed to delete JD #%d for user %d: %s", jd_id, user_id, e)
+            return False, str(e)
+
+    def get_job_description_history(self, user_id: int, jd_id: int) -> List[JobDescription]:
+        """Returns version lineage for a job description snapshot."""
+        try:
+            return self.db.get_job_description_history(user_id=user_id, jd_id=jd_id)
+        except Exception as e:
+            self.logger.warning("Failed to get JD history for #%d (user %d): %s", jd_id, user_id, e)
+            return []

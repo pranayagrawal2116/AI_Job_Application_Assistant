@@ -100,17 +100,24 @@ CREATE TABLE IF NOT EXISTS resume_versions (
 );
 
 -- ---------------------------------------------------------------------
--- 5. JOB DESCRIPTIONS (Composite Ownership)
+-- 5. JOB DESCRIPTIONS (Composite Ownership & Immutable Snapshots)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS job_descriptions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    source_type TEXT NOT NULL CHECK(source_type IN ('pasted', 'url', 'upload')),
+    source_type TEXT NOT NULL CHECK(source_type IN ('pasted', 'url', 'upload', 'PASTE', 'URL', 'UPLOAD')),
+    source_url TEXT,
+    original_filename TEXT,
+    storage_filename TEXT,
     company_name TEXT NOT NULL,
     job_title TEXT NOT NULL,
     raw_content TEXT NOT NULL,
     content_hash TEXT NOT NULL,
     parsed_data TEXT,
+    parser_version TEXT DEFAULT '1.0.0',
+    extraction_confidence REAL DEFAULT 1.0,
+    supersedes_job_description_id INTEGER REFERENCES job_descriptions(id) ON DELETE SET NULL,
+    is_active INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id, user_id)
 );
@@ -309,6 +316,8 @@ CREATE INDEX IF NOT EXISTS idx_pwd_reset_user ON password_reset_tokens(user_id);
 CREATE INDEX IF NOT EXISTS idx_candidate_profiles_user ON candidate_profiles(user_id);
 CREATE INDEX IF NOT EXISTS idx_resumes_user ON resumes(user_id);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_user ON job_descriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_job_descriptions_user_content ON job_descriptions(user_id, content_hash);
+CREATE INDEX IF NOT EXISTS idx_job_descriptions_supersedes ON job_descriptions(supersedes_job_description_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
 CREATE INDEX IF NOT EXISTS idx_applications_job_id ON applications(job_id);

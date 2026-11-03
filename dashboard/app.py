@@ -14,6 +14,7 @@ from dashboard.views.application_preparer import render_application_preparer
 from dashboard.views.application_tracker import render_application_tracker
 from dashboard.views.candidate_profile import render_candidate_profile
 from dashboard.views.discovery import render_discovery
+from dashboard.views.job_description_analyzer import render_job_description_analyzer
 from dashboard.views.job_explorer import render_job_explorer
 from dashboard.views.overview import render_overview
 from dashboard.views.settings import render_settings
@@ -98,6 +99,7 @@ def main():
     # Define Navigation Structure using st.navigation
     pages = [
         st.Page(render_overview, title="Overview", icon="📊", url_path="overview", default=True),
+        st.Page(render_job_description_analyzer, title="Job Analyzer & Ingestion", icon="📑", url_path="job_analyzer"),
         st.Page(render_job_explorer, title="Explore Jobs", icon="🔍", url_path="explore"),
         st.Page(render_shortlisted, title="Shortlisted Jobs", icon="⭐", url_path="shortlisted"),
         st.Page(render_application_preparer, title="Application Preparer", icon="✍️", url_path="preparer"),

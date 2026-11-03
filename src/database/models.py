@@ -258,7 +258,7 @@ class ApplicationApproval:
 
 @dataclass
 class JobDescription:
-    """Manual or parsed user-provided job description."""
+    """Manual or parsed user-provided job description snapshot."""
     user_id: int
     source_type: str
     company_name: str
@@ -266,11 +266,24 @@ class JobDescription:
     raw_content: str
     content_hash: str
     id: Optional[int] = None
+    source_url: Optional[str] = None
+    original_filename: Optional[str] = None
+    storage_filename: Optional[str] = None
     parsed_data: Optional[str] = None
+    parser_version: Optional[str] = "1.0.0"
+    extraction_confidence: Optional[float] = 1.0
+    supersedes_job_description_id: Optional[int] = None
+    is_active: bool = True
     created_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if isinstance(data.get("parsed_data"), str):
+            try:
+                data["parsed_data"] = json.loads(data["parsed_data"])
+            except Exception:
+                pass
+        return data
 
 
 @dataclass
