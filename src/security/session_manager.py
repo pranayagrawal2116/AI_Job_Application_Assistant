@@ -6,7 +6,6 @@ import hashlib
 import hmac
 import json
 import os
-from pathlib import Path
 import secrets
 import time
 from typing import Any, Dict, Optional, Set, Tuple, Union
@@ -480,6 +479,50 @@ class SessionManager:
         logger.info("Issued single-use action ticket for %s (Key %s, App #%d, Nonce %s...)", action_type, key_id, application_id, nonce[:8])
         return ticket_str
 
+    @classmethod
+    def parse_action_ticket(cls, ticket_str: str) -> Tuple[str, str, int, str]:
+        """Parses an action ticket into constituent (key_id, nonce, timestamp, signature).
+
+        Expected format: TKT-{key_id}-{nonce}.{timestamp}.{signature}
+        (or legacy format: TKT-{nonce}.{timestamp}.{signature})
+
+        Returns:
+            Tuple of (key_id, nonce, timestamp, signature)
+        Raises:
+            ValueError: If the ticket is missing, malformed, or has an invalid structure or timestamp.
+        """
+        if not ticket_str or not isinstance(ticket_str, str) or not ticket_str.strip():
+            raise ValueError("Missing action ticket.")
+
+        clean_ticket = ticket_str.strip()
+        if not clean_ticket.startswith("TKT-") or "." not in clean_ticket:
+            raise ValueError("Malformed action ticket.")
+
+        body = clean_ticket[4:]
+        parts = body.split(".")
+        if len(parts) != 3:
+            raise ValueError("Invalid action ticket structure.")
+
+        header_nonce, ts_str, signature = parts
+        try:
+            timestamp = int(ts_str)
+        except ValueError:
+            raise ValueError("Corrupt timestamp in action ticket.")
+
+        if not signature:
+            raise ValueError("Missing signature in action ticket.")
+
+        if "-" in header_nonce:
+            key_id, nonce = header_nonce.split("-", 1)
+        else:
+            key_id = "v1"
+            nonce = header_nonce
+
+        if not key_id or not nonce:
+            raise ValueError("Action ticket missing key_id or nonce.")
+
+        return key_id, nonce, timestamp, signature
+
     def verify_and_consume_action_ticket(
         self,
         session_id: str,
@@ -502,28 +545,10 @@ class SessionManager:
         if ticket_str in ("CANDIDATE_VERIFIED_DASHBOARD_APPROVAL", "CANDIDATE_VERIFIED_MANUAL_SUBMISSION"):
             return False, "Authorization rejected: Static constant token rejected. Authenticated session ticket required."
 
-        if not ticket_str.startswith("TKT-") or "." not in ticket_str:
-            return False, "Authorization rejected: Malformed action ticket."
-
-        # Parse ticket prefix
-        body = ticket_str[4:]
-        parts = body.split(".")
-        if len(parts) != 3:
-            return False, "Authorization rejected: Invalid action ticket structure."
-
-        header_nonce, ts_str, signature = parts
         try:
-            timestamp = int(ts_str)
-        except ValueError:
-            return False, "Authorization rejected: Corrupt timestamp in action ticket."
-
-        # Parse key_id and nonce
-        if "-" in header_nonce:
-            key_id, nonce = header_nonce.split("-", 1)
-        else:
-            # Legacy format support
-            key_id = self._active_key_id
-            nonce = header_nonce
+            key_id, nonce, timestamp, signature = self.parse_action_ticket(ticket_str)
+        except ValueError as err:
+            return False, f"Authorization rejected: {err}"
 
         # Rotation & Revocation check via KeyRotationManager
         try:
@@ -548,16 +573,16 @@ class SessionManager:
             return False, "Authorization rejected: Action ticket has expired."
 
         # Verify HMAC cryptographic signature
-        if "-" in header_nonce:
-            expected_msg = f"{session.session_id}:{key_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-        else:
-            expected_msg = f"{session.session_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-
+        expected_msg = f"{session.session_id}:{key_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
         expected_sig = hmac.new(key_secret, expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
         if not hmac.compare_digest(signature, expected_sig):
-            logger.error("Action ticket signature forgery attempt detected.")
-            return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt)."
+            # Check legacy message format without key_id
+            legacy_msg = f"{session.session_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+            legacy_sig = hmac.new(key_secret, legacy_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(signature, legacy_sig):
+                logger.error("Action ticket signature forgery attempt detected.")
+                return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt)."
 
         # Verify exact scope binding
         if meta["action_type"] != action_type:

@@ -83,14 +83,25 @@ class ValidationError(DatabaseError):
 class InvalidStatusTransitionError(DatabaseError):
     """Raised when an illegal application status transition is attempted."""
 
-    def __init__(self, old_status: str, new_status: str, allowed: list[str]):
-        super().__init__(
-            f"Illegal status transition from '{old_status}' to '{new_status}'. "
-            f"Allowed next transitions are: {', '.join(allowed)}"
-        )
-        self.old_status = old_status
-        self.new_status = new_status
-        self.allowed = allowed
+    def __init__(
+        self,
+        old_status: str,
+        new_status: Optional[str] = None,
+        allowed: Optional[list[str]] = None,
+    ):
+        if new_status is None:
+            super().__init__(old_status)
+            self.old_status = old_status
+            self.new_status = ""
+            self.allowed = allowed or []
+        else:
+            super().__init__(
+                f"Illegal status transition from '{old_status}' to '{new_status}'. "
+                f"Allowed next transitions are: {', '.join(allowed or [])}"
+            )
+            self.old_status = old_status
+            self.new_status = new_status
+            self.allowed = allowed or []
 
 
 class SecurityAuthorizationError(DatabaseError):

@@ -484,7 +484,13 @@ class HumanApprovalGate:
                     if q.get("exceeds_limit"):
                         return False, f"Approval rejected: Question '{q_text}' exceeds the allowable character limit.", None
 
-        # 3. Verify & Consume HMAC Action Ticket
+        # 3. Parse Action Ticket constituent parts
+        try:
+            key_id, nonce, timestamp, signature = self.session_manager.parse_action_ticket(action_ticket)
+        except ValueError as parse_err:
+            return False, f"Approval rejected: {parse_err}", None
+
+        # 4. Verify & Consume HMAC Action Ticket
         valid_ticket, ticket_msg = self.session_manager.verify_and_consume_action_ticket(
             session_id=session_id,
             ticket_str=action_ticket,
@@ -495,57 +501,20 @@ class HumanApprovalGate:
         if not valid_ticket:
             return False, f"Approval rejected: {ticket_msg}", None
 
-        # 4. Extract Key ID and Record in application_approvals
-        # Ticket format: TKT-<nonce>.<key_id>.<sig>
-        parts = action_ticket.split(".")
-        nonce = parts[0][4:] if parts[0].startswith("TKT-") else parts[0]
-        key_id = parts[1] if len(parts) >= 2 else "v1"
-
+        # 5. Atomically authorize packet, advance status, and record timeline audit event
         try:
-            approval = self.db.record_packet_approval(
+            approval = self.db.authorize_application_packet_atomic(
                 application_id=application_id,
                 user_id=user_id,
+                packet_id=packet.id,
                 packet_version_hash=packet.packet_version_hash,
                 ticket_nonce=nonce,
                 key_id=key_id,
                 approver_name=cleaned_approver,
                 session_id=session_id,
-                packet_id=packet.id,
             )
-            # Advance application status to Awaiting Approval and append PACKET_HUMAN_APPROVED event
-            with self.db.transaction() as conn:
-                cursor = conn.cursor()
-                cursor.execute("SELECT status FROM applications WHERE id = ?", (application_id,))
-                prev_row = cursor.fetchone()
-                prev_status = prev_row["status"] if prev_row else "READY_FOR_REVIEW"
-
-                cursor.execute(
-                    """
-                    UPDATE applications
-                    SET status = ?, updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND user_id = ?
-                    """,
-                    (ApplicationStatus.AWAITING_APPROVAL.value, application_id, user_id),
-                )
-                self.db._insert_application_event_internal(
-                    cursor=cursor,
-                    application_id=application_id,
-                    user_id=user_id,
-                    event_type="PACKET_HUMAN_APPROVED",
-                    new_status=ApplicationStatus.AWAITING_APPROVAL.value,
-                    previous_status=prev_status,
-                    actor_type="CANDIDATE",
-                    actor_identifier=cleaned_approver,
-                    session_reference=session_id,
-                    event_payload={
-                        "approver": cleaned_approver,
-                        "packet_id": packet.id,
-                        "packet_version_hash": packet.packet_version_hash,
-                        "ticket_nonce": nonce,
-                    },
-                )
         except Exception as exc:
-            logger.error("Error creating application approval: %s", exc, exc_info=True)
+            logger.error("Error authorizing application packet atomically: %s", exc, exc_info=True)
             return False, f"Database error recording approval: {exc}", None
 
         logger.info(

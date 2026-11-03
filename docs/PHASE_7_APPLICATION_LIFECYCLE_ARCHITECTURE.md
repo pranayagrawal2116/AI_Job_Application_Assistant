@@ -949,3 +949,36 @@ Phase 7.2.1 addresses key security and integrity findings identified during inde
 
 ### 23.6 Action Ticket In-Memory Lifetime Limitation
 - **Architectural Scope**: Action ticket nonces and rotation keys are maintained in-memory by `SessionManager`. Replay protection operates across the active process lifetime. Process restarts or distributed worker deployments require ticket re-issuance.
+
+---
+
+## 24. Phase 7.2.2 Human Approval Atomicity, Ticket Provenance & URL Security
+
+Phase 7.2.2 resolves approval workflow consistency, action ticket metadata, URL validation, and transaction error-handling issues identified during independent review of Phase 7.2.1:
+
+### 24.1 Human Approval Workflow Atomicity & Immediate Write Lock
+- **Elimination of Multi-Transaction Gap**: Refactored `HumanApprovalGate.authorize_universal_packet()` and `DatabaseManager.record_packet_approval()` to eliminate the two-phase transaction vulnerability where approval records could commit while application status update or event logging failed.
+- **`authorize_application_packet_atomic()`**: Executes all four operations within a single SQLite `immediate_transaction()` under an immediate RESERVED write lock:
+  1. Validates that current application status is `READY_FOR_REVIEW` (or legacy `APPLICATION_PREPARED`). Rejects any other status (`DRAFT`, `PREPARING`, `APPROVED`, `SUBMITTED`, `REJECTED`, `WITHDRAWN`, `CLOSED`) with `InvalidStatusTransitionError`.
+  2. Records approval in `application_approvals` with user ownership, packet revision check, and hash matching via `_record_packet_approval_internal()`.
+  3. Appends `HUMAN_APPROVAL_GRANTED` record to `application_logs`.
+  4. Updates `applications.status` to `APPROVED` (or `Awaiting Approval`).
+  5. Inserts `PACKET_HUMAN_APPROVED` event into `application_events` and advances the cryptographic event chain hash.
+- **Zero Partial State Guarantee**: If any step fails, the entire transaction rolls back completely, ensuring no orphan approval records or inconsistent application states are persisted.
+
+### 24.2 Action Ticket Constituent Parsing & Accurate Metadata Persistence
+- **`SessionManager.parse_action_ticket()`**: Centralized classmethod parser extracting `(key_id, nonce, timestamp, signature)` from `TKT-{key_id}-{nonce}.{timestamp}.{signature}` (and legacy `TKT-{nonce}.{timestamp}.{signature}`). Validates dot-delimited structure, non-empty segments, integer timestamp, and non-empty key/nonce.
+- **Accurate Metadata Binding**: Corrected `HumanApprovalGate` parsing to ensure `application_approvals.key_id` records the actual key ID (e.g. `'v1'`), not the timestamp integer, and `application_approvals.ticket_nonce` records the exact 32-character hex nonce rather than composite header prefixes.
+- **Pre-Consumption Integrity**: Ticket parsing errors reject the request before ticket consumption, while valid tickets consumed in memory cannot be replayed even if downstream database operations fail.
+
+### 24.3 DNS Resolution & SSRF Boundary Hardening
+- **Elimination of `skip_dns=True` Bypass**: Both `create_candidate_application()` and `log_external_application_url_opened()` perform full DNS validation through `URLSafetyValidator.validate_url()`, resolving hostnames and asserting that all resolved IP addresses are public, globally routable addresses.
+- **Injectable DNS Resolver**: `DashboardService` accepts an optional `url_resolver: Optional[Callable[[str, int], List[str]]]` in `__init__`, enabling deterministic, network-isolated unit and integration testing without external DNS dependencies while enforcing strict SSRF boundaries.
+
+### 24.4 Complete URL Audit Redaction & Fragment Elimination
+- **Fragment Stripping**: `DashboardService._redact_sensitive_url()` completely removes URL fragments (setting fragment to empty string `""`), preventing sensitive OAuth access tokens (`#access_token=...`), ID tokens (`#id_token=...`), or private client state from leaking into `application_events` audit payloads.
+- **Case-Insensitive Unquoted Parameter Redaction**: Query parameter keys are unquoted and evaluated case-insensitively against sensitive substrings (`token`, `secret`, `auth`, `key`, `password`, `session`, `jwt`, `code`, `sig`, `bearer`, `credential`), replacing sensitive values with `REDACTED` while preserving non-sensitive operational parameters (`job_id`, `source`, `utm_campaign`, `category`, `page`).
+
+### 24.5 Hardened `immediate_transaction()` Error Handling
+- **Active Transaction State Tracking**: `immediate_transaction()` tracks whether `BEGIN IMMEDIATE` succeeded (`txn_started = True`).
+- **Lock Contention Preservation**: If `BEGIN IMMEDIATE` fails due to lock contention (`sqlite3.OperationalError: database is locked`), `ROLLBACK` is not attempted in autocommit mode, preventing SQLite from raising secondary `cannot rollback - no transaction is active` errors and cleanly preserving the original lock contention exception.

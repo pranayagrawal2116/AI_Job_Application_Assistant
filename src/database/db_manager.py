@@ -195,12 +195,19 @@ class DatabaseManager:
         """
         conn = self.get_connection()
         conn.isolation_level = None  # Autocommit mode to allow explicit BEGIN IMMEDIATE
+        txn_started = False
         try:
             conn.execute("BEGIN IMMEDIATE")
+            txn_started = True
             yield conn
             conn.execute("COMMIT")
+            txn_started = False
         except Exception as e:
-            conn.execute("ROLLBACK")
+            if txn_started:
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception as rollback_err:
+                    logger.warning("Rollback failed in immediate_transaction: %s", rollback_err)
             logger.error("Immediate transaction failed and was rolled back: %s", e)
             raise
         finally:
@@ -2070,6 +2077,139 @@ class DatabaseManager:
             row = cursor.fetchone()
             return bool(row and row["is_consumed"])
 
+    def _record_packet_approval_internal(
+        self,
+        cursor: sqlite3.Cursor,
+        application_id: int,
+        user_id: int,
+        packet_version_hash: str,
+        ticket_nonce: str,
+        key_id: str = "v1",
+        approver_name: str = "Human Candidate",
+        session_id: str = "",
+        packet_id: Optional[int] = None,
+    ) -> ApplicationApproval:
+        """Internal worker recording human approval and log on an existing transaction cursor."""
+        if not approver_name or not approver_name.strip():
+            raise ValidationError("Approver name cannot be empty.")
+
+        clean_approver = approver_name.strip()
+        prohibited_keywords = [
+            "bot", "agent", "matcher", "automated", "auto", "ai", "playwright", "scraper", "system"
+        ]
+        if any(keyword in clean_approver.lower() for keyword in prohibited_keywords):
+            raise ValidationError(
+                f"Unauthorized approver '{clean_approver}'. Automated engines/agents are strictly forbidden from approving applications."
+            )
+
+        # Verify application exists and belongs to user
+        cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+        app_row = cursor.fetchone()
+        if not app_row:
+            raise ApplicationNotFoundError(application_id)
+        if app_row["user_id"] is not None and app_row["user_id"] != user_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=app_row["user_id"],
+                resource=f"Application #{application_id}",
+            )
+
+        # If packet_id provided, verify packet belongs to user, matches application, hash, and active revision
+        if packet_id is not None:
+            cursor.execute(
+                "SELECT id, user_id, application_id, packet_version_hash, is_active_revision FROM prepared_packets WHERE id = ?",
+                (packet_id,),
+            )
+            pkt_row = cursor.fetchone()
+            if not pkt_row:
+                raise ValidationError(f"Prepared packet #{packet_id} not found.")
+            if pkt_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=pkt_row["user_id"],
+                    resource=f"PreparedPacket #{packet_id}",
+                )
+            if pkt_row["application_id"] != application_id:
+                raise ValidationError(
+                    f"Prepared packet #{packet_id} belongs to Application #{pkt_row['application_id']}, not #{application_id}."
+                )
+            if pkt_row["packet_version_hash"] != packet_version_hash:
+                raise ValidationError(
+                    f"Packet version hash mismatch for PreparedPacket #{packet_id}."
+                )
+            if not pkt_row["is_active_revision"]:
+                raise ValidationError(
+                    f"Prepared packet #{packet_id} is not the active revision. Previous approvals cannot authorize outdated packet revisions."
+                )
+        else:
+            cursor.execute(
+                """
+                SELECT id, user_id, application_id, packet_version_hash, is_active_revision
+                FROM prepared_packets
+                WHERE application_id = ? AND user_id = ? AND is_active_revision = 1
+                ORDER BY version_num DESC LIMIT 1
+                """,
+                (application_id, user_id),
+            )
+            pkt_row = cursor.fetchone()
+            if pkt_row:
+                if pkt_row["packet_version_hash"] != packet_version_hash:
+                    raise ValidationError("Packet version hash mismatch with active prepared packet.")
+                packet_id = pkt_row["id"]
+
+        try:
+            cursor.execute(
+                """
+                INSERT INTO application_approvals (
+                    application_id, packet_id, user_id, packet_version_hash,
+                    ticket_nonce, key_id, approver_name, session_id,
+                    approved_at, is_consumed
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
+                """,
+                (
+                    application_id,
+                    packet_id,
+                    user_id,
+                    packet_version_hash,
+                    ticket_nonce,
+                    key_id,
+                    clean_approver,
+                    session_id,
+                ),
+            )
+        except sqlite3.IntegrityError as e:
+            if "ticket_nonce" in str(e):
+                raise TicketAlreadyConsumedError(
+                    f"Ticket nonce '{ticket_nonce}' is already registered in approvals."
+                )
+            raise
+
+        approval_id = cursor.lastrowid
+        cursor.execute("SELECT * FROM application_approvals WHERE id = ?", (approval_id,))
+        row = cursor.fetchone()
+
+        # Also log to application_logs
+        cursor.execute(
+            """
+            INSERT INTO application_logs (application_id, user_id, action, details)
+            VALUES (?, ?, ?, ?)
+            """,
+            (
+                application_id,
+                user_id,
+                "HUMAN_APPROVAL_GRANTED",
+                json.dumps({
+                    "approver": clean_approver,
+                    "session_id": session_id,
+                    "packet_version_hash": packet_version_hash,
+                    "ticket_nonce": ticket_nonce,
+                    "key_id": key_id,
+                    "is_human": True,
+                }),
+            ),
+        )
+        return ApplicationApproval(**dict(row))
+
     def record_packet_approval(
         self,
         application_id: int,
@@ -2085,23 +2225,49 @@ class DatabaseManager:
 
         Validates user ownership and ensures automated agents cannot approve.
         """
-        if not approver_name or not approver_name.strip():
-            raise ValidationError("Approver name cannot be empty.")
-
-        clean_approver = approver_name.strip()
-        prohibited_keywords = [
-            "bot", "agent", "matcher", "automated", "auto", "ai", "playwright", "scraper", "system"
-        ]
-        if any(keyword in clean_approver.lower() for keyword in prohibited_keywords):
-            raise ValidationError(
-                f"Unauthorized approver '{clean_approver}'. Automated engines/agents are strictly forbidden from approving applications."
-            )
-
         with self.transaction() as conn:
             cursor = conn.cursor()
+            return self._record_packet_approval_internal(
+                cursor=cursor,
+                application_id=application_id,
+                user_id=user_id,
+                packet_version_hash=packet_version_hash,
+                ticket_nonce=ticket_nonce,
+                key_id=key_id,
+                approver_name=approver_name,
+                session_id=session_id,
+                packet_id=packet_id,
+            )
 
-            # Verify application exists and belongs to user
-            cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+    def authorize_application_packet_atomic(
+        self,
+        application_id: int,
+        user_id: int,
+        packet_id: Optional[int] = None,
+        packet_version_hash: str = "",
+        ticket_nonce: str = "",
+        key_id: str = "v1",
+        approver_name: str = "Human Candidate",
+        session_id: str = "",
+        target_status: Optional[str] = None,
+    ) -> ApplicationApproval:
+        """Atomically authorizes an application packet under an immediate write lock.
+
+        Executes all four operations within a single immediate SQLite transaction:
+        1. Validates current status is in READY_FOR_REVIEW (or legacy APPLICATION_PREPARED).
+        2. Records packet approval in application_approvals.
+        3. Appends HUMAN_APPROVAL_GRANTED to application_logs.
+        4. Updates applications.status to APPROVED (or AWAITING_APPROVAL).
+        5. Inserts PACKET_HUMAN_APPROVED event into application_events.
+        If any step fails, the entire transaction rolls back cleanly leaving zero partial state.
+        """
+        from src.lifecycle.state_machine import ApplicationStateMachine
+
+        with self.immediate_transaction() as conn:
+            cursor = conn.cursor()
+
+            # 1. Verify application exists and belongs to user
+            cursor.execute("SELECT id, user_id, status FROM applications WHERE id = ?", (application_id,))
             app_row = cursor.fetchone()
             if not app_row:
                 raise ApplicationNotFoundError(application_id)
@@ -2112,101 +2278,67 @@ class DatabaseManager:
                     resource=f"Application #{application_id}",
                 )
 
-            # If packet_id provided, verify packet belongs to user, matches application, hash, and active revision
-            if packet_id is not None:
-                cursor.execute(
-                    "SELECT id, user_id, application_id, packet_version_hash, is_active_revision FROM prepared_packets WHERE id = ?",
-                    (packet_id,),
+            current_status = app_row["status"]
+            norm_status = ApplicationStateMachine.normalize_status(current_status)
+            if norm_status != ApplicationStatus.READY_FOR_REVIEW:
+                raise InvalidStatusTransitionError(
+                    old_status=current_status,
+                    new_status=ApplicationStatus.APPROVED.value,
+                    allowed=[ApplicationStatus.READY_FOR_REVIEW.value, ApplicationStatus.APPLICATION_PREPARED.value],
                 )
-                pkt_row = cursor.fetchone()
-                if not pkt_row:
-                    raise ValidationError(f"Prepared packet #{packet_id} not found.")
-                if pkt_row["user_id"] != user_id:
-                    raise CrossUserAccessError(
-                        user_id=user_id,
-                        target_user_id=pkt_row["user_id"],
-                        resource=f"PreparedPacket #{packet_id}",
-                    )
-                if pkt_row["application_id"] != application_id:
-                    raise ValidationError(
-                        f"Prepared packet #{packet_id} belongs to Application #{pkt_row['application_id']}, not #{application_id}."
-                    )
-                if pkt_row["packet_version_hash"] != packet_version_hash:
-                    raise ValidationError(
-                        f"Packet version hash mismatch for PreparedPacket #{packet_id}."
-                    )
-                if not pkt_row["is_active_revision"]:
-                    raise ValidationError(
-                        f"Prepared packet #{packet_id} is not the active revision. Previous approvals cannot authorize outdated packet revisions."
-                    )
+
+            # Determine new status preserving legacy style if applicable
+            if target_status is not None:
+                new_status = target_status
+            elif current_status == ApplicationStatus.READY_FOR_REVIEW.value:
+                new_status = ApplicationStatus.APPROVED.value
             else:
-                cursor.execute(
-                    """
-                    SELECT id, user_id, application_id, packet_version_hash, is_active_revision
-                    FROM prepared_packets
-                    WHERE application_id = ? AND user_id = ? AND is_active_revision = 1
-                    ORDER BY version_num DESC LIMIT 1
-                    """,
-                    (application_id, user_id),
-                )
-                pkt_row = cursor.fetchone()
-                if pkt_row:
-                    if pkt_row["packet_version_hash"] != packet_version_hash:
-                        raise ValidationError("Packet version hash mismatch with active prepared packet.")
-                    packet_id = pkt_row["id"]
+                new_status = ApplicationStatus.AWAITING_APPROVAL.value
 
-            try:
-                cursor.execute(
-                    """
-                    INSERT INTO application_approvals (
-                        application_id, packet_id, user_id, packet_version_hash,
-                        ticket_nonce, key_id, approver_name, session_id,
-                        approved_at, is_consumed
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, 0)
-                    """,
-                    (
-                        application_id,
-                        packet_id,
-                        user_id,
-                        packet_version_hash,
-                        ticket_nonce,
-                        key_id,
-                        clean_approver,
-                        session_id,
-                    ),
-                )
-            except sqlite3.IntegrityError as e:
-                if "ticket_nonce" in str(e):
-                    raise TicketAlreadyConsumedError(
-                        f"Ticket nonce '{ticket_nonce}' is already registered in approvals."
-                    )
-                raise
+            # 2. Record approval & log via internal helper
+            approval = self._record_packet_approval_internal(
+                cursor=cursor,
+                application_id=application_id,
+                user_id=user_id,
+                packet_version_hash=packet_version_hash,
+                ticket_nonce=ticket_nonce,
+                key_id=key_id,
+                approver_name=approver_name,
+                session_id=session_id,
+                packet_id=packet_id,
+            )
 
-            approval_id = cursor.lastrowid
-            cursor.execute("SELECT * FROM application_approvals WHERE id = ?", (approval_id,))
-            row = cursor.fetchone()
-
-            # Also log to application_logs
+            # 3. Update application status
             cursor.execute(
                 """
-                INSERT INTO application_logs (application_id, user_id, action, details)
-                VALUES (?, ?, ?, ?)
+                UPDATE applications
+                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ?
                 """,
-                (
-                    application_id,
-                    user_id,
-                    "HUMAN_APPROVAL_GRANTED",
-                    json.dumps({
-                        "approver": clean_approver,
-                        "session_id": session_id,
-                        "packet_version_hash": packet_version_hash,
-                        "ticket_nonce": ticket_nonce,
-                        "key_id": key_id,
-                        "is_human": True,
-                    }),
-                ),
+                (new_status, application_id, user_id),
             )
-            return ApplicationApproval(**dict(row))
+
+            # 4. Insert PACKET_HUMAN_APPROVED timeline event
+            self._insert_application_event_internal(
+                cursor=cursor,
+                application_id=application_id,
+                user_id=user_id,
+                event_type="PACKET_HUMAN_APPROVED",
+                new_status=new_status,
+                previous_status=current_status,
+                actor_type="CANDIDATE",
+                actor_identifier=approver_name.strip(),
+                session_reference=session_id,
+                event_payload={
+                    "approver": approver_name.strip(),
+                    "packet_id": packet_id,
+                    "packet_version_hash": packet_version_hash,
+                    "ticket_nonce": ticket_nonce,
+                    "key_id": key_id,
+                },
+            )
+
+            return approval
 
     def has_valid_packet_approval(
         self,
