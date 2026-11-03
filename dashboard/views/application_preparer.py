@@ -605,6 +605,11 @@ def render_application_preparer():
                     candidate_profile_version=db_profile.get("version", 1) if db_profile else 1,
                     candidate_profile_hash=db_profile.get("profile_hash", "") if db_profile else "",
                     template_id=doc_template.value if 'doc_template' in locals() else "modern",
+                    template_version="1.0.0",
+                    original_resume_version_num=selected_res_meta.get("active_version", 1),
+                    job_description_id=selected_jd.id if selected_jd else None,
+                    matching_engine_version="2.1.1",
+                    scoring_configuration_version="1.0.0",
                 )
                 st.session_state["prepared_packet"] = pkt
                 st.success(f"Immutable Packet #{pkt.id} (Version {pkt.version_num}) recorded in SQLite!")
@@ -653,31 +658,40 @@ def render_application_preparer():
                 elif over_limit_qs:
                     st.error(f"Authorization Blocked: Question '{over_limit_qs[0].question_text}' exceeds allowable character limit.")
                 else:
-                    # Issue cryptographic single-use ticket
-                    sess = service.get_or_create_candidate_session(
-                        candidate_name=approver_name_input.strip(),
-                        candidate_id=f"user_{user_id}",
-                        user_id=user_id,
-                    )
-                    action_ticket = service.issue_approval_ticket(
-                        session_id=sess.session_id,
-                        job_id=app.id,
-                        packet_hash=pkt.packet_version_hash,
-                    )
-                    succ, msg, approval = service.authorize_universal_application_packet(
-                        user_id=user_id,
-                        application_id=app.id,
-                        packet_id=pkt.id,
-                        approver_name=approver_name_input.strip(),
-                        session_id=sess.session_id,
-                        action_ticket=action_ticket,
-                        candidate_confirmed=confirm_truthfulness,
-                    )
-                    if succ:
-                        st.success(f"✅ {msg}")
-                        st.rerun()
+                    # Resolve active authenticated session from login state (never create sessions during approval)
+                    auth_session_id = st.session_state.get("authenticated_session_id") or st.session_state.get("session_id")
+                    if not auth_session_id:
+                        st.error("🔒 **Authentication Required**: No active authenticated session found. Please sign in to authorize this application.")
                     else:
-                        st.error(f"Authorization failed: {msg}")
+                        sess = None
+                        try:
+                            sess = service.get_authenticated_candidate_session(
+                                user_id=user_id,
+                                session_id=auth_session_id,
+                            )
+                        except Exception as auth_err:
+                            st.error(f"🔒 **Authentication Failed**: {auth_err}. Please sign in again.")
+
+                        if sess:
+                            action_ticket = service.issue_approval_ticket(
+                                session_id=sess.session_id,
+                                job_id=app.id,
+                                packet_hash=pkt.packet_version_hash,
+                            )
+                            succ, msg, approval = service.authorize_universal_application_packet(
+                                user_id=user_id,
+                                application_id=app.id,
+                                packet_id=pkt.id,
+                                approver_name=approver_name_input.strip(),
+                                session_id=sess.session_id,
+                                action_ticket=action_ticket,
+                                candidate_confirmed=confirm_truthfulness,
+                            )
+                            if succ:
+                                st.success(f"✅ {msg}")
+                                st.rerun()
+                            else:
+                                st.error(f"Authorization failed: {msg}")
 
     # =========================================================================
     # TAB 8: PACKET HISTORY & DOWNLOADS

@@ -265,6 +265,10 @@ CREATE TABLE IF NOT EXISTS prepared_packets (
     candidate_profile_version INTEGER,
     candidate_profile_hash TEXT,
     matching_result_id INTEGER,
+    matching_engine_version TEXT,
+    scoring_configuration_version TEXT,
+    original_resume_version_num INTEGER,
+    job_description_id INTEGER,
     template_id TEXT,
     template_version TEXT,
     is_active_revision INTEGER DEFAULT 1 CHECK(is_active_revision IN (0, 1)),
@@ -272,7 +276,7 @@ CREATE TABLE IF NOT EXISTS prepared_packets (
     UNIQUE(id, user_id),
     UNIQUE(application_id, version_num),
     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
-    FOREIGN KEY (original_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE CASCADE
+    FOREIGN KEY (original_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
 );
 
 -- ---------------------------------------------------------------------

@@ -117,13 +117,13 @@ Phase 6 introduces 6 new automated test suites (31 new tests), bringing the tota
 | `tests/test_application_packet_integrity.py` | 5 | Packet versioning, RFC 8785 canonical hashing, ticket replay protection |
 | `tests/test_phase6_1_hardening.py` | 37 | Multi-user security, session ownership, truthful evidence, packet provenance |
 | **Existing Phase 1–5.1.1 Suites** | 336 | Regression tests for all previous deliverables |
-| **Total Test Suite** | **404** | **100% Passing** |
+| **Total Test Suite** | **424** | **100% Passing** |
 
 ---
 
 ## 4. Stopping Protocol Compliance
 
-Phase 6 and 6.1 implement complete application preparation, document generation, and provenance hardening. In strict accordance with `AGENTS.md` and Phase 6 specifications:
+Phase 6, 6.1, and 6.1.1 implement complete application preparation, document generation, and provenance hardening. In strict accordance with `AGENTS.md` and Phase 6 specifications:
 - No automatic submission actions are executed.
 - No Playwright browser automation or external employer portal interactions are invoked.
 - Application status stops cleanly at `Awaiting Approval` under strict human governance.
@@ -157,3 +157,41 @@ Phase 6.1 performed a comprehensive security, provenance, and data-integrity aud
    - Real disk-inspected `attachments_manifest` with file format verification, on-disk size calculation, and SHA-256 hashes.
    - PDF validation requires non-empty extractable text.
    - Streamlit UI context keys isolate session state per application workspace, resume hash, JD snapshot hash, and candidate profile hash.
+
+---
+
+## 6. Phase 6.1.1 Authenticated Session Binding & Complete Packet Hash Integrity
+
+Phase 6.1.1 completed final hardening for authenticated approval sessions and canonical packet integrity:
+
+1. **Actual Login Session Requirement for Packet Approval**:
+   - Streamlit Application Preparer workflow (Tab 7) strictly resolves the active authenticated session from the actual Phase 2 login state (`st.session_state["authenticated_session_id"]` or `st.session_state["session_id"]`).
+   - Replaced ambiguous `get_or_create_candidate_session()` fallback with `DashboardService.get_authenticated_candidate_session(user_id, session_id)`.
+   - Strictly fails if the session ID is missing, unissued, expired, deactivated, or belongs to another user (`InvalidSessionError`, `SessionExpiredError`, `SecurityAuthorizationError`).
+   - Strictly NEVER automatically fabricates or creates sessions during approval attempts.
+
+2. **Server-Side Session & User Identity Verification**:
+   - `HumanApprovalGate.authorize_universal_packet` independently validates the session existence, activity, and expiration directly via `SessionManager.validate_session`.
+   - Strictly verifies that `session.user_id == user_id` and the candidate identity matches.
+   - All approval tickets are cryptographically bound to the authenticated session ID, user ID, application ID, packet version hash, and single-use HMAC nonce.
+
+3. **Complete Canonical Packet Payload**:
+   - Enriched RFC 8785 canonical JSON dictionary to cover all persisted provenance and artifact hashes:
+     - **Identity & Source Versions**: `user_id`, `application_id`, `packet_version`, `original_resume_id`, `original_resume_version_num`, `original_resume_file_hash`, `candidate_profile_version`, `candidate_profile_snapshot_hash`, `job_description_id`, `job_description_snapshot_hash`, `matching_result_id`, `matching_engine_version`, `scoring_configuration_version`.
+     - **Generated Materials**: Complete tailored resume content & provenance map, tailored resume document content hash, cover letter text & provenance claims, cover letter document content hash, screening QA list with review states, provenance, character limits, candidate edits, and confirmation state.
+     - **Attachment Manifest**: Actual artifacts with type, stored filename, file format, byte size, SHA-256 content hash, source version, and creation timestamp.
+     - **Rendering Metadata**: `template_id`, `template_version`, `rendering_engine`, `generation_timestamp`.
+   - Stored file paths serve as reference locators only; integrity is cryptographically guaranteed by SHA-256 content hashes.
+
+4. **Independent Packet Hash Verification**:
+   - `HumanApprovalGate.verify_packet_integrity(packet)` independently re-computes `hashlib.sha256(packet.canonical_snapshot_json.encode('utf-8')).hexdigest()` and verifies exact match with `packet.packet_version_hash`.
+   - `authorize_universal_packet` validates packet integrity prior to approval; tampered snapshot JSON or mismatched hashes fail closed.
+
+5. **Legacy Packet Migration & Handling**:
+   - Migration `_migrate_prepared_packets_foreign_keys` preserves historical packet records and approval audit records without fabricating missing metadata.
+   - `PreparedPacket.is_legacy` property cleanly identifies historical packets missing canonical snapshots (`canonical_snapshot_json is None`), preventing invalid hash recalculations.
+
+6. **Resume Archival & Packet Retention**:
+   - `prepared_packets` foreign key migrated to `FOREIGN KEY (original_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT`.
+   - `delete_user_resume`: If a resume is referenced by historical prepared packets or match results, it is safely archived (`is_active = 0, is_primary = 0`), preserving historical packet versions, original file hashes, and disk files intact.
+   - Explicit user account privacy erasure (`delete_user_account_data`) deletes prepared packets prior to users table cascade, cleanly distinguishing normal resume archival from user account deletion.

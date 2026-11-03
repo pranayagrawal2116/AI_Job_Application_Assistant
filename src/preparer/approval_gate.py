@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import hashlib
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -92,32 +93,97 @@ class HumanApprovalGate:
         matching_result_id: Optional[int] = None,
         template_id: Optional[str] = None,
         template_version: Optional[str] = None,
+        original_resume_version_num: Optional[int] = None,
+        job_description_id: Optional[int] = None,
+        matching_engine_version: Optional[str] = None,
+        scoring_configuration_version: Optional[str] = None,
+        generation_timestamp: Optional[str] = None,
     ) -> PreparedPacket:
         """Assembles and stores an immutable PreparedPacket revision in SQLite."""
-        # 1. Compute RFC 8785 canonical bytes and hash of all constituent materials
-        packet_payload = {
-            "application_id": application_id,
-            "user_id": user_id,
-            "original_resume_id": original_resume_id,
-            "original_resume_hash": original_resume_hash,
-            "job_description_snapshot_hash": job_description_snapshot_hash,
-            "tailored_resume": tailored_resume.to_dict(),
-            "cover_letter_text": cover_letter.letter_text,
-            "screening_answers": [q.to_dict() for q in qa_packet.questions],
-            "attachments_manifest": attachments_manifest or [],
-        }
-        canonical_snapshot = canonical_json_bytes(packet_payload).decode("utf-8")
-        packet_hash = canonical_json_hash(packet_payload)
+        # 0. Resolve source version metadata and packet revision number
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT COALESCE(MAX(version_num), 0) + 1 AS next_v FROM prepared_packets WHERE application_id = ?",
+                (application_id,),
+            )
+            version_num = cursor.fetchone()["next_v"]
+
+            if original_resume_version_num is None and original_resume_id is not None:
+                cursor.execute("SELECT active_version FROM resumes WHERE id = ?", (original_resume_id,))
+                r_row = cursor.fetchone()
+                original_resume_version_num = r_row["active_version"] if r_row and r_row["active_version"] is not None else 1
+
+            if job_description_id is None:
+                cursor.execute("SELECT job_description_id FROM applications WHERE id = ?", (application_id,))
+                app_row = cursor.fetchone()
+                if app_row and app_row["job_description_id"] is not None:
+                    job_description_id = app_row["job_description_id"]
+
+            if candidate_profile_version is None or candidate_profile_hash is None:
+                cursor.execute(
+                    "SELECT version, profile_hash FROM candidate_profiles WHERE user_id = ? ORDER BY version DESC LIMIT 1",
+                    (user_id,),
+                )
+                p_row = cursor.fetchone()
+                if p_row:
+                    if candidate_profile_version is None:
+                        candidate_profile_version = p_row["version"]
+                    if candidate_profile_hash is None:
+                        candidate_profile_hash = p_row["profile_hash"]
+
+        matching_eng_ver = matching_engine_version or ("2.1.1" if matching_result_id is not None else None)
+        scoring_cfg_ver = scoring_configuration_version or ("1.0.0" if matching_result_id is not None else None)
+        tmpl_id = template_id or "modern"
+        tmpl_ver = template_version or "1.0.0"
+        gen_time = generation_timestamp or getattr(tailored_resume, "created_at", None) or datetime.now(timezone.utc).isoformat()
 
         tailored_path = tailored_resume_doc.file_path if tailored_resume_doc else None
         tailored_hash = tailored_resume_doc.file_hash if tailored_resume_doc else None
         cover_path = cover_letter_doc.file_path if cover_letter_doc else cover_letter.file_path
         cover_hash = cover_letter_doc.file_hash if cover_letter_doc else None
 
+        # 1. Compute RFC 8785 canonical bytes and hash of all constituent materials
+        complete_snapshot_payload = {
+            "user_id": user_id,
+            "application_id": application_id,
+            "packet_version": version_num,
+            "original_resume_id": original_resume_id,
+            "original_resume_version_num": original_resume_version_num,
+            "original_resume_file_hash": original_resume_hash,
+            "candidate_profile_version": candidate_profile_version,
+            "candidate_profile_snapshot_hash": candidate_profile_hash,
+            "job_description_id": job_description_id,
+            "job_description_snapshot_hash": job_description_snapshot_hash,
+            "matching_result_id": matching_result_id,
+            "matching_engine_version": matching_eng_ver,
+            "scoring_configuration_version": scoring_cfg_ver,
+            "tailored_resume": tailored_resume.to_dict(),
+            "tailored_resume_document_hash": tailored_hash,
+            "cover_letter": {
+                "letter_text": cover_letter.letter_text,
+                "paragraphs": cover_letter.paragraphs,
+                "provenance_claims": [c.to_dict() for c in cover_letter.provenance_claims],
+                "tone": cover_letter.tone,
+                "career_level": cover_letter.career_level,
+            },
+            "cover_letter_document_hash": cover_hash,
+            "screening_questions": [q.to_dict() for q in qa_packet.questions],
+            "attachments_manifest": attachments_manifest or [],
+            "template_id": tmpl_id,
+            "template_version": tmpl_ver,
+            "document_generation_engine": "ReportLab/python-docx Universal v2.1.1",
+            "generation_timestamp": gen_time,
+        }
+        canonical_snapshot_bytes = canonical_json_bytes(complete_snapshot_payload)
+        canonical_snapshot = canonical_snapshot_bytes.decode("utf-8")
+        packet_hash = hashlib.sha256(canonical_snapshot_bytes).hexdigest()
+
         # 2. Persist in prepared_packets table
         packet = self.db.create_prepared_packet(
             application_id=application_id,
             user_id=user_id,
+            version_num=version_num,
             packet_version_hash=packet_hash,
             original_resume_hash=original_resume_hash,
             job_description_snapshot_hash=job_description_snapshot_hash,
@@ -132,8 +198,12 @@ class HumanApprovalGate:
             candidate_profile_version=candidate_profile_version,
             candidate_profile_hash=candidate_profile_hash,
             matching_result_id=matching_result_id,
-            template_id=template_id,
-            template_version=template_version,
+            matching_engine_version=matching_eng_ver,
+            scoring_configuration_version=scoring_cfg_ver,
+            original_resume_version_num=original_resume_version_num,
+            job_description_id=job_description_id,
+            template_id=tmpl_id,
+            template_version=tmpl_ver,
         )
 
         # 3. Transition application status to Application Prepared
@@ -164,6 +234,20 @@ class HumanApprovalGate:
             application_id,
         )
         return packet
+
+    def verify_packet_integrity(self, packet: PreparedPacket) -> Tuple[bool, str]:
+        """Independently verifies that a PreparedPacket's stored canonical snapshot matches its version hash."""
+        if not packet.canonical_snapshot_json:
+            return False, "Legacy packet record: canonical snapshot JSON is unavailable."
+
+        recomputed_hash = hashlib.sha256(packet.canonical_snapshot_json.encode("utf-8")).hexdigest()
+        if recomputed_hash != packet.packet_version_hash:
+            return False, (
+                f"Integrity check failed: Recomputed hash ({recomputed_hash}) "
+                f"does not match packet version hash ({packet.packet_version_hash})."
+            )
+
+        return True, "Packet integrity verified."
 
     def authorize_universal_packet(
         self,
@@ -215,6 +299,11 @@ class HumanApprovalGate:
 
         if not packet.is_active_revision:
             return False, "Approval rejected: This packet version is outdated. Please approve the active revision.", None
+
+        # 2.2. Recompute and verify packet integrity from stored canonical snapshot
+        valid_integrity, integrity_msg = self.verify_packet_integrity(packet)
+        if not valid_integrity:
+            return False, f"Approval rejected: {integrity_msg}", None
 
         # 2.5. Verify Screening Answers Readiness
         screening_data = (

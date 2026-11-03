@@ -235,8 +235,17 @@ class PreparedPacket:
     candidate_profile_version: Optional[int] = None
     candidate_profile_hash: Optional[str] = None
     matching_result_id: Optional[int] = None
+    matching_engine_version: Optional[str] = None
+    scoring_configuration_version: Optional[str] = None
+    original_resume_version_num: Optional[int] = None
+    job_description_id: Optional[int] = None
     template_id: Optional[str] = None
     template_version: Optional[str] = None
+
+    @property
+    def is_legacy(self) -> bool:
+        """Returns True if this prepared packet is a legacy record without a complete canonical snapshot."""
+        return self.canonical_snapshot_json is None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -536,6 +536,54 @@ class DashboardService:
             email=f"candidate_{target_uid or 1}@assistant.local",
         )
 
+    def get_authenticated_candidate_session(
+        self,
+        user_id: int,
+        session_id: Optional[str] = None,
+    ):
+        """Retrieves and validates an existing authenticated candidate session.
+
+        Strictly fails if:
+        - session_id is missing or empty
+        - session does not exist in SessionManager
+        - session is expired
+        - session is inactive/revoked
+        - session.user_id != user_id
+        - session identity does not match candidate
+
+        Strictly NEVER creates or fabricates a session.
+        """
+        from src.security.session_manager import SessionManager
+        from src.database.exceptions import (
+            InvalidSessionError,
+            SessionExpiredError,
+            SecurityAuthorizationError,
+        )
+
+        if not session_id or not isinstance(session_id, str) or not session_id.strip():
+            raise InvalidSessionError("No authenticated session provided. Please sign in again.")
+
+        session_mgr = SessionManager.get_instance()
+        sess = session_mgr.validate_session(session_id.strip())
+        if not sess:
+            raise InvalidSessionError("Session not found or inactive. Please sign in again.")
+
+        if sess.is_expired:
+            raise SessionExpiredError("Session has expired. Re-authentication required.")
+
+        if not sess.is_active:
+            raise InvalidSessionError("Session is revoked or deactivated. Please sign in again.")
+
+        if sess.user_id is not None and sess.user_id != user_id:
+            raise SecurityAuthorizationError(
+                f"Cross-user session violation: Session belongs to User #{sess.user_id}, not User #{user_id}."
+            )
+
+        if sess.candidate_id and sess.candidate_id not in (str(user_id), f"user_{user_id}") and sess.user_id is None:
+            raise SecurityAuthorizationError("Session candidate identity does not match authenticated user.")
+
+        return sess
+
     def issue_approval_ticket(self, session_id: str, job_id: int, packet_hash: str) -> str:
         """Issues an authenticated single-use ticket for application approval."""
         from src.security.session_manager import SessionManager
@@ -616,6 +664,11 @@ class DashboardService:
             resume_hash=res_hash,
             answers=answers,
         )
+
+        cleaned_approver = (approver_name or "").strip()
+        bot_keywords = ["bot", "agent", "system", "auto", "script", "ai_assistant", "daemon", "matcher", "scraper"]
+        if any(b in cleaned_approver.lower() for b in bot_keywords):
+            return False, f"Approval rejected: '{cleaned_approver}' indicates automated authorization. Strict human approval is required."
 
         sess = None
         if session_id:
@@ -1114,6 +1167,11 @@ class DashboardService:
         matching_result_id: Optional[int] = None,
         template_id: Optional[str] = None,
         template_version: Optional[str] = None,
+        original_resume_version_num: Optional[int] = None,
+        job_description_id: Optional[int] = None,
+        matching_engine_version: Optional[str] = None,
+        scoring_configuration_version: Optional[str] = None,
+        generation_timestamp: Optional[str] = None,
     ):
         """Assembles and stores immutable PreparedPacket revision in SQLite."""
         from src.preparer.approval_gate import HumanApprovalGate
@@ -1135,6 +1193,11 @@ class DashboardService:
             matching_result_id=matching_result_id,
             template_id=template_id,
             template_version=template_version,
+            original_resume_version_num=original_resume_version_num,
+            job_description_id=job_description_id,
+            matching_engine_version=matching_engine_version,
+            scoring_configuration_version=scoring_configuration_version,
+            generation_timestamp=generation_timestamp,
         )
 
     def authorize_universal_application_packet(

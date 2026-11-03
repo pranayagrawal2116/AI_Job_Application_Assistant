@@ -214,6 +214,10 @@ class DatabaseManager:
         add_col_if_missing("prepared_packets", "candidate_profile_version", "INTEGER DEFAULT 1")
         add_col_if_missing("prepared_packets", "candidate_profile_hash", "TEXT")
         add_col_if_missing("prepared_packets", "matching_result_id", "INTEGER")
+        add_col_if_missing("prepared_packets", "matching_engine_version", "TEXT")
+        add_col_if_missing("prepared_packets", "scoring_configuration_version", "TEXT")
+        add_col_if_missing("prepared_packets", "original_resume_version_num", "INTEGER")
+        add_col_if_missing("prepared_packets", "job_description_id", "INTEGER")
         add_col_if_missing("prepared_packets", "template_id", "TEXT")
         add_col_if_missing("prepared_packets", "template_version", "TEXT DEFAULT '1.0.0'")
 
@@ -321,6 +325,105 @@ class DatabaseManager:
 
         logger.info("match_results migration completed successfully.")
 
+    def _migrate_prepared_packets_foreign_keys(self, conn: sqlite3.Connection) -> None:
+        """Migrates prepared_packets table to enforce ON DELETE RESTRICT on resumes.
+
+        Preserves all historical packet rows, version numbers, hashes, and canonical snapshots without fabricating metadata.
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
+        if not cursor.fetchone():
+            return
+
+        cursor.execute("PRAGMA foreign_key_list(prepared_packets)")
+        fks = cursor.fetchall()
+        needs_migration = False
+        for fk in fks:
+            table_ref = fk[2]
+            on_delete = fk[6]
+            if table_ref == "resumes" and on_delete != "RESTRICT":
+                needs_migration = True
+                break
+
+        if not needs_migration:
+            return
+
+        logger.info("Performing table rebuild migration for prepared_packets foreign keys (enforcing RESTRICT on resumes)...")
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("DROP TABLE IF EXISTS prepared_packets_v2")
+
+        cursor.execute("""
+            CREATE TABLE prepared_packets_v2 (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                version_num INTEGER NOT NULL DEFAULT 1,
+                packet_version_hash TEXT NOT NULL,
+                original_resume_id INTEGER,
+                original_resume_hash TEXT NOT NULL,
+                tailored_resume_path TEXT,
+                tailored_resume_hash TEXT,
+                cover_letter_path TEXT,
+                cover_letter_hash TEXT,
+                job_description_snapshot_hash TEXT NOT NULL,
+                screening_answers_json TEXT NOT NULL,
+                form_payload_json TEXT,
+                form_payload_hash TEXT,
+                attachments_manifest_json TEXT,
+                attachments_manifest_hash TEXT,
+                canonical_snapshot_json TEXT,
+                candidate_profile_version INTEGER,
+                candidate_profile_hash TEXT,
+                matching_result_id INTEGER,
+                matching_engine_version TEXT,
+                scoring_configuration_version TEXT,
+                original_resume_version_num INTEGER,
+                job_description_id INTEGER,
+                template_id TEXT,
+                template_version TEXT,
+                is_active_revision INTEGER DEFAULT 1 CHECK(is_active_revision IN (0, 1)),
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(id, user_id),
+                UNIQUE(application_id, version_num),
+                FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
+                FOREIGN KEY (original_resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT
+            )
+        """)
+
+        cursor.execute("PRAGMA table_info(prepared_packets)")
+        old_cols = [r[1] for r in cursor.fetchall()]
+        v2_cols = [
+            "id", "application_id", "user_id", "version_num", "packet_version_hash",
+            "original_resume_id", "original_resume_hash", "tailored_resume_path",
+            "tailored_resume_hash", "cover_letter_path", "cover_letter_hash",
+            "job_description_snapshot_hash", "screening_answers_json",
+            "form_payload_json", "form_payload_hash", "attachments_manifest_json",
+            "attachments_manifest_hash", "canonical_snapshot_json",
+            "candidate_profile_version", "candidate_profile_hash",
+            "matching_result_id", "matching_engine_version",
+            "scoring_configuration_version", "original_resume_version_num",
+            "job_description_id", "template_id", "template_version",
+            "is_active_revision", "created_at",
+        ]
+        shared_cols = [c for c in v2_cols if c in old_cols]
+        cols_str = ", ".join(shared_cols)
+
+        cursor.execute(f"INSERT INTO prepared_packets_v2 ({cols_str}) SELECT {cols_str} FROM prepared_packets")
+        cursor.execute("DROP TABLE prepared_packets")
+        cursor.execute("ALTER TABLE prepared_packets_v2 RENAME TO prepared_packets")
+
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_prepared_packets_app ON prepared_packets(application_id, user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_prepared_packets_hash ON prepared_packets(packet_version_hash)")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_prepared_packets_id_user ON prepared_packets(id, user_id)")
+
+        cursor.execute("PRAGMA foreign_keys = ON")
+        cursor.execute("PRAGMA foreign_key_check(prepared_packets)")
+        fk_errors = cursor.fetchall()
+        if fk_errors:
+            raise RuntimeError(f"Foreign key integrity check failed after prepared_packets migration: {fk_errors}")
+
+        logger.info("prepared_packets migration completed successfully.")
+
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
         if not self.schema_path.is_file():
@@ -334,6 +437,8 @@ class DatabaseManager:
             self._ensure_backward_compatible_columns(cursor)
             conn.commit()
             self._migrate_match_results_foreign_keys(conn)
+            conn.commit()
+            self._migrate_prepared_packets_foreign_keys(conn)
             conn.commit()
             conn.executescript(schema_sql)
             conn.commit()
@@ -2511,13 +2616,11 @@ class DatabaseManager:
 
             # Check if referenced by applications
             cursor.execute("SELECT id FROM applications WHERE resume_id = ? AND user_id = ?", (resume_id, user_id))
-            if cursor.fetchone():
-                raise ResumeInUseError(f"Cannot delete Resume #{resume_id}: referenced by existing job applications.")
+            has_application = cursor.fetchone() is not None
 
             # Check if referenced by prepared_packets
-            cursor.execute("SELECT id FROM prepared_packets WHERE original_resume_id = ? AND user_id = ?", (resume_id, user_id))
-            if cursor.fetchone():
-                raise ResumeInUseError(f"Cannot delete Resume #{resume_id}: referenced by prepared application packets.")
+            cursor.execute("SELECT COUNT(*) as cnt FROM prepared_packets WHERE original_resume_id = ? AND user_id = ?", (resume_id, user_id))
+            linked_packets = cursor.fetchone()["cnt"]
 
             # Check if referenced by match_results
             cursor.execute(
@@ -2535,8 +2638,8 @@ class DatabaseManager:
 
         base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
 
-        if linked_matches > 0:
-            # Soft-delete / Archive resume to protect historical match records and audit integrity
+        if linked_packets > 0 or linked_matches > 0:
+            # Soft-delete / Archive resume to protect historical prepared packets, match records and audit integrity
             with self.transaction() as conn:
                 cursor = conn.cursor()
                 cursor.execute(
@@ -2553,10 +2656,13 @@ class DatabaseManager:
                         cursor.execute("UPDATE resumes SET is_primary = 1 WHERE id = ?", (rem["id"],))
 
             logger.info(
-                f"Resume #{resume_id} archived (soft-deleted) due to {linked_matches} historical match evaluations; "
-                "physical files and evaluation records preserved."
+                f"Resume #{resume_id} archived (soft-deleted) due to {linked_packets} prepared packets and "
+                f"{linked_matches} match evaluations; physical files and revision history preserved."
             )
             return True
+
+        if has_application:
+            raise ResumeInUseError(f"Cannot delete Resume #{resume_id}: referenced by existing job applications.")
 
         # If completely unreferenced, perform clean deletion of row and physical files
         with self.transaction() as conn:
@@ -2673,6 +2779,10 @@ class DatabaseManager:
         matching_result_id: Optional[int] = None,
         template_id: Optional[str] = None,
         template_version: Optional[str] = None,
+        matching_engine_version: Optional[str] = None,
+        scoring_configuration_version: Optional[str] = None,
+        original_resume_version_num: Optional[int] = None,
+        job_description_id: Optional[int] = None,
     ) -> PreparedPacket:
         """Stores a prepared application packet revision with composite foreign key integrity."""
         with self.transaction() as conn:
@@ -2744,9 +2854,11 @@ class DatabaseManager:
                     attachments_manifest_json, attachments_manifest_hash,
                     canonical_snapshot_json, candidate_profile_version,
                     candidate_profile_hash, matching_result_id,
+                    matching_engine_version, scoring_configuration_version,
+                    original_resume_version_num, job_description_id,
                     template_id, template_version,
                     is_active_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     application_id,
@@ -2769,6 +2881,10 @@ class DatabaseManager:
                     candidate_profile_version,
                     candidate_profile_hash,
                     matching_result_id,
+                    matching_engine_version,
+                    scoring_configuration_version,
+                    original_resume_version_num,
+                    job_description_id,
                     template_id,
                     template_version or "1.0.0",
                 ),
@@ -2880,11 +2996,12 @@ class DatabaseManager:
                 (user_id,),
             )
 
-            # 2.5 Delete user match_results to prevent ON DELETE RESTRICT from blocking cascade deletion of resumes/JDs
+            # 2.5 Delete user match_results and prepared_packets to prevent ON DELETE RESTRICT from blocking cascade deletion of resumes/JDs
             cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
 
             # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
-            #    applications, prepared_packets, application_approvals, password_reset_tokens)
+            #    applications, application_approvals, password_reset_tokens)
             cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
             logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
             return True
