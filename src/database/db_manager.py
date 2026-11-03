@@ -177,6 +177,7 @@ class DatabaseManager:
         add_col_if_missing("resumes", "updated_at", "DATETIME DEFAULT CURRENT_TIMESTAMP")
         add_col_if_missing("resumes", "parsing_status", "TEXT DEFAULT 'COMPLETED'")
         add_col_if_missing("resumes", "active_version", "INTEGER DEFAULT 1")
+        add_col_if_missing("resumes", "is_active", "INTEGER DEFAULT 1")
         add_col_if_missing("candidate_profiles", "profile_hash", "TEXT")
         add_col_if_missing("job_descriptions", "source_url", "TEXT")
         add_col_if_missing("job_descriptions", "original_filename", "TEXT")
@@ -189,6 +190,7 @@ class DatabaseManager:
         add_col_if_missing("match_results", "resume_version_num", "INTEGER DEFAULT 1")
         add_col_if_missing("match_results", "resume_file_hash", "TEXT")
         add_col_if_missing("match_results", "candidate_profile_version", "INTEGER DEFAULT 1")
+        add_col_if_missing("match_results", "candidate_profile_hash", "TEXT")
         add_col_if_missing("match_results", "job_snapshot_hash", "TEXT")
         add_col_if_missing("match_results", "scoring_profile", "TEXT DEFAULT 'general_baseline'")
         add_col_if_missing("match_results", "scoring_config_version", "TEXT DEFAULT '1.0.0'")
@@ -1906,11 +1908,20 @@ class DatabaseManager:
                 )
             return dict(row)
 
-    def list_user_resumes(self, user_id: int) -> List[Dict[str, Any]]:
-        """Lists all resumes belonging to a user."""
+    def list_user_resumes(self, user_id: int, active_only: bool = True) -> List[Dict[str, Any]]:
+        """Lists all resumes belonging to a user, filtering active by default."""
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM resumes WHERE user_id = ? ORDER BY uploaded_at DESC", (user_id,))
+            if active_only:
+                cursor.execute(
+                    "SELECT * FROM resumes WHERE user_id = ? AND is_active = 1 ORDER BY uploaded_at DESC",
+                    (user_id,),
+                )
+            else:
+                cursor.execute(
+                    "SELECT * FROM resumes WHERE user_id = ? ORDER BY uploaded_at DESC",
+                    (user_id,),
+                )
             return [dict(row) for row in cursor.fetchall()]
 
     def create_resume_version(
@@ -2185,10 +2196,10 @@ class DatabaseManager:
             return dict(cursor.fetchone())
 
     def get_primary_resume(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Returns the primary resume record for a user, or None."""
+        """Returns the primary active resume record for a user, or None."""
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM resumes WHERE user_id = ? AND is_primary = 1 LIMIT 1", (user_id,))
+            cursor.execute("SELECT * FROM resumes WHERE user_id = ? AND is_primary = 1 AND is_active = 1 LIMIT 1", (user_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
 
@@ -2275,6 +2286,13 @@ class DatabaseManager:
             if cursor.fetchone():
                 raise ResumeInUseError(f"Cannot delete Resume #{resume_id}: referenced by prepared application packets.")
 
+            # Check if referenced by match_results
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM match_results WHERE resume_id = ? AND user_id = ?",
+                (resume_id, user_id),
+            )
+            linked_matches = cursor.fetchone()["cnt"]
+
             cursor.execute("SELECT storage_filename FROM resume_versions WHERE resume_id = ?", (resume_id,))
             version_files = [r["storage_filename"] for r in cursor.fetchall() if r["storage_filename"]]
             if row["storage_filename"] not in version_files:
@@ -2284,6 +2302,30 @@ class DatabaseManager:
 
         base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
 
+        if linked_matches > 0:
+            # Soft-delete / Archive resume to protect historical match records and audit integrity
+            with self.transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "UPDATE resumes SET is_active = 0, is_primary = 0 WHERE id = ? AND user_id = ?",
+                    (resume_id, user_id),
+                )
+                if was_primary:
+                    cursor.execute(
+                        "SELECT id FROM resumes WHERE user_id = ? AND is_active = 1 ORDER BY uploaded_at DESC LIMIT 1",
+                        (user_id,),
+                    )
+                    rem = cursor.fetchone()
+                    if rem:
+                        cursor.execute("UPDATE resumes SET is_primary = 1 WHERE id = ?", (rem["id"],))
+
+            logger.info(
+                f"Resume #{resume_id} archived (soft-deleted) due to {linked_matches} historical match evaluations; "
+                "physical files and evaluation records preserved."
+            )
+            return True
+
+        # If completely unreferenced, perform clean deletion of row and physical files
         with self.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM resume_versions WHERE resume_id = ? AND user_id = ?", (resume_id, user_id))
@@ -2292,7 +2334,7 @@ class DatabaseManager:
             # If it was primary, promote the latest remaining resume
             if was_primary:
                 cursor.execute(
-                    "SELECT id FROM resumes WHERE user_id = ? ORDER BY uploaded_at DESC LIMIT 1",
+                    "SELECT id FROM resumes WHERE user_id = ? AND is_active = 1 ORDER BY uploaded_at DESC LIMIT 1",
                     (user_id,),
                 )
                 rem = cursor.fetchone()
@@ -2660,12 +2702,13 @@ class DatabaseManager:
                     match_score, match_classification, eligibility_status,
                     score_breakdown, explanation,
                     resume_version_num, resume_file_hash, candidate_profile_version,
+                    candidate_profile_hash,
                     job_snapshot_hash, scoring_profile, scoring_config_version,
                     assessment_confidence, engine_version,
                     matching_skills, related_skills, partial_matches, missing_skills,
                     education_analysis, experience_analysis, certification_analysis,
                     eligibility_reasons, scoring_explanations, recommendations, details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     result.user_id,
@@ -2680,6 +2723,7 @@ class DatabaseManager:
                     result.resume_version_num,
                     result.resume_file_hash,
                     result.candidate_profile_version,
+                    result.candidate_profile_hash,
                     result.job_snapshot_hash,
                     result.scoring_profile,
                     result.scoring_config_version,
@@ -2782,6 +2826,7 @@ class DatabaseManager:
             resume_version_num=row["resume_version_num"] if "resume_version_num" in keys and row["resume_version_num"] is not None else 1,
             resume_file_hash=row["resume_file_hash"] if "resume_file_hash" in keys else None,
             candidate_profile_version=row["candidate_profile_version"] if "candidate_profile_version" in keys and row["candidate_profile_version"] is not None else 1,
+            candidate_profile_hash=row["candidate_profile_hash"] if "candidate_profile_hash" in keys else None,
             job_snapshot_hash=row["job_snapshot_hash"] if "job_snapshot_hash" in keys else None,
             scoring_profile=row["scoring_profile"] if "scoring_profile" in keys and row["scoring_profile"] else "general_baseline",
             scoring_config_version=row["scoring_config_version"] if "scoring_config_version" in keys and row["scoring_config_version"] else "1.0.0",

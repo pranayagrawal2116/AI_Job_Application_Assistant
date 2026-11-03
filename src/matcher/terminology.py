@@ -278,10 +278,15 @@ SKILL_SYNONYMS: Dict[str, str] = {
 # Related Skills Taxonomies (for Related Matches)
 RELATED_SKILLS_MAP: Dict[str, Set[str]] = {
     # Tech
+    "ai": {"machine learning", "deep learning", "data science", "nlp", "computer vision", "artificial intelligence"},
+    "artificial intelligence": {"machine learning", "deep learning", "ai", "data science"},
+    "machine learning": {"deep learning", "data science", "statistics", "python", "pytorch", "tensorflow", "computer vision", "neural networks"},
     "pytorch": {"tensorflow", "keras", "deep learning", "machine learning"},
     "tensorflow": {"pytorch", "keras", "deep learning", "machine learning"},
-    "deep learning": {"machine learning", "pytorch", "tensorflow", "neural networks"},
-    "machine learning": {"deep learning", "data science", "statistics", "python"},
+    "deep learning": {"machine learning", "pytorch", "tensorflow", "neural networks", "computer vision"},
+    "computer vision": {"image processing", "deep learning", "machine learning", "pytorch", "opencv"},
+    "nlp": {"natural language processing", "deep learning", "machine learning", "llm", "transformers"},
+    "natural language processing": {"nlp", "deep learning", "machine learning", "llm"},
     "react": {"vue", "angular", "frontend development", "javascript", "typescript"},
     "vue": {"react", "angular", "frontend development", "javascript"},
     "angular": {"react", "vue", "frontend development", "typescript"},
@@ -367,12 +372,93 @@ def get_degree_level_rank(degree_text: str) -> int:
     return max_rank
 
 
+LICENSE_CANONICAL_MAP: Dict[str, str] = {
+    "rn": "registered nurse",
+    "rn license": "registered nurse",
+    "registered nurse": "registered nurse",
+    "registered nurse license": "registered nurse",
+    "lpn": "licensed practical nurse",
+    "lpn license": "licensed practical nurse",
+    "licensed practical nurse": "licensed practical nurse",
+    "nurse practitioner": "nurse practitioner",
+    "nurse practitioner license": "nurse practitioner",
+    "np license": "nurse practitioner",
+    "cpa": "certified public accountant",
+    "cpa license": "certified public accountant",
+    "certified public accountant": "certified public accountant",
+    "certified public accountant license": "certified public accountant",
+    "pe": "professional engineer",
+    "pe license": "professional engineer",
+    "pe registration": "professional engineer",
+    "professional engineer": "professional engineer",
+    "licensed professional engineer": "professional engineer",
+    "bar admission": "state bar admission",
+    "admitted to the bar": "state bar admission",
+    "admitted to the state bar": "state bar admission",
+    "state bar": "state bar admission",
+    "state bar admission": "state bar admission",
+    "licensed attorney": "state bar admission",
+    "law practice license": "state bar admission",
+    "medical license": "medical license",
+    "physician license": "medical license",
+    "medical registration": "medical license",
+    "state medical board license": "medical license",
+    "mbbs": "medical license",
+    "chartered accountant": "chartered accountant",
+    "cdl": "commercial driver license",
+    "commercial driver license": "commercial driver license",
+    "cdl license": "commercial driver license",
+    "commercial driver's license": "commercial driver license",
+    "teaching license": "teaching license",
+    "teaching credential": "teaching license",
+    "state teaching credential": "teaching license",
+    "state teaching license": "teaching license",
+}
+
+
+def canonicalize_license_name(name: str) -> str:
+    """Normalizes license name to canonical title."""
+    if not name:
+        return ""
+    clean = re.sub(r"\.", "", name.lower()).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    return LICENSE_CANONICAL_MAP.get(clean, clean)
+
+
+def match_license_names(mand_lic: str, cand_lic: str) -> bool:
+    """Matches mandatory license requirements against candidate credentials using controlled terminology.
+    
+    Prevents arbitrary substring false positives (e.g. 'rn' inside 'intern' or 'internal auditor').
+    """
+    if not mand_lic or not cand_lic:
+        return False
+    
+    c_mand = canonicalize_license_name(mand_lic)
+    c_cand = canonicalize_license_name(cand_lic)
+    
+    if c_mand == c_cand:
+        return True
+        
+    pattern_mand = rf"(?<!\w){re.escape(c_mand)}(?!\w)"
+    if re.search(pattern_mand, c_cand):
+        return True
+    pattern_cand = rf"(?<!\w){re.escape(c_cand)}(?!\w)"
+    if re.search(pattern_cand, c_mand):
+        return True
+        
+    return False
+
+
 def is_statutory_license(license_name: str) -> bool:
     """Returns True if the given credential is a legally regulated/statutory professional license."""
     if not license_name:
         return False
-    clean = license_name.lower().strip()
+    clean = re.sub(r"\.", "", license_name.lower()).strip()
+    clean = re.sub(r"\s+", " ", clean)
+    if clean in LICENSE_CANONICAL_MAP or clean in STATUTORY_LICENSES:
+        return True
     for lic in STATUTORY_LICENSES:
-        if lic in clean or clean in lic:
+        pattern = rf"(?<!\w){re.escape(lic)}(?!\w)"
+        if re.search(pattern, clean):
             return True
     return False

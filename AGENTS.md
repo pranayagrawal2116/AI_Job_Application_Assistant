@@ -127,6 +127,17 @@ When interacting with the browser via Playwright MCP:
   - SQLite immutable snapshot management with `supersedes_job_description_id` linking, per-user deduplication via content hash, cross-user duplicate independence, and composite ownership isolation (`UNIQUE(id, user_id)`).
   - Streamlit Job Analyzer & Ingestion interface (`Job Analyzer & Ingestion` view) with Paste Text, Document Upload, Safe URL Ingestion, Structured Requirements Inspector, Candidate Review & In-Place Correction Form, Version Lineage, and Deletion.
   - Verified with 29 new automated tests across 5 new test suites (192 total project suite tests passing, 100%), 0 pyflakes errors, and mypy/ruff clean.
+- [x] **Architecture v2.1.1 Phase 5 & 5.1: Universal Resume-to-Job Matching Engine & Correctness Hardening** (Complete)
+  - Explainable, deterministic, cross-industry resume-to-job matching engine (`UniversalMatcher`) computing multi-dimensional scores across 100 points with configurable scoring profiles (`SCORING_PROFILES`) and mathematical invariant `sum(weights) == 100.0`.
+  - Strict three-state eligibility engine (`UniversalEligibilityEvaluator`): `ELIGIBLE`, `INELIGIBLE`, and `UNKNOWN` without defaulting unverified data or missing cutoffs to eligible.
+  - Candidate fact provenance distinction (`USER_CONFIRMED` vs `EXTRACTED_UNVERIFIED`): unverified resume facts cannot satisfy mandatory statutory licenses, degree requirements, or minimum CGPA cutoffs, nor can they definitively disqualify without verification (`UNKNOWN`).
+  - Strict experience requirement evaluation: non-overlapping interval date merging (`_merge_intervals`), ISO format `YYYY-MM-DD` and `Month Year` date parsing, missing date detection, and strict cutoff enforcement for all required years without arbitrary lower thresholds.
+  - Statutory licensing precision: exact token and boundary-safe matching (`match_license_names`), preventing arbitrary substring collisions (e.g. "rn" in "intern"), with unconfirmed licenses flagged as `UNVERIFIED` and triggering `UNKNOWN` eligibility.
+  - Project relevance scoring: related skills taxonomy expansion (`RELATED_SKILLS_MAP`), duty-word alignment, and fair weighting allowing candidates with relevant project deliverables to achieve full project points while strictly ensuring unrelated projects score lower (`relevant_score > unrelated_score`).
+  - Version provenance and audit retention: `candidate_profile_hash` stored in `match_results`, linking each evaluation to the exact candidate profile version snapshot at evaluation time.
+  - Immutable audit trail protection: deleting a resume (`delete_user_resume`) or job description (`delete_job_description`) referenced in historical matches safely archives the record (`is_active = 0`), preserving historical `match_results` evaluations intact with `ON DELETE RESTRICT` foreign keys.
+  - Dashboard integration: authenticated user session resolution in `resume_match_analysis` view and automatic candidate profile loading via `db.get_user_candidate_profile(user_id)`.
+  - Verified with 22 new comprehensive hardening regression tests in `test_phase5_1_hardening.py` (310 total project suite tests passing, 100%), 0 pyflakes errors, and clean ruff check.
 
 ---
 

@@ -22,7 +22,10 @@ def render_resume_match_analysis():
     )
 
     service = DashboardService.get_instance()
-    user_id = st.session_state.get("user_id", 1)
+    user_id = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
+    if not user_id:
+        st.error("⚠️ Authentication required: You must be logged in to access Resume Match Analysis.")
+        return
 
     # 1. Fetch User Resumes and Job Descriptions
     resumes = service.get_user_resumes(user_id=user_id)

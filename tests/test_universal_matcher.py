@@ -39,11 +39,11 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_01_cs_fresher_vs_software_intern(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "career_level": "student",
                 "education": [{"degree": "B.Tech", "major": "Computer Science", "current_cgpa": 8.1}],
-                "technical_skills": ["Python", "Data Structures", "Git"],
-                "projects": [{"title": "Web App", "description": "Flask app with REST API"}],
+                "skills": {"tech": ["Python", "Data Structures", "Git"]},
+                "projects": [{"title": "Web App", "description": "Flask app with REST API", "technologies": ["Python", "Git"]}],
             },
             job_data={
                 "job_title": "Software Developer Intern",
@@ -60,11 +60,11 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_02_experienced_software_engineer_vs_senior_engineer(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "career_level": "senior",
                 "education": [{"degree": "B.S. in Computer Science", "major": "Computer Science"}],
-                "work_experience": [{"job_title": "Senior Engineer", "duration_months": 84, "responsibilities": ["Lead architecture"]}],
-                "technical_skills": ["Python", "System Design", "Kubernetes", "AWS"],
+                "experience": [{"job_title": "Senior Engineer", "duration_months": 84, "start_date": "2017-01", "end_date": "2024-01", "responsibilities": ["Lead architecture"]}],
+                "skills": {"tech": ["Python", "System Design", "Kubernetes", "AWS"]},
             },
             job_data={
                 "job_title": "Senior Software Engineer",
@@ -81,11 +81,11 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_03_registered_nurse_vs_clinical_nurse(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "education": [{"degree": "Bachelor of Science in Nursing", "major": "Nursing"}],
                 "certifications": [{"name": "Registered Nurse License", "issuing_organization": "State Board of Nursing"}],
-                "work_experience": [{"job_title": "Staff Nurse", "duration_months": 36, "responsibilities": ["Triage", "Patient Care"]}],
-                "technical_skills": ["Patient Care", "Phlebotomy", "BLS", "EHR"],
+                "experience": [{"job_title": "Staff Nurse", "duration_months": 36, "start_date": "2020-01", "end_date": "2023-01", "responsibilities": ["Triage", "Patient Care"]}],
+                "skills": {"tech": ["Patient Care", "Phlebotomy", "BLS", "EHR"]},
             },
             job_data={
                 "job_title": "Clinical Staff Nurse",
@@ -104,11 +104,11 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_04_medical_doctor_vs_medical_officer(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "education": [{"degree": "MBBS", "major": "Medicine"}],
                 "certifications": [{"name": "Medical License"}],
-                "work_experience": [{"job_title": "Resident Medical Officer", "duration_months": 24}],
-                "technical_skills": ["Clinical Diagnosis", "Patient Care", "Pharmacology"],
+                "experience": [{"job_title": "Resident Medical Officer", "duration_months": 24, "start_date": "2021-01", "end_date": "2023-01"}],
+                "skills": {"tech": ["Clinical Diagnosis", "Patient Care", "Pharmacology"]},
             },
             job_data={
                 "job_title": "Hospital Medical Officer",
@@ -124,11 +124,11 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_05_accountant_vs_accountant_role(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "education": [{"degree": "Bachelor of Commerce", "major": "Accounting"}],
                 "certifications": [{"name": "CPA License"}],
-                "work_experience": [{"job_title": "Accountant", "duration_months": 36}],
-                "technical_skills": ["GAAP", "General Ledger", "Financial Reporting", "Tax Compliance"],
+                "experience": [{"job_title": "Accountant", "duration_months": 36, "start_date": "2020-01", "end_date": "2023-01"}],
+                "skills": {"tech": ["GAAP", "General Ledger", "Financial Reporting", "Tax Compliance"]},
             },
             job_data={
                 "job_title": "Senior Accountant",
@@ -162,9 +162,9 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_07_mechanical_engineer(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "education": [{"degree": "B.E. Mechanical Engineering", "major": "Mechanical"}],
-                "technical_skills": ["AutoCAD", "SolidWorks", "FEA", "Thermodynamics"],
+                "skills": {"tech": ["AutoCAD", "SolidWorks", "FEA", "Thermodynamics"]},
             },
             job_data={
                 "job_title": "CAD Design Engineer",
@@ -198,10 +198,10 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_09_lawyer_vs_legal_associate(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "education": [{"degree": "Juris Doctor", "major": "Law"}],
                 "certifications": [{"name": "Bar Admission", "issuing_organization": "State Bar"}],
-                "technical_skills": ["Legal Research", "Contract Drafting", "Westlaw"],
+                "skills": {"tech": ["Legal Research", "Contract Drafting", "Westlaw"]},
             },
             job_data={
                 "job_title": "Legal Associate",
@@ -249,10 +249,10 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_12_teacher_vs_teaching_role(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "education": [{"degree": "Bachelor of Education", "major": "Education"}],
                 "certifications": [{"name": "State Teaching Credential"}],
-                "technical_skills": ["Curriculum Design", "Classroom Management"],
+                "skills": {"tech": ["Curriculum Design", "Classroom Management"]},
             },
             job_data={
                 "job_title": "Secondary School Teacher",
@@ -283,10 +283,10 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_14_experienced_executive(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
+            profile_data={
                 "career_level": "senior",
-                "work_experience": [{"job_title": "VP Engineering", "duration_months": 120, "responsibilities": ["P&L", "Strategic Roadmap"]}],
-                "technical_skills": ["Team Leadership", "Budget Management", "Stakeholder Management"],
+                "experience": [{"job_title": "VP Engineering", "duration_months": 120, "start_date": "2014-01", "end_date": "2024-01", "responsibilities": ["P&L", "Strategic Roadmap"]}],
+                "skills": {"tech": ["Team Leadership", "Budget Management", "Stakeholder Management"]},
             },
             job_data={
                 "job_title": "Director of Engineering",
@@ -321,13 +321,13 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_16_career_gaps_not_penalized(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={
-                "work_experience": [
-                    {"job_title": "Developer", "duration_months": 24},
+            profile_data={
+                "experience": [
+                    {"job_title": "Developer", "duration_months": 24, "start_date": "2019-01", "end_date": "2021-01"},
                     # 1 year gap
-                    {"job_title": "Senior Developer", "duration_months": 24},
+                    {"job_title": "Senior Developer", "duration_months": 24, "start_date": "2022-01", "end_date": "2024-01"},
                 ],
-                "technical_skills": ["Python", "Docker"],
+                "skills": {"tech": ["Python", "Docker"]},
             },
             job_data={
                 "job_title": "Developer",
@@ -446,7 +446,7 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
     def test_25_preferred_education(self):
         res = self.matcher.evaluate(
             user_id=self.user_id,
-            resume_data={"education": [{"degree": "Bachelor of Technology", "major": "Information Technology"}]},
+            profile_data={"education": [{"degree": "Bachelor of Technology", "major": "Information Technology"}]},
             job_data={"required_degree_levels": ["Bachelor"], "preferred_fields_of_study": ["Computer Science"]},
             persist=False,
         )
@@ -484,13 +484,25 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
 
     # Scenario 29: Job with mandatory professional license
     def test_29_mandatory_license_present(self):
-        res = self.matcher.evaluate(
+        # 1. Resume-extracted unverified license must not be considered verified
+        res_unverified = self.matcher.evaluate(
             user_id=self.user_id,
             resume_data={"certifications": [{"name": "Bar Admission"}]},
             job_data={"job_title": "Counsel", "licenses_required": ["Bar Admission"]},
             persist=False,
         )
-        self.assertEqual(res.certification_analysis.get("license_status"), "SATISFIED")
+        self.assertEqual(res_unverified.certification_analysis.get("license_status"), "UNVERIFIED")
+        self.assertEqual(res_unverified.eligibility_status, "UNKNOWN")
+
+        # 2. User-confirmed license in candidate profile satisfies mandatory requirement
+        res_confirmed = self.matcher.evaluate(
+            user_id=self.user_id,
+            profile_data={"certifications": [{"name": "Bar Admission"}]},
+            job_data={"job_title": "Counsel", "licenses_required": ["Bar Admission"]},
+            persist=False,
+        )
+        self.assertEqual(res_confirmed.certification_analysis.get("license_status"), "SATISFIED")
+        self.assertEqual(res_confirmed.eligibility_status, "ELIGIBLE")
 
     # Scenario 30: Job with undisclosed compensation
     def test_30_undisclosed_compensation(self):

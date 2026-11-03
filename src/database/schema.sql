@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS resumes (
     file_size_bytes INTEGER NOT NULL,
     parsing_status TEXT DEFAULT 'COMPLETED' CHECK(parsing_status IN ('PENDING', 'PARSED', 'FAILED', 'COMPLETED')),
     active_version INTEGER DEFAULT 1,
+    is_active INTEGER DEFAULT 1 CHECK(is_active IN (0, 1)),
     uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id, user_id)
@@ -184,6 +185,7 @@ CREATE TABLE IF NOT EXISTS match_results (
     resume_version_num INTEGER DEFAULT 1,
     resume_file_hash TEXT,
     candidate_profile_version INTEGER DEFAULT 1,
+    candidate_profile_hash TEXT,
     job_snapshot_hash TEXT,
     scoring_profile TEXT DEFAULT 'general_baseline',
     scoring_config_version TEXT DEFAULT '1.0.0',
@@ -201,8 +203,8 @@ CREATE TABLE IF NOT EXISTS match_results (
     recommendations TEXT,
     details_json TEXT,
     evaluated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE CASCADE,
-    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE CASCADE
+    FOREIGN KEY (resume_id, user_id) REFERENCES resumes(id, user_id) ON DELETE RESTRICT,
+    FOREIGN KEY (job_description_id, user_id) REFERENCES job_descriptions(id, user_id) ON DELETE RESTRICT
 );
 
 -- ---------------------------------------------------------------------

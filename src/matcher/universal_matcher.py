@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
@@ -28,6 +28,7 @@ from src.matcher.terminology import (
     are_skills_strictly_distinct,
     get_degree_level_rank,
     is_statutory_license,
+    match_license_names,
     normalize_skill_token,
     RELATED_SKILLS_MAP,
 )
@@ -100,6 +101,7 @@ class NormalizedCandidateFacts:
     education: List[NormalizedEducation] = field(default_factory=list)
     experience: List[NormalizedExperience] = field(default_factory=list)
     total_experience_months: Optional[int] = None
+    confirmed_experience_months: Optional[int] = None
     experience_dates_missing: bool = False
     projects: List[NormalizedProject] = field(default_factory=list)
     certifications: List[NormalizedCertification] = field(default_factory=list)
@@ -182,6 +184,7 @@ class UniversalMatchResult:
     resume_id: Optional[int] = None
     resume_version_num: int = 1
     candidate_profile_version: int = 1
+    candidate_profile_hash: Optional[str] = None
     job_description_id: Optional[int] = None
     job_id: Optional[int] = None
     engine_version: str = "2.1.1"
@@ -213,6 +216,7 @@ class UniversalMatchResult:
             "resume_id": self.resume_id,
             "resume_version_num": self.resume_version_num,
             "candidate_profile_version": self.candidate_profile_version,
+            "candidate_profile_hash": self.candidate_profile_hash,
             "job_description_id": self.job_description_id,
             "job_id": self.job_id,
             "engine_version": self.engine_version,
@@ -287,11 +291,47 @@ class CandidateFactNormalizer:
 
         return facts
 
+    @staticmethod
+    def _is_confirmed(item: Any, section_key: str, profile: Dict[str, Any], from_profile: bool = False) -> bool:
+        """Determines if an item is confirmed by the candidate based on item attributes and profile provenance."""
+        if isinstance(item, dict):
+            status = item.get("verification_status")
+            if status in ("USER_CONFIRMED", "USER_CORRECTED", "CONFIRMED"):
+                return True
+            if item.get("is_confirmed") is True or item.get("is_verified") is True:
+                return True
+            if status in ("EXTRACTED_UNVERIFIED", "UNVERIFIED", "PENDING"):
+                return False
+            if item.get("is_confirmed") is False:
+                return False
+
+        # Check section-level field provenance in profile
+        field_prov = profile.get("field_provenance")
+        if isinstance(field_prov, dict) and field_prov:
+            prov = field_prov.get(section_key, {})
+            if isinstance(prov, dict):
+                p_status = prov.get("verification_status")
+                if p_status in ("USER_CONFIRMED", "USER_CORRECTED", "CONFIRMED"):
+                    return True
+                if prov.get("is_confirmed") is True:
+                    return True
+                if p_status in ("EXTRACTED_UNVERIFIED", "UNVERIFIED", "PENDING"):
+                    return False
+            return False
+
+        if profile.get("is_user_confirmed") is True or profile.get("status") == "CONFIRMED":
+            return True
+
+        if from_profile:
+            return True
+
+        return False
+
     @classmethod
     def _normalize_skills(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
         """Consolidates skills with provenance and verification status."""
-        # A. Profile skills (user confirmed)
         profile_skills = profile.get("skills", {})
+        is_skills_conf = cls._is_confirmed(profile_skills, "skills", profile, from_profile=True) or cls._is_confirmed(profile_skills, "technical_skills", profile, from_profile=True)
         if isinstance(profile_skills, dict):
             for category, skills_list in profile_skills.items():
                 if isinstance(skills_list, list):
@@ -303,9 +343,9 @@ class CandidateFactNormalizer:
                                 name=s_str,
                                 canonical_name=norm_key,
                                 provenance_field=f"profile.skills.{category}",
-                                verification_status="USER_CONFIRMED",
+                                verification_status="USER_CONFIRMED" if is_skills_conf else "EXTRACTED_UNVERIFIED",
                                 raw_text=s_str,
-                                is_confirmed=True,
+                                is_confirmed=is_skills_conf,
                             )
         elif isinstance(profile_skills, list):
             for s in profile_skills:
@@ -316,9 +356,9 @@ class CandidateFactNormalizer:
                         name=s_str,
                         canonical_name=norm_key,
                         provenance_field="profile.skills",
-                        verification_status="USER_CONFIRMED",
+                        verification_status="USER_CONFIRMED" if is_skills_conf else "EXTRACTED_UNVERIFIED",
                         raw_text=s_str,
-                        is_confirmed=True,
+                        is_confirmed=is_skills_conf,
                     )
 
         # B. Resume skills (extracted, fallback if not already confirmed)
@@ -342,6 +382,7 @@ class CandidateFactNormalizer:
     @classmethod
     def _normalize_education(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
         raw_edu = profile.get("education") or r_dict.get("education") or []
+        from_profile = bool(profile.get("education"))
         for edu in raw_edu:
             if isinstance(edu, dict):
                 inst = edu.get("institution", "")
@@ -363,6 +404,7 @@ class CandidateFactNormalizer:
                         pass
 
                 rank = get_degree_level_rank(f"{deg} {major}")
+                is_conf = cls._is_confirmed(edu, "education", profile, from_profile=from_profile)
                 facts.education.append(
                     NormalizedEducation(
                         institution=inst,
@@ -371,21 +413,25 @@ class CandidateFactNormalizer:
                         degree_rank=rank,
                         cgpa=cgpa_val,
                         graduation_year=grad_year,
-                        verification_status="USER_CONFIRMED" if profile.get("education") else "EXTRACTED_UNVERIFIED",
+                        verification_status="USER_CONFIRMED" if is_conf else "EXTRACTED_UNVERIFIED",
                     )
                 )
 
     @classmethod
     def _normalize_experience(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
-        raw_exp = profile.get("experience") or r_dict.get("work_experience") or []
+        raw_exp = profile.get("experience") or profile.get("work_experience") or r_dict.get("experience") or r_dict.get("work_experience") or []
+        from_profile = bool(profile.get("experience") or profile.get("work_experience"))
         total_months = 0
-        intervals: List[Tuple[datetime, datetime]] = []
+        confirmed_months = 0
+        all_intervals: List[Tuple[datetime, datetime]] = []
+        confirmed_intervals: List[Tuple[datetime, datetime]] = []
+        has_incomplete_dates = False
 
         for exp in raw_exp:
             if isinstance(exp, dict):
-                emp = exp.get("employer", "")
-                title = exp.get("job_title", "")
-                dur_str = exp.get("duration", "")
+                emp = exp.get("employer") or exp.get("company", "")
+                title = exp.get("job_title") or exp.get("title", "")
+                dur_str = exp.get("duration") or exp.get("dates", "")
                 dur_months = exp.get("duration_months")
                 resp = exp.get("responsibilities", [])
                 if isinstance(resp, str):
@@ -393,6 +439,7 @@ class CandidateFactNormalizer:
 
                 is_intern = "intern" in title.lower() or "intern" in dur_str.lower()
                 is_free = "freelance" in title.lower() or "freelance" in emp.lower()
+                is_conf = cls._is_confirmed(exp, "work_experience", profile, from_profile=from_profile) or cls._is_confirmed(exp, "experience", profile, from_profile=from_profile)
 
                 # Parse duration months if not explicit
                 if dur_months is None and dur_str:
@@ -408,9 +455,15 @@ class CandidateFactNormalizer:
                 end_dt = cls._parse_month_year(exp.get("end_date") or dur_str, default_now=True)
 
                 if start_dt and end_dt and start_dt <= end_dt:
-                    intervals.append((start_dt, end_dt))
+                    all_intervals.append((start_dt, end_dt))
+                    if is_conf:
+                        confirmed_intervals.append((start_dt, end_dt))
                 elif dur_months is not None and dur_months > 0:
                     total_months += dur_months
+                    if is_conf:
+                        confirmed_months += dur_months
+                else:
+                    has_incomplete_dates = True
 
                 facts.experience.append(
                     NormalizedExperience(
@@ -422,30 +475,41 @@ class CandidateFactNormalizer:
                         is_internship=is_intern,
                         is_freelance=is_free,
                         responsibilities=resp,
-                        verification_status="USER_CONFIRMED" if profile.get("experience") else "EXTRACTED_UNVERIFIED",
+                        verification_status="USER_CONFIRMED" if is_conf else "EXTRACTED_UNVERIFIED",
                     )
                 )
 
-        # Merge overlapping date intervals to prevent double-counting
-        if intervals:
-            merged_intervals = cls._merge_intervals(intervals)
-            interval_months = sum(
+        # Merge overlapping date intervals for all experience
+        if all_intervals:
+            merged = cls._merge_intervals(all_intervals)
+            int_months = sum(
                 (int((end.year - start.year) * 12 + (end.month - start.month)) + 1)
-                for start, end in merged_intervals
+                for start, end in merged
             )
-            facts.total_experience_months = max(total_months, interval_months)
-            facts.experience_dates_missing = False
-        elif raw_exp:
-            if total_months > 0:
-                facts.total_experience_months = total_months
-                facts.experience_dates_missing = False
-            else:
-                facts.total_experience_months = None
-                facts.experience_dates_missing = True
-        else:
-            # No experience entries
+            facts.total_experience_months = max(total_months, int_months)
+        elif total_months > 0:
+            facts.total_experience_months = total_months
+        elif not raw_exp:
             facts.total_experience_months = 0
-            facts.experience_dates_missing = False
+        else:
+            facts.total_experience_months = None
+
+        # Merge overlapping date intervals for confirmed experience
+        if confirmed_intervals:
+            merged_c = cls._merge_intervals(confirmed_intervals)
+            c_int_months = sum(
+                (int((end.year - start.year) * 12 + (end.month - start.month)) + 1)
+                for start, end in merged_c
+            )
+            facts.confirmed_experience_months = max(confirmed_months, c_int_months)
+        elif confirmed_months > 0:
+            facts.confirmed_experience_months = confirmed_months
+        elif not raw_exp:
+            facts.confirmed_experience_months = 0
+        else:
+            facts.confirmed_experience_months = None
+
+        facts.experience_dates_missing = has_incomplete_dates or (bool(raw_exp) and facts.total_experience_months is None)
 
     @staticmethod
     def _parse_month_year(s: Optional[str], default_now: bool = False) -> Optional[datetime]:
@@ -455,7 +519,15 @@ class CandidateFactNormalizer:
         if "present" in clean or "current" in clean:
             return datetime.now(timezone.utc)
 
-        # Match "Month Year" or "MM/YYYY" or "YYYY"
+        # Match ISO format "YYYY-MM-DD" or "YYYY-MM"
+        m_iso = re.search(r"\b(\d{4})[-/](\d{1,2})(?:[-/](\d{1,2}))?\b", clean)
+        if m_iso:
+            year = int(m_iso.group(1))
+            month = int(m_iso.group(2))
+            if 1 <= month <= 12:
+                return datetime(year, month, 1, tzinfo=timezone.utc)
+
+        # Match "Month Year" (e.g. "Jan 2020")
         m = re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s*(\d{4})", clean)
         if m:
             month_map = {
@@ -466,10 +538,15 @@ class CandidateFactNormalizer:
             year = int(m.group(2))
             return datetime(year, month, 1, tzinfo=timezone.utc)
 
-        m2 = re.search(r"(\d{1,2})/(\d{4})", clean)
+        # Match "MM/YYYY" or "MM-YYYY"
+        m2 = re.search(r"\b(\d{1,2})[-/](\d{4})\b", clean)
         if m2:
-            return datetime(int(m2.group(2)), int(m2.group(1)), 1, tzinfo=timezone.utc)
+            month = int(m2.group(1))
+            year = int(m2.group(2))
+            if 1 <= month <= 12:
+                return datetime(year, month, 1, tzinfo=timezone.utc)
 
+        # Match standalone year "YYYY"
         m3 = re.search(r"\b(19\d{2}|20\d{2})\b", clean)
         if m3:
             return datetime(int(m3.group(1)), 1 if not default_now else 12, 1, tzinfo=timezone.utc)
@@ -506,6 +583,7 @@ class CandidateFactNormalizer:
     @classmethod
     def _normalize_certifications(cls, facts: NormalizedCandidateFacts, r_dict: Dict[str, Any], profile: Dict[str, Any]) -> None:
         raw_certs = profile.get("certifications") or r_dict.get("certifications") or []
+        from_profile = bool(profile.get("certifications"))
         for c in raw_certs:
             c_name = ""
             org = None
@@ -517,12 +595,13 @@ class CandidateFactNormalizer:
 
             if c_name:
                 is_lic = is_statutory_license(c_name)
+                is_conf = cls._is_confirmed(c, "certifications", profile, from_profile=from_profile)
                 facts.certifications.append(
                     NormalizedCertification(
                         name=c_name,
                         issuing_org=org,
                         is_license=is_lic,
-                        verification_status="USER_CONFIRMED" if profile.get("certifications") else "EXTRACTED_UNVERIFIED",
+                        verification_status="USER_CONFIRMED" if is_conf else "EXTRACTED_UNVERIFIED",
                     )
                 )
 
@@ -618,9 +697,14 @@ class JobRequirementNormalizer:
         reqs.preferred_fields_of_study = p_majors
 
         # CGPA cutoff
-        if j_dict.get("min_gpa_or_percentage") is not None:
+        raw_gpa = j_dict.get("min_gpa_or_percentage")
+        if raw_gpa is None:
+            raw_gpa = j_dict.get("min_gpa")
+        if raw_gpa is None:
+            raw_gpa = j_dict.get("min_cgpa")
+        if raw_gpa is not None:
             try:
-                reqs.min_gpa = float(j_dict["min_gpa_or_percentage"])
+                reqs.min_gpa = float(raw_gpa)
             except ValueError:
                 pass
 
@@ -637,12 +721,12 @@ class JobRequirementNormalizer:
                 pass
 
         # Certifications and Licenses
-        raw_lic = j_dict.get("licenses_required") or []
+        raw_lic = j_dict.get("licenses_required") or j_dict.get("mandatory_licenses") or []
         if isinstance(raw_lic, str):
             raw_lic = [l.strip() for l in raw_lic.split(",") if l.strip()]
         reqs.mandatory_licenses = raw_lic
 
-        raw_certs = j_dict.get("certifications_required") or []
+        raw_certs = j_dict.get("certifications_required") or j_dict.get("preferred_certifications") or []
         if isinstance(raw_certs, str):
             raw_certs = [c.strip() for c in raw_certs.split(",") if c.strip()]
         reqs.preferred_certifications = raw_certs
@@ -988,12 +1072,19 @@ class CertificationLicensingEvaluator:
 
         # 1. Statutory Licenses
         license_ratio = 1.0
-        cand_lic_names = [c.name.lower() for c in facts.certifications if c.is_license]
+        cand_lics = [c for c in facts.certifications if c.is_license or is_statutory_license(c.name)]
         for mand_lic in reqs.mandatory_licenses:
-            norm_mand = mand_lic.lower()
-            matched = any(norm_mand in cl or cl in norm_mand for cl in cand_lic_names)
-            if matched:
-                analysis["notes"].append(f"Verified statutory license: '{mand_lic}'.")
+            matched_cert = next((c for c in cand_lics if match_license_names(mand_lic, c.name)), None)
+            if matched_cert:
+                if matched_cert.verification_status == "USER_CONFIRMED":
+                    analysis["notes"].append(f"Verified statutory license: '{mand_lic}'.")
+                else:
+                    if analysis["license_status"] == "SATISFIED":
+                        analysis["license_status"] = "UNVERIFIED"
+                    analysis["notes"].append(
+                        f"Mandatory statutory license '{mand_lic}' documented in resume but unverified; requires candidate confirmation."
+                    )
+                    license_ratio = min(license_ratio, 0.70)
             else:
                 analysis["license_status"] = "NOT_DOCUMENTED"
                 analysis["notes"].append(f"Mandatory statutory license '{mand_lic}' is not documented in candidate profile.")
@@ -1134,46 +1225,98 @@ class UniversalEligibilityEvaluator:
         unknown_reasons = []
 
         # 1. Mandatory Statutory Licenses
+        cand_lics = [c for c in facts.certifications if c.is_license or is_statutory_license(c.name)]
         for mand_lic in reqs.mandatory_licenses:
-            cand_lics = [c.name.lower() for c in facts.certifications if c.is_license]
-            if not any(mand_lic.lower() in cl or cl in mand_lic.lower() for cl in cand_lics):
+            matched_cert = next((c for c in cand_lics if match_license_names(mand_lic, c.name)), None)
+            if not matched_cert:
                 unknown_reasons.append(
                     f"Mandatory statutory license '{mand_lic}' is not documented in candidate profile."
                 )
-
-        # 2. Mandatory CGPA Cutoff
-        if reqs.min_gpa is not None:
-            if edu_analysis.get("cgpa_status") == "BELOW_CUTOFF":
-                ineligible_reasons.append(
-                    f"Candidate CGPA is below employer's mandatory minimum cutoff of {reqs.min_gpa}."
+            elif matched_cert.verification_status != "USER_CONFIRMED":
+                unknown_reasons.append(
+                    f"Mandatory statutory license '{mand_lic}' was extracted from resume but has not been confirmed by candidate."
                 )
-            elif edu_analysis.get("cgpa_status") == "UNKNOWN":
+
+        # 2. Mandatory Degree Level
+        best_edu = max(facts.education, key=lambda e: e.degree_rank) if facts.education else None
+        if reqs.min_degree_rank > 0:
+            if not facts.education or best_edu is None:
+                unknown_reasons.append(
+                    "Job requires formal degree qualification, but candidate education records are missing."
+                )
+            else:
+                cand_rank = best_edu.degree_rank
+                is_conf = (best_edu.verification_status == "USER_CONFIRMED")
+                if cand_rank < reqs.min_degree_rank:
+                    if is_conf:
+                        ineligible_reasons.append(
+                            f"Candidate's highest confirmed qualification ({best_edu.degree or 'None'}) is below mandatory required degree level."
+                        )
+                    else:
+                        unknown_reasons.append(
+                            f"Candidate extracted qualification ({best_edu.degree or 'None'}) is below required degree level, but remains unverified."
+                        )
+                else:
+                    if not is_conf:
+                        unknown_reasons.append(
+                            f"Candidate qualification ({best_edu.degree}) satisfies degree requirement, but remains unverified from resume."
+                        )
+
+        # 3. Mandatory CGPA Cutoff
+        if reqs.min_gpa is not None:
+            if not facts.education or best_edu is None or best_edu.cgpa is None:
                 unknown_reasons.append(
                     f"Employer specifies mandatory CGPA cutoff of {reqs.min_gpa}, but candidate CGPA is missing."
                 )
-
-        # 3. Mandatory Degree Level
-        if reqs.min_degree_rank > 0 and edu_analysis.get("status") == "BELOW_REQUIRED_LEVEL":
-            ineligible_reasons.append(
-                "Candidate's highest educational qualification is below the mandatory required degree level."
-            )
-        elif reqs.min_degree_rank > 0 and not facts.education:
-            unknown_reasons.append(
-                "Job requires formal degree qualification, but candidate education records are missing."
-            )
+            else:
+                cand_cgpa = best_edu.cgpa
+                is_conf = (best_edu.verification_status == "USER_CONFIRMED")
+                if cand_cgpa < reqs.min_gpa:
+                    if is_conf:
+                        ineligible_reasons.append(
+                            f"Candidate confirmed CGPA ({cand_cgpa}) is below employer's mandatory minimum cutoff of {reqs.min_gpa}."
+                        )
+                    else:
+                        unknown_reasons.append(
+                            f"Candidate extracted CGPA ({cand_cgpa}) is below cutoff of {reqs.min_gpa}, but remains unverified."
+                        )
+                else:
+                    if not is_conf:
+                        unknown_reasons.append(
+                            f"Candidate extracted CGPA ({cand_cgpa}) satisfies cutoff of {reqs.min_gpa}, but remains unverified from resume."
+                        )
 
         # 4. Mandatory Experience Duration (for non-internship experienced roles)
-        if reqs.min_years_experience and reqs.min_years_experience >= 3.0 and not reqs.is_internship:
+        if reqs.min_years_experience and reqs.min_years_experience > 0.0 and not reqs.is_internship:
+            min_yrs = reqs.min_years_experience
             if facts.experience_dates_missing:
                 unknown_reasons.append(
-                    f"Job requires {reqs.min_years_experience} years experience; candidate dates cannot be verified."
+                    f"Job mandates {min_yrs} years experience; candidate dates cannot be verified."
                 )
-            elif facts.total_experience_months is not None:
-                cand_yrs = facts.total_experience_months / 12.0
-                if cand_yrs < (reqs.min_years_experience * 0.5):
-                    ineligible_reasons.append(
-                        f"Documented experience ({cand_yrs:.1f} yrs) falls substantially below non-negotiable threshold of {reqs.min_years_experience} yrs."
-                    )
+            elif facts.total_experience_months is None:
+                unknown_reasons.append(
+                    f"Job mandates {min_yrs} years experience, but candidate experience duration cannot be determined."
+                )
+            else:
+                tot_yrs = facts.total_experience_months / 12.0
+                conf_yrs = (facts.confirmed_experience_months / 12.0) if facts.confirmed_experience_months is not None else 0.0
+                all_unverified = bool(facts.experience and all(e.verification_status != "USER_CONFIRMED" for e in facts.experience))
+
+                if tot_yrs < min_yrs:
+                    if not all_unverified:
+                        ineligible_reasons.append(
+                            f"Documented experience ({tot_yrs:.1f} yrs) is below mandatory minimum requirement of {min_yrs:.1f} yrs."
+                        )
+                    else:
+                        unknown_reasons.append(
+                            f"Extracted experience ({tot_yrs:.1f} yrs) is below mandatory requirement of {min_yrs:.1f} yrs, but remains unverified."
+                        )
+                else:
+                    # Meets or exceeds, but check if confirmed
+                    if conf_yrs < min_yrs:
+                        unknown_reasons.append(
+                            f"Experience meets mandatory requirement ({tot_yrs:.1f} yrs >= {min_yrs:.1f} yrs), but unverified experience requires candidate confirmation."
+                        )
 
         # Final Status Decision
         if ineligible_reasons:
@@ -1189,6 +1332,91 @@ class UniversalEligibilityEvaluator:
 
 class UniversalScoringEngine:
     """Computes transparent points per dimension and total match score out of 100."""
+
+    @classmethod
+    def evaluate_projects_relevance(
+        cls,
+        projects: List[NormalizedProject],
+        reqs: NormalizedJobRequirements,
+    ) -> Tuple[float, float, str]:
+        """Calculates project relevance ratio (0.0 to 1.0), confidence, and explanatory notes.
+        
+        Evaluates project technologies, titles, descriptions against job skills and domain duties.
+        Relevant projects contribute significantly more than unrelated projects.
+        """
+        if not projects:
+            return 0.0, 1.0, "Candidate has no documented practical project deliverables."
+
+        job_skills = set(reqs.mandatory_skills + reqs.preferred_skills)
+        job_norm_skills = {normalize_skill_token(s) for s in job_skills if s}
+
+        # Expand skills with domain/related skills
+        expanded_related_skills: Set[str] = set()
+        for s in job_norm_skills:
+            if s in RELATED_SKILLS_MAP:
+                expanded_related_skills.update(RELATED_SKILLS_MAP[s])
+            for k, vals in RELATED_SKILLS_MAP.items():
+                if s in vals:
+                    expanded_related_skills.add(k)
+
+        job_duty_words = set()
+        token_sources = list(reqs.responsibilities)
+        if reqs.job_title:
+            token_sources.append(reqs.job_title)
+        if reqs.industry:
+            token_sources.append(reqs.industry)
+        for src in token_sources:
+            for w in re.findall(r"\b[a-zA-Z0-9+#.]{2,}\b", src.lower()):
+                job_duty_words.add(w)
+
+        stop_words = {"the", "and", "for", "with", "that", "this", "from", "have", "will", "our", "are", "per", "all", "any"}
+        job_duty_words -= stop_words
+
+        total_relevance = 0.0
+        relevant_project_titles: List[str] = []
+
+        for p in projects:
+            p_techs = {normalize_skill_token(t) for t in p.technologies if t}
+            p_text = f"{p.title} {p.description}".lower()
+
+            tech_matches = p_techs.intersection(job_norm_skills)
+            tech_rel_matches = p_techs.intersection(expanded_related_skills)
+            text_skill_matches = sum(1 for s in job_norm_skills if re.search(rf"\b{re.escape(s)}\b", p_text))
+            text_rel_matches = sum(1 for s in expanded_related_skills if re.search(rf"\b{re.escape(s)}\b", p_text))
+
+            proj_words = set(re.findall(r"\b[a-zA-Z0-9+#.]{2,}\b", p_text)) - stop_words
+            duty_overlap = len(proj_words.intersection(job_duty_words))
+
+            if len(tech_matches) >= 1 or text_skill_matches >= 1:
+                p_rel = 1.0
+            elif len(tech_rel_matches) >= 1 or text_rel_matches >= 1 or duty_overlap >= 3:
+                p_rel = 1.0
+            elif duty_overlap >= 2:
+                p_rel = 0.65
+            elif duty_overlap >= 1:
+                p_rel = 0.30
+            else:
+                p_rel = 0.05
+
+            if p_rel >= 0.5:
+                relevant_project_titles.append(p.title or "Untitled Project")
+
+            total_relevance += p_rel
+
+        proj_ratio = min(1.0, max(0.0, total_relevance))
+
+        if relevant_project_titles:
+            notes = (
+                f"{len(relevant_project_titles)} of {len(projects)} project(s) demonstrated direct skill/duty alignment "
+                f"({', '.join(relevant_project_titles[:3])})."
+            )
+        else:
+            notes = (
+                f"Candidate has {len(projects)} documented project(s), but none demonstrated relevance "
+                f"to the required skills or domain duties."
+            )
+
+        return proj_ratio, 0.95, notes
 
     @classmethod
     def calculate_score(
@@ -1257,18 +1485,18 @@ class UniversalScoringEngine:
 
         # 4. Projects & Achievements
         w_proj = scoring_profile.weights.get("projects", 10.0)
-        proj_ratio = min(1.0, len(facts.projects) / 2.0) if facts.projects else 0.0
+        proj_ratio, proj_conf, proj_notes = cls.evaluate_projects_relevance(facts.projects, reqs)
         e_proj = round(w_proj * proj_ratio, 1) if w_proj > 0 else 0.0
         breakdown["projects"] = DimensionBreakdown(
             dimension_key="projects",
             dimension_label=scoring_profile.dimension_labels.get("projects", "Projects and Achievements"),
             max_points=w_proj,
             earned_points=e_proj,
-            coverage_confidence=1.0 if facts.projects else 0.5,
-            notes=f"Candidate has {len(facts.projects)} documented practical project deliverables.",
+            coverage_confidence=proj_conf,
+            notes=proj_notes,
         )
         total_score += e_proj
-        weighted_conf_sum += w_proj * (1.0 if facts.projects else 0.5)
+        weighted_conf_sum += w_proj * proj_conf
 
         # 5. Certifications & Licenses
         w_cert = scoring_profile.weights.get("certifications", 10.0)
@@ -1429,6 +1657,7 @@ class MatchResultPersistenceService:
             resume_version_num=result.resume_version_num,
             resume_file_hash=result.resume_file_hash,
             candidate_profile_version=result.candidate_profile_version,
+            candidate_profile_hash=result.candidate_profile_hash,
             job_snapshot_hash=result.job_snapshot_hash,
             scoring_profile=result.scoring_profile,
             scoring_config_version=result.scoring_config_version,
@@ -1470,7 +1699,9 @@ class UniversalMatcher:
         scoring_profile_id: Optional[str] = None,
         persist: bool = True,
         resume_id: Optional[int] = None,
-        resume_version_num: int = 1,
+        resume_version_num: Optional[int] = None,
+        candidate_profile_version: Optional[int] = None,
+        candidate_profile_hash: Optional[str] = None,
         job_description_id: Optional[int] = None,
         job_id: Optional[int] = None,
     ) -> UniversalMatchResult:
@@ -1486,8 +1717,27 @@ class UniversalMatcher:
             if not res_rec:
                 raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
             resume_file_hash = res_rec.get("file_hash")
+            if resume_version_num is None:
+                resume_version_num = res_rec.get("active_version", 1)
             if resume_data is None:
                 resume_data = res_rec.get("parsed_data")
+        elif resume_version_num is None:
+            resume_version_num = 1
+
+        # Resolve candidate profile from database if not explicitly provided
+        if profile_data is None:
+            prof_rec = self.db.get_user_candidate_profile(user_id)
+            if prof_rec:
+                profile_data = prof_rec.get("profile_data")
+                if candidate_profile_version is None:
+                    candidate_profile_version = prof_rec.get("version", 1)
+                if candidate_profile_hash is None:
+                    candidate_profile_hash = prof_rec.get("profile_hash")
+        elif candidate_profile_hash is None and profile_data:
+            candidate_profile_hash = canonical_json_hash(profile_data)
+
+        if candidate_profile_version is None:
+            candidate_profile_version = 1
 
         job_snapshot_hash = None
         if job_description_id is not None:
@@ -1599,7 +1849,9 @@ class UniversalMatcher:
             resume_file_hash=resume_file_hash,
             job_snapshot_hash=job_snapshot_hash,
             resume_id=resume_id,
-            resume_version_num=resume_version_num,
+            resume_version_num=resume_version_num or 1,
+            candidate_profile_version=candidate_profile_version or 1,
+            candidate_profile_hash=candidate_profile_hash,
             job_description_id=job_description_id,
             job_id=job_id,
         )

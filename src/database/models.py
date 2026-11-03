@@ -303,6 +303,7 @@ class ResumeRecord:
     target_role: Optional[str] = None
     parsing_status: str = "COMPLETED"
     active_version: int = 1
+    is_active: int = 1
     uploaded_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -342,6 +343,7 @@ class MatchResult:
     resume_version_num: int = 1
     resume_file_hash: Optional[str] = None
     candidate_profile_version: int = 1
+    candidate_profile_hash: Optional[str] = None
     job_id: Optional[int] = None
     job_description_id: Optional[int] = None
     job_snapshot_hash: Optional[str] = None

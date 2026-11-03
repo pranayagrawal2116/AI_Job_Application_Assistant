@@ -885,11 +885,25 @@ class DashboardService:
         job_description_id: int,
         scoring_profile_id: Optional[str] = None,
     ) -> UniversalMatchResult:
-        """Executes full universal match evaluation and stores immutable record."""
+        """Executes full universal match evaluation incorporating authenticated user profile and stores immutable record."""
+        # 1. Fetch user's active candidate profile
+        prof_rec = self.db.get_user_candidate_profile(user_id)
+        profile_data = prof_rec.get("profile_data") if prof_rec else None
+        candidate_profile_version = prof_rec.get("version", 1) if prof_rec else 1
+        candidate_profile_hash = prof_rec.get("profile_hash") if prof_rec else None
+
+        # 2. Fetch active resume version
+        res_rec = self.db.get_user_resume(resume_id, user_id)
+        active_version = res_rec.get("active_version", 1) if res_rec else 1
+
         matcher = UniversalMatcher(db_manager=self.db)
         return matcher.evaluate(
             user_id=user_id,
             resume_id=resume_id,
+            resume_version_num=active_version,
+            profile_data=profile_data,
+            candidate_profile_version=candidate_profile_version,
+            candidate_profile_hash=candidate_profile_hash,
             job_description_id=job_description_id,
             scoring_profile_id=scoring_profile_id,
             persist=True,
