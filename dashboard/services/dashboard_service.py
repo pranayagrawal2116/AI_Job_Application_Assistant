@@ -7,6 +7,19 @@ from typing import Any, Dict, List, Optional, Tuple
 import pandas as pd
 
 from src.database.db_manager import DatabaseManager
+from src.database.exceptions import (
+    ApplicationNotFoundError,
+    CrossUserAccessError,
+    DatabaseError,
+    DuplicateResumeError,
+    FileSecurityError,
+    InvalidStatusError,
+    InvalidStatusTransitionError,
+    ResumeInUseError,
+    ResumeNotFoundError,
+    SecurityAuthorizationError,
+    ValidationError,
+)
 from src.database.models import ApplicationStatus
 from src.matcher.job_matcher import JobMatcher
 from src.scraper.discovery.search_coordinator import DiscoverySummary, SearchCoordinator
@@ -82,7 +95,7 @@ class DashboardService:
         """Calculates live KPI metrics directly from SQLite database."""
         jobs = self.db.list_jobs()
         apps = self.db.list_applications()
-        app_by_status = {}
+        app_by_status: Dict[str, int] = {}
         for a in apps:
             stat = a.status.value if hasattr(a.status, "value") else str(a.status)
             app_by_status[stat] = app_by_status.get(stat, 0) + 1
@@ -158,7 +171,8 @@ class DashboardService:
         """Updates job application status enforcing human-in-the-loop authorization."""
         try:
             target_status = ApplicationStatus.from_str(new_status)
-        except ValueError as e:
+        except (ValueError, KeyError, InvalidStatusError) as e:
+            self.logger.warning("Invalid application status '%s': %s", new_status, e)
             return False, str(e)
 
         if target_status in (ApplicationStatus.APPLIED, ApplicationStatus.AWAITING_APPROVAL):
@@ -176,7 +190,11 @@ class DashboardService:
                 notes=notes,
             )
             return True, f"Application status updated to '{target_status.value}'."
+        except (InvalidStatusTransitionError, ApplicationNotFoundError) as exc:
+            self.logger.warning("Disallowed status transition for Job #%d: %s", job_id, exc)
+            return False, f"Status update failed: {exc}"
         except Exception as exc:
+            self.logger.error("Unexpected failure updating status for Job #%d: %s", job_id, exc, exc_info=True)
             return False, f"Status update failed: {exc}"
 
     def toggle_shortlist(self, job_id: int, notes: Optional[str] = None) -> Tuple[bool, str]:
@@ -196,7 +214,11 @@ class DashboardService:
         try:
             self.db.update_application_status(job_id=job_id, new_status=new_stat, notes=notes)
             return True, msg
+        except (InvalidStatusTransitionError, ApplicationNotFoundError) as exc:
+            self.logger.warning("Shortlist toggle transition error for Job #%d: %s", job_id, exc)
+            return False, f"Shortlist toggle failed: {exc}"
         except Exception as exc:
+            self.logger.error("Unexpected error toggling shortlist for Job #%d: %s", job_id, exc, exc_info=True)
             return False, f"Shortlist toggle failed: {exc}"
 
     def update_job_notes(self, job_id: int, notes: str) -> Tuple[bool, str]:
@@ -213,6 +235,7 @@ class DashboardService:
             )
             return True, "Notes saved successfully."
         except Exception as exc:
+            self.logger.error("Failed updating notes for Job #%d: %s", job_id, exc, exc_info=True)
             return False, f"Failed updating notes: {exc}"
 
     # -------------------------------------------------------------------------
@@ -271,6 +294,7 @@ class DashboardService:
             self.matcher = JobMatcher(candidate_profile=profile_data, db_manager=self.db)
             return True, "Candidate profile updated and version recorded."
         except Exception as exc:
+            self.logger.error("Failed saving candidate profile: %s", exc, exc_info=True)
             return False, f"Failed saving candidate profile: {exc}"
 
     def get_user_resumes(self, user_id: int) -> List[Dict[str, Any]]:
@@ -297,8 +321,14 @@ class DashboardService:
                 set_as_primary=set_as_primary,
             )
             return True, f"Successfully uploaded '{original_filename}'.", record
+        except (DuplicateResumeError, FileSecurityError, ValidationError) as e:
+            self.logger.warning("Resume validation failed for user %d ('%s'): %s", user_id, original_filename, e)
+            return False, str(e), None
+        except DatabaseError as e:
+            self.logger.error("Database error uploading resume for user %d: %s", user_id, e, exc_info=True)
+            return False, str(e), None
         except Exception as e:
-            logger.error("Failed to upload user resume: %s", e)
+            self.logger.error("Unexpected failure uploading user resume for user %d: %s", user_id, e, exc_info=True)
             return False, str(e), None
 
     def add_resume_version(
@@ -319,8 +349,14 @@ class DashboardService:
                 change_notes=change_notes,
             )
             return True, f"Successfully created Version {ver['version_num']} for Resume #{resume_id}.", ver
+        except (DuplicateResumeError, FileSecurityError, CrossUserAccessError, ResumeNotFoundError, ValidationError) as e:
+            self.logger.warning("Resume version rejected for user %d on resume %d: %s", user_id, resume_id, e)
+            return False, str(e), None
+        except DatabaseError as e:
+            self.logger.error("Database error adding resume version for user %d (resume %d): %s", user_id, resume_id, e, exc_info=True)
+            return False, str(e), None
         except Exception as e:
-            logger.error("Failed to add resume version: %s", e)
+            self.logger.error("Unexpected failure adding resume version for user %d (resume %d): %s", user_id, resume_id, e, exc_info=True)
             return False, str(e), None
 
     def set_primary_resume(self, user_id: int, resume_id: int) -> Tuple[bool, str]:
@@ -328,8 +364,14 @@ class DashboardService:
         try:
             self.db.set_primary_resume(user_id, resume_id)
             return True, f"Resume #{resume_id} is now your primary resume."
+        except (CrossUserAccessError, ResumeNotFoundError) as e:
+            self.logger.warning("Primary resume setting denied for user %d (resume %d): %s", user_id, resume_id, e)
+            return False, str(e)
+        except DatabaseError as e:
+            self.logger.error("Database error setting primary resume for user %d (resume %d): %s", user_id, resume_id, e, exc_info=True)
+            return False, str(e)
         except Exception as e:
-            logger.error("Failed to set primary resume: %s", e)
+            self.logger.error("Unexpected failure setting primary resume for user %d (resume %d): %s", user_id, resume_id, e, exc_info=True)
             return False, str(e)
 
     def delete_user_resume(self, user_id: int, resume_id: int) -> Tuple[bool, str]:
@@ -337,8 +379,14 @@ class DashboardService:
         try:
             self.db.delete_user_resume(user_id, resume_id)
             return True, f"Resume #{resume_id} deleted successfully."
+        except (CrossUserAccessError, ResumeInUseError, ResumeNotFoundError) as e:
+            self.logger.warning("Resume deletion denied for user %d (resume %d): %s", user_id, resume_id, e)
+            return False, str(e)
+        except DatabaseError as e:
+            self.logger.error("Database error deleting resume for user %d (resume %d): %s", user_id, resume_id, e, exc_info=True)
+            return False, str(e)
         except Exception as e:
-            logger.error("Failed to delete resume: %s", e)
+            self.logger.error("Unexpected failure deleting resume for user %d (resume %d): %s", user_id, resume_id, e, exc_info=True)
             return False, str(e)
 
     def get_resume_download_data(
@@ -348,10 +396,17 @@ class DashboardService:
         try:
             path = self.db.get_resume_file_path(user_id, resume_id, version_num)
             file_bytes = path.read_bytes()
-            mime = "application/pdf" if path.suffix.lower() == ".pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            mime = (
+                "application/pdf"
+                if path.suffix.lower() == ".pdf"
+                else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            )
             return file_bytes, path.name, mime
+        except (CrossUserAccessError, ResumeNotFoundError, FileNotFoundError, SecurityAuthorizationError) as e:
+            self.logger.warning("Resume download denied or file missing for user %d (resume %d): %s", user_id, resume_id, e)
+            return None, None, None
         except Exception as e:
-            logger.error("Failed to read resume file for download: %s", e)
+            self.logger.error("Unexpected error reading resume file for download (user %d, resume %d): %s", user_id, resume_id, e, exc_info=True)
             return None, None, None
 
     # -------------------------------------------------------------------------
@@ -373,8 +428,10 @@ class DashboardService:
                     p = self.db.get_resume_file_path(user_id=user_id, resume_id=r["id"], user_base_dir=user_base_dir)
                     if p.exists() and p not in res_paths:
                         res_paths.append(p)
-                except Exception:
-                    continue
+                except (ResumeNotFoundError, CrossUserAccessError, FileNotFoundError) as e:
+                    self.logger.debug("Resume file unavailable for resume #%d (user #%d): %s", r.get("id", 0), user_id, e)
+                except Exception as e:
+                    self.logger.warning("Error resolving path for resume #%d (user #%d): %s", r.get("id", 0), user_id, e)
             return sorted(res_paths, key=lambda p: p.name)
 
         # Fallback for unauthenticated legacy test fixtures only if directory exists
@@ -383,7 +440,9 @@ class DashboardService:
             return sorted([f for f in resume_dir.iterdir() if f.suffix.lower() in [".pdf", ".docx"] and not f.name.startswith(".")])
         return []
 
-    def sync_resume_file(self, resume_path: str | Path, user_id: Optional[int] = None) -> Tuple[bool, str, Dict[str, Any]]:
+    def sync_resume_file(
+        self, resume_path: str | Path, user_id: Optional[int] = None
+    ) -> Tuple[bool, str, Dict[str, Any]]:
         """Parses a resume file and updates profile and SQLite version history."""
         try:
             from src.preparer.profile_updater import ProfileUpdater
@@ -391,7 +450,11 @@ class DashboardService:
             updated_prof = updater.sync_from_resume(resume_path, user_id=user_id)
             self.matcher = JobMatcher(candidate_profile=updated_prof, db_manager=self.db)
             return True, "Resume parsed and profile updated successfully.", updated_prof
+        except (FileSecurityError, ValidationError) as e:
+            self.logger.warning("Resume file rejected during profile sync for '%s': %s", resume_path, e)
+            return False, f"Resume parsing failed: {e}", {}
         except Exception as e:
+            self.logger.error("Resume parsing failed unexpectedly for '%s': %s", resume_path, e, exc_info=True)
             return False, f"Resume parsing failed: {e}", {}
 
     def get_job_alignment(self, job_id: int):
@@ -520,11 +583,13 @@ class DashboardService:
                 from src.security.session_manager import SessionManager
                 sess = SessionManager.get_instance().validate_session(session_id)
             except Exception as e:
+                self.logger.warning("Session validation failed for application authorization (Job #%d): %s", job_id, e)
                 return False, f"Approval rejected: {e}"
         else:
             try:
                 sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Authorized Candidate")
             except Exception as e:
+                self.logger.error("Failed to create candidate session for authorization (Job #%d): %s", job_id, e, exc_info=True)
                 return False, f"Approval rejected: {e}"
 
         active_session_id = sess.session_id
@@ -563,8 +628,8 @@ class DashboardService:
                     try:
                         d = json.loads(log.details)
                         p_hash = d.get("packet_version_hash")
-                    except Exception:
-                        pass
+                    except (json.JSONDecodeError, TypeError, ValueError) as json_err:
+                        self.logger.debug("Failed parsing approval log details for Job #%d: %s", job_id, json_err)
 
         if not p_hash:
             return False, f"Submission rejected: No prior human approval record found for Job #{job_id}."
@@ -575,11 +640,13 @@ class DashboardService:
                 from src.security.session_manager import SessionManager
                 sess = SessionManager.get_instance().validate_session(session_id)
             except Exception as e:
+                self.logger.warning("Session validation failed for submission confirmation (Job #%d): %s", job_id, e)
                 return False, f"Submission rejected: {e}"
         else:
             try:
                 sess = self.get_or_create_candidate_session(candidate_name=approver_name or "Authorized Candidate")
             except Exception as e:
+                self.logger.error("Failed to create candidate session for submission (Job #%d): %s", job_id, e, exc_info=True)
                 return False, f"Submission rejected: {e}"
 
         active_session_id = sess.session_id

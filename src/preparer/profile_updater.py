@@ -437,8 +437,13 @@ class ProfileUpdater:
             logger.info("Updated candidate profile for user %d to version %d", user_id, saved["version"])
             return saved["profile_data"]
 
-    def sync_from_resume(self, resume_path: str | Path) -> Dict[str, Any]:
+    def sync_from_resume(
+        self, resume_path: str | Path, user_id: Optional[int] = None
+    ) -> Dict[str, Any]:
         """Parses the resume file, updates candidate_profile.json, and stores a version in SQLite."""
+        if user_id is not None:
+            return self.sync_user_profile(user_id=user_id, resume_path=resume_path)
+
         parser = ResumeParser()
         parsed = parser.parse_file(resume_path)
         profile_data = self.build_profile_dict(parsed)

@@ -98,7 +98,8 @@ class CoverLetterGenerator:
             "technologies": ["Python"],
         }
         proj_title = top_project.get("title") or "Medical Chatbot"
-        proj_desc = (top_project.get("description") or "built a software application").strip().rstrip(".")
+        proj_desc_raw = top_project.get("description") or "built a software application"
+        proj_desc = (" ".join(proj_desc_raw) if isinstance(proj_desc_raw, (list, tuple)) else str(proj_desc_raw)).strip().rstrip(".")
         if proj_desc.lower().startswith("built a "):
             proj_desc = proj_desc[8:]
         elif proj_desc.lower().startswith("developed a "):

@@ -62,7 +62,8 @@ class QuestionAnswerer:
             "technologies": ["Python"],
         }
         proj_title = top_project.get("title", "Medical Chatbot")
-        proj_desc = top_project.get("description", "Built a Python-based medical chatbot project focused on conversational access to health-related information.")
+        raw_desc = top_project.get("description", "Built a Python-based medical chatbot project focused on conversational access to health-related information.")
+        proj_desc = " ".join(raw_desc) if isinstance(raw_desc, (list, tuple)) else str(raw_desc)
 
         top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {
             "employer": "Sarita Infotech Pvt. Ltd.",

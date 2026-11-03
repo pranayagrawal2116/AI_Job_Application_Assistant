@@ -149,7 +149,7 @@ class ResumeJobMatcher:
 
         # 3. Match Relevant Projects
         candidate_projects = self.profile.get("projects", [])
-        relevant_projects = []
+        relevant_projects: List[Dict[str, Any]] = []
         is_ai_ml_role = any(k in job_full_text for k in ["ai", "machine learning", "deep learning", "nlp", "chatbot", "data science", "cv", "vision"])
         is_app_mobile_role = any(k in job_full_text for k in ["mobile", "flutter", "android", "app", "ui", "dart"])
         is_api_backend_role = any(k in job_full_text for k in ["api", "backend", "integration", "rest", "server"])

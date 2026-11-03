@@ -153,15 +153,17 @@ class SearchCoordinator:
             # Validate payload quality
             val_res = self.validator.validate(payload)
             if not val_res.is_valid:
-                self.logger.warning("Rejecting invalid payload from %s: %s", payload.platform, val_res.issues)
+                self.logger.warning("Rejecting invalid payload from %s: %s", payload.platform, val_res.errors)
                 continue
 
             clean_payload = val_res.sanitized_payload or payload
             norm_url = URLNormalizer.normalize(clean_payload.page_url)
+            comp_name = clean_payload.company_name or ""
+            j_title = clean_payload.job_title or ""
 
             # Atomic Deduplication Check (Normalized URL & Company+Title composite)
             is_dup, existing_id, dup_reason = self.db.check_is_duplicate(
-                norm_url, clean_payload.company_name, clean_payload.job_title
+                norm_url, comp_name, j_title
             )
             if is_dup:
                 summary.duplicates_skipped += 1
@@ -170,8 +172,8 @@ class SearchCoordinator:
 
             # Convert to Job domain model
             job = Job(
-                company_name=clean_payload.company_name,
-                job_title=clean_payload.job_title,
+                company_name=comp_name,
+                job_title=j_title,
                 job_description=clean_payload.job_description,
                 job_url=norm_url,
                 platform=clean_payload.platform,
