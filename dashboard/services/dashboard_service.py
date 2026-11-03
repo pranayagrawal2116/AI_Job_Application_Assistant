@@ -498,16 +498,42 @@ class DashboardService:
         answerer = QuestionAnswerer()
         return answerer.generate_standard_answers(job)
 
-    def get_or_create_candidate_session(self, candidate_name: str = "Authorized Candidate", candidate_id: str = "candidate_1"):
-        """Retrieves or initializes the server-side authenticated candidate session."""
+    def get_or_create_candidate_session(
+        self,
+        candidate_name: str = "Authorized Candidate",
+        candidate_id: Optional[str] = None,
+        user_id: Optional[int] = None,
+    ):
+        """Retrieves or initializes the server-side authenticated candidate session bound to user_id.
+
+        Never returns sessions belonging to a different user.
+        """
         from src.security.session_manager import SessionManager
         session_mgr = SessionManager.get_instance()
+
+        target_uid = user_id
+        if target_uid is None and candidate_id and candidate_id.startswith("user_"):
+            try:
+                target_uid = int(candidate_id.split("_")[1])
+            except (ValueError, IndexError):
+                pass
+
+        # Look for matching active session
         for sess in session_mgr._sessions.values():
             if sess.is_active and not sess.is_expired:
-                return sess
+                if target_uid is not None:
+                    if sess.user_id == target_uid or sess.candidate_id in (str(target_uid), f"user_{target_uid}"):
+                        return sess
+                elif candidate_id is not None and sess.candidate_id == candidate_id:
+                    return sess
+
+        # If no active session for this user, create an authenticated one
+        cid = candidate_id or (f"user_{target_uid}" if target_uid else "candidate_1")
         return session_mgr.authenticate_candidate(
-            candidate_id=candidate_id,
+            candidate_id=cid,
             candidate_name=candidate_name,
+            user_id=target_uid,
+            email=f"candidate_{target_uid or 1}@assistant.local",
         )
 
     def issue_approval_ticket(self, session_id: str, job_id: int, packet_hash: str) -> str:
@@ -1083,6 +1109,11 @@ class DashboardService:
         tailored_resume_doc: Optional[Any] = None,
         cover_letter_doc: Optional[Any] = None,
         attachments_manifest: Optional[List[Dict[str, Any]]] = None,
+        candidate_profile_version: Optional[int] = None,
+        candidate_profile_hash: Optional[str] = None,
+        matching_result_id: Optional[int] = None,
+        template_id: Optional[str] = None,
+        template_version: Optional[str] = None,
     ):
         """Assembles and stores immutable PreparedPacket revision in SQLite."""
         from src.preparer.approval_gate import HumanApprovalGate
@@ -1099,6 +1130,11 @@ class DashboardService:
             tailored_resume_doc=tailored_resume_doc,
             cover_letter_doc=cover_letter_doc,
             attachments_manifest=attachments_manifest,
+            candidate_profile_version=candidate_profile_version,
+            candidate_profile_hash=candidate_profile_hash,
+            matching_result_id=matching_result_id,
+            template_id=template_id,
+            template_version=template_version,
         )
 
     def authorize_universal_application_packet(

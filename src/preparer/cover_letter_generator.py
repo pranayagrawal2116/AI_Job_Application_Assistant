@@ -79,20 +79,7 @@ class CoverLetterGenerator:
         candidate_profile: Optional[Dict[str, Any]] = None,
         output_dir: Optional[str | Path] = None,
     ):
-        if candidate_profile is not None:
-            self.profile = candidate_profile
-        else:
-            json_path = Path("data/profile/candidate_profile.json")
-            if json_path.exists():
-                try:
-                    import json
-                    with open(json_path, "r", encoding="utf-8") as pf:
-                        self.profile = json.load(pf)
-                except Exception:
-                    self.profile = {}
-            else:
-                self.profile = {}
-
+        self.profile = candidate_profile or {}
         self.output_dir = Path(output_dir or "data/exports/cover_letters").resolve()
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.matcher = ResumeJobMatcher(candidate_profile=self.profile)
@@ -273,14 +260,14 @@ class CoverLetterGenerator:
         """Crafts a factual, compelling opening paragraph without fabricated backstory."""
         if tone == LetterTone.ENTHUSIASTIC_MODERN:
             p = (
-                f"I am excited to submit my application for the {role} role at {company}. "
-                f"With a dedicated focus on {headline or role}, I have closely followed {company}'s work and "
-                f"am inspired by the team's commitment to excellence and high-impact delivery."
+                f"I am pleased to submit my application for the {role} position at {company}. "
+                f"With focused preparation and training in {headline or role}, I appreciate {company}'s work and "
+                f"look forward to contributing effectively to your team's objectives."
             )
         elif tone == LetterTone.EXECUTIVE_FORMAL:
             p = (
                 f"Please accept this letter and the accompanying application materials for the {role} position at {company}. "
-                f"As an established professional specializing in {headline or role}, I bring a disciplined background "
+                f"With a dedicated background in {headline or role}, I bring a structured approach "
                 f"focused on operational excellence, rigorous standards, and sustained value creation."
             )
         elif tone == LetterTone.ACADEMIC_RESEARCH:
@@ -301,7 +288,7 @@ class CoverLetterGenerator:
             generated_text=p,
             source_type="synthesized_summary",
             source_field="personal.headline/role",
-            evidence_status="VERIFIED",
+            evidence_status="USER_CONFIRMED",
             confidence=1.0,
         )
         return p, prov
@@ -316,6 +303,7 @@ class CoverLetterGenerator:
     ) -> tuple[str, ClaimProvenance]:
         """Summarizes candidate's actual qualifications rooted strictly in verified evidence."""
         parts = []
+        has_unverified = False
 
         if experiences:
             top_exp = experiences[0]
@@ -325,6 +313,9 @@ class CoverLetterGenerator:
             resps = top_exp.get("responsibilities", [])
             resp_str = f", focusing on {resps[0]}" if resps and isinstance(resps, list) else ""
             parts.append(f"In my role as {title} at {emp}{dur}, I delivered substantive responsibilities{resp_str}.")
+            ev = top_exp.get("verification_status") or top_exp.get("evidence_status")
+            if ev == "EXTRACTED_UNVERIFIED":
+                has_unverified = True
 
         if educations:
             top_edu = educations[0]
@@ -332,15 +323,23 @@ class CoverLetterGenerator:
             deg = top_edu.get("degree") or "degree"
             maj = f" in {top_edu['major']}" if top_edu.get("major") else ""
             parts.append(f"My academic training includes a {deg}{maj} from {inst}.")
+            ev = top_edu.get("verification_status") or top_edu.get("evidence_status")
+            if ev == "EXTRACTED_UNVERIFIED":
+                has_unverified = True
 
         if licenses:
             top_lic = licenses[0]
             l_name = top_lic.get("name") if isinstance(top_lic, dict) else str(top_lic)
-            parts.append(f"I maintain statutory professional licensure as a {l_name}.")
+            ev = top_lic.get("verification_status") or top_lic.get("evidence_status") if isinstance(top_lic, dict) else "EXTRACTED_UNVERIFIED"
+            if ev in ("USER_CONFIRMED", "VERIFIED"):
+                parts.append(f"I hold verified professional credentials in {l_name}.")
+            else:
+                parts.append(f"My qualifications include reported training/licensure in {l_name}.")
+                has_unverified = True
 
         if not parts:
             p = (
-                "My background encompasses rigorous preparation, disciplined practical training, "
+                "My background encompasses disciplined practical preparation, training, "
                 "and an established record of taking initiative across complex assignments."
             )
         else:
@@ -351,7 +350,7 @@ class CoverLetterGenerator:
             generated_text=p,
             source_type="candidate_profile",
             source_field="work_experience[0]/education[0]",
-            evidence_status="VERIFIED",
+            evidence_status="EXTRACTED_UNVERIFIED" if has_unverified else "USER_CONFIRMED",
             confidence=1.0,
         )
         return p, prov
@@ -367,9 +366,10 @@ class CoverLetterGenerator:
     ) -> tuple[str, ClaimProvenance]:
         """Aligns candidate's skills and projects to the job's core expectations."""
         sentences = []
+        has_unverified = False
         if skills:
             top_s = ", ".join(skills[:5])
-            sentences.append(f"My core competencies directly match your needs, including verified capabilities in {top_s}.")
+            sentences.append(f"My core competencies directly align with your requirements, including practical capabilities in {top_s}.")
 
         if projects:
             top_p = projects[0]
@@ -377,11 +377,19 @@ class CoverLetterGenerator:
             p_desc = top_p.get("description") or ""
             if p_desc:
                 sentences.append(f"In my deliverable, {p_title}, I {p_desc.rstrip('.')}.")
+            ev = top_p.get("verification_status") or top_p.get("evidence_status") if isinstance(top_p, dict) else "EXTRACTED_UNVERIFIED"
+            if ev == "EXTRACTED_UNVERIFIED":
+                has_unverified = True
 
         if certifications:
             top_c = certifications[0]
             c_name = top_c.get("name") if isinstance(top_c, dict) else str(top_c)
-            sentences.append(f"Furthermore, I hold professional certification in {c_name}.")
+            ev = top_c.get("verification_status") or top_c.get("evidence_status") if isinstance(top_c, dict) else "EXTRACTED_UNVERIFIED"
+            if ev in ("USER_CONFIRMED", "VERIFIED"):
+                sentences.append(f"Furthermore, I hold verified professional certification in {c_name}.")
+            else:
+                sentences.append(f"Furthermore, I have completed reported certification training in {c_name}.")
+                has_unverified = True
 
         sentences.append(
             f"I am eager to bring this background to {company}, ensuring smooth execution, collaborative problem-solving, and reliable results."
@@ -393,9 +401,10 @@ class CoverLetterGenerator:
             generated_text=p,
             source_type="candidate_profile",
             source_field="skills/projects",
-            evidence_status="VERIFIED",
+            evidence_status="EXTRACTED_UNVERIFIED" if has_unverified else "USER_CONFIRMED",
             confidence=1.0,
         )
+        return p, prov
         return p, prov
 
     def _build_closing(
@@ -438,36 +447,26 @@ class CoverLetterGenerator:
 
         # Use profile or sensible defaults if not set
         personal = self.profile.get("personal", {})
-        cand_name = personal.get("full_name") or "Pranay Anup Agrawal"
-        if cand_name == "Pranay":
-            cand_name = "Pranay Anup Agrawal"
-        email = personal.get("email") or "pranayagrawal2116@gmail.com"
-        phone = personal.get("phone") or "+91 95100 29575"
-        location = str(personal.get("location") or "Kothrud, Pune, Maharashtra")
+        cand_name = personal.get("full_name") or "Candidate"
+        email = personal.get("email") or ""
+        phone = personal.get("phone") or ""
+        location = str(personal.get("location") or "")
 
-        edu = self.profile.get("education", [{}])[0]
-        institution = edu.get("institution", "MIT World Peace University")
-        degree = edu.get("degree", "Bachelor of Technology (B.Tech)")
-        major = edu.get("major", "Computer Science Engineering – Artificial Intelligence & Data Science")
-        grad_year = edu.get("expected_graduation_year", 2028)
-        cgpa = edu.get("current_cgpa", 7.6)
+        edu = self.profile.get("education", [{}])[0] if self.profile.get("education") else {}
+        institution = edu.get("institution", "")
+        degree = edu.get("degree", "")
+        major = edu.get("major", "")
+        grad_year = edu.get("expected_graduation_year") or edu.get("graduation_year", "")
+        cgpa = edu.get("current_cgpa") or edu.get("cgpa", "")
 
-        skills_highlight = ", ".join(alignment.matching_skills[:4]) if alignment.matching_skills else "Python, software engineering fundamentals, and data handling"
+        skills_highlight = ", ".join(alignment.matching_skills[:4]) if alignment.matching_skills else "practical software engineering and technical skills"
 
-        top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {
-            "title": "Medical Chatbot",
-            "description": "built a Python-based medical chatbot project focused on conversational access to health-related information.",
-            "technologies": ["Python"],
-        }
-        proj_title = top_project.get("title") or "Medical Chatbot"
-        proj_desc_raw = top_project.get("description") or "built a software application"
+        top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {}
+        proj_title = top_project.get("title") or "Key Project"
+        proj_desc_raw = top_project.get("description") or "built practical technical solutions"
         proj_desc = (" ".join(proj_desc_raw) if isinstance(proj_desc_raw, (list, tuple)) else str(proj_desc_raw)).strip().rstrip(".")
 
-        top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {
-            "employer": "Sarita Infotech Pvt. Ltd.",
-            "job_title": "Project Manager | Mobile App Development",
-            "duration": "3 months",
-        }
+        top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {}
 
         today_str = datetime.now().strftime("%B %d, %Y")
 

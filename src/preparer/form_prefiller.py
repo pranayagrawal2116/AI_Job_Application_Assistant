@@ -41,21 +41,7 @@ class FormPrefiller:
     """Prepares structured form pre-filling payloads while enforcing strict safety gates."""
 
     def __init__(self, candidate_profile: Optional[Dict[str, Any]] = None):
-        if candidate_profile:
-            self.profile = candidate_profile
-        else:
-            json_path = Path("data/profile/candidate_profile.json")
-            if json_path.exists():
-                try:
-                    import json
-                    with open(json_path, "r", encoding="utf-8") as pf:
-                        self.profile = json.load(pf)
-                except Exception:
-                    from src.config import config
-                    self.profile = config.candidate_profile
-            else:
-                from src.config import config
-                self.profile = config.candidate_profile
+        self.profile = candidate_profile or {}
 
     def detect_anti_automation(self, snapshot_text: str) -> bool:
         """Detects anti-bot mechanisms like Cloudflare, CAPTCHA, or login gates."""
@@ -88,21 +74,21 @@ class FormPrefiller:
             job_url = job.job_url
 
         personal = self.profile.get("personal", {})
-        full_name = personal.get("full_name", "Pranay Anup Agrawal")
+        full_name = personal.get("full_name", "")
         name_parts = full_name.split()
-        first_name = name_parts[0] if name_parts else "Pranay"
-        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else "Agrawal"
-        email = personal.get("email", "pranayagrawal2116@gmail.com")
-        phone = personal.get("phone", "95100 29575")
-        location = personal.get("location", "Kothrud, Pune, Maharashtra")
-        github = personal.get("github", "https://github.com")
-        linkedin = personal.get("linkedin", "https://linkedin.com")
+        first_name = name_parts[0] if name_parts else ""
+        last_name = " ".join(name_parts[1:]) if len(name_parts) > 1 else ""
+        email = personal.get("email", "")
+        phone = personal.get("phone", "")
+        location = personal.get("location", "")
+        github = personal.get("github", "")
+        linkedin = personal.get("linkedin", "")
 
-        edu = self.profile.get("education", [{}])[0]
-        institution = edu.get("institution", "MIT World Peace University")
-        degree = edu.get("degree", "Bachelor of Technology (B.Tech)")
-        grad_year = str(edu.get("expected_graduation_year", 2028))
-        cgpa = str(edu.get("current_cgpa", 7.6))
+        edu = self.profile.get("education", [{}])[0] if self.profile.get("education") else {}
+        institution = edu.get("institution", "")
+        degree = edu.get("degree", "")
+        grad_year = str(edu.get("expected_graduation_year") or edu.get("graduation_year", ""))
+        cgpa = str(edu.get("current_cgpa") or edu.get("cgpa", ""))
 
         fields: List[FormFieldMapping] = [
             FormFieldMapping(
@@ -166,6 +152,13 @@ class FormPrefiller:
                 target_selector="input[name*='college'], input[name*='university'], input[name*='school']",
                 field_type="text",
                 intended_value=institution,
+                status="PREPARED",
+            ),
+            FormFieldMapping(
+                field_name="Degree / Qualification",
+                target_selector="input[name*='degree'], select[name*='degree']",
+                field_type="text",
+                intended_value=degree,
                 status="PREPARED",
             ),
             FormFieldMapping(

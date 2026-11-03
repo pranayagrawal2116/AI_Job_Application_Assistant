@@ -5,6 +5,7 @@ screening question assistance, document generation, and human approval workflow.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
@@ -15,9 +16,75 @@ from src.preparer.question_answerer import AnswerState, ScreeningQAPacket
 from src.preparer.tailored_resume_generator import TailoredResume
 
 
-def get_current_user_id() -> int:
-    """Returns the authenticated user_id from session state."""
-    return st.session_state.get("authenticated_user_id") or st.session_state.get("user_id") or 1
+def get_current_user_id() -> Optional[int]:
+    """Returns the authenticated user_id from session state. Fails closed if not authenticated."""
+    uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
+    if uid is not None:
+        try:
+            return int(uid)
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def build_real_attachments_manifest(
+    selected_res_meta: Dict[str, Any],
+    generated_docs: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """Inspects actual files on disk to build a cryptographic, tamper-evident attachment manifest."""
+    import hashlib
+    from datetime import datetime, timezone
+
+    manifest: List[Dict[str, Any]] = []
+
+    # 1. Original Source Resume File
+    res_path_str = selected_res_meta.get("storage_path") or selected_res_meta.get("file_path")
+    if res_path_str and Path(res_path_str).exists():
+        p = Path(res_path_str)
+        st_res = p.stat()
+        file_bytes = p.read_bytes()
+        manifest.append({
+            "artifact_type": "original_resume",
+            "filename": selected_res_meta.get("original_filename", p.name),
+            "stored_filename": p.name,
+            "format": selected_res_meta.get("file_format", p.suffix.lstrip(".").lower()).upper(),
+            "size_bytes": st_res.st_size,
+            "size_kb": f"{st_res.st_size / 1024:.1f} KB",
+            "file_hash": hashlib.sha256(file_bytes).hexdigest(),
+            "file_path": str(p),
+            "timestamp": datetime.fromtimestamp(st_res.st_mtime, tz=timezone.utc).isoformat(),
+        })
+
+    # 2. Generated Documents (Tailored Resume, Cover Letter, Screening QA, Packet)
+    doc_keys = [
+        ("resume_pdf", "tailored_resume_pdf", "PDF"),
+        ("resume_docx", "tailored_resume_docx", "DOCX"),
+        ("cover_letter_pdf", "cover_letter_pdf", "PDF"),
+        ("cover_letter_docx", "cover_letter_docx", "DOCX"),
+        ("screening_qa_pdf", "screening_qa_pdf", "PDF"),
+        ("screening_qa_docx", "screening_qa_docx", "DOCX"),
+        ("packet_pdf", "consolidated_packet_pdf", "PDF"),
+        ("packet_docx", "consolidated_packet_docx", "DOCX"),
+    ]
+    for key, art_type, fmt in doc_keys:
+        doc = generated_docs.get(key)
+        if doc and hasattr(doc, "file_path") and Path(doc.file_path).exists():
+            p = Path(doc.file_path)
+            st_doc = p.stat()
+            file_bytes = p.read_bytes()
+            manifest.append({
+                "artifact_type": art_type,
+                "filename": getattr(doc, "filename", p.name),
+                "stored_filename": p.name,
+                "format": fmt,
+                "size_bytes": st_doc.st_size,
+                "size_kb": f"{st_doc.st_size / 1024:.1f} KB",
+                "file_hash": getattr(doc, "file_hash", "") or hashlib.sha256(file_bytes).hexdigest(),
+                "file_path": str(p),
+                "timestamp": datetime.fromtimestamp(st_doc.st_mtime, tz=timezone.utc).isoformat(),
+            })
+
+    return manifest
 
 
 def render_application_preparer():
@@ -28,8 +95,13 @@ def render_application_preparer():
         "Strict zero-hallucination policy with claim-level auditability under human governance."
     )
 
-    service = DashboardService.get_instance()
     user_id = get_current_user_id()
+    if not user_id:
+        st.error("🔒 Authentication required. Please sign in to prepare job applications.")
+        st.info("Log in with your candidate credentials to access and manage your role-specific application workspaces.")
+        return
+
+    service = DashboardService.get_instance()
 
     # Load candidate's saved job descriptions and resumes
     user_jds = service.get_user_job_descriptions(user_id=user_id)
@@ -99,6 +171,17 @@ def render_application_preparer():
             job_description_id=selected_jd_id,
             resume_id=selected_resume_id,
         )
+
+        # Cross-Application Context Identity: isolate session state across opportunities
+        jd_snapshot = selected_jd.snapshot_hash if (selected_jd and selected_jd.snapshot_hash) else (getattr(selected_jd, 'content_hash', '') or 'none')
+        res_hash = selected_res_meta.get("file_hash", "none") if selected_res_meta else "none"
+        prof_hash = db_profile.get("profile_hash", "none") if db_profile else "none"
+        ctx_key = f"u{user_id}_a{app.id}_r{selected_resume_id}_{res_hash[:8]}_j{selected_jd.id}_{jd_snapshot[:8]}_p{prof_hash[:8]}"
+
+        if st.session_state.get("prep_active_context_key") != ctx_key:
+            for k in ["tailored_resume", "cover_letter", "qa_packet", "generated_docs", "prepared_packet"]:
+                st.session_state.pop(k, None)
+            st.session_state["prep_active_context_key"] = ctx_key
 
         st.divider()
 
@@ -383,8 +466,13 @@ def render_application_preparer():
                 col_qa1, col_qa2 = st.columns([2, 2])
                 with col_qa1:
                     if st.button("💾 Save Answer & Mark Approved", key=f"app_q_{q_idx}"):
-                        q.answer_text = new_ans.strip()
-                        q.state = AnswerState.USER_APPROVED.value
+                        from src.preparer.question_answerer import QuestionAnswerer
+                        qa_helper = QuestionAnswerer(candidate_profile=candidate_profile)
+                        qa_helper.update_question_answer(
+                            question=q,
+                            new_answer=new_ans.strip(),
+                            new_state=AnswerState.USER_APPROVED,
+                        )
                         st.session_state["qa_packet"] = qa_packet
                         st.success("Answer confirmed and approved!")
                         st.rerun()
@@ -430,13 +518,23 @@ def render_application_preparer():
         st.markdown("### 📎 Application Attachments Manifest")
         st.caption("Cryptographically tracks all supporting documents and deliverables for this application packet.")
 
-        attachments = [
-            {"name": f"Original Resume ({selected_res_meta.get('original_filename', 'Resume')})", "type": "Source Document", "format": selected_res_meta.get("file_format", "PDF").upper(), "size_kb": f"{(selected_res_meta.get('file_size_bytes', 0) / 1024):.1f} KB"},
-            {"name": "Tailored Resume (Generated)", "type": "Application Material", "format": "PDF / DOCX", "size_kb": "Auto-calculated"},
-            {"name": "Tailored Cover Letter (Generated)", "type": "Application Material", "format": "PDF / DOCX", "size_kb": "Auto-calculated"},
-            {"name": "Screening Questions & Responses", "type": "Application Material", "format": "PDF / DOCX", "size_kb": "Auto-calculated"},
-        ]
-        st.table(attachments)
+        docs = st.session_state.get("generated_docs", {})
+        real_manifest = build_real_attachments_manifest(selected_res_meta or {}, docs)
+        if not real_manifest:
+            st.info("No documents generated yet. Generate documents in Tab 7 to populate the manifest.")
+        else:
+            display_manifest = [
+                {
+                    "Artifact Type": m["artifact_type"],
+                    "Filename": m["filename"],
+                    "Format": m["format"],
+                    "File Size": m["size_kb"],
+                    "SHA-256 Digest": f"{m['file_hash'][:16]}...",
+                    "Timestamp": m["timestamp"],
+                }
+                for m in real_manifest
+            ]
+            st.table(display_manifest)
 
     # =========================================================================
     # TAB 7: REVIEW & APPROVAL GATE
@@ -478,6 +576,7 @@ def render_application_preparer():
                 st.success("Successfully generated and structurally validated all application documents!")
 
         docs = st.session_state.get("generated_docs", {})
+        real_manifest = build_real_attachments_manifest(selected_res_meta or {}, docs)
 
         # 2. Assemble Prepared Packet in SQLite
         st.markdown("#### 2. Assemble Immutable Prepared Packet")
@@ -490,7 +589,7 @@ def render_application_preparer():
         if prep_packet_btn or "prepared_packet" not in st.session_state:
             with st.spinner("Assembling RFC 8785 canonical packet snapshot..."):
                 res_hash = selected_res_meta.get("file_hash", "")
-                jd_hash = selected_jd.content_hash if selected_jd else "jd_hash"
+                jd_hash = selected_jd.snapshot_hash if (selected_jd and selected_jd.snapshot_hash) else getattr(selected_jd, 'content_hash', '')
                 pkt = service.prepare_universal_application_packet(
                     user_id=user_id,
                     application_id=app.id,
@@ -502,6 +601,10 @@ def render_application_preparer():
                     job_description_snapshot_hash=jd_hash,
                     tailored_resume_doc=docs.get("resume_pdf"),
                     cover_letter_doc=docs.get("cover_letter_pdf"),
+                    attachments_manifest=real_manifest,
+                    candidate_profile_version=db_profile.get("version", 1) if db_profile else 1,
+                    candidate_profile_hash=db_profile.get("profile_hash", "") if db_profile else "",
+                    template_id=doc_template.value if 'doc_template' in locals() else "modern",
                 )
                 st.session_state["prepared_packet"] = pkt
                 st.success(f"Immutable Packet #{pkt.id} (Version {pkt.version_num}) recorded in SQLite!")
@@ -514,6 +617,19 @@ def render_application_preparer():
 
         # 3. Human Authorization Gate Form
         st.markdown("#### 3. Authorize Application for Submission")
+
+        needs_input_qs = [q for q in qa_packet.questions if q.state == AnswerState.NEEDS_CANDIDATE_INPUT.value]
+        over_limit_qs = [q for q in qa_packet.questions if q.exceeds_limit]
+
+        if needs_input_qs:
+            st.warning(
+                f"⚠️ Authorization Blocked: {len(needs_input_qs)} screening question(s) still require candidate input in Tab 4."
+            )
+        if over_limit_qs:
+            st.warning(
+                f"⚠️ Authorization Blocked: {len(over_limit_qs)} question(s) exceed allowable character limits in Tab 4."
+            )
+
         with st.form("human_authorization_form"):
             approver_name_input = st.text_input(
                 "Full Name of Human Approver",
@@ -532,9 +648,17 @@ def render_application_preparer():
                     st.error("You must check the confirmation checkbox to authorize.")
                 elif not approver_name_input.strip():
                     st.error("Approver full name is required.")
+                elif needs_input_qs:
+                    st.error(f"Authorization Blocked: Question '{needs_input_qs[0].question_text}' requires candidate input before authorization.")
+                elif over_limit_qs:
+                    st.error(f"Authorization Blocked: Question '{over_limit_qs[0].question_text}' exceeds allowable character limit.")
                 else:
                     # Issue cryptographic single-use ticket
-                    sess = service.get_or_create_candidate_session(candidate_name=approver_name_input.strip(), candidate_id=f"user_{user_id}")
+                    sess = service.get_or_create_candidate_session(
+                        candidate_name=approver_name_input.strip(),
+                        candidate_id=f"user_{user_id}",
+                        user_id=user_id,
+                    )
                     action_ticket = service.issue_approval_ticket(
                         session_id=sess.session_id,
                         job_id=app.id,

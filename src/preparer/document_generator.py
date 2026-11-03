@@ -751,7 +751,7 @@ class UniversalDocumentGenerator:
             raise ValueError("PDF contains 0 pages.")
         text = "".join(page.extract_text() or "" for page in reader.pages)
         if not text.strip():
-            logger.warning("PDF contains no extractable text: %s", file_path)
+            raise ValueError(f"PDF contains no extractable text: {file_path}")
         return True
 
     @staticmethod

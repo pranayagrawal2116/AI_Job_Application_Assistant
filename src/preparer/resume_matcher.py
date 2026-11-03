@@ -88,7 +88,7 @@ class ResumeJobMatcher:
             sk_clean = sk.lower()
             sk_norm = normalize_skill(sk)
             # Standard boundary match or normalized alias
-            if re.search(r"(?<!\w)" + re.escape(sk_clean) + r"(?!\w)", job_full_text):
+            if re.search(r"(?<!\w)" + re.escape(sk_clean) + r"(?!\w)", job_full_text) or (sk_norm and re.search(r"(?<!\w)" + re.escape(sk_norm) + r"(?!\w)", job_full_text)):
                 matching_skills.append(sk)
             elif "rest api" in sk_clean and ("rest api" in job_full_text or "restful" in job_full_text or "apis" in job_full_text):
                 if sk not in matching_skills:
@@ -194,19 +194,23 @@ class ResumeJobMatcher:
             })
 
         # 5. Tailored Application Alignment Summary
-        edu = self.profile.get("education", [{}])[0]
-        deg = edu.get("degree", "B.Tech")
-        inst = edu.get("institution", "MIT World Peace University")
-        cgpa = edu.get("current_cgpa", 7.6)
+        summary_sentences = []
+        if self.profile.get("education"):
+            edu = self.profile["education"][0]
+            deg = edu.get("degree") or "degree"
+            inst = edu.get("institution") or "institution"
+            cg = f", CGPA {edu['current_cgpa']}" if edu.get("current_cgpa") else (f", CGPA {edu['cgpa']}" if edu.get("cgpa") else "")
+            yr = f", Class of {edu['expected_graduation_year']}" if edu.get("expected_graduation_year") else (f", Class of {edu['graduation_year']}" if edu.get("graduation_year") else "")
+            summary_sentences.append(f"Candidate is a {deg} student at {inst} ({cg.lstrip(', ')}{yr}).")
 
-        skills_str = ", ".join(matching_skills[:5]) if matching_skills else "Python, problem-solving, and software fundamentals"
-        proj_str = relevant_projects[0]["title"] if relevant_projects else "Medical Chatbot"
-        
-        summary_sentences = [
-            f"Candidate is a {deg} student at {inst} (CGPA {cgpa}, Class of 2028).",
-            f"Strong technical alignment with verified skills in {skills_str}.",
-            f"Directly applicable project experience includes '{proj_str}'.",
-        ]
+        skills_str = ", ".join(matching_skills[:5]) if matching_skills else ""
+        if skills_str:
+            summary_sentences.append(f"Strong technical alignment with skills in {skills_str}.")
+
+        if relevant_projects:
+            proj_str = relevant_projects[0].get("title") or "Deliverable"
+            summary_sentences.append(f"Directly applicable project experience includes '{proj_str}'.")
+
         if relevant_exp:
             summary_sentences.append(
                 f"Possesses hands-on industry experience as {relevant_exp[0]['job_title']} at {relevant_exp[0]['employer']} ({relevant_exp[0]['duration']})."

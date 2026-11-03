@@ -9,7 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 import uuid
@@ -129,19 +128,7 @@ class QuestionAnswerer:
     """Universal screening question assistant with zero-hallucination guarantees."""
 
     def __init__(self, candidate_profile: Optional[Dict[str, Any]] = None):
-        if candidate_profile is not None:
-            self.profile = candidate_profile
-        else:
-            json_path = Path("data/profile/candidate_profile.json")
-            if json_path.exists():
-                try:
-                    import json
-                    with open(json_path, "r", encoding="utf-8") as pf:
-                        self.profile = json.load(pf)
-                except Exception:
-                    self.profile = {}
-            else:
-                self.profile = {}
+        self.profile = candidate_profile or {}
         self.matcher = ResumeJobMatcher(candidate_profile=self.profile)
 
     def classify_question(self, question_text: str) -> QuestionCategory:
@@ -533,29 +520,21 @@ class QuestionAnswerer:
         title = alignment.job_title
 
         personal = self.profile.get("personal", {})
-        cand_name = personal.get("full_name", "Pranay Anup Agrawal")
+        cand_name = personal.get("full_name", "Candidate")
 
-        edu = self.profile.get("education", [{}])[0]
-        inst = edu.get("institution", "MIT World Peace University")
-        degree = edu.get("degree", "Bachelor of Technology (B.Tech)")
-        major = edu.get("major", "Computer Science Engineering – Artificial Intelligence & Data Science")
-        grad_year = edu.get("expected_graduation_year", 2028)
-        cgpa = edu.get("current_cgpa", 7.6)
+        edu = self.profile.get("education", [{}])[0] if self.profile.get("education") else {}
+        inst = edu.get("institution", "")
+        degree = edu.get("degree", "")
+        major = edu.get("major", "")
+        grad_year = edu.get("expected_graduation_year") or edu.get("graduation_year", "")
+        cgpa = edu.get("current_cgpa") or edu.get("cgpa", "")
 
-        top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {
-            "title": "Medical Chatbot",
-            "description": "Built a Python-based medical chatbot project focused on conversational access to health-related information.",
-            "technologies": ["Python"],
-        }
-        proj_title = top_project.get("title", "Medical Chatbot")
-        raw_desc = top_project.get("description", "Built a Python-based medical chatbot project focused on conversational access to health-related information.")
+        top_project = alignment.relevant_projects[0] if alignment.relevant_projects else {}
+        proj_title = top_project.get("title", "Project Deliverable")
+        raw_desc = top_project.get("description", "built technical software solutions")
         proj_desc = " ".join(raw_desc) if isinstance(raw_desc, (list, tuple)) else str(raw_desc)
 
-        top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {
-            "employer": "Sarita Infotech Pvt. Ltd.",
-            "job_title": "Project Manager | Mobile App Development",
-            "duration": "3 months",
-        }
+        top_exp = alignment.relevant_experience[0] if alignment.relevant_experience else {}
 
         cand_inputs = self.profile.get("candidate_inputs", {})
         avail = cand_inputs.get("internship_availability")

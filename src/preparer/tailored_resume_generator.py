@@ -625,6 +625,7 @@ class UniversalTailoredResumeGenerator:
                 rel_score = len(matched) * 1.5
 
                 claim_id = f"claim_exp_{e_idx}_{b_idx}_{uuid.uuid4().hex[:6]}"
+                exp_ev_status = exp.get("verification_status") or exp.get("evidence_status") or "EXTRACTED_UNVERIFIED"
                 prov = ClaimProvenance(
                     claim_id=claim_id,
                     generated_text=text,
@@ -632,7 +633,7 @@ class UniversalTailoredResumeGenerator:
                     source_record_id=f"work_experience[{e_idx}]",
                     source_field=f"responsibilities[{b_idx}]",
                     source_version=1,
-                    evidence_status=exp.get("verification_status", "VERIFIED"),
+                    evidence_status=exp_ev_status,
                     confidence=1.0,
                 )
                 claims[claim_id] = prov
@@ -658,7 +659,7 @@ class UniversalTailoredResumeGenerator:
                     duration=exp.get("duration"),
                     is_current=bool(exp.get("is_current", False)),
                     bullets=scored_bullets,
-                    evidence_status=exp.get("verification_status", "VERIFIED"),
+                    evidence_status=exp.get("verification_status") or exp.get("evidence_status") or "EXTRACTED_UNVERIFIED",
                 )
             )
 
@@ -681,13 +682,14 @@ class UniversalTailoredResumeGenerator:
                 continue
 
             claim_id = f"claim_edu_{idx}_{uuid.uuid4().hex[:6]}"
+            edu_ev_status = ed.get("verification_status") or ed.get("evidence_status") or "EXTRACTED_UNVERIFIED"
             prov = ClaimProvenance(
                 claim_id=claim_id,
                 generated_text=f"{deg} at {inst}",
                 source_type="candidate_profile" if profile.get("education") else "uploaded_resume",
                 source_record_id=f"education[{idx}]",
                 source_field="degree/institution",
-                evidence_status=ed.get("verification_status", "VERIFIED"),
+                evidence_status=edu_ev_status,
                 confidence=1.0,
             )
             claims[claim_id] = prov
@@ -701,7 +703,7 @@ class UniversalTailoredResumeGenerator:
                     major=ed.get("major"),
                     graduation_year=int(yr) if yr else None,
                     cgpa=float(cg) if cg else None,
-                    evidence_status=ed.get("verification_status", "VERIFIED"),
+                    evidence_status=edu_ev_status,
                     claim_id=claim_id,
                 )
             )
@@ -737,13 +739,14 @@ class UniversalTailoredResumeGenerator:
             rel = float(len(matched))
 
             claim_id = f"claim_proj_{p_idx}_{uuid.uuid4().hex[:6]}"
+            proj_ev_status = p.get("verification_status") or p.get("evidence_status") or "EXTRACTED_UNVERIFIED"
             prov = ClaimProvenance(
                 claim_id=claim_id,
                 generated_text=f"{title}: {desc[:80]}",
                 source_type="candidate_profile" if profile.get("projects") else "uploaded_resume",
                 source_record_id=f"projects[{p_idx}]",
                 source_field="title/description",
-                evidence_status="VERIFIED",
+                evidence_status=proj_ev_status,
                 confidence=1.0,
             )
             claims[claim_id] = prov
@@ -769,9 +772,12 @@ class UniversalTailoredResumeGenerator:
         out = []
         for c in raw:
             if isinstance(c, dict):
-                out.append(c)
+                ev = c.get("verification_status") or c.get("evidence_status") or "EXTRACTED_UNVERIFIED"
+                entry = dict(c)
+                entry["verification_status"] = ev
+                out.append(entry)
             elif isinstance(c, str) and c.strip():
-                out.append({"name": c.strip(), "verification_status": "VERIFIED"})
+                out.append({"name": c.strip(), "verification_status": "EXTRACTED_UNVERIFIED"})
         return out
 
     def _extract_licenses(
@@ -781,9 +787,13 @@ class UniversalTailoredResumeGenerator:
         out = []
         for l in raw:
             if isinstance(l, dict):
-                out.append(l)
+                ev = l.get("verification_status") or l.get("evidence_status") or "EXTRACTED_UNVERIFIED"
+                entry = dict(l)
+                entry["verification_status"] = ev
+                entry["is_license"] = True
+                out.append(entry)
             elif isinstance(l, str) and l.strip():
-                out.append({"name": l.strip(), "is_license": True, "verification_status": "VERIFIED"})
+                out.append({"name": l.strip(), "is_license": True, "verification_status": "EXTRACTED_UNVERIFIED"})
         return out
 
     def _synthesize_factual_summary(
@@ -832,13 +842,20 @@ class UniversalTailoredResumeGenerator:
         closing = f" Prepared to contribute effectively to {target_company} as {target_role}."
         summary_text = body + closing
 
+        # Determine evidence status
+        has_unverified = False
+        if highest_edu and highest_edu.evidence_status == "EXTRACTED_UNVERIFIED":
+            has_unverified = True
+        if recent_exp and recent_exp.evidence_status == "EXTRACTED_UNVERIFIED":
+            has_unverified = True
+
         claim_id = f"claim_summary_{uuid.uuid4().hex[:8]}"
         prov = ClaimProvenance(
             claim_id=claim_id,
             generated_text=summary_text,
             source_type="synthesized_summary",
             source_field="profile_synthesis",
-            evidence_status="VERIFIED",
+            evidence_status="EXTRACTED_UNVERIFIED" if has_unverified else "USER_CONFIRMED",
             confidence=0.95,
         )
 

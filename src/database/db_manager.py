@@ -210,11 +210,18 @@ class DatabaseManager:
         add_col_if_missing("match_results", "scoring_explanations", "TEXT")
         add_col_if_missing("match_results", "recommendations", "TEXT")
         add_col_if_missing("match_results", "details_json", "TEXT")
+        add_col_if_missing("prepared_packets", "canonical_snapshot_json", "TEXT")
+        add_col_if_missing("prepared_packets", "candidate_profile_version", "INTEGER DEFAULT 1")
+        add_col_if_missing("prepared_packets", "candidate_profile_hash", "TEXT")
+        add_col_if_missing("prepared_packets", "matching_result_id", "INTEGER")
+        add_col_if_missing("prepared_packets", "template_id", "TEXT")
+        add_col_if_missing("prepared_packets", "template_version", "TEXT DEFAULT '1.0.0'")
 
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_prepared_packets_id_user ON prepared_packets(id, user_id)")
+            cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_user_jd ON applications(user_id, job_description_id) WHERE job_description_id IS NOT NULL")
         except sqlite3.OperationalError:
             pass
 
@@ -825,7 +832,7 @@ class DatabaseManager:
                 "old_status": old_status,
                 "new_status": matched_status,
                 "notes": notes,
-                "user_id": user_id or "candidate_pranay",
+                "user_id": str(user_id or "candidate_user"),
                 "packet_version_hash": packet_version_hash or "",
             }
             cursor.execute(
@@ -854,7 +861,7 @@ class DatabaseManager:
                         json.dumps({
                             "action": "CONSUMED",
                             "consumed_at": datetime.now().isoformat(),
-                            "user_id": user_id or "candidate_pranay",
+                            "user_id": str(user_id or "candidate_user"),
                             "packet_version_hash": packet_version_hash or "",
                             "notes": notes or "Approval record consumed for confirmed manual application submission.",
                         }),
@@ -896,7 +903,7 @@ class DatabaseManager:
 
         details = {
             "approver": clean_approver,
-            "approver_id": approver_id or "candidate_pranay",
+            "approver_id": approver_id or "candidate_user",
             "session_id": session_id or "",
             "packet_version_hash": packet_version_hash or "",
             "ticket_nonce": ticket_nonce or "",
@@ -966,7 +973,7 @@ class DatabaseManager:
         details = {
             "action": "CONSUMED",
             "consumed_at": datetime.now().isoformat(),
-            "user_id": str(user_id or "candidate_pranay"),
+            "user_id": str(user_id or "candidate_user"),
             "session_id": session_id or "",
             "packet_version_hash": packet_version_hash or "",
             "ticket_nonce": ticket_nonce or "",
@@ -1365,9 +1372,12 @@ class DatabaseManager:
                     resource=f"Application #{application_id}",
                 )
 
-            # If packet_id provided, verify packet belongs to user
+            # If packet_id provided, verify packet belongs to user, matches application, hash, and active revision
             if packet_id is not None:
-                cursor.execute("SELECT id, user_id FROM prepared_packets WHERE id = ?", (packet_id,))
+                cursor.execute(
+                    "SELECT id, user_id, application_id, packet_version_hash, is_active_revision FROM prepared_packets WHERE id = ?",
+                    (packet_id,),
+                )
                 pkt_row = cursor.fetchone()
                 if not pkt_row:
                     raise ValidationError(f"Prepared packet #{packet_id} not found.")
@@ -1377,6 +1387,33 @@ class DatabaseManager:
                         target_user_id=pkt_row["user_id"],
                         resource=f"PreparedPacket #{packet_id}",
                     )
+                if pkt_row["application_id"] != application_id:
+                    raise ValidationError(
+                        f"Prepared packet #{packet_id} belongs to Application #{pkt_row['application_id']}, not #{application_id}."
+                    )
+                if pkt_row["packet_version_hash"] != packet_version_hash:
+                    raise ValidationError(
+                        f"Packet version hash mismatch for PreparedPacket #{packet_id}."
+                    )
+                if not pkt_row["is_active_revision"]:
+                    raise ValidationError(
+                        f"Prepared packet #{packet_id} is not the active revision. Previous approvals cannot authorize outdated packet revisions."
+                    )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, user_id, application_id, packet_version_hash, is_active_revision
+                    FROM prepared_packets
+                    WHERE application_id = ? AND user_id = ? AND is_active_revision = 1
+                    ORDER BY version_num DESC LIMIT 1
+                    """,
+                    (application_id, user_id),
+                )
+                pkt_row = cursor.fetchone()
+                if pkt_row:
+                    if pkt_row["packet_version_hash"] != packet_version_hash:
+                        raise ValidationError("Packet version hash mismatch with active prepared packet.")
+                    packet_id = pkt_row["id"]
 
             try:
                 cursor.execute(
@@ -1962,7 +1999,7 @@ class DatabaseManager:
         avoiding duplicate application records when reopening preparation.
         """
         # Validate JD belongs to user
-        with self.connection() as conn:
+        with self.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 "SELECT id, user_id, job_title, company_name FROM job_descriptions WHERE id = ?",
@@ -1978,6 +2015,24 @@ class DatabaseManager:
                     resource=f"JobDescription #{job_description_id}",
                 )
 
+            # Validate resume belongs to user and is active if provided
+            if resume_id is not None:
+                cursor.execute(
+                    "SELECT id, user_id, is_active FROM resumes WHERE id = ?",
+                    (resume_id,),
+                )
+                res_row = cursor.fetchone()
+                if not res_row:
+                    raise ValidationError(f"Resume #{resume_id} not found.")
+                if res_row["user_id"] != user_id:
+                    raise CrossUserAccessError(
+                        user_id=user_id,
+                        target_user_id=res_row["user_id"],
+                        resource=f"Resume #{resume_id}",
+                    )
+                if not res_row["is_active"]:
+                    raise ValidationError(f"Resume #{resume_id} is inactive / archived.")
+
             # Check for existing application
             cursor.execute(
                 """
@@ -1992,21 +2047,17 @@ class DatabaseManager:
                 app = Application(**dict(existing))
                 # Update resume_id if provided and different
                 if resume_id is not None and app.resume_id != resume_id:
-                    with self.transaction() as tconn:
-                        tcursor = tconn.cursor()
-                        tcursor.execute(
-                            "UPDATE applications SET resume_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
-                            (resume_id, app.id, user_id),
-                        )
-                        tcursor.execute("SELECT * FROM applications WHERE id = ?", (app.id,))
-                        return Application(**dict(tcursor.fetchone()))
+                    cursor.execute(
+                        "UPDATE applications SET resume_id = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+                        (resume_id, app.id, user_id),
+                    )
+                    cursor.execute("SELECT * FROM applications WHERE id = ?", (app.id,))
+                    return Application(**dict(cursor.fetchone()))
                 return app
 
-        # Create new application record
-        company = jd_row["company_name"] or "Target Organization"
-        title = jd_row["job_title"] or "Target Role"
-        with self.transaction() as conn:
-            cursor = conn.cursor()
+            # Create new application record within same transaction
+            company = jd_row["company_name"] or "Target Organization"
+            title = jd_row["job_title"] or "Target Role"
             cursor.execute(
                 """
                 INSERT INTO applications (
@@ -2607,7 +2658,7 @@ class DatabaseManager:
         packet_version_hash: str,
         original_resume_hash: str,
         job_description_snapshot_hash: str,
-        screening_answers: Union[Dict[str, Any], str],
+        screening_answers: Union[Dict[str, Any], str, List[Any]],
         original_resume_id: Optional[int] = None,
         tailored_resume_path: Optional[str] = None,
         tailored_resume_hash: Optional[str] = None,
@@ -2616,6 +2667,12 @@ class DatabaseManager:
         form_payload: Optional[Union[Dict[str, Any], str]] = None,
         attachments_manifest: Optional[Union[List[Dict[str, Any]], str]] = None,
         version_num: Optional[int] = None,
+        canonical_snapshot_json: Optional[str] = None,
+        candidate_profile_version: Optional[int] = None,
+        candidate_profile_hash: Optional[str] = None,
+        matching_result_id: Optional[int] = None,
+        template_id: Optional[str] = None,
+        template_version: Optional[str] = None,
     ) -> PreparedPacket:
         """Stores a prepared application packet revision with composite foreign key integrity."""
         with self.transaction() as conn:
@@ -2685,8 +2742,11 @@ class DatabaseManager:
                     job_description_snapshot_hash, screening_answers_json,
                     form_payload_json, form_payload_hash,
                     attachments_manifest_json, attachments_manifest_hash,
+                    canonical_snapshot_json, candidate_profile_version,
+                    candidate_profile_hash, matching_result_id,
+                    template_id, template_version,
                     is_active_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                 """,
                 (
                     application_id,
@@ -2705,6 +2765,12 @@ class DatabaseManager:
                     hashlib.sha256(form_payload_str.encode("utf-8")).hexdigest() if form_payload_str else None,
                     attachments_str,
                     hashlib.sha256(attachments_str.encode("utf-8")).hexdigest() if attachments_str else None,
+                    canonical_snapshot_json,
+                    candidate_profile_version,
+                    candidate_profile_hash,
+                    matching_result_id,
+                    template_id,
+                    template_version or "1.0.0",
                 ),
             )
             pkt_id = cursor.lastrowid

@@ -21,7 +21,6 @@ from dashboard.views.resume_match_analysis import render_resume_match_analysis
 from dashboard.views.settings import render_settings
 from dashboard.views.shortlisted import render_shortlisted
 from dashboard.services.dashboard_service import DashboardService
-from src.config import config
 
 
 def main():
@@ -69,15 +68,22 @@ def main():
     # Sidebar Candidate Information
     service = DashboardService.get_instance()
     metrics = service.get_metrics()
-    cand = config.candidate_profile
+    auth_uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
+    if auth_uid:
+        db_prof = service.db.get_user_candidate_profile(int(auth_uid))
+        cand = db_prof.get("profile_data", {}) if db_prof else {}
+    else:
+        cand = {}
     personal = cand.get("personal", {})
-    edu = cand.get("education", [{}])[0]
+    edu = cand.get("education", [{}])[0] if cand.get("education") else {}
 
     with st.sidebar:
         st.markdown("### 💼 Job Assistant")
-        st.markdown(f"**Candidate:** {personal.get('full_name', 'Pranay')}")
-        st.caption(f"{edu.get('degree', 'B.Tech')} ({edu.get('major', 'AI & DS')}) | Class of {edu.get('expected_graduation_year', '2028')}")
-        st.caption(f"🏛️ {edu.get('institution', 'MIT World Peace University')} | CGPA: {edu.get('current_cgpa', '7.6')}")
+        cand_name = personal.get("full_name") or (f"User #{auth_uid}" if auth_uid else "Candidate")
+        st.markdown(f"**Candidate:** {cand_name}")
+        if edu.get("institution") or edu.get("degree"):
+            st.caption(f"{edu.get('degree', '')} {f'({edu.get('major')})' if edu.get('major') else ''} {f'| Class of {edu.get('expected_graduation_year')}' if edu.get('expected_graduation_year') else ''}")
+            st.caption(f"🏛️ {edu.get('institution', '')} {f'| CGPA: {edu.get('current_cgpa')}' if edu.get('current_cgpa') else ''}")
 
         st.divider()
 

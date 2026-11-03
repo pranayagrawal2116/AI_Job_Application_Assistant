@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.database.db_manager import DatabaseManager
@@ -18,7 +19,7 @@ from src.preparer.document_generator import GeneratedDocument
 from src.preparer.question_answerer import ScreeningQAPacket
 from src.preparer.tailored_resume_generator import TailoredResume
 from src.security.session_manager import SessionManager
-from src.utils.canonical_json import canonical_json_hash
+from src.utils.canonical_json import canonical_json_bytes, canonical_json_hash
 from src.utils.logger import setup_logger
 
 logger = setup_logger("HumanApprovalGate")
@@ -86,9 +87,14 @@ class HumanApprovalGate:
         tailored_resume_doc: Optional[GeneratedDocument] = None,
         cover_letter_doc: Optional[GeneratedDocument] = None,
         attachments_manifest: Optional[List[Dict[str, Any]]] = None,
+        candidate_profile_version: Optional[int] = None,
+        candidate_profile_hash: Optional[str] = None,
+        matching_result_id: Optional[int] = None,
+        template_id: Optional[str] = None,
+        template_version: Optional[str] = None,
     ) -> PreparedPacket:
         """Assembles and stores an immutable PreparedPacket revision in SQLite."""
-        # 1. Compute RFC 8785 canonical hash of all constituent materials
+        # 1. Compute RFC 8785 canonical bytes and hash of all constituent materials
         packet_payload = {
             "application_id": application_id,
             "user_id": user_id,
@@ -100,6 +106,7 @@ class HumanApprovalGate:
             "screening_answers": [q.to_dict() for q in qa_packet.questions],
             "attachments_manifest": attachments_manifest or [],
         }
+        canonical_snapshot = canonical_json_bytes(packet_payload).decode("utf-8")
         packet_hash = canonical_json_hash(packet_payload)
 
         tailored_path = tailored_resume_doc.file_path if tailored_resume_doc else None
@@ -121,6 +128,12 @@ class HumanApprovalGate:
             cover_letter_path=cover_path,
             cover_letter_hash=cover_hash,
             attachments_manifest=attachments_manifest,
+            canonical_snapshot_json=canonical_snapshot,
+            candidate_profile_version=candidate_profile_version,
+            candidate_profile_hash=candidate_profile_hash,
+            matching_result_id=matching_result_id,
+            template_id=template_id,
+            template_version=template_version,
         )
 
         # 3. Transition application status to Application Prepared
@@ -174,13 +187,18 @@ class HumanApprovalGate:
         if any(b in cleaned_approver.lower() for b in bot_keywords):
             return False, f"Approval rejected: '{cleaned_approver}' indicates automated authorization.", None
 
-        # 1. Validate Session
+        # 1. Validate Session & Verify Ownership
         try:
-            self.session_manager.validate_session(session_id)
+            sess = self.session_manager.validate_session(session_id)
         except (InvalidSessionError, SessionExpiredError) as exc:
             return False, f"Approval rejected: {exc}", None
 
-        # 2. Retrieve & Verify Packet
+        if sess.user_id is not None and sess.user_id != user_id:
+            return False, f"Approval rejected: Session belongs to User #{sess.user_id}, not User #{user_id}.", None
+        if sess.candidate_id and sess.candidate_id not in (str(user_id), f"user_{user_id}") and sess.user_id is None:
+            return False, "Approval rejected: Session candidate identity does not match authenticated user.", None
+
+        # 2. Retrieve & Verify Packet Ownership & Active Status
         try:
             packet = self.db.get_prepared_packet(packet_id=packet_id, user_id=user_id)
         except CrossUserAccessError as exc:
@@ -189,8 +207,29 @@ class HumanApprovalGate:
         if not packet:
             return False, f"Prepared packet #{packet_id} not found.", None
 
+        if packet.user_id != user_id:
+            return False, f"Approval rejected: Packet belongs to User #{packet.user_id}, not #{user_id}.", None
+
+        if packet.application_id != application_id:
+            return False, f"Approval rejected: Packet #{packet_id} belongs to Application #{packet.application_id}, not #{application_id}.", None
+
         if not packet.is_active_revision:
             return False, "Approval rejected: This packet version is outdated. Please approve the active revision.", None
+
+        # 2.5. Verify Screening Answers Readiness
+        screening_data = (
+            json.loads(packet.screening_answers_json)
+            if isinstance(packet.screening_answers_json, str)
+            else packet.screening_answers_json
+        )
+        if isinstance(screening_data, list):
+            for q in screening_data:
+                if isinstance(q, dict):
+                    q_text = q.get("question_text", "Screening Question")
+                    if q.get("state") == "NEEDS_CANDIDATE_INPUT":
+                        return False, f"Approval rejected: Question '{q_text}' requires candidate input before authorization.", None
+                    if q.get("exceeds_limit"):
+                        return False, f"Approval rejected: Question '{q_text}' exceeds the allowable character limit.", None
 
         # 3. Verify & Consume HMAC Action Ticket
         valid_ticket, ticket_msg = self.session_manager.verify_and_consume_action_ticket(

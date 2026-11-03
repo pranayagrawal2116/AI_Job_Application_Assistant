@@ -231,6 +231,12 @@ class PreparedPacket:
     attachments_manifest_hash: Optional[str] = None
     is_active_revision: bool = True
     created_at: Optional[str] = None
+    canonical_snapshot_json: Optional[str] = None
+    candidate_profile_version: Optional[int] = None
+    candidate_profile_hash: Optional[str] = None
+    matching_result_id: Optional[int] = None
+    template_id: Optional[str] = None
+    template_version: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -115,14 +115,45 @@ Phase 6 introduces 6 new automated test suites (31 new tests), bringing the tota
 | `tests/test_screening_questions.py` | 5 | 19-category classification, 5 states, missing data enforcement |
 | `tests/test_document_generation.py` | 6 | PDF and DOCX generation, 7 templates, and structural validation |
 | `tests/test_application_packet_integrity.py` | 5 | Packet versioning, RFC 8785 canonical hashing, ticket replay protection |
+| `tests/test_phase6_1_hardening.py` | 37 | Multi-user security, session ownership, truthful evidence, packet provenance |
 | **Existing Phase 1–5.1.1 Suites** | 336 | Regression tests for all previous deliverables |
-| **Total Test Suite** | **367** | **100% Passing** |
+| **Total Test Suite** | **404** | **100% Passing** |
 
 ---
 
 ## 4. Stopping Protocol Compliance
 
-Phase 6 implements complete preparation and document generation. In strict accordance with `AGENTS.md` and Phase 6 specifications:
+Phase 6 and 6.1 implement complete application preparation, document generation, and provenance hardening. In strict accordance with `AGENTS.md` and Phase 6 specifications:
 - No automatic submission actions are executed.
 - No Playwright browser automation or external employer portal interactions are invoked.
-- Application status stops cleanly at `Awaiting Approval` under human governance.
+- Application status stops cleanly at `Awaiting Approval` under strict human governance.
+
+---
+
+## 5. Phase 6.1 Security, Provenance & Packet Integrity Hardening
+
+Phase 6.1 performed a comprehensive security, provenance, and data-integrity audit of the Phase 6 application preparation engine, ensuring complete cross-user isolation and cryptographic auditability:
+
+1. **Authentication Fail-Closed & Session Ownership**:
+   - `get_current_user_id()` fails closed without unauthenticated fallbacks to User #1.
+   - `HumanApprovalGate.authorize_universal_packet` validates session ownership against `user_id` and verifies active packet revision.
+   - Cross-user session injection and packet authorization across different user accounts are strictly blocked.
+   - `DatabaseManager.get_or_create_application_workspace` enforces resume ownership (`CrossUserAccessError`) and blocks archived/inactive resumes.
+
+2. **Database Approval Integrity & Replay Protection**:
+   - `DatabaseManager.record_packet_approval` strictly verifies application ownership, packet ownership, application ID binding, hash matching, and active revision status.
+   - Single-use HMAC action tickets are consumed upon approval, preventing replay attacks.
+   - Content guardrails in `HumanApprovalGate` prevent packet approval if any screening answer remains in `NEEDS_CANDIDATE_INPUT` or exceeds character limits.
+
+3. **Truthful Evidence & Elimination of Hardcoded Fallbacks**:
+   - `UniversalTailoredResumeGenerator` preserves verification states and ensures unconfirmed certifications, statutory licenses, experience, education, and projects remain `EXTRACTED_UNVERIFIED`.
+   - `CoverLetterGenerator` removed opening over-claims ("closely followed", "established professional") and verifies statutory licensure before claiming it.
+   - Eliminated all legacy hardcoded defaults ("Pranay Anup Agrawal", "MIT World Peace University", "Medical Chatbot", "Sarita Infotech Pvt. Ltd.") across all generators and matchers.
+   - Removed implicit disk loading of `candidate_profile.json` in constructors; generators require explicit profile injection.
+
+4. **Immutable Packet Provenance & RFC 8785 Snapshot Persistence**:
+   - Added schema columns to `prepared_packets`: `canonical_snapshot_json`, `candidate_profile_version`, `candidate_profile_hash`, `matching_result_id`, `template_id`, `template_version`.
+   - RFC 8785 canonical JSON bytes stored directly in SQLite, guaranteeing `sha256(canonical_snapshot_json) == packet_version_hash`.
+   - Real disk-inspected `attachments_manifest` with file format verification, on-disk size calculation, and SHA-256 hashes.
+   - PDF validation requires non-empty extractable text.
+   - Streamlit UI context keys isolate session state per application workspace, resume hash, JD snapshot hash, and candidate profile hash.
