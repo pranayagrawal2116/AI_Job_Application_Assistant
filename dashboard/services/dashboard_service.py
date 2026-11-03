@@ -3,7 +3,7 @@
 from datetime import datetime
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 import pandas as pd
 
 from src.database.db_manager import DatabaseManager
@@ -20,7 +20,13 @@ from src.database.exceptions import (
     SecurityAuthorizationError,
     ValidationError,
 )
-from src.database.models import ApplicationStatus, JobDescription, MatchResult
+from src.database.models import (
+    Application,
+    ApplicationStatus,
+    JobDescription,
+    MatchResult,
+    SubmissionConfirmation,
+)
 from src.matcher.job_matcher import JobMatcher
 from src.matcher.scoring_profiles import SCORING_PROFILES, recommend_scoring_profile
 from src.matcher.universal_matcher import UniversalMatchResult, UniversalMatcher
@@ -782,6 +788,428 @@ class DashboardService:
             submission_ticket=ticket,
             packet_version_hash=p_hash,
             submission_notes=submission_notes,
+        )
+
+    # -------------------------------------------------------------------------
+    # PHASE 7.2: UNIVERSAL APPLICATION STATE MACHINE & LIFECYCLE SERVICE LAYER
+    # -------------------------------------------------------------------------
+
+    def resolve_authenticated_candidate(
+        self,
+        session_id: Optional[str],
+        client_user_id: Optional[int] = None,
+    ) -> Tuple[int, Any]:
+        """Resolves authenticated candidate user_id strictly from a validated active session.
+
+        A user_id supplied by a client, form, URL, query parameter, or UI field is NEVER
+        trusted as authentication evidence. If client_user_id is provided, it is asserted
+        to match the session's verified user_id; any mismatch raises CrossUserAccessError.
+        """
+        from src.security.session_manager import SessionManager
+        from src.database.exceptions import (
+            InvalidSessionError,
+            SessionExpiredError,
+            SecurityAuthorizationError,
+            CrossUserAccessError,
+        )
+
+        if not session_id or not isinstance(session_id, str) or not session_id.strip():
+            raise InvalidSessionError("No authenticated session provided. Please sign in again.")
+
+        session_mgr = SessionManager.get_instance()
+        sess = session_mgr.validate_session(session_id.strip())
+        if not sess:
+            raise InvalidSessionError("Session not found or inactive. Please sign in again.")
+
+        if sess.is_expired:
+            raise SessionExpiredError("Session has expired. Re-authentication required.")
+
+        if not sess.is_active:
+            raise InvalidSessionError("Session is revoked or deactivated. Please sign in again.")
+
+        if sess.user_id is None:
+            raise SecurityAuthorizationError(
+                "Unbound session: Session does not contain a verified database user_id. Please authenticate again."
+            )
+
+        session_uid = sess.user_id
+
+        if client_user_id is not None and client_user_id != session_uid:
+            raise CrossUserAccessError(
+                user_id=session_uid,
+                target_user_id=client_user_id,
+                resource="Authenticated Candidate Session",
+            )
+
+        # Validate with get_authenticated_candidate_session for full multi-factor verification
+        verified_sess = self.get_authenticated_candidate_session(session_uid, session_id.strip())
+        return session_uid, verified_sess
+
+    def create_candidate_application(
+        self,
+        session_id: str,
+        company_name: str,
+        job_title: str,
+        job_description_id: Optional[int] = None,
+        resume_id: Optional[int] = None,
+        status: Optional[str] = None,
+        job_url: Optional[str] = None,
+        employment_type: Optional[str] = None,
+        location: Optional[str] = None,
+        salary_range: Optional[str] = None,
+        notes: Optional[str] = None,
+        client_user_id: Optional[int] = None,
+    ) -> Application:
+        """Creates a candidate-owned application under strict authenticated session verification."""
+        from src.lifecycle.state_machine import ApplicationStateMachine
+        from src.database.exceptions import ValidationError, SecurityAuthorizationError
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        clean_company = (company_name or "").strip()
+        clean_title = (job_title or "").strip()
+        if not clean_company:
+            raise ValidationError("company_name is required and cannot be empty.")
+        if not clean_title:
+            raise ValidationError("job_title is required and cannot be empty.")
+
+        # Validate JD ownership if provided
+        if job_description_id is not None:
+            try:
+                jd = self.db.get_job_description(jd_id=job_description_id, user_id=user_id)
+            except CrossUserAccessError:
+                raise ValidationError(f"JobDescription #{job_description_id} not found or unauthorized.")
+            if not jd:
+                raise ValidationError(f"JobDescription #{job_description_id} not found or unauthorized.")
+
+        # Validate resume ownership if provided
+        if resume_id is not None:
+            try:
+                res = self.db.get_user_resume(resume_id=resume_id, user_id=user_id)
+            except CrossUserAccessError:
+                raise ValidationError(f"Resume #{resume_id} not found or unauthorized.")
+            if not res:
+                raise ValidationError(f"Resume #{resume_id} not found or unauthorized.")
+
+        # Initial status validation
+        initial_status = ApplicationStatus.DRAFT.value
+        if status:
+            norm = ApplicationStateMachine.normalize_status(status)
+            if norm not in (ApplicationStatus.DRAFT, ApplicationStatus.PREPARING):
+                raise SecurityAuthorizationError(
+                    f"New applications can only be created in DRAFT or PREPARING status, not '{norm.value}'."
+                )
+            initial_status = norm.value
+
+        app = self.db.create_user_application(
+            user_id=user_id,
+            company_name=clean_company,
+            job_title=clean_title,
+            status=initial_status,
+            resume_id=resume_id,
+            job_description_id=job_description_id,
+            external_application_url=job_url,
+            employment_type=employment_type,
+            location=location,
+            salary_range=salary_range,
+            notes=notes,
+        )
+        return app
+
+    def get_candidate_application(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Application:
+        """Retrieves a candidate's application, strictly enforcing user ownership."""
+        from src.database.exceptions import ApplicationNotFoundError
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+        return app
+
+    def list_candidate_applications(
+        self,
+        session_id: str,
+        status: Optional[str] = None,
+        search_term: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+        client_user_id: Optional[int] = None,
+    ) -> List[Application]:
+        """Lists applications belonging to the authenticated candidate, with filtering and sorting."""
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        return self.db.list_user_applications(
+            user_id=user_id,
+            status=status,
+            search_term=search_term,
+            sort_by=sort_by,
+            limit=limit,
+            offset=offset,
+        )
+
+    def transition_application_status(
+        self,
+        application_id: int,
+        session_id: str,
+        new_status: Union[str, ApplicationStatus],
+        expected_current_status: Optional[Union[str, ApplicationStatus]] = None,
+        transition_metadata: Optional[Dict[str, Any]] = None,
+        client_user_id: Optional[int] = None,
+    ) -> Application:
+        """Transitions an application status through the core service layer.
+
+        Generic transition attempts to APPROVED or SUBMITTED are strictly rejected.
+        """
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+        return self.db.transition_application_status(
+            application_id=application_id,
+            user_id=user_id,
+            new_status=new_status,
+            expected_current_status=expected_current_status,
+            actor_type="CANDIDATE",
+            actor_identifier=f"user_{user_id}",
+            session_reference=sess.session_id,
+            transition_metadata=transition_metadata,
+            is_gate_authorized=False,
+        )
+
+    def get_application_timeline(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Retrieves the event timeline and cryptographic chain verification for an application."""
+        from src.database.exceptions import ApplicationNotFoundError
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        events = self.db.get_application_events(application_id=application_id, user_id=user_id)
+        chain_valid, msg = self.db.verify_application_event_chain(application_id=application_id, user_id=user_id)
+        return {
+            "application_id": application_id,
+            "user_id": user_id,
+            "events": events,
+            "chain_valid": chain_valid,
+            "verification_message": msg,
+        }
+
+    def issue_manual_submission_ticket(
+        self,
+        session_id: str,
+        application_id: int,
+        packet_hash: str,
+        client_user_id: Optional[int] = None,
+    ) -> str:
+        """Issues an authenticated single-use MANUAL_SUBMISSION action ticket bound to application and packet hash."""
+        from src.security.session_manager import SessionManager
+        from src.lifecycle.state_machine import ApplicationStateMachine
+        from src.database.exceptions import ApplicationNotFoundError, SecurityAuthorizationError
+
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        norm_status = ApplicationStateMachine.normalize_status(app.status)
+        if norm_status not in (ApplicationStatus.APPROVED, ApplicationStatus.AWAITING_APPROVAL):
+            raise SecurityAuthorizationError(
+                f"Application #{application_id} is in status '{app.status}'. "
+                "Manual submission tickets can only be issued for applications in APPROVED status."
+            )
+
+        packet = self.db.get_active_prepared_packet(application_id=application_id, user_id=user_id)
+        if not packet:
+            raise SecurityAuthorizationError(
+                f"No active prepared packet found for Application #{application_id}."
+            )
+        if packet.packet_version_hash != packet_hash:
+            raise SecurityAuthorizationError(
+                "Supplied packet hash does not match the active prepared packet."
+            )
+
+        return SessionManager.get_instance().issue_action_ticket(
+            session_id=sess.session_id,
+            action_type="MANUAL_SUBMISSION",
+            application_id=application_id,
+            packet_hash=packet_hash,
+        )
+
+    def record_candidate_manual_submission(
+        self,
+        application_id: int,
+        session_id: str,
+        submission_ticket: str,
+        candidate_confirmed: bool,
+        submission_channel: str,
+        submission_timestamp: Optional[str] = None,
+        confirmation_reference: Optional[str] = None,
+        confirmation_doc_path: Optional[str] = None,
+        confirmation_doc_hash: Optional[str] = None,
+        candidate_notes: Optional[str] = None,
+        client_user_id: Optional[int] = None,
+    ) -> SubmissionConfirmation:
+        """Executes the strict 16-step candidate manual submission workflow.
+
+        Enforces:
+        1. Session-derived user identity.
+        2. Application ownership and allowed pre-submission status (APPROVED).
+        3. Active prepared packet ownership, active revision, and integrity check.
+        4. Valid unconsumed human approval record for the exact packet hash.
+        5. Mandatory candidate confirmation boolean (unconfirmed submission rejected).
+        6. Controlled submission channel validation.
+        7. Cryptographic action ticket verification and single-use consumption.
+        8. Atomic database transition to SUBMITTED, approval consumption, and SUBMISSION_CONFIRMED event.
+        """
+        from src.security.session_manager import SessionManager
+        from src.lifecycle.state_machine import ApplicationStateMachine
+        from src.database.models import SubmissionChannel
+        from src.database.exceptions import (
+            ApplicationNotFoundError,
+            SecurityAuthorizationError,
+            UnconfirmedSubmissionError,
+            ValidationError,
+            TicketAlreadyConsumedError,
+        )
+
+        # 1. Resolve active authenticated candidate session
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        # 2. Retrieve requested application under strict ownership filtering
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        # 3. Verify application is in allowed pre-submission status
+        norm_status = ApplicationStateMachine.normalize_status(app.status)
+        if norm_status not in (ApplicationStatus.APPROVED, ApplicationStatus.AWAITING_APPROVAL):
+            raise SecurityAuthorizationError(
+                f"Application #{application_id} is in status '{app.status}'. "
+                "Only APPROVED applications can be submitted."
+            )
+
+        # 4. Retrieve active prepared packet
+        packet = self.db.get_active_prepared_packet(application_id=application_id, user_id=user_id)
+        if not packet or packet.id is None:
+            raise SecurityAuthorizationError(
+                f"No active prepared packet found for Application #{application_id}."
+            )
+        packet_id: int = packet.id
+
+        # 5. Verify packet belongs to user and application
+        if packet.application_id != application_id or packet.user_id != user_id:
+            raise SecurityAuthorizationError("Prepared packet ownership mismatch.")
+
+        # 6. Verify packet is active revision
+        if packet.is_active_revision != 1:
+            raise SecurityAuthorizationError("Prepared packet is not the active revision.")
+
+        # 7. Recompute and verify packet integrity
+        if hasattr(self, "verify_prepared_packet_integrity"):
+            is_intact, int_msg, _ = self.verify_prepared_packet_integrity(
+                packet_id=packet_id,
+                user_id=user_id,
+                expected_application_id=application_id,
+            )
+            if not is_intact:
+                raise SecurityAuthorizationError(f"Prepared packet integrity compromised: {int_msg}")
+
+        # 8. Retrieve corresponding human approval record
+        approval = self.db.get_packet_approval(packet_id, user_id)
+        if not approval:
+            raise SecurityAuthorizationError(
+                f"No human approval record found for PreparedPacket #{packet_id}."
+            )
+
+        # 9. Confirm approval corresponds to exact packet hash
+        if approval.packet_version_hash != packet.packet_version_hash:
+            raise SecurityAuthorizationError(
+                "Human approval hash mismatch: The approved packet version differs from the current packet."
+            )
+
+        # 10. Confirm approval has not already been consumed
+        if approval.is_consumed == 1:
+            raise TicketAlreadyConsumedError(
+                f"Human approval for PreparedPacket #{packet_id} has already been consumed."
+            )
+
+        # 11. Require explicit candidate confirmation flag
+        if not candidate_confirmed:
+            raise UnconfirmedSubmissionError(
+                "Cannot confirm submission without explicit candidate confirmation that external submission has occurred."
+            )
+
+        # 12. Require valid submission channel
+        if submission_channel not in SubmissionChannel.list():
+            raise ValidationError(
+                f"Invalid submission channel '{submission_channel}'. Allowed: {SubmissionChannel.list()}"
+            )
+
+        # 13. Verify and consume the fresh MANUAL_SUBMISSION action ticket
+        session_mgr = SessionManager.get_instance()
+        valid, msg = session_mgr.verify_and_consume_action_ticket(
+            session_id=sess.session_id,
+            ticket_str=submission_ticket,
+            action_type="MANUAL_SUBMISSION",
+            application_id=application_id,
+            packet_hash=packet.packet_version_hash,
+            db_manager=self.db,
+        )
+        if not valid:
+            raise SecurityAuthorizationError(f"Submission ticket verification failed: {msg}")
+
+        # 14. Call atomic database submission confirmation with transition_status=True
+        confirmation = self.db.create_submission_confirmation(
+            application_id=application_id,
+            user_id=user_id,
+            submission_channel=submission_channel,
+            packet_id=packet_id,
+            submission_timestamp=submission_timestamp,
+            confirmation_reference=confirmation_reference,
+            confirmation_doc_path=confirmation_doc_path,
+            confirmation_doc_hash=confirmation_doc_hash,
+            candidate_notes=candidate_notes,
+            transition_status=True,
+        )
+
+        return confirmation
+
+    def log_external_application_url_opened(
+        self,
+        application_id: int,
+        session_id: str,
+        url: str,
+        client_user_id: Optional[int] = None,
+    ) -> None:
+        """Appends an EXTERNAL_APPLICATION_URL_OPENED audit event when a candidate opens an employer link.
+
+        CRITICAL SAFETY INVARIANT: Strictly preserves existing application status without mutating it to SUBMITTED.
+        """
+        from src.database.exceptions import ApplicationNotFoundError
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        # Emits audit event with URL payload; status is strictly preserved
+        self.db.create_application_event(
+            application_id=application_id,
+            user_id=user_id,
+            event_type="EXTERNAL_APPLICATION_URL_OPENED",
+            actor_type="CANDIDATE",
+            actor_identifier=f"user_{user_id}",
+            session_reference=sess.session_id,
+            event_payload={
+                "opened_url": url,
+                "application_status_preserved": app.status,
+            },
         )
 
     # -------------------------------------------------------------------------

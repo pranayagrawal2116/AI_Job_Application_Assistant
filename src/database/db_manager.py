@@ -2206,6 +2206,21 @@ class DatabaseManager:
             )
             return cursor.fetchone() is not None
 
+    def get_packet_approval(self, packet_id: int, user_id: int) -> Optional[ApplicationApproval]:
+        """Retrieves the latest human approval record for a prepared packet, enforcing user ownership."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM application_approvals
+                WHERE packet_id = ? AND user_id = ?
+                ORDER BY approved_at DESC LIMIT 1
+                """,
+                (packet_id, user_id),
+            )
+            row = cursor.fetchone()
+            return ApplicationApproval(**dict(row)) if row else None
+
     # -------------------------------------------------------------------------
     # PHASE 2 & 4: USER-SCOPED JOB DESCRIPTIONS & SNAPSHOT MANAGEMENT
     # -------------------------------------------------------------------------
@@ -2796,18 +2811,148 @@ class DatabaseManager:
                 )
             return Application(**dict(row))
 
-    def list_user_applications(self, user_id: int, status: Optional[str] = None) -> List[Application]:
-        """Lists applications belonging to a user, optionally filtered by status."""
+    def list_user_applications(
+        self,
+        user_id: int,
+        status: Optional[str] = None,
+        search_term: Optional[str] = None,
+        sort_by: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> List[Application]:
+        """Lists applications belonging to a user, optionally filtered by status and search term, with sorting and pagination."""
         query = "SELECT * FROM applications WHERE user_id = ?"
         params: List[Any] = [user_id]
         if status:
+            from src.lifecycle.state_machine import ApplicationStateMachine
+            try:
+                norm_status = ApplicationStateMachine.normalize_status(status).value
+            except Exception:
+                norm_status = status
             query += " AND status = ?"
-            params.append(status)
-        query += " ORDER BY updated_at DESC"
+            params.append(norm_status)
+        if search_term and search_term.strip():
+            term = f"%{search_term.strip()}%"
+            query += " AND (company_name LIKE ? OR job_title LIKE ? OR notes LIKE ?)"
+            params.extend([term, term, term])
+
+        # Sorting
+        if sort_by == "created_at_asc":
+            query += " ORDER BY created_at ASC"
+        elif sort_by == "created_at_desc":
+            query += " ORDER BY created_at DESC"
+        elif sort_by == "company_name":
+            query += " ORDER BY company_name ASC, updated_at DESC"
+        elif sort_by == "job_title":
+            query += " ORDER BY job_title ASC, updated_at DESC"
+        else:
+            query += " ORDER BY updated_at DESC"
+
+        if limit is not None:
+            query += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+
         with self.connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
             return [Application(**dict(row)) for row in cursor.fetchall()]
+
+    def transition_application_status(
+        self,
+        application_id: int,
+        user_id: int,
+        new_status: Union[str, ApplicationStatus],
+        expected_current_status: Optional[Union[str, ApplicationStatus]] = None,
+        actor_type: str = "CANDIDATE",
+        actor_identifier: Optional[str] = None,
+        session_reference: Optional[str] = None,
+        transition_metadata: Optional[Dict[str, Any]] = None,
+        is_gate_authorized: bool = False,
+    ) -> Application:
+        """Atomically transitions an application's lifecycle status and appends a timeline event.
+
+        Enforces:
+        1. Single SQLite transaction enclosing status update and timeline event insertion.
+        2. Strict user ownership (application_id + user_id).
+        3. ApplicationStateMachine transition validation (rejects invalid transitions).
+        4. Stale-state detection if expected_current_status is provided.
+        5. Gate authorization enforcement (blocks unauthorized transitions to APPROVED or SUBMITTED).
+        6. Conditional UPDATE preventing concurrent overwrite races.
+        7. Complete rollback of status mutation and timeline event if any step fails.
+        """
+        from src.lifecycle.state_machine import ApplicationStateMachine
+
+        target_status = ApplicationStateMachine.normalize_status(new_status)
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                raise ApplicationNotFoundError(application_id)
+
+            if app_row["user_id"] is not None and app_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            current_status_raw = app_row["status"]
+            current_status = ApplicationStateMachine.normalize_status(current_status_raw)
+
+            if expected_current_status is not None:
+                expected_norm = ApplicationStateMachine.normalize_status(expected_current_status)
+                if current_status != expected_norm:
+                    raise ValidationError(
+                        f"Stale state conflict: Expected application #{application_id} to be in status "
+                        f"'{expected_norm.value}', but found '{current_status.value}'."
+                    )
+
+            ApplicationStateMachine.validate_transition(
+                current_status=current_status,
+                new_status=target_status,
+                is_gate_authorized=is_gate_authorized,
+            )
+
+            # Conditional UPDATE to prevent concurrency races
+            cursor.execute(
+                """
+                UPDATE applications
+                SET status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND user_id = ? AND status = ?
+                """,
+                (target_status.value, application_id, user_id, current_status_raw),
+            )
+            if cursor.rowcount == 0:
+                raise ValidationError(
+                    f"Concurrent status modification conflict detected on application #{application_id}."
+                )
+
+            event_type = ApplicationStateMachine.get_transition_event_type(current_status, target_status)
+            payload = {
+                "previous_status": current_status.value,
+                "new_status": target_status.value,
+                **(transition_metadata or {}),
+            }
+
+            self._insert_application_event_internal(
+                cursor=cursor,
+                application_id=application_id,
+                user_id=user_id,
+                event_type=event_type,
+                new_status=target_status.value,
+                previous_status=current_status.value,
+                actor_type=actor_type,
+                actor_identifier=actor_identifier or f"user_{user_id}",
+                session_reference=session_reference,
+                event_payload=payload,
+            )
+
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (application_id,))
+            fresh_row = cursor.fetchone()
+            return Application(**dict(fresh_row))
 
     def get_or_create_application_workspace(
         self,

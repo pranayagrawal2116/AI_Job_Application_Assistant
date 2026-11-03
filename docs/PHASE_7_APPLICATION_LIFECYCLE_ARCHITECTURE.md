@@ -855,3 +855,61 @@ The following capabilities are strictly forbidden from implementation in Phase 7
 - ❌ **CAPTCHA or Anti-Bot Bypassing:** No integration with 2Captcha, AntiCaptcha, Cloudflare turnstile bypassers, or fingerprint spoofers.
 - ❌ **Automated Outbound Messaging:** No automatic emailing, SMS, or direct messaging to recruiters or employers.
 - ❌ **Inferred Submission:** Never marking an application as submitted merely because an external link was clicked or a timer elapsed.
+
+---
+
+## 22. Phase 7.2 Implementation Details: Application State Machine & Core Service Layer
+
+Phase 7.2 implements the application state machine, transactional status transition engine, and core service layer bridging candidate authenticated sessions with application lifecycle actions.
+
+### 22.1 UI-Independent State Machine (`src/lifecycle/state_machine.py`)
+- **12 Lifecycle States**: `DRAFT`, `PREPARING`, `READY_FOR_REVIEW`, `APPROVED`, `SUBMITTED`, `IN_PROGRESS`, `ASSESSMENT`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN`, `CLOSED`.
+- **Bidirectional Legacy Status Mapping**: Automatically normalizes legacy title-case states (`Discovered` -> `DRAFT`, `Under Review` -> `PREPARING`, `Shortlisted` -> `READY_FOR_REVIEW`, `Application Prepared` -> `READY_FOR_REVIEW`, `Awaiting Approval` -> `APPROVED`, `Applied` -> `SUBMITTED`).
+- **Strict Transition Matrix (`ALLOWED_TRANSITIONS`)**:
+  - `DRAFT` -> `PREPARING`, `WITHDRAWN`, `CLOSED`
+  - `PREPARING` -> `DRAFT`, `READY_FOR_REVIEW`, `WITHDRAWN`, `CLOSED`
+  - `READY_FOR_REVIEW` -> `PREPARING`, `APPROVED`, `WITHDRAWN`, `CLOSED`
+  - `APPROVED` -> `READY_FOR_REVIEW`, `SUBMITTED`, `WITHDRAWN`, `CLOSED`
+  - `SUBMITTED` -> `IN_PROGRESS`, `ASSESSMENT`, `INTERVIEW`, `REJECTED`, `WITHDRAWN`, `CLOSED`
+  - `IN_PROGRESS` -> `ASSESSMENT`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN`, `CLOSED`
+  - `ASSESSMENT` -> `IN_PROGRESS`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN`, `CLOSED`
+  - `INTERVIEW` -> `IN_PROGRESS`, `ASSESSMENT`, `OFFER`, `REJECTED`, `WITHDRAWN`, `CLOSED`
+  - `OFFER` -> `CLOSED`, `WITHDRAWN`, `REJECTED`
+  - `REJECTED` -> `IN_PROGRESS` (Re-open only)
+  - `WITHDRAWN` -> `IN_PROGRESS` (Re-open only)
+  - `CLOSED` -> `IN_PROGRESS` (Re-open only)
+- **Gate-Protected Transitions**:
+  - Transition to `APPROVED` requires an active approved packet.
+  - Transition to `SUBMITTED` requires submission confirmation with an active unconsumed human approval.
+- **Terminal Status Re-opening**: Terminal statuses (`REJECTED`, `WITHDRAWN`, `CLOSED`) can only transition to `IN_PROGRESS`, requiring an explicit re-opening rationale and emitting `APPLICATION_REOPENED`.
+
+### 22.2 Atomic Status Transition Engine (`DatabaseManager.transition_application_status`)
+- Executes within an atomic write lock transaction (`with self.transaction() as conn:`).
+- Checks user ownership and authorization, raising `CrossUserAccessError` on foreign application access attempts.
+- Performs optimistic concurrency validation via `expected_current_status`, raising `StaleDataError` if concurrent edits occurred.
+- Validates status transition using `ApplicationStateMachine.validate_transition()`.
+- Executes conditional atomic `UPDATE applications SET status = ?, updated_at = ... WHERE id = ? AND user_id = ? AND status = ?`.
+- Appends immutable audit event (`STATUS_CHANGED` or `APPLICATION_REOPENED`) via `_insert_application_event_internal()`, ensuring state mutation and timeline history commit atomically.
+
+### 22.3 Core Service Layer (`DashboardService`)
+- **Session Identity Enforcement**: `resolve_authenticated_candidate(session_id, client_user_id)` strictly validates the active candidate session, enforces non-null `session.user_id`, and matches `client_user_id == session.user_id`.
+- **Application CRUD**: `create_candidate_application()`, `get_candidate_application()`, `list_candidate_applications()` supporting filtering by status, search terms, and sort orders.
+- **16-Step Protected Manual Submission Sequence**:
+  1. Resolves candidate session and verifies identity.
+  2. Retrieves application and verifies candidate ownership.
+  3. Verifies application status is `APPROVED`.
+  4. Validates state transition via `ApplicationStateMachine`.
+  5. Resolves active revision prepared packet.
+  6. Independently verifies packet integrity via canonical JSON snapshot hash.
+  7. Retrieves human approval record and verifies it is unconsumed (`is_consumed == 0`).
+  8. Verifies approval packet hash matches current active packet hash.
+  9. Validates candidate submission channel against allowed channel list.
+  10. Verifies and consumes single-use HMAC action ticket via `SessionManager`.
+  11. Enforces action ticket cryptographic scope (`application_id`, `packet_hash`, `action_type="confirm_submission"`).
+  12. Records manual submission confirmation receipt in `submission_confirmations`.
+  13. Atomically consumes human approval (`is_consumed = 1`).
+  14. Advances application status to `SUBMITTED`.
+  15. Emits `SUBMISSION_CONFIRMED` audit timeline event.
+  16. Returns updated application model and confirmation record.
+- **External Portal Audit**: `log_external_application_url_opened()` validates external URLs via `URLSafetyValidator` and records `EXTERNAL_PORTAL_OPENED` timeline events without mutating application status.
+- **Strict Zero-Automation Safeguard**: No browser automation tools or automated form fillers are invoked. Candidate manually completes external submission and provides submission details.

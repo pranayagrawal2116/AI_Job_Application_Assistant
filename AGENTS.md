@@ -222,6 +222,18 @@ When interacting with the browser via Playwright MCP:
   - Before/after audit event provenance: Upgraded `correct_submission_confirmation()` payload to record both `updated_fields` and `previous_fields` alongside `confirmation_id`, providing complete before/after state provenance for all modified confirmation attributes.
   - Verified with 6 new deterministic failure-injection and audit review tests in `test_phase7_1_3_audit_consistency.py` (17 tests total in suite, 544 total project suite tests passing, 100%), 0 pyflakes errors, 0 ruff errors, and clean git diff.
 
+- [x] **Architecture v2.1.1 Phase 7.2: Universal Application State Machine & Core Service Layer** (Complete)
+  - Dedicated UI-independent state machine (`ApplicationStateMachine` in `src/lifecycle/`): formalizes all 12 universal application statuses (`DRAFT`, `PREPARING`, `READY_FOR_REVIEW`, `APPROVED`, `SUBMITTED`, `IN_PROGRESS`, `ASSESSMENT`, `INTERVIEW`, `OFFER`, `REJECTED`, `WITHDRAWN`, `CLOSED`) with bidirectional legacy aliases (`Discovered`, `Under Review`, `Shortlisted`, `Application Prepared`, `Awaiting Approval`, `Applied`).
+  - Strict transition validation matrix: explicit allowed transitions matrix across all 12 states; gate-protected targets (`APPROVED` requires approved packet, `SUBMITTED` requires submission confirmation with active unconsumed human approval); terminal statuses (`REJECTED`, `WITHDRAWN`, `CLOSED`) restricted to re-opening only to `IN_PROGRESS` with mandatory rationale.
+  - Transactional status transition engine: `DatabaseManager.transition_application_status()` executes under SQLite write lock, verifies candidate ownership (`CrossUserAccessError`), performs optimistic concurrency check via `expected_current_status`, validates transitions against `ApplicationStateMachine`, executes conditional `UPDATE`, and atomically records immutable audit timeline events (`STATUS_CHANGED`, `APPLICATION_REOPENED`) via `_insert_application_event_internal()`.
+  - Secure core lifecycle service layer (`DashboardService`):
+    - `resolve_authenticated_candidate(session_id, client_user_id)` strictly validates active session, enforces non-null `session.user_id`, and verifies `client_user_id == session.user_id`.
+    - Session-bound candidate application management: `create_candidate_application()`, `get_candidate_application()`, `list_candidate_applications()` with filtering, searching, and sorting.
+    - Protected manual submission workflow: 16-step verification sequence in `record_candidate_manual_submission()` verifying candidate session identity, application ownership, state machine transition validity, active packet integrity, unconsumed human approval, and single-use HMAC action ticket consumption.
+    - External URL opening audit: `log_external_application_url_opened()` validates safe URLs via `URLSafetyValidator` and records `EXTERNAL_PORTAL_OPENED` timeline events without mutating application status.
+    - Strict zero-automation boundary: zero browser automation or submission scripting in lifecycle modules; candidate retains complete control over external submissions.
+  - Verified with 50 new automated tests across 3 new test suites (`test_application_state_machine.py` [11 tests], `test_application_lifecycle_service.py` [21 tests], `test_phase_7_2_submission_security.py` [18 tests]), totaling 594 passing tests across the entire repository (100% pass rate). 0 pyflakes errors, 0 ruff errors, and clean git diff.
+
 ---
 
 ## 7. Approval Requirement
