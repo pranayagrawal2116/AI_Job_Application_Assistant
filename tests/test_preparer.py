@@ -31,10 +31,50 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         cls.db = DatabaseManager(db_path=cls.db_path)
         cls.profile_path = Path(cls.temp_dir.name) / "test_candidate_profile.json"
 
-        # Check for sample PDF resume
+        # Check for sample PDF resume; synthesize if absent (e.g. clean CI environment)
         cls.sample_pdf = Path("data/resumes/Pranay_Agrawal_Resume(2).pdf").resolve()
         if not cls.sample_pdf.exists():
             cls.sample_pdf = Path("data/resumes/Pranay_Agrawal_Resume.pdf").resolve()
+        if not cls.sample_pdf.exists():
+            cls.sample_pdf = Path(cls.temp_dir.name) / "Pranay_Agrawal_Resume.pdf"
+            from reportlab.pdfgen import canvas
+            from reportlab.lib.pagesizes import letter
+            c = canvas.Canvas(str(cls.sample_pdf), pagesize=letter)
+            y = 750
+            c.setFont("Helvetica-Bold", 16)
+            c.drawString(50, y, "PRANAY ANUP AGRAWAL")
+            y -= 20
+            c.setFont("Helvetica", 10)
+            c.drawString(50, y, "95100 29575 | pranayagrawal2116@gmail.com | Kothrud, Pune, Maharashtra")
+            y -= 25
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, y, "EDUCATION")
+            y -= 15
+            c.setFont("Helvetica", 10)
+            c.drawString(50, y, "MIT World Peace University")
+            c.drawString(50, y - 15, "B.Tech - Computer Science & Engineering (Artificial Intelligence & Data Science)")
+            c.drawString(50, y - 30, "Expected Graduation: 2028 | CGPA: 7.6")
+            y -= 55
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, y, "TECHNICAL SKILLS")
+            y -= 15
+            c.setFont("Helvetica", 10)
+            c.drawString(50, y, "Python, JavaScript, C/C++, Flutter & Dart, Android application development, REST API integration, SQLite & MySQL, Git & GitHub")
+            y -= 25
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, y, "WORK EXPERIENCE")
+            y -= 15
+            c.setFont("Helvetica", 10)
+            c.drawString(50, y, "Sarita Infotech Pvt. Ltd. | 3 months")
+            c.drawString(50, y - 15, "Project Manager | Mobile App Development")
+            y -= 40
+            c.setFont("Helvetica-Bold", 12)
+            c.drawString(50, y, "SELECTED PROJECTS")
+            y -= 15
+            c.setFont("Helvetica", 10)
+            c.drawString(50, y, "Medical Chatbot")
+            c.drawString(50, y - 15, "Sarita ABDM - Milestone 2 Integration")
+            c.save()
 
         # Create a synthetic DOCX resume for testing DOCX parsing
         cls.docx_path = Path(cls.temp_dir.name) / "test_candidate_resume.docx"
@@ -85,7 +125,8 @@ class TestApplicationPreparationEngine(unittest.TestCase):
     def setUp(self):
         self.parser = ResumeParser()
         self.updater = ProfileUpdater(db_manager=self.db, profile_path=self.profile_path)
-        self.profile = self.updater.sync_from_resume(self.sample_pdf)
+        resume_to_sync = self.sample_pdf if self.sample_pdf.exists() else self.docx_path
+        self.profile = self.updater.sync_from_resume(resume_to_sync)
         self.matcher = ResumeJobMatcher(candidate_profile=self.profile)
         self.letter_gen = CoverLetterGenerator(
             candidate_profile=self.profile,
