@@ -432,12 +432,12 @@ class TestAtomicApplicationTransitions(TestApplicationLifecycleServiceBase):
             company_name="URL Logging Co",
             job_title="Frontend Engineer",
             status="DRAFT",
+            job_url="https://company.careers/apply/123",
         )
 
         self.service.log_external_application_url_opened(
             application_id=app.id,
             session_id=self.session_a.session_id,
-            url="https://company.careers/apply/123",
         )
 
         # Status MUST still be DRAFT (never automatically advanced to SUBMITTED!)

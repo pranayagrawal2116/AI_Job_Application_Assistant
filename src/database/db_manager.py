@@ -3093,16 +3093,18 @@ class DatabaseManager:
         else:
             query += " ORDER BY updated_at DESC"
 
+        # Validate pagination arguments independently before SQL construction
         if limit is not None:
-            if not isinstance(limit, int) or limit < 0:
-                raise ValidationError("limit must be a non-negative integer.")
-            if not isinstance(offset, int) or offset < 0:
-                raise ValidationError("offset must be a non-negative integer.")
+            if isinstance(limit, bool) or not isinstance(limit, int) or limit < 0:
+                raise ValidationError("limit must be a non-negative integer or None.")
+
+        if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+            raise ValidationError("offset must be a non-negative integer.")
+
+        if limit is not None:
             query += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])
         elif offset > 0:
-            if not isinstance(offset, int) or offset < 0:
-                raise ValidationError("offset must be a non-negative integer.")
             query += " LIMIT -1 OFFSET ?"
             params.append(offset)
 

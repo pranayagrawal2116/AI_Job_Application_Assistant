@@ -473,13 +473,13 @@ class TestPhase721SecurityHardening(unittest.TestCase):
             company_name="Preserve Status Co",
             job_title="Dev",
             status="PREPARING",
+            job_url="https://jobs.example.com/posting/999",
         )
 
         # Valid URL logging
         self.service.log_external_application_url_opened(
             application_id=app.id,
             session_id=self.session_a.session_id,
-            url="https://jobs.example.com/posting/999",
         )
 
         # Verify status is preserved (NOT modified to SUBMITTED or anything else)
@@ -487,24 +487,22 @@ class TestPhase721SecurityHardening(unittest.TestCase):
         self.assertEqual(fresh_app.status, "PREPARING")
 
         # Unsafe URL rejected and NO event appended
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE applications SET external_application_url = 'http://127.0.0.1:8080/exploit' WHERE id = ?",
+                (app.id,),
+            )
         initial_event_count = len(self.db.get_application_events(app.id, self.user_a))
         with self.assertRaises(UnsafeURLError):
             self.service.log_external_application_url_opened(
                 application_id=app.id,
                 session_id=self.session_a.session_id,
-                url="http://127.0.0.1:8080/exploit",
             )
         post_event_count = len(self.db.get_application_events(app.id, self.user_a))
         self.assertEqual(initial_event_count, post_event_count)
 
     def test_sensitive_query_parameters_redacted_in_audit_event(self):
         """Tokens, api_keys, passwords, and secrets are redacted from the logged URL payload."""
-        app = self.service.create_candidate_application(
-            session_id=self.session_a.session_id,
-            company_name="Privacy Co",
-            job_title="Dev",
-        )
-
         url_with_tokens = (
             "https://ats.example.com/apply?job_id=456"
             "&token=secret_token_12345"
@@ -513,10 +511,16 @@ class TestPhase721SecurityHardening(unittest.TestCase):
             "&candidate_email=candidate@example.com"
             "&source=linkedin"
         )
+        app = self.service.create_candidate_application(
+            session_id=self.session_a.session_id,
+            company_name="Privacy Co",
+            job_title="Dev",
+            job_url=url_with_tokens,
+        )
+
         self.service.log_external_application_url_opened(
             application_id=app.id,
             session_id=self.session_a.session_id,
-            url=url_with_tokens,
         )
 
         events = self.db.get_application_events(app.id, self.user_a)

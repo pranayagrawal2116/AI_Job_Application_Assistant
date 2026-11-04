@@ -296,6 +296,49 @@ class TestApplicationListingQueries(BaseTrackerReadAPITest):
         with self.assertRaises(ValidationError):
             self.service.list_candidate_applications(self.session_a.session_id, offset=-5)
 
+    def test_database_pagination_validation_matrix(self):
+        """Verifies full matrix of pagination input validation directly on DatabaseManager."""
+        for i in range(5):
+            self._create_app(self.user_a, f"Company {i}", f"Title {i}")
+
+        # 1. limit=-1 raises ValidationError
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, limit=-1)
+
+        # 2. offset=-1, limit=20 raises ValidationError
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, limit=20, offset=-1)
+
+        # 3. offset=-1, limit=None raises ValidationError
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, limit=None, offset=-1)
+
+        # 4. offset="abc" raises ValidationError
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, offset="abc")  # type: ignore
+
+        # 5. limit="abc" raises ValidationError
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, limit="abc")  # type: ignore
+
+        # 6. booleans rejected
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, limit=True)  # type: ignore
+        with self.assertRaises(ValidationError):
+            self.db.list_user_applications(self.user_a, offset=True)  # type: ignore
+
+        # 7. limit=None, offset=0 is valid (returns all 5)
+        res_all = self.db.list_user_applications(self.user_a, limit=None, offset=0)
+        self.assertEqual(len(res_all), 5)
+
+        # 8. limit=None, offset=3 is valid (skips 3, returns 2)
+        res_offset3 = self.db.list_user_applications(self.user_a, limit=None, offset=3)
+        self.assertEqual(len(res_offset3), 2)
+
+        # 9. limit=0, offset=0 is valid empty result
+        res_empty = self.db.list_user_applications(self.user_a, limit=0, offset=0)
+        self.assertEqual(len(res_empty), 0)
+
 
 class TestCandidateTrackerMetrics(BaseTrackerReadAPITest):
     """Verifies get_candidate_tracker_metrics across all statuses, follow-ups, and archive states."""
@@ -554,6 +597,100 @@ class TestExternalApplicationURLSecurity(BaseTrackerReadAPITest):
             session_id=self.session_a.session_id,
         )
         self.assertEqual(retrieved.status, "APPROVED")
+
+    def test_valid_stored_canonical_url_succeeds(self):
+        """Valid stored canonical URL succeeds and returns validated URL for browser navigation."""
+        app = self._create_app(
+            self.user_a, "Co", "Role", status="PREPARING", job_url="https://careers.google.com/jobs/1"
+        )
+        res_url = self.service.log_external_application_url_opened(
+            application_id=app,
+            session_id=self.session_a.session_id,
+        )
+        self.assertEqual(res_url, "https://careers.google.com/jobs/1")
+
+    def test_missing_canonical_url_with_supplied_url_rejected(self):
+        """When canonical URL is missing, caller-supplied URL is NOT used and raises ValidationError."""
+        app = self._create_app(self.user_a, "Co", "Role", job_url=None)
+        with self.assertRaises(ValidationError):
+            self.service.log_external_application_url_opened(
+                application_id=app,
+                session_id=self.session_a.session_id,
+                url="https://attacker.site/apply",
+            )
+
+    def test_url_validator_not_invoked_before_authentication(self):
+        """URL safety validator and DNS resolver are never called when candidate authentication fails."""
+        resolver_called = []
+
+        def spy_resolver(host: str, port: int) -> List[str]:
+            resolver_called.append((host, port))
+            return ["93.184.215.14"]
+
+        service = DashboardService(db_manager=self.db, url_resolver=spy_resolver)
+        app = self._create_app(self.user_a, "Co", "Role", job_url="https://example.com/apply")
+
+        with self.assertRaises(InvalidSessionError):
+            service.log_external_application_url_opened(
+                application_id=app,
+                session_id="totally_invalid_session_token",
+            )
+
+        self.assertEqual(len(resolver_called), 0, "Resolver must not be called before authentication.")
+
+    def test_url_validator_not_invoked_for_cross_user_application(self):
+        """URL safety validator and DNS resolver are never called for applications owned by another candidate."""
+        resolver_called = []
+
+        def spy_resolver(host: str, port: int) -> List[str]:
+            resolver_called.append((host, port))
+            return ["93.184.215.14"]
+
+        service = DashboardService(db_manager=self.db, url_resolver=spy_resolver)
+        app_b = self._create_app(self.user_b, "Bob Co", "Dev", job_url="https://example.com/apply")
+
+        with self.assertRaises((ApplicationNotFoundError, CrossUserAccessError)):
+            service.log_external_application_url_opened(
+                application_id=app_b,
+                session_id=self.session_a.session_id,
+            )
+
+        self.assertEqual(len(resolver_called), 0, "Resolver must not be called for another candidate's application.")
+
+    def test_no_audit_event_appended_on_validation_failure(self):
+        """No audit event is appended when URL validation fails at any point."""
+        app_missing = self._create_app(self.user_a, "Co Missing", "Role", job_url=None)
+        app_unsafe = self._create_app(self.user_a, "Co Unsafe", "Role", job_url="http://127.0.0.1/admin")
+        app_valid = self._create_app(self.user_a, "Co Valid", "Role", job_url="https://example.com/apply")
+
+        # 1. Missing canonical URL
+        with self.assertRaises(ValidationError):
+            self.service.log_external_application_url_opened(app_missing, self.session_a.session_id)
+        self.assertEqual(len(self.db.get_application_events(app_missing, self.user_a)), 0)
+
+        # 2. Missing canonical URL with supplied URL
+        with self.assertRaises(ValidationError):
+            self.service.log_external_application_url_opened(
+                app_missing, self.session_a.session_id, url="https://example.com/apply"
+            )
+        self.assertEqual(len(self.db.get_application_events(app_missing, self.user_a)), 0)
+
+        # 3. Unsafe canonical URL
+        with self.assertRaises(UnsafeURLError):
+            self.service.log_external_application_url_opened(app_unsafe, self.session_a.session_id)
+        self.assertEqual(len(self.db.get_application_events(app_unsafe, self.user_a)), 0)
+
+        # 4. Arbitrary substitution attempt
+        with self.assertRaises(SecurityAuthorizationError):
+            self.service.log_external_application_url_opened(
+                app_valid, self.session_a.session_id, url="https://phish.com"
+            )
+        self.assertEqual(len(self.db.get_application_events(app_valid, self.user_a)), 0)
+
+        # 5. Invalid session
+        with self.assertRaises(InvalidSessionError):
+            self.service.log_external_application_url_opened(app_valid, "bad_session")
+        self.assertEqual(len(self.db.get_application_events(app_valid, self.user_a)), 0)
 
 
 class TestCandidateFollowUpService(BaseTrackerReadAPITest):

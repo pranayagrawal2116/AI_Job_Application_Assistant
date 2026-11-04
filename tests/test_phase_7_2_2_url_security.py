@@ -136,13 +136,13 @@ class TestPhase722URLSecurity(unittest.TestCase):
             company_name="Employer Inc",
             job_title="Staff Engineer",
             status="PREPARING",
+            job_url="https://careers.google.com/jobs/101?source=board#fragment_should_be_stripped",
         )
 
         # Open link
         service.log_external_application_url_opened(
             application_id=app.id,
             session_id=self.session.session_id,
-            url="https://careers.google.com/jobs/101?source=board#fragment_should_be_stripped",
         )
 
         # Verify application status strictly unchanged

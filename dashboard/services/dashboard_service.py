@@ -1391,35 +1391,38 @@ class DashboardService:
             SecurityAuthorizationError,
         )
 
-        # 1. Authenticate session and candidate first
+        # 1. Authenticate candidate session first using resolve_authenticated_candidate()
         user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
 
-        # 2. Retrieve application under strict ownership filtering
+        # 2. Retrieve candidate application enforcing user ownership (get_user_application)
         app = self.db.get_user_application(application_id=application_id, user_id=user_id)
         if not app:
             raise ApplicationNotFoundError(application_id)
 
-        # 3. Read canonical stored employer URL (prohibit arbitrary client substitution)
-        stored_url = app.external_application_url
-        if stored_url and stored_url.strip():
-            if url and url.strip() and url.strip() != stored_url.strip():
+        # 3. Read canonical stored employer URL (app.external_application_url)
+        canonical_url = app.external_application_url
+
+        # 4. If canonical URL is missing or empty, raise ValidationError
+        # Caller-supplied URL must NEVER supply a missing canonical URL!
+        if not canonical_url or not str(canonical_url).strip():
+            raise ValidationError(f"Application #{application_id} has no external application URL configured.")
+        canonical_url = str(canonical_url).strip()
+
+        # 5. If compatibility 'url' parameter is supplied, enforce that it matches canonical URL;
+        # any mismatch raises SecurityAuthorizationError; caller input must never override canonical URL.
+        if url is not None and str(url).strip():
+            if str(url).strip() != canonical_url:
                 raise SecurityAuthorizationError(
                     "Arbitrary URL substitution is prohibited. Client-supplied URL does not match canonical stored application URL."
                 )
-            target_url = stored_url.strip()
-        else:
-            if url and url.strip():
-                target_url = url.strip()
-            else:
-                raise ValidationError(f"Application #{application_id} has no external application URL configured.")
 
-        # 4. Validate canonical URL via URLSafetyValidator (destination for browser)
-        validated_url = URLSafetyValidator.validate_url(target_url, resolver=self._resolve_url)
+        # 6. Validate only the canonical stored URL through URLSafetyValidator (validated_url)
+        validated_url = URLSafetyValidator.validate_url(canonical_url, resolver=self._resolve_url)
 
-        # 5. Redact sensitive query parameters and strip fragments for audit logging only
+        # 7. Produce sanitized_url for the audit event (_redact_sensitive_url)
         sanitized_url = self._redact_sensitive_url(validated_url)
 
-        # 6. Emit audit event: Status is strictly PRESERVED, payload receives sanitized_url
+        # 8. Append EXTERNAL_APPLICATION_URL_OPENED without changing application status
         self.db.create_application_event(
             application_id=application_id,
             user_id=user_id,
@@ -1434,7 +1437,7 @@ class DashboardService:
             },
         )
 
-        # 7. Return validated canonical destination for browser navigation
+        # 9. Return validated_url as browser navigation destination
         return validated_url
 
     # -------------------------------------------------------------------------
