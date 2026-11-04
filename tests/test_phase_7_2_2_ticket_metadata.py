@@ -62,6 +62,38 @@ class TestPhase722TicketMetadata(unittest.TestCase):
         self.assertEqual(ts, 1705000000)
         self.assertEqual(sig, "f8e9d0c1b2a34567")
 
+    def test_parse_action_ticket_hyphenated_key_ids(self):
+        """Correctly parses tickets where key_id contains hyphens (e.g. production-2026)."""
+        hyphenated_cases = [
+            (
+                "TKT-production-2026-0123456789abcdef0123456789abcdef.1705000000.f8e9d0c1b2a34567",
+                "production-2026",
+                "0123456789abcdef0123456789abcdef",
+                1705000000,
+                "f8e9d0c1b2a34567",
+            ),
+            (
+                "TKT-auth-v2-prod-key-deadbeef1234567890abcdef12345678.1706000000.signature123",
+                "auth-v2-prod-key",
+                "deadbeef1234567890abcdef12345678",
+                1706000000,
+                "signature123",
+            ),
+            (
+                "TKT-multi-part-cluster-key-fedcba9876543210fedcba9876543210.1707000000.sigxyz",
+                "multi-part-cluster-key",
+                "fedcba9876543210fedcba9876543210",
+                1707000000,
+                "sigxyz",
+            ),
+        ]
+        for ticket_str, expected_key, expected_nonce, expected_ts, expected_sig in hyphenated_cases:
+            key_id, nonce, ts, sig = SessionManager.parse_action_ticket(ticket_str)
+            self.assertEqual(key_id, expected_key)
+            self.assertEqual(nonce, expected_nonce)
+            self.assertEqual(ts, expected_ts)
+            self.assertEqual(sig, expected_sig)
+
     def test_parse_action_ticket_legacy_format(self):
         """Correctly parses legacy ticket without key_id hyphen, defaulting to v1."""
         ticket_str = "TKT-legacyNonce12345.1699999999.aabbccddeeff0011"
@@ -195,6 +227,102 @@ class TestPhase722TicketMetadata(unittest.TestCase):
             row = cursor.fetchone()
             self.assertEqual(row["ticket_nonce"], expected_nonce)
             self.assertEqual(row["key_id"], expected_key_id)
+
+    def test_approval_with_hyphenated_key_id_records_exact_key_and_nonce(self):
+        """When active key has hyphens (e.g. 'production-2026'), approval records exact key_id and clean nonce."""
+        import secrets
+        hyphen_key_id = "production-2026"
+        secret_bytes = secrets.token_bytes(32)
+
+        original_key = self.session_mgr.active_key_id
+        original_keys = dict(self.session_mgr._rotation_keys)
+        try:
+            self.session_mgr.configure_keys(hyphen_key_id, {hyphen_key_id: secret_bytes})
+
+            jd = self.db.save_job_description_snapshot(
+                user_id=self.user_id,
+                company_name="Hyphen Key Corp",
+                job_title="Security Engineer",
+                raw_content="Cloud security and IAM.",
+            )
+            app = self.db.create_user_application(
+                user_id=self.user_id,
+                company_name="Hyphen Key Corp",
+                job_title="Security Engineer",
+                status="READY_FOR_REVIEW",
+                job_description_id=jd.id,
+            )
+            dummy_snapshot = {
+                "application_id": app.id,
+                "user_id": self.user_id,
+                "job_description_id": jd.id,
+                "packet_version": 1,
+            }
+            snap_bytes = canonical_json_bytes(dummy_snapshot)
+            snap_hash = canonical_json_hash(dummy_snapshot)
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO prepared_packets (
+                        id, application_id, user_id, version_num, packet_version_hash,
+                        original_resume_hash, job_description_snapshot_hash, screening_answers_json,
+                        canonical_snapshot_json, is_active_revision
+                    ) VALUES (305, ?, ?, 1, ?, 'hash_cv', 'jdh', '[]', ?, 1)
+                    """,
+                    (app.id, self.user_id, snap_hash, snap_bytes.decode("utf-8")),
+                )
+            packet = self.db.get_active_prepared_packet(app.id, self.user_id)
+
+            ticket = self.session_mgr.issue_action_ticket(
+                session_id=self.session.session_id,
+                action_type="HUMAN_APPROVAL",
+                application_id=app.id,
+                packet_hash=snap_hash,
+            )
+            self.assertTrue(ticket.startswith(f"TKT-{hyphen_key_id}-"))
+
+            # Authorize via HumanApprovalGate
+            success, msg, approval = self.gate.authorize_universal_packet(
+                user_id=self.user_id,
+                application_id=app.id,
+                packet_id=packet.id,
+                approver_name="Ticket Candidate",
+                session_id=self.session.session_id,
+                action_ticket=ticket,
+                candidate_confirmed=True,
+            )
+            self.assertTrue(success, f"Approval failed: {msg}")
+
+            # Inspect returned approval and DB row
+            self.assertEqual(approval.key_id, "production-2026")
+            self.assertNotIn("-", approval.ticket_nonce)
+            self.assertEqual(len(approval.ticket_nonce), 32)
+
+            with self.db.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT ticket_nonce, key_id FROM application_approvals WHERE id = ?",
+                    (approval.id,),
+                )
+                row = cursor.fetchone()
+                self.assertEqual(row["key_id"], "production-2026")
+                self.assertEqual(row["ticket_nonce"], approval.ticket_nonce)
+
+            # Replaying this hyphenated ticket fails
+            succ2, msg2, _ = self.gate.authorize_universal_packet(
+                user_id=self.user_id,
+                application_id=app.id,
+                packet_id=packet.id,
+                approver_name="Ticket Candidate",
+                session_id=self.session.session_id,
+                action_ticket=ticket,
+                candidate_confirmed=True,
+            )
+            self.assertFalse(succ2)
+            self.assertIn("already been used", msg2)
+        finally:
+            self.session_mgr.configure_keys(original_key, original_keys)
 
     # =========================================================================
     # 3. REPLAY & SCOPE TAMPERING CHECKS

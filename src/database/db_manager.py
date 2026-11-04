@@ -50,6 +50,7 @@ from src.database.models import (
     PreparedPacket,
     SubmissionChannel,
     SubmissionConfirmation,
+    VerifiedApprovalContext,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
@@ -132,9 +133,10 @@ class DatabaseManager:
 
         self._init_db()
 
-    def get_connection(self) -> sqlite3.Connection:
+    def get_connection(self, timeout: Optional[float] = None) -> sqlite3.Connection:
         """Creates and configures a new SQLite connection."""
-        conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        timeout_val = timeout if timeout is not None else 5.0
+        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=timeout_val)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         if self.db_path != ":memory:":
@@ -186,14 +188,14 @@ class DatabaseManager:
             conn.close()
 
     @contextmanager
-    def immediate_transaction(self) -> Generator[sqlite3.Connection, None, None]:
+    def immediate_transaction(self, timeout: Optional[float] = None) -> Generator[sqlite3.Connection, None, None]:
         """Context manager providing an atomic database transaction with an immediate write lock (BEGIN IMMEDIATE).
 
         Prevents concurrent read-before-write races by acquiring SQLite's RESERVED write lock
         at the beginning of the transaction before any SELECT or inspection statements.
         Commits on normal block exit, rolls back on any exception, and closes connection.
         """
-        conn = self.get_connection()
+        conn = self.get_connection(timeout=timeout)
         conn.isolation_level = None  # Autocommit mode to allow explicit BEGIN IMMEDIATE
         txn_started = False
         try:
@@ -2239,29 +2241,42 @@ class DatabaseManager:
                 packet_id=packet_id,
             )
 
-    def authorize_application_packet_atomic(
+    def _authorize_application_packet_atomic(
         self,
-        application_id: int,
-        user_id: int,
+        application_id: Optional[int] = None,
+        user_id: Optional[int] = None,
         packet_id: Optional[int] = None,
         packet_version_hash: str = "",
         ticket_nonce: str = "",
         key_id: str = "v1",
         approver_name: str = "Human Candidate",
         session_id: str = "",
-        target_status: Optional[str] = None,
+        auth_context: Optional[VerifiedApprovalContext] = None,
     ) -> ApplicationApproval:
-        """Atomically authorizes an application packet under an immediate write lock.
+        """Internal atomic persistence helper for human approvals under an immediate write lock.
 
-        Executes all four operations within a single immediate SQLite transaction:
-        1. Validates current status is in READY_FOR_REVIEW (or legacy APPLICATION_PREPARED).
-        2. Records packet approval in application_approvals.
-        3. Appends HUMAN_APPROVAL_GRANTED to application_logs.
-        4. Updates applications.status to APPROVED (or AWAITING_APPROVAL).
-        5. Inserts PACKET_HUMAN_APPROVED event into application_events.
-        If any step fails, the entire transaction rolls back cleanly leaving zero partial state.
+        TRUSTED WORKFLOW INVARIANT:
+        This internal method may ONLY be invoked by HumanApprovalGate after successful cryptographic
+        session validation, active packet integrity verification, candidate confirmation, and action ticket consumption.
+        It is strictly NOT exposed as a public service API.
+
+        Target status is derived exclusively from the application's current status (READY_FOR_REVIEW -> APPROVED,
+        or legacy Application Prepared -> Awaiting Approval) and is strictly non-caller-selectable.
         """
         from src.lifecycle.state_machine import ApplicationStateMachine
+
+        if auth_context is not None:
+            application_id = auth_context.application_id
+            user_id = auth_context.user_id
+            packet_id = auth_context.packet_id
+            packet_version_hash = auth_context.packet_version_hash
+            ticket_nonce = auth_context.ticket_nonce
+            key_id = auth_context.key_id
+            approver_name = auth_context.approver_name
+            session_id = auth_context.session_id
+
+        if application_id is None or user_id is None:
+            raise ValidationError("application_id and user_id are mandatory for approval persistence.")
 
         with self.immediate_transaction() as conn:
             cursor = conn.cursor()
@@ -2287,13 +2302,19 @@ class DatabaseManager:
                     allowed=[ApplicationStatus.READY_FOR_REVIEW.value, ApplicationStatus.APPLICATION_PREPARED.value],
                 )
 
-            # Determine new status preserving legacy style if applicable
-            if target_status is not None:
-                new_status = target_status
-            elif current_status == ApplicationStatus.READY_FOR_REVIEW.value:
+            # Derive new status exclusively from existing application status representation (never caller-selectable)
+            if current_status == ApplicationStatus.READY_FOR_REVIEW.value:
                 new_status = ApplicationStatus.APPROVED.value
-            else:
+            elif current_status == ApplicationStatus.APPLICATION_PREPARED.value:
                 new_status = ApplicationStatus.AWAITING_APPROVAL.value
+            else:
+                new_status = ApplicationStatus.APPROVED.value
+
+            # Strict guard against setting unauthorized statuses
+            if new_status not in (ApplicationStatus.APPROVED.value, ApplicationStatus.AWAITING_APPROVAL.value):
+                raise SecurityAuthorizationError(
+                    f"Illegal approval target status '{new_status}'. Approval can only transition to APPROVED or Awaiting Approval."
+                )
 
             # 2. Record approval & log via internal helper
             approval = self._record_packet_approval_internal(

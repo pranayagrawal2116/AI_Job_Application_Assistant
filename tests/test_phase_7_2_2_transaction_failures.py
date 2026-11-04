@@ -98,6 +98,42 @@ class TestPhase722TransactionFailures(unittest.TestCase):
             blocking_conn.rollback()
             blocking_conn.close()
 
+    def test_real_sqlite_write_lock_contention_between_connections(self):
+        """Genuine multi-connection SQLite lock contention test on file-backed DB without mocks.
+
+        Connection A holds BEGIN IMMEDIATE.
+        Connection B calls DatabaseManager.immediate_transaction(timeout=0.05).
+        SQLite reports lock contention (database is locked).
+        Original OperationalError is preserved without being masked.
+        Connection B's connection is closed cleanly.
+        After Connection A releases, Connection B acquires immediate_transaction successfully.
+        """
+        conn_a = sqlite3.connect(self.db_path, timeout=5.0)
+        conn_a.execute("BEGIN IMMEDIATE")
+        conn_a.execute("UPDATE test_counter SET count = 333 WHERE id = 1")
+
+        try:
+            # Connection B calls immediate_transaction with short timeout
+            with self.assertRaises(sqlite3.OperationalError) as ctx:
+                with self.db.immediate_transaction(timeout=0.05) as conn_b:
+                    conn_b.execute("UPDATE test_counter SET count = 444 WHERE id = 1")
+
+            err_msg = str(ctx.exception).lower()
+            self.assertIn("locked", err_msg)
+            self.assertNotIn("cannot rollback", err_msg)
+        finally:
+            conn_a.execute("COMMIT")
+            conn_a.close()
+
+        # After Connection A releases lock, DatabaseManager.immediate_transaction succeeds
+        with self.db.immediate_transaction(timeout=1.0) as conn_b:
+            conn_b.execute("UPDATE test_counter SET count = 555 WHERE id = 1")
+
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT count FROM test_counter WHERE id = 1")
+            self.assertEqual(cursor.fetchone()[0], 555)
+
     def test_mock_begin_immediate_failure_does_not_mask_original_exception(self):
         """Synthetic failure in BEGIN IMMEDIATE does not call conn.execute('ROLLBACK')."""
         fake_conn = MagicMock()

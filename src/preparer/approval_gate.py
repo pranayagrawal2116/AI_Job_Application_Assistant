@@ -15,7 +15,13 @@ from src.database.exceptions import (
     SessionExpiredError,
     ValidationError,
 )
-from src.database.models import ApplicationApproval, ApplicationStatus, Job, PreparedPacket
+from src.database.models import (
+    ApplicationApproval,
+    ApplicationStatus,
+    Job,
+    PreparedPacket,
+    VerifiedApprovalContext,
+)
 from src.preparer.cover_letter_generator import CoverLetter
 from src.preparer.document_generator import GeneratedDocument
 from src.preparer.question_answerer import ScreeningQAPacket
@@ -503,7 +509,7 @@ class HumanApprovalGate:
 
         # 5. Atomically authorize packet, advance status, and record timeline audit event
         try:
-            approval = self.db.authorize_application_packet_atomic(
+            auth_context = VerifiedApprovalContext(
                 application_id=application_id,
                 user_id=user_id,
                 packet_id=packet.id,
@@ -512,6 +518,9 @@ class HumanApprovalGate:
                 key_id=key_id,
                 approver_name=cleaned_approver,
                 session_id=session_id,
+            )
+            approval = self.db._authorize_application_packet_atomic(
+                auth_context=auth_context
             )
         except Exception as exc:
             logger.error("Error authorizing application packet atomically: %s", exc, exc_info=True)

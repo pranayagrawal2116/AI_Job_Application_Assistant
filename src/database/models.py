@@ -544,3 +544,21 @@ class MatchResult:
         return data
 
 
+@dataclass(frozen=True)
+class VerifiedApprovalContext:
+    """Internal trusted capability proving cryptographically verified human approval.
+
+    Issued exclusively by HumanApprovalGate after successful session validation,
+    packet integrity verification, candidate confirmation, and single-use action ticket consumption.
+    Required by DatabaseManager._authorize_application_packet_atomic.
+    """
+    application_id: int
+    user_id: int
+    packet_id: Optional[int]
+    packet_version_hash: str
+    ticket_nonce: str
+    key_id: str
+    approver_name: str
+    session_id: str
+
+

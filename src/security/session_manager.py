@@ -359,6 +359,8 @@ class SessionManager:
         self._active_key_id = active_key_id
         self._rotation_keys = dict(keys)
         self._server_secret = self._rotation_keys[active_key_id]
+        self.key_rotation_mgr.active_key_id = active_key_id
+        self.key_rotation_mgr._keys = dict(keys)
         logger.info("SessionManager keys rotated: active key is '%s' (%d total keys)", active_key_id, len(keys))
 
     def authenticate_candidate(
@@ -513,12 +515,12 @@ class SessionManager:
             raise ValueError("Missing signature in action ticket.")
 
         if "-" in header_nonce:
-            key_id, nonce = header_nonce.split("-", 1)
+            key_id, nonce = header_nonce.rsplit("-", 1)
         else:
             key_id = "v1"
             nonce = header_nonce
 
-        if not key_id or not nonce:
+        if not key_id.strip() or not nonce.strip():
             raise ValueError("Action ticket missing key_id or nonce.")
 
         return key_id, nonce, timestamp, signature
