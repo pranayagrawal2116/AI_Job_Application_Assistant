@@ -18,7 +18,6 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import streamlit as st
-from streamlit.errors import StreamlitAPIException
 
 from dashboard.services.dashboard_service import DashboardService
 from src.database.exceptions import (
@@ -915,8 +914,24 @@ def render_manual_submission_dialog_content(
                 st.error(f"Manual submission confirmation failed: {exc}")
 
 
-if hasattr(st, "dialog"):
-    @st.dialog("🚀 Confirm Manual Job Submission", width="medium")
+def get_submission_dialog_decorator() -> Any:
+    """Returns the modal dialog decorator for the active Streamlit version.
+
+    Prefers stable st.dialog(..., width="large") (Streamlit 1.37+).
+    Falls back to st.experimental_dialog(..., width="large") (Streamlit 1.35-1.36).
+    Returns None if neither modal API is available.
+    """
+    if hasattr(st, "dialog") and callable(st.dialog):
+        return st.dialog("🚀 Confirm Manual Job Submission", width="large")
+    if hasattr(st, "experimental_dialog") and callable(st.experimental_dialog):
+        return st.experimental_dialog("🚀 Confirm Manual Job Submission", width="large")
+    return None
+
+
+_dialog_decorator = get_submission_dialog_decorator()
+
+if _dialog_decorator is not None:
+    @_dialog_decorator
     def _confirm_manual_submission_dialog_decorated(
         service: DashboardService,
         session_id: str,
@@ -931,7 +946,10 @@ else:
         app: Application,
         user_id: int,
     ) -> None:
-        render_manual_submission_dialog_content(service, session_id, app, user_id)
+        raise RuntimeError(
+            "Modal submission confirmation requires Streamlit >= 1.35.0 with st.dialog or st.experimental_dialog support. "
+            "Inline submission fallback is strictly prohibited for human-in-the-loop compliance."
+        )
 
 
 def confirm_manual_submission_dialog(
@@ -940,11 +958,8 @@ def confirm_manual_submission_dialog(
     app: Application,
     user_id: int,
 ) -> None:
-    """Invokes the modal submission confirmation dialog, falling back to direct rendering in headless test environments."""
-    try:
-        _confirm_manual_submission_dialog_decorated(service, session_id, app, user_id)
-    except (StreamlitAPIException, Exception):  # noqa: BLE001
-        render_manual_submission_dialog_content(service, session_id, app, user_id)
+    """Invokes the modal submission confirmation dialog. Fails closed on error."""
+    _confirm_manual_submission_dialog_decorated(service, session_id, app, user_id)
 
 
 def render_manual_submission_section(

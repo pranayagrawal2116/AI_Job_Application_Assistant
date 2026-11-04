@@ -31,8 +31,10 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate
 from dashboard.components.tracker_components import (
     KANBAN_COLUMNS,
     build_tracker_csv_export,
+    confirm_manual_submission_dialog,
     format_status_badge,
     get_application_follow_up_chips,
+    get_submission_dialog_decorator,
     render_application_card,
     render_archive_action,
     render_external_navigation_action,
@@ -57,6 +59,7 @@ from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
     ApplicationNotFoundError,
     CrossUserAccessError,
+    DatabaseError,
     SecurityAuthorizationError,
     UnconfirmedSubmissionError,
     ValidationError,
@@ -946,7 +949,7 @@ class TestManualSubmissionConfirmation(BaseTrackerUITest):
         mock_st.text_area.return_value = "Applied directly on career site."
         mock_st.button.return_value = True
 
-        render_manual_submission_section(self.service, self.session_a.session_id, self.app, self.user_a)
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
 
         # Verify DB status transitioned to SUBMITTED
         app_db = self.db.get_user_application(self.app.id, self.user_a)
@@ -964,7 +967,7 @@ class TestManualSubmissionConfirmation(BaseTrackerUITest):
         mock_st.text_area.return_value = ""
         mock_st.button.return_value = True
 
-        render_manual_submission_section(self.service, self.session_a.session_id, self.app, self.user_a)
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
 
         # Status must remain APPROVED
         app_db = self.db.get_user_application(self.app.id, self.user_a)
@@ -1297,10 +1300,11 @@ class TestComponentRendering(BaseTrackerUITest):
         render_manual_submission_section(self.service, self.session_a.session_id, app_approved, self.user_a)
         mock_st.button.assert_called_with("🚀 Open Manual Submission Confirmation", key=f"open_sub_modal_btn_{self.user_a}_{app_approved.id}", type="primary")
 
-        # When button is clicked, confirmation dialog content is rendered
-        mock_st.button.return_value = True
-        render_manual_submission_section(self.service, self.session_a.session_id, app_approved, self.user_a)
-        mock_st.warning.assert_called()
+        # When button is clicked, confirmation dialog is invoked
+        with patch("dashboard.components.tracker_components.confirm_manual_submission_dialog") as mock_dialog:
+            mock_st.button.return_value = True
+            render_manual_submission_section(self.service, self.session_a.session_id, app_approved, self.user_a)
+            mock_dialog.assert_called_once_with(self.service, self.session_a.session_id, app_approved, self.user_a)
 
     @patch("dashboard.components.tracker_components.st")
     def test_render_lifecycle_status_actions(self, mock_st):
@@ -2205,6 +2209,7 @@ class TestPhase75LifecycleOverhaul(BaseTrackerUITest):
         mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
         mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
         mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.button.return_value = False
 
         # Render with expanded=True
         render_application_card(
@@ -2865,6 +2870,238 @@ class TestPhase751Remediation(BaseTrackerUITest):
         self.assertEqual(mock_st.session_state.get("tracker_selected_app_id"), app.id)
         self.assertEqual(mock_st.session_state.get("active_view"), "application_tracker")
         mock_st.rerun.assert_called()
+
+
+# =============================================================================
+# PHASE 7.5.1.1: STREAMLIT MODAL DIALOG COMPATIBILITY & REGRESSION TESTS
+# =============================================================================
+
+class TestPhase7511ModalCompatibility(BaseTrackerUITest):
+    """Regression tests for Phase 7.5.1.1: Modal Dialog Compatibility, Fail-Closed Security & Submission Safety."""
+
+    def setUp(self):
+        super().setUp()
+        self.app = self._create_app(self.user_a, "Anthropic", "Research Scientist", status="APPROVED")
+        self.packet = self._create_packet(self.app.id, self.user_a, version_num=1, is_active=True)
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                """
+                INSERT INTO application_approvals (
+                    application_id, packet_id, user_id, packet_version_hash,
+                    ticket_nonce, key_id, approver_name, session_id, approved_at, is_consumed
+                ) VALUES (?, ?, ?, ?, 'nonce_7511', 'key_7511', 'Alice Candidate', ?, CURRENT_TIMESTAMP, 0)
+                """,
+                (self.app.id, self.packet.id, self.user_a, self.packet.packet_version_hash, self.session_a.session_id),
+            )
+
+    # -------------------------------------------------------------------------
+    # A. Decorator Compatibility Tests
+    # -------------------------------------------------------------------------
+    def test_decorator_selects_stable_dialog_with_large_width(self):
+        """When stable st.dialog is available (Streamlit 1.37+), it is selected with width='large'."""
+        mock_st = MagicMock()
+        mock_st.dialog = MagicMock(return_value=lambda fn: fn)
+        with patch("dashboard.components.tracker_components.st", mock_st):
+            dec = get_submission_dialog_decorator()
+            mock_st.dialog.assert_called_once_with("🚀 Confirm Manual Job Submission", width="large")
+            self.assertIsNotNone(dec)
+
+    def test_decorator_falls_back_to_experimental_dialog_with_large_width(self):
+        """When stable st.dialog is absent but st.experimental_dialog exists (Streamlit 1.35-1.36), it is selected with width='large'."""
+        mock_st = MagicMock(spec=["experimental_dialog"])
+        mock_st.experimental_dialog = MagicMock(return_value=lambda fn: fn)
+        with patch("dashboard.components.tracker_components.st", mock_st):
+            dec = get_submission_dialog_decorator()
+            mock_st.experimental_dialog.assert_called_once_with("🚀 Confirm Manual Job Submission", width="large")
+            self.assertIsNotNone(dec)
+
+    def test_decorator_fails_when_neither_modal_api_available(self):
+        """When neither st.dialog nor st.experimental_dialog is available, get_submission_dialog_decorator returns None."""
+        mock_st = MagicMock(spec=[])  # Neither attribute exists
+        with patch("dashboard.components.tracker_components.st", mock_st):
+            dec = get_submission_dialog_decorator()
+            self.assertIsNone(dec)
+
+    def test_runtime_error_when_modal_api_unavailable(self):
+        """Calling undecorated fallback when modal API is unavailable raises RuntimeError with human-in-the-loop compliance rationale."""
+        def fallback_fn(service, session_id, app, user_id):
+            raise RuntimeError(
+                "Modal submission confirmation requires Streamlit >= 1.35.0 with st.dialog or st.experimental_dialog support. "
+                "Inline submission fallback is strictly prohibited for human-in-the-loop compliance."
+            )
+
+        with patch("dashboard.components.tracker_components._confirm_manual_submission_dialog_decorated", side_effect=fallback_fn):
+            with self.assertRaises(RuntimeError) as ctx:
+                confirm_manual_submission_dialog(self.service, self.session_a.session_id, self.app, self.user_a)
+            self.assertIn("Modal submission confirmation requires Streamlit >= 1.35.0", str(ctx.exception))
+            self.assertIn("Inline submission fallback is strictly prohibited", str(ctx.exception))
+
+    def test_absence_of_inline_fallback_in_production(self):
+        """confirm_manual_submission_dialog must never catch exceptions or fall back to inline rendering."""
+        with (
+            patch("dashboard.components.tracker_components._confirm_manual_submission_dialog_decorated", side_effect=RuntimeError("Decorated modal failure")),
+            patch("dashboard.components.tracker_components.render_manual_submission_dialog_content") as mock_render,
+        ):
+            with self.assertRaises(RuntimeError):
+                confirm_manual_submission_dialog(self.service, self.session_a.session_id, self.app, self.user_a)
+            mock_render.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # B. Exception Handling Tests
+    # -------------------------------------------------------------------------
+    def test_unexpected_value_error_is_not_swallowed(self):
+        """Unexpected ValueError during modal dialog invocation propagates directly to caller."""
+        with (
+            patch("dashboard.components.tracker_components._confirm_manual_submission_dialog_decorated", side_effect=ValueError("Invalid dialog argument")),
+            patch("dashboard.components.tracker_components.render_manual_submission_dialog_content") as mock_render,
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                confirm_manual_submission_dialog(self.service, self.session_a.session_id, self.app, self.user_a)
+            self.assertEqual(str(ctx.exception), "Invalid dialog argument")
+            mock_render.assert_not_called()
+
+    def test_unexpected_runtime_error_does_not_cause_second_execution(self):
+        """Unexpected RuntimeError inside dialog modal does not cause a second execution or inline rendering."""
+        call_count = 0
+
+        def flaky_modal(service, session_id, app, user_id):
+            nonlocal call_count
+            call_count += 1
+            raise RuntimeError("Dialog execution aborted")
+
+        with (
+            patch("dashboard.components.tracker_components._confirm_manual_submission_dialog_decorated", side_effect=flaky_modal),
+            patch("dashboard.components.tracker_components.render_manual_submission_dialog_content") as mock_render,
+        ):
+            with self.assertRaises(RuntimeError):
+                confirm_manual_submission_dialog(self.service, self.session_a.session_id, self.app, self.user_a)
+            self.assertEqual(call_count, 1)
+            mock_render.assert_not_called()
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_post_submission_service_errors_do_not_reinvoke_dialog(self, mock_st):
+        """Errors occurring during manual submission recording are handled inside dialog with st.error without re-invoking dialog."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = "REF-ERR"
+        mock_st.text_area.return_value = "Notes"
+        mock_st.button.return_value = True
+
+        with patch.object(self.service, "record_candidate_manual_submission", side_effect=DatabaseError("Database write failed")):
+            render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
+            mock_st.error.assert_called_with("Manual submission confirmation failed: Database write failed")
+            # Must not rerun on failure
+            mock_st.rerun.assert_not_called()
+
+    # -------------------------------------------------------------------------
+    # C. Submission Safety Invariants Tests
+    # -------------------------------------------------------------------------
+    @patch("dashboard.components.tracker_components.st")
+    def test_no_ticket_or_event_on_dialog_open_or_dismiss(self, mock_st):
+        """Opening or dismissing the modal without clicking confirm issues NO ticket and records NO events."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.button.return_value = False  # Not clicked (dialog open or dismissed)
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
+
+        # Check approvals table: unconsumed approval count unchanged
+        with self.db.transaction() as conn:
+            consumed = conn.cursor().execute(
+                "SELECT COUNT(*) FROM application_approvals WHERE application_id = ? AND is_consumed = 1",
+                (self.app.id,),
+            ).fetchone()[0]
+            self.assertEqual(consumed, 0)
+
+            # Check confirmations: none created
+            conf_count = conn.cursor().execute(
+                "SELECT COUNT(*) FROM submission_confirmations WHERE application_id = ?",
+                (self.app.id,),
+            ).fetchone()[0]
+            self.assertEqual(conf_count, 0)
+
+        # Status must remain APPROVED
+        app_db = self.db.get_user_application(self.app.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_checkbox_enforcement_prevents_ticket_issuance_and_transition(self, mock_st):
+        """Unchecked confirmation checkbox strictly blocks ticket issuance and status transition."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = False  # Candidate did NOT check box
+        mock_st.button.return_value = True     # But clicked submit
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
+
+        mock_st.error.assert_called_with("You must explicitly check the confirmation checkbox to authorize manual submission.")
+        app_db = self.db.get_user_application(self.app.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_packet_hash_binding_and_atomic_transition_to_submitted(self, mock_st):
+        """Submitting with valid checkbox consumes ticket bound to packet hash and atomically updates status to SUBMITTED."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = "CONF-HASH-BOUND-1"
+        mock_st.text_area.return_value = "Confirmed manually by candidate"
+        mock_st.button.return_value = True
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
+
+        # Status must now be SUBMITTED
+        app_db = self.db.get_user_application(self.app.id, self.user_a)
+        self.assertEqual(app_db.status, "SUBMITTED")
+        mock_st.success.assert_called_with("Manual submission successfully confirmed! Application status updated to SUBMITTED.")
+
+        # Approval ticket must be consumed
+        with self.db.transaction() as conn:
+            approval = conn.cursor().execute(
+                "SELECT is_consumed, packet_version_hash FROM application_approvals WHERE application_id = ?",
+                (self.app.id,),
+            ).fetchone()
+            self.assertEqual(approval[0], 1)
+            self.assertEqual(approval[1], self.packet.packet_version_hash)
+
+            # Submission confirmation document created with matching reference
+            conf = conn.cursor().execute(
+                "SELECT confirmation_reference, submission_channel FROM submission_confirmations WHERE application_id = ?",
+                (self.app.id,),
+            ).fetchone()
+            self.assertEqual(conf[0], "CONF-HASH-BOUND-1")
+            self.assertEqual(conf[1], "COMPANY_PORTAL")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_evidence_upload_validation_in_modal(self, mock_st):
+        """Invalid uploaded proof in modal is rejected with error without updating status to SUBMITTED."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = "CONF-PROOF-FAIL"
+        mock_st.text_area.return_value = "Notes"
+        mock_st.button.return_value = True
+
+        # Malformed uploaded file (invalid header)
+        mock_file = MagicMock()
+        mock_file.getvalue.return_value = b"NOT_A_VALID_PDF_HEADER"
+        mock_file.name = "receipt.pdf"
+        mock_st.file_uploader.return_value = mock_file
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app, self.user_a)
+
+        # Must report error
+        mock_st.error.assert_called()
+        err_msg = mock_st.error.call_args[0][0]
+        self.assertIn("Manual submission confirmation failed", err_msg)
+
+        # Application status must remain APPROVED
+        app_db = self.db.get_user_application(self.app.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
 
 
 if __name__ == "__main__":

@@ -23,7 +23,7 @@ from PIL import Image
 from pypdf import PdfWriter
 
 from dashboard.components.tracker_components import (
-    render_manual_submission_section,
+    render_manual_submission_dialog_content,
     render_submission_confirmation_details,
 )
 from dashboard.services.dashboard_service import DashboardService
@@ -916,7 +916,7 @@ class TestConfirmationProofUI(BaseConfirmationProofTest):
 
     @patch("dashboard.components.tracker_components.st")
     def test_ui_optional_file_uploader_rendered_in_manual_submission(self, mock_st):
-        """Optional file uploader is rendered inside manual submission section."""
+        """Optional file uploader is rendered inside manual submission dialog."""
         mock_st.container.return_value.__enter__.return_value = MagicMock()
         mock_st.columns.return_value = [MagicMock(), MagicMock()]
         mock_st.checkbox.return_value = False
@@ -925,7 +925,7 @@ class TestConfirmationProofUI(BaseConfirmationProofTest):
         mock_st.text_area.return_value = ""
         mock_st.button.return_value = True
 
-        render_manual_submission_section(self.service, self.session_a.session_id, self.app_a, self.user_a)
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app_a, self.user_a)
 
         mock_st.file_uploader.assert_called_with(
             "Upload Optional Submission Confirmation Evidence",
@@ -950,7 +950,7 @@ class TestConfirmationProofUI(BaseConfirmationProofTest):
         mock_file.name = "receipt.pdf"
         mock_st.file_uploader.return_value = mock_file
 
-        render_manual_submission_section(self.service, self.session_a.session_id, self.app_a, self.user_a)
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app_a, self.user_a)
 
         mock_st.success.assert_called_with(
             "Manual submission successfully confirmed with evidence attached! Application status updated to SUBMITTED."
