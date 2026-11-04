@@ -1,111 +1,224 @@
-"""Application Tracker Page: State machine management, audit logging, and human-in-the-loop verification."""
+"""Candidate Application Tracker View (Phase 7.3.2.3).
+
+Replaces legacy catalog-based tracker with the authentic multi-user candidate application tracker:
+- Enforces session-derived candidate identity and multi-user isolation.
+- Displays authoritative real-time lifecycle KPIs.
+- Surfaces pending follow-up reminder alerts.
+- Provides comprehensive List View and 5-Column Canonical Kanban Board.
+- Enables deep application inspection: metadata, linked match evaluation, and read-only audit timeline.
+- Supports historical prepared packet inspection and verified document downloads (PDF/DOCX).
+- Secure employer portal navigation using validated canonical URLs.
+- Anti-automation manual submission confirmation with cryptographic single-use action tickets.
+- Lifecycle status transitions respecting authoritative state machine and mandatory terminal reopen rationale.
+- Candidate-controlled reminder scheduling, completion, and deletion.
+- Soft-archive management and candidate-scoped CSV data export.
+"""
+
+from __future__ import annotations
 
 import streamlit as st
 
+from dashboard.components.tracker_components import (
+    render_application_card,
+    render_follow_up_alert_bar,
+    render_kanban_board_view,
+    render_tracker_filter_toolbar,
+    render_tracker_header,
+    render_tracker_metrics_bar,
+)
 from dashboard.services.dashboard_service import DashboardService
-from src.database.models import ApplicationStatus
+from src.database.exceptions import (
+    DatabaseError,
+    SecurityAuthorizationError,
+)
 
 
-def render_application_tracker():
-    """Renders the comprehensive application state machine tracker and audit log viewer."""
-    st.markdown("## 📋 Application Tracker & State Machine")
-    st.caption("Manage application lifecycles with strict human-in-the-loop verification and full audit trail.")
+def render_application_tracker() -> None:
+    """Renders the comprehensive Candidate Application Tracker interface."""
+    # -------------------------------------------------------------------------
+    # 1. AUTHENTICATED SESSION RESOLUTION & MULTI-USER ISOLATION
+    # -------------------------------------------------------------------------
+    session_id = st.session_state.get("authenticated_session_id") or st.session_state.get("session_id")
+    client_user_id = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
 
-    service = DashboardService.get_instance()
-    df = service.get_all_jobs_df()
-
-    if df.empty:
-        st.info("No applications to track. Run discovery to discover and evaluate opportunities.")
+    if not session_id:
+        st.error("Authentication required")
+        st.info(
+            "Your session is missing, invalid, or expired.\n"
+            "Please sign in again to access your application tracker."
+        )
         return
 
-    # Status summary metric chips
-    st.markdown("#### Application Status Overview")
-    statuses = [s.value for s in ApplicationStatus]
-    status_counts = df["application_status"].value_counts().to_dict()
+    service = DashboardService.get_instance()
 
-    cols = st.columns(len(statuses))
-    for i, stat in enumerate(statuses):
-        with cols[i]:
-            cnt = status_counts.get(stat, 0)
-            st.metric(label=stat, value=cnt)
+    try:
+        user_id, _ = service.resolve_authenticated_candidate(
+            session_id=session_id,
+            client_user_id=client_user_id,
+        )
+    except SecurityAuthorizationError:
+        st.error("Authentication required")
+        st.info(
+            "Your session is missing, invalid, or expired.\n"
+            "Please sign in again to access your application tracker."
+        )
+        return
 
+    # -------------------------------------------------------------------------
+    # 2. VIEW 1 — HEADER & AUTHORITATIVE KPI DASHBOARD
+    # -------------------------------------------------------------------------
+    render_tracker_header(user_id)
+
+    # Read current include_archived setting from session state if already toggled
+    include_archived = st.session_state.get(f"tracker_include_archived_{user_id}", False)
+
+    try:
+        metrics = service.get_candidate_tracker_metrics(
+            session_id=session_id,
+            include_archived=include_archived,
+        )
+    except (DatabaseError, SecurityAuthorizationError) as exc:
+        st.error(f"Cannot load application tracker metrics: {exc}")
+        return
+
+    render_tracker_metrics_bar(metrics)
     st.divider()
 
-    # Filter by Status
-    sel_status = st.selectbox(
-        "Filter by Application Status",
-        options=["All Statuses"] + statuses,
-    )
+    # -------------------------------------------------------------------------
+    # 3. VIEW 2 — FOLLOW-UP ALERT BAR
+    # -------------------------------------------------------------------------
+    try:
+        pending_follow_ups = service.list_application_follow_ups(
+            session_id=session_id,
+            is_completed=False,
+            include_archived=False,
+        )
+    except (DatabaseError, SecurityAuthorizationError) as exc:
+        st.error(f"Cannot load follow-up reminders: {exc}")
+        pending_follow_ups = []
 
-    tracked_df = df if sel_status == "All Statuses" else df[df["application_status"] == sel_status]
+    # Preload user applications to map company/title in alerts
+    try:
+        raw_apps = service.list_candidate_applications(
+            session_id=session_id,
+            include_archived=True,
+            limit=None,
+        )
+        app_map = {app.id: app for app in raw_apps if app.id is not None}
+    except (DatabaseError, SecurityAuthorizationError):
+        app_map = {}
 
-    st.markdown(f"**Tracking {len(tracked_df)} Opportunities**")
+    render_follow_up_alert_bar(service, session_id, user_id, pending_follow_ups, app_map)
+    st.divider()
 
-    # Table of Applications
-    for _, row in tracked_df.iterrows():
-        job_id = row["id"]
-        title = row["job_title"]
-        company = row["company_name"]
-        curr_stat = row["application_status"]
-        score = row["match_score"]
-        tier = row["match_classification"]
-        notes = row.get("notes", "")
+    # -------------------------------------------------------------------------
+    # 4. VIEW 3 — FILTER TOOLBAR, SORTING & CSV EXPORT
+    # -------------------------------------------------------------------------
+    # Load candidate applications for CSV export
+    try:
+        export_apps = service.list_candidate_applications(
+            session_id=session_id,
+            include_archived=include_archived,
+            limit=None,
+        )
+    except (DatabaseError, SecurityAuthorizationError):
+        export_apps = []
 
-        with st.expander(f"[{curr_stat.upper()}] {title} at {company} (Score: {score:.1f})", expanded=False):
-            col_info, col_form = st.columns([3, 2])
+    filters = render_tracker_filter_toolbar(user_id, export_apps)
+    view_mode = filters["view_mode"]
+    search_term = filters["search_term"]
+    status_in = filters["status_in"]
+    employment_type = filters["employment_type"]
+    sort_by = filters["sort_by"]
+    include_archived = filters["include_archived"]
 
-            with col_info:
-                st.markdown(f"**Company:** {company}")
-                st.markdown(f"**Location:** {row['location']} | **Mode:** {row['work_arrangement']}")
-                st.markdown(f"**Platform:** {row['platform']} | **Match Tier:** {tier}")
-                if row.get("job_url"):
-                    st.link_button("🌐 Open Job Link", url=row["job_url"])
+    # -------------------------------------------------------------------------
+    # 5. VIEW 4 & 5 — LIST VIEW / KANBAN BOARD
+    # -------------------------------------------------------------------------
+    if view_mode == "List View":
+        # Pagination Management
+        page_key = f"tracker_page_{user_id}"
+        filter_state_key = f"tracker_filter_state_{user_id}"
+        current_filter_state = (search_term, tuple(status_in) if status_in else None, employment_type, sort_by, include_archived)
 
-                # Audit logs for this job
-                logs = service.db.get_application_logs(job_id)
-                if logs:
-                    st.markdown("**Recent Audit History:**")
-                    for log in logs[-3:]:
-                        st.caption(f"• `{log.timestamp}` — **{log.action}**: {log.details}")
+        # Reset pagination when filters change
+        if st.session_state.get(filter_state_key) != current_filter_state:
+            st.session_state[filter_state_key] = current_filter_state
+            st.session_state[page_key] = 0
 
-            with col_form:
-                st.markdown("#### Transition Status")
-                allowed_tracker_statuses = [
-                    ApplicationStatus.UNDER_REVIEW.value,
-                    ApplicationStatus.SHORTLISTED.value,
-                    ApplicationStatus.APPLICATION_PREPARED.value,
-                    ApplicationStatus.INTERVIEW.value,
-                    ApplicationStatus.REJECTED.value,
-                    ApplicationStatus.WITHDRAWN.value,
-                ]
-                if curr_stat not in allowed_tracker_statuses:
-                    allowed_tracker_statuses = [curr_stat] + allowed_tracker_statuses
+        page = st.session_state.get(page_key, 0)
+        page_size = 20
 
-                next_stat = st.selectbox(
-                    "New Status",
-                    options=allowed_tracker_statuses,
-                    index=allowed_tracker_statuses.index(curr_stat) if curr_stat in allowed_tracker_statuses else 0,
-                    key=f"status_sel_{job_id}",
-                )
+        try:
+            # Get total matching count
+            matching_apps = service.list_candidate_applications(
+                session_id=session_id,
+                search_term=search_term,
+                status_in=status_in,
+                employment_type=employment_type,
+                include_archived=include_archived,
+                limit=None,
+            )
+            total_matching = len(matching_apps)
 
-                if curr_stat in (ApplicationStatus.AWAITING_APPROVAL.value, ApplicationStatus.APPLIED.value):
-                    st.info("🛡️ Applications in 'Awaiting Approval' or 'Applied' are governed strictly through the **Application Preparer** approval gate.")
+            # Get paginated slice
+            apps = service.list_candidate_applications(
+                session_id=session_id,
+                search_term=search_term,
+                sort_by=sort_by,
+                limit=page_size,
+                offset=page * page_size,
+                include_archived=include_archived,
+                status_in=status_in,
+                employment_type=employment_type,
+            )
+        except (DatabaseError, SecurityAuthorizationError) as exc:
+            st.error(f"Cannot load applications: {exc}")
+            return
 
-                notes_input = st.text_area(
-                    "Application Notes",
-                    value=notes,
-                    height=70,
-                    key=f"notes_{job_id}",
-                )
+        if total_matching == 0:
+            st.info("No applications match your filter criteria.")
+            st.caption("Try adjusting your search terms or status filters, or start a new application in the Application Preparer.")
+            return
 
-                if st.button("Save Transition", key=f"trans_btn_{job_id}"):
-                    succ, msg = service.update_application_status(
-                        job_id=job_id,
-                        new_status=next_stat,
-                        notes=notes_input,
-                    )
-                    if succ:
-                        st.success(msg)
-                        st.rerun()
-                    else:
-                        st.error(msg)
+        start_idx = page * page_size + 1
+        end_idx = min((page + 1) * page_size, total_matching)
+        st.markdown(f"**Showing {start_idx}–{end_idx} of {total_matching} Tracked Opportunities**")
+
+        for app in apps:
+            render_application_card(app, service, session_id, user_id, include_archived)
+
+        # Pagination controls
+        total_pages = max(1, (total_matching + page_size - 1) // page_size)
+        if total_pages > 1:
+            st.markdown("<br>", unsafe_allow_html=True)
+            col_prev, col_ind, col_next = st.columns([1, 2, 1])
+            with col_prev:
+                if page > 0 and st.button("⬅️ Previous Page", key=f"prev_btn_{user_id}_{page}"):
+                    st.session_state[page_key] = page - 1
+                    st.rerun()
+            with col_ind:
+                st.markdown(f"<div style='text-align: center; padding-top: 6px;'>Page {page + 1} of {total_pages}</div>", unsafe_allow_html=True)
+            with col_next:
+                if (page + 1) < total_pages and st.button("Next Page ➡️", key=f"next_btn_{user_id}_{page}"):
+                    st.session_state[page_key] = page + 1
+                    st.rerun()
+
+    else:
+        # Kanban Board View
+        try:
+            kanban_apps = service.list_candidate_applications(
+                session_id=session_id,
+                search_term=search_term,
+                sort_by=sort_by,
+                limit=200,
+                offset=0,
+                include_archived=include_archived,
+                status_in=status_in,
+                employment_type=employment_type,
+            )
+        except (DatabaseError, SecurityAuthorizationError) as exc:
+            st.error(f"Cannot load applications for Kanban Board: {exc}")
+            return
+
+        render_kanban_board_view(kanban_apps, service, session_id, user_id, include_archived)
