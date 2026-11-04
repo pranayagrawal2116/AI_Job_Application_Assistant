@@ -281,6 +281,12 @@ When interacting with the browser via Playwright MCP:
   - Shared SessionManager identity consistency: enforced invariant that `HumanApprovalGate.session_manager` and `DatabaseManager.session_manager` reference the exact same instance (`gate.session_manager is db.session_manager`); automatically wires the genuine instance if `DatabaseManager` initially lacks a verifier; rejects mismatched genuine instances with `SecurityAuthorizationError` ("SessionManager identity mismatch: DatabaseManager and HumanApprovalGate must share the exact same SessionManager instance.") to prevent dual-registry split-brain authorization bugs.
   - Verified with 10 new comprehensive automated tests in `test_phase_7_2_2_4_exact_verifier.py` (totaling 690 passing tests across the entire repository, 100% pass rate), 0 pyflakes errors, 0 ruff errors on modified files, and clean git diff.
 
+- [x] **Architecture v2.1.1 Phase 7.3.1: Candidate Application Tracker Architecture, API Design & Implementation Blueprint** (Complete)
+  - Architectural blueprint & security model: authored comprehensive 22-section design specification in `docs/PHASE_7_3_CANDIDATE_APPLICATION_TRACKER_ARCHITECTURE.md` establishing the candidate-controlled tracking experience, zero-hallucination policy, and multi-user session scoping.
+  - Multi-dimensional tracking specification: designed reactive Streamlit Tracker views (KPI metrics chips, filter/search/sort toolbar, dense list view, 5-phase Kanban board with strict action-driven guardrails prohibiting drag-and-drop state bypass).
+  - Cryptographic verification & audit transparency: specified real-time append-only event stream rendering with SHA-256 hash chain verification badge (green verified vs red alert), read-only approved packet review modal, safe external employer navigation with token/fragment redaction and status preservation invariant, and 16-step manual submission confirmation dialog.
+  - Database schema gap analysis & test plan: verified existing normalized SQLite schema (`applications`, `application_events`, `submission_confirmations`, `application_follow_ups`, `prepared_packets`, `application_approvals`) requires zero schema migrations; defined 13 measurable acceptance criteria and dedicated test suites for Phase 7.3.2. Pure architectural design only; Phase 7.3.2 implementation pending user approval.
+
 ---
 
 ## 7. Approval Requirement
