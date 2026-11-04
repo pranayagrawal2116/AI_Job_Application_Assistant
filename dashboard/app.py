@@ -82,8 +82,11 @@ def main():
         cand_name = personal.get("full_name") or (f"User #{auth_uid}" if auth_uid else "Candidate")
         st.markdown(f"**Candidate:** {cand_name}")
         if edu.get("institution") or edu.get("degree"):
-            st.caption(f"{edu.get('degree', '')} {f'({edu.get('major')})' if edu.get('major') else ''} {f'| Class of {edu.get('expected_graduation_year')}' if edu.get('expected_graduation_year') else ''}")
-            st.caption(f"🏛️ {edu.get('institution', '')} {f'| CGPA: {edu.get('current_cgpa')}' if edu.get('current_cgpa') else ''}")
+            major_str = f"({edu.get('major')})" if edu.get("major") else ""
+            grad_str = f"| Class of {edu.get('expected_graduation_year')}" if edu.get("expected_graduation_year") else ""
+            st.caption(f"{edu.get('degree', '')} {major_str} {grad_str}".strip())
+            cgpa_str = f"| CGPA: {edu.get('current_cgpa')}" if edu.get("current_cgpa") else ""
+            st.caption(f"🏛️ {edu.get('institution', '')} {cgpa_str}".strip())
 
         st.divider()
 

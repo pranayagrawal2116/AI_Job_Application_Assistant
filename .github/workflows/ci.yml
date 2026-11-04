@@ -36,7 +36,7 @@ jobs:
 
       - name: Run code quality linter (ruff)
         run: |
-          ruff check --select F821,F822,F823 dashboard/ src/ tests/
+          ruff check dashboard/ src/ tests/
 
       - name: Run comprehensive test suite (pytest)
         run: |

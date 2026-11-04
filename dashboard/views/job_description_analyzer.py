@@ -11,6 +11,7 @@ import json
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
+from dashboard.views.auth_utils import resolve_view_authenticated_user
 from src.database.exceptions import (
     UnsafeURLError,
     URLFetchRestrictedError,
@@ -25,16 +26,12 @@ def render_job_description_analyzer():
         "with strict SSRF defense, document safety, zero-hallucination provenance, and immutable snapshot versioning."
     )
 
-    raw_uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
-    if not raw_uid:
-        st.error("🔒 Authentication required. Please sign in to analyze and ingest job descriptions.")
-        st.info("Log in with your candidate credentials to manage your job descriptions.")
-        return
-
-    try:
-        user_id = int(raw_uid)
-    except (ValueError, TypeError):
-        st.error("🔒 Invalid user session. Please sign in again.")
+    user_id, _ = resolve_view_authenticated_user(
+        view_name="Job Description Analyzer & Ingestion Engine",
+        custom_error_message="🔒 Authentication required. Please sign in to analyze and ingest job descriptions.",
+        st_module=st,
+    )
+    if not user_id:
         return
 
     service = DashboardService.get_instance()

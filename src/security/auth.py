@@ -125,12 +125,16 @@ class AuthManager:
         env_pepper = os.environ.get("PASSWORD_RESET_PEPPER")
         if env_pepper:
             self.pepper = env_pepper
+        elif app_env in ("development", "test", "dev"):
+            self.pepper = DEFAULT_PWD_PEPPER
         elif app_env == "production":
             raise SecurityAuthorizationError(
                 "PASSWORD_RESET_PEPPER must be explicitly configured in production environment."
             )
         else:
-            self.pepper = DEFAULT_PWD_PEPPER
+            raise SecurityAuthorizationError(
+                f"PASSWORD_RESET_PEPPER must be explicitly configured in '{app_env}' environment."
+            )
         self._reset_attempts: Dict[str, list[float]] = {}  # In-memory rate limiting tracker
 
     @staticmethod

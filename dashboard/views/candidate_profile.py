@@ -8,19 +8,19 @@ from datetime import datetime, timezone
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
+from dashboard.views.auth_utils import resolve_view_authenticated_user
 from src.preparer.profile_updater import ProfileUpdater
 from src.preparer.resume_parser import ResumeParser, VerificationStatus
 
 
 def get_current_user_id() -> int | None:
-    """Returns the authenticated user_id from session state. Fails closed if not authenticated."""
-    uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
-    if uid is not None:
-        try:
-            return int(uid)
-        except (ValueError, TypeError):
-            return None
-    return None
+    """Returns the authoritatively verified user_id from active session. Fails closed if not authenticated."""
+    user_id, _ = resolve_view_authenticated_user(
+        view_name="your Candidate Profile",
+        custom_error_message="🔒 Authentication required. Please sign in to access your Candidate Profile.",
+        st_module=st,
+    )
+    return user_id
 
 
 def render_candidate_profile():
@@ -33,8 +33,6 @@ def render_candidate_profile():
 
     user_id = get_current_user_id()
     if not user_id:
-        st.error("🔒 Authentication required. Please sign in to access your Candidate Profile.")
-        st.info("Log in with your candidate credentials to manage your profile and resumes.")
         return
 
     service = DashboardService.get_instance()

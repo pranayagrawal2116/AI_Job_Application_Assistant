@@ -11,6 +11,7 @@ from typing import Any
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
+from dashboard.views.auth_utils import resolve_view_authenticated_user
 from src.database.exceptions import DatabaseError
 from src.database.models import ApplicationStatus
 from src.preparer.cover_letter_generator import CareerLevel, LetterTone
@@ -20,7 +21,16 @@ from src.preparer.tailored_resume_generator import TailoredResume
 
 
 def get_current_user_id() -> int | None:
-    """Returns the authenticated user_id from session state. Fails closed if not authenticated."""
+    """Returns the authoritatively verified user_id from active session. Fails closed if not authenticated."""
+    session_id = st.session_state.get("authenticated_session_id") or st.session_state.get("session_id")
+    if session_id:
+        user_id, _ = resolve_view_authenticated_user(
+            view_name="Application Preparer",
+            custom_error_message="🔒 Authentication required. Please sign in to prepare job applications.",
+            st_module=st,
+        )
+        return user_id
+
     uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
     if uid is not None:
         try:
@@ -98,10 +108,12 @@ def render_application_preparer():
         "Strict zero-hallucination policy with claim-level auditability under human governance."
     )
 
-    user_id = get_current_user_id()
+    user_id, _ = resolve_view_authenticated_user(
+        view_name="Application Preparer",
+        custom_error_message="🔒 Authentication required. Please sign in to prepare job applications.",
+        st_module=st,
+    )
     if not user_id:
-        st.error("🔒 Authentication required. Please sign in to prepare job applications.")
-        st.info("Log in with your candidate credentials to access and manage your role-specific application workspaces.")
         return
 
     service = DashboardService.get_instance()
