@@ -1064,3 +1064,41 @@ Added 10 comprehensive tests to `tests/test_phase_7_2_2_approval_atomicity.py`:
 ### 26.5 Action Ticket Parser Validation
 - **Regex Enforcement**: Enforced regex validation on `key_id` (`^[a-zA-Z0-9_\-]+$`), `nonce` (`^[a-zA-Z0-9_\-]+$`), and `signature` (`^[a-zA-Z0-9_\-]+$`) in `SessionManager.parse_action_ticket()`.
 - **Precedence Integrity**: Positive integer timestamp validation precedes signature structure validation, ensuring malformed timestamps trigger `Corrupt timestamp in action ticket`.
+
+---
+
+## 27. Phase 7.2.2.3 Hardening: Trusted Verifier Binding & Complete Grant Identity Integrity
+
+Phase 7.2.2.3 closes the remaining security vulnerabilities identified during independent review of Phase 7.2.2.2: eliminating caller-controlled verifier injection, cryptographically binding complete 12-attribute grant identity via RFC 8785 canonical JSON, enforcing active registered-grant matching, ensuring thread-safe single-use consumption, and documenting deployment constraints.
+
+### 27.1 Elimination of Caller-Controlled Verifier Injection
+- **Removal of Direct Kwargs & Parameters**: In `DatabaseManager._authorize_application_packet_atomic()`, the caller-supplied `session_manager` parameter was removed from the method signature. Passing unexpected keyword arguments (such as `session_manager=...`) raises `SecurityAuthorizationError` ("Raw parameter bypass rejected").
+- **Server-Level Verifier Wiring**: `DatabaseManager` accepts an optional `session_manager` instance during initialization (`DatabaseManager.__init__(..., session_manager=None)`). Any supplied verifier is strictly validated using `isinstance(sm, SessionManager) and type(sm).__name__ == "SessionManager"`, rejecting forged or mock verifiers with `SecurityAuthorizationError`. When omitted, the `session_manager` property falls back safely to `SessionManager.get_instance()`.
+- **Pre-Lock Verification Boundary**: `_authorize_application_packet_atomic` calls `self.session_manager.verify_and_consume_approval_grant(grant)` before requesting any SQLite write lock or connection. False-returning or None-returning verifiers fail closed with `SecurityAuthorizationError` and rollback without mutating database state.
+
+### 27.2 Complete 12-Attribute Cryptographic Grant Identity
+- **Inclusion of Approver Name**: `approver_name` is explicitly included in the server-side HMAC grant signature computation (`_compute_grant_signature()`), preventing tampering with candidate identification.
+- **Deterministic RFC 8785 Canonical JSON Serialization**: Replaced custom string delimiter concatenation (`GRANT:...`) with RFC 8785 canonical JSON (`canonical_json_bytes`) across all 12 attributes:
+  1. `action_type`: "HUMAN_APPROVAL"
+  2. `application_id`: int
+  3. `approver_name`: str
+  4. `expires_at`: int (epoch seconds)
+  5. `grant_id`: str (hex token)
+  6. `issued_at`: int (epoch seconds)
+  7. `key_id`: str (key rotation ID)
+  8. `packet_id`: int
+  9. `packet_version_hash`: str (SHA-256)
+  10. `session_id`: str (session token)
+  11. `ticket_nonce`: str (ticket nonce)
+  12. `user_id`: int
+- **Active Registered-Grant Comparison**: `verify_and_consume_approval_grant()` retrieves the registered grant record from `SessionManager._active_grants[grant.grant_id]`. It checks registered session ID and expiry, and verifies that every attribute on the submitted grant matches the server-issued registered grant. Any alteration raises `SecurityAuthorizationError` ("Submitted grant does not match registered grant identity").
+
+### 27.3 Thread-Safe Single-Use Grant Consumption
+- **Process Lock Protection**: A dedicated `threading.Lock()` (`_grant_lock`) wraps the active-to-consumed transition in `verify_and_consume_approval_grant()`.
+- **Concurrency Guarantees**: When concurrent threads attempt to consume the same grant, exactly one thread verifies and consumes the grant, while subsequent threads encounter `grant.grant_id in self._consumed_grants` and raise `TicketAlreadyConsumedError`.
+- **Database Write Isolation**: The process lock is released immediately after memory consumption; no process lock is held during lengthy database write transactions or SQLite lock contention.
+
+### 27.4 In-Memory Storage Deployment Constraints & Architecture Limitations
+- **Process Memory Bound**: In-flight `VerifiedApprovalGrant` records and consumed grant IDs are retained in `SessionManager` process memory (`_active_grants`, `_consumed_grants`).
+- **Process Restart Invalidation**: Restarting the backend application process clears in-memory active grants. Any outstanding, unconsumed grants become invalid and will be rejected with `SecurityAuthorizationError` ("Unrecognized, unissued, or forged approval grant"), requiring the candidate to perform a fresh authorization via the Human Approval Gate.
+- **Multi-Worker Deployment Requirement**: In a multi-worker deployment model (e.g., multiple Gunicorn/Uvicorn worker processes), sticky sessions (routing requests for a given candidate session to the same process) or a shared centralized session/grant store is required. In the current single-process SQLite architecture, this constraint is satisfied by design.

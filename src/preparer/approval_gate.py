@@ -74,8 +74,11 @@ class HumanApprovalGate:
         db_manager: Optional[DatabaseManager] = None,
         session_manager: Optional[SessionManager] = None,
     ):
-        self.db = db_manager or DatabaseManager()
+        from src.security.session_manager import SessionManager
         self.session_manager = session_manager or SessionManager.get_instance()
+        self.db = db_manager or DatabaseManager(session_manager=self.session_manager)
+        if getattr(self.db, "_session_manager", None) is None:
+            self.db._session_manager = self.session_manager
 
     # -------------------------------------------------------------------------
     # MULTI-USER UNIVERSAL PREPARED PACKET METHODS (Architecture v2.1.1)
@@ -511,7 +514,6 @@ class HumanApprovalGate:
         try:
             approval = self.db._authorize_application_packet_atomic(
                 auth_grant=auth_grant,
-                session_manager=self.session_manager,
             )
         except Exception as exc:
             logger.error("Error authorizing application packet atomically: %s", exc, exc_info=True)

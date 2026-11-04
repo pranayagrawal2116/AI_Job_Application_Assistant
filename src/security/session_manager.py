@@ -7,6 +7,7 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import time
 from typing import Any, Dict, Optional, Set, Tuple, Union
 
@@ -19,6 +20,7 @@ from src.database.exceptions import (
     SessionExpiredError,
     TicketAlreadyConsumedError,
 )
+from src.utils.canonical_json import canonical_json_bytes
 from src.utils.logger import setup_logger
 
 logger = setup_logger("SessionManager")
@@ -170,6 +172,7 @@ class SessionManager:
         self._sessions: Dict[str, CandidateSession] = {}
         self._active_grants: Dict[str, Dict[str, Any]] = {}
         self._consumed_grants: Set[str] = set()
+        self._grant_lock = threading.Lock()
         self._active_key_id = active_key_id or os.environ.get("ACTION_TICKET_ACTIVE_KEY_ID", "v1")
         self._rotation_keys: Dict[str, bytes] = {}
 
@@ -559,15 +562,26 @@ class SessionManager:
         action_type: str,
         issued_at: int,
         expires_at: int,
+        approver_name: str = "Human Candidate",
     ) -> str:
-        """Computes server-side HMAC signature for a VerifiedApprovalGrant."""
+        """Computes server-side HMAC signature for a VerifiedApprovalGrant over all 12 attributes using RFC 8785 canonical JSON."""
         key_secret = self.key_rotation_mgr.get_verification_key(key_id)
-        message = (
-            f"GRANT:{grant_id}:{user_id}:{session_id}:{application_id}:"
-            f"{packet_id}:{packet_hash}:{ticket_nonce}:{key_id}:{action_type}:"
-            f"{issued_at}:{expires_at}"
-        )
-        return hmac.new(key_secret, message.encode("utf-8"), hashlib.sha256).hexdigest()
+        payload = {
+            "action_type": str(action_type),
+            "application_id": int(application_id),
+            "approver_name": str(approver_name),
+            "expires_at": int(expires_at),
+            "grant_id": str(grant_id),
+            "issued_at": int(issued_at),
+            "key_id": str(key_id),
+            "packet_id": int(packet_id),
+            "packet_version_hash": str(packet_hash),
+            "session_id": str(session_id),
+            "ticket_nonce": str(ticket_nonce),
+            "user_id": int(user_id),
+        }
+        canonical_bytes = canonical_json_bytes(payload)
+        return hmac.new(key_secret, canonical_bytes, hashlib.sha256).hexdigest()
 
     def verify_and_issue_approval_grant(
         self,
@@ -669,6 +683,7 @@ class SessionManager:
             action_type="HUMAN_APPROVAL",
             issued_at=issued_at,
             expires_at=expires_at,
+            approver_name=approver_name,
         )
 
         from src.database.models import VerifiedApprovalGrant
@@ -722,57 +737,89 @@ class SessionManager:
         if grant.action_type != "HUMAN_APPROVAL":
             raise SecurityAuthorizationError(f"Authorization rejected: Grant action mismatch. Expected HUMAN_APPROVAL, got '{grant.action_type}'.")
 
-        # Replay check
-        if grant.grant_id in self._consumed_grants:
-            raise TicketAlreadyConsumedError("Authorization rejected: Approval grant has already been consumed (replay attempt).")
+        with self._grant_lock:
+            # Replay check
+            if grant.grant_id in self._consumed_grants:
+                raise TicketAlreadyConsumedError("Authorization rejected: Approval grant has already been consumed (replay attempt).")
 
-        if grant.grant_id not in self._active_grants:
-            raise SecurityAuthorizationError("Authorization rejected: Unrecognized, unissued, or forged approval grant.")
+            if grant.grant_id not in self._active_grants:
+                raise SecurityAuthorizationError("Authorization rejected: Unrecognized, unissued, or forged approval grant.")
 
-        # Expiry check
-        now = time.time()
-        if now > grant.expires_at:
-            raise SecurityAuthorizationError("Authorization rejected: Approval grant has expired.")
+            reg_entry = self._active_grants[grant.grant_id]
+            registered_grant = reg_entry.get("grant")
 
-        # Key & HMAC signature check
-        try:
-            self.key_rotation_mgr.get_verification_key(grant.key_id)
-        except KeyRevokedError as err:
-            raise SecurityAuthorizationError(f"Authorization rejected: Grant signed with revoked key '{grant.key_id}': {err}")
+            # Check registered session ID and expiry
+            if reg_entry.get("session_id") != grant.session_id:
+                raise SecurityAuthorizationError("Authorization rejected: Registered grant session mismatch.")
+            if reg_entry.get("expires_at") != grant.expires_at:
+                raise SecurityAuthorizationError("Authorization rejected: Registered grant expiry mismatch.")
 
-        expected_sig = self._compute_grant_signature(
-            key_id=grant.key_id,
-            grant_id=grant.grant_id,
-            user_id=grant.user_id,
-            session_id=grant.session_id,
-            application_id=grant.application_id,
-            packet_id=grant.packet_id,
-            packet_hash=grant.packet_version_hash,
-            ticket_nonce=grant.ticket_nonce,
-            action_type=grant.action_type,
-            issued_at=grant.issued_at,
-            expires_at=grant.expires_at,
-        )
-        if not hmac.compare_digest(grant.grant_signature, expected_sig):
-            raise SecurityAuthorizationError("Authorization rejected: Cryptographic grant signature mismatch (forgery attempt).")
+            # Compare submitted grant against complete registered grant
+            if registered_grant is None:
+                raise SecurityAuthorizationError("Authorization rejected: Active registration missing grant record.")
 
-        # Session validation
-        session = self.validate_session(grant.session_id)
-        if session.user_id != grant.user_id:
-            raise CrossUserAccessError(
+            if (
+                grant.grant_id != registered_grant.grant_id
+                or grant.user_id != registered_grant.user_id
+                or grant.session_id != registered_grant.session_id
+                or grant.application_id != registered_grant.application_id
+                or grant.packet_id != registered_grant.packet_id
+                or grant.packet_version_hash != registered_grant.packet_version_hash
+                or grant.ticket_nonce != registered_grant.ticket_nonce
+                or grant.key_id != registered_grant.key_id
+                or grant.action_type != registered_grant.action_type
+                or grant.issued_at != registered_grant.issued_at
+                or grant.expires_at != registered_grant.expires_at
+                or grant.approver_name != registered_grant.approver_name
+                or grant.grant_signature != registered_grant.grant_signature
+            ):
+                raise SecurityAuthorizationError("Authorization rejected: Submitted grant does not match registered grant identity.")
+
+            # Expiry check
+            now = time.time()
+            if now > grant.expires_at:
+                raise SecurityAuthorizationError("Authorization rejected: Approval grant has expired.")
+
+            # Key & HMAC signature check
+            try:
+                self.key_rotation_mgr.get_verification_key(grant.key_id)
+            except KeyRevokedError as err:
+                raise SecurityAuthorizationError(f"Authorization rejected: Grant signed with revoked key '{grant.key_id}': {err}")
+
+            expected_sig = self._compute_grant_signature(
+                key_id=grant.key_id,
+                grant_id=grant.grant_id,
                 user_id=grant.user_id,
-                target_user_id=session.user_id or 0,
-                resource="Approval Grant",
+                session_id=grant.session_id,
+                application_id=grant.application_id,
+                packet_id=grant.packet_id,
+                packet_hash=grant.packet_version_hash,
+                ticket_nonce=grant.ticket_nonce,
+                action_type=grant.action_type,
+                issued_at=grant.issued_at,
+                expires_at=grant.expires_at,
+                approver_name=grant.approver_name,
             )
+            if not hmac.compare_digest(grant.grant_signature, expected_sig):
+                raise SecurityAuthorizationError("Authorization rejected: Cryptographic grant signature mismatch (forgery attempt).")
 
-        if grant.ticket_nonce not in session.consumed_tickets:
-            raise SecurityAuthorizationError("Authorization rejected: Underlying ticket nonce was not consumed by this session.")
+            # Session validation
+            session = self.validate_session(grant.session_id)
+            if session.user_id != grant.user_id:
+                raise CrossUserAccessError(
+                    user_id=grant.user_id,
+                    target_user_id=session.user_id or 0,
+                    resource="Approval Grant",
+                )
 
-        # Single-use consumption
-        del self._active_grants[grant.grant_id]
-        self._consumed_grants.add(grant.grant_id)
-        session.active_grants.pop(grant.grant_id, None)
-        session.consumed_grants.add(grant.grant_id)
+            if grant.ticket_nonce not in session.consumed_tickets:
+                raise SecurityAuthorizationError("Authorization rejected: Underlying ticket nonce was not consumed by this session.")
+
+            # Single-use consumption
+            del self._active_grants[grant.grant_id]
+            self._consumed_grants.add(grant.grant_id)
+            session.active_grants.pop(grant.grant_id, None)
+            session.consumed_grants.add(grant.grant_id)
 
         logger.info("Successfully verified and consumed approval grant #%s...", grant.grant_id[:8])
         return True, "Approval grant verified and consumed."
@@ -882,6 +929,7 @@ class SessionManager:
                 action_type="HUMAN_APPROVAL",
                 issued_at=issued_at,
                 expires_at=expires_at,
+                approver_name="Human Candidate",
             )
             from src.database.models import VerifiedApprovalGrant
             grant = VerifiedApprovalGrant(

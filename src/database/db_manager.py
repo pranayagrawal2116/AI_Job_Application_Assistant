@@ -123,15 +123,31 @@ class DatabaseManager:
         self,
         db_path: Union[str, Path] = DEFAULT_DB_PATH,
         schema_path: Union[str, Path] = DEFAULT_SCHEMA_PATH,
+        session_manager: Optional[Any] = None,
     ):
         self.db_path = str(db_path)
         self.schema_path = Path(schema_path)
+
+        from src.security.session_manager import SessionManager
+        if session_manager is not None:
+            if not isinstance(session_manager, SessionManager) or type(session_manager).__name__ != "SessionManager":
+                raise SecurityAuthorizationError(
+                    f"Invalid verifier configuration: session_manager must be an authentic SessionManager instance, got {type(session_manager).__name__}."
+                )
+        self._session_manager = session_manager
 
         # Ensure parent directory exists for file-based DB
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
 
         self._init_db()
+
+    @property
+    def session_manager(self) -> Any:
+        from src.security.session_manager import SessionManager
+        if self._session_manager is None:
+            return SessionManager.get_instance()
+        return self._session_manager
 
     def get_connection(self, timeout: Optional[float] = None) -> sqlite3.Connection:
         """Creates and configures a new SQLite connection."""
@@ -2233,7 +2249,6 @@ class DatabaseManager:
     def _authorize_application_packet_atomic(
         self,
         auth_grant: Optional[VerifiedApprovalGrant] = None,
-        session_manager: Optional[Any] = None,
         **kwargs: Any,
     ) -> ApplicationApproval:
         """Internal atomic persistence helper for human approvals under an immediate write lock.
@@ -2250,7 +2265,7 @@ class DatabaseManager:
         grant = auth_grant or kwargs.pop("auth_context", None)
         if kwargs:
             raise SecurityAuthorizationError(
-                f"Raw parameter bypass rejected: _authorize_application_packet_atomic accepts only a VerifiedApprovalGrant, got unexpected: {list(kwargs.keys())}."
+                f"Raw parameter bypass rejected: _authorize_application_packet_atomic accepts only auth_grant: VerifiedApprovalGrant, got unexpected: {list(kwargs.keys())}."
             )
 
         if grant is None:
@@ -2263,10 +2278,22 @@ class DatabaseManager:
                 f"Invalid authorization evidence: Expected VerifiedApprovalGrant, got {type(grant).__name__}."
             )
 
+        trusted_sm = self.session_manager
         from src.security.session_manager import SessionManager
-        sm = session_manager or SessionManager.get_instance()
-        # Verify and consume the grant single-use
-        sm.verify_and_consume_approval_grant(grant)
+        if not isinstance(trusted_sm, SessionManager) or type(trusted_sm).__name__ != "SessionManager":
+            raise SecurityAuthorizationError("Invalid verifier configuration: Trusted SessionManager instance required.")
+
+        try:
+            verif_res = trusted_sm.verify_and_consume_approval_grant(grant)
+            if verif_res is None or not isinstance(verif_res, tuple) or len(verif_res) != 2:
+                raise SecurityAuthorizationError("Authorization rejected: Invalid verifier response format.")
+            is_valid, verif_msg = verif_res
+            if is_valid is not True:
+                raise SecurityAuthorizationError(f"Authorization rejected: Verifier rejected grant: {verif_msg}")
+        except (TicketAlreadyConsumedError, CrossUserAccessError, SecurityAuthorizationError):
+            raise
+        except Exception as exc:
+            raise SecurityAuthorizationError(f"Authorization rejected: Verifier error: {exc}") from exc
 
         application_id = grant.application_id
         user_id = grant.user_id

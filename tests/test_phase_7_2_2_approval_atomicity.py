@@ -545,7 +545,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
             with self.assertRaises(InvalidStatusTransitionError):
                 self.db._authorize_application_packet_atomic(
                     auth_grant=auth_grant,
-                    session_manager=self.session_mgr,
                 )
 
             # Via gate
@@ -1083,7 +1082,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         with self.assertRaises(SecurityAuthorizationError):
             self.db._authorize_application_packet_atomic(
                 auth_grant=forged_grant,
-                session_manager=self.session_mgr,
             )
         # Verify 0 approvals exist
         with self.db.connection() as conn:
@@ -1131,7 +1129,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         with self.assertRaises(SecurityAuthorizationError):
             self.db._authorize_application_packet_atomic(
                 auth_grant=tampered_app_grant,
-                session_manager=self.session_mgr,
             )
 
         # 2. Attacker tampers User B's grant to bind to User A's session
@@ -1153,7 +1150,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         with self.assertRaises((SecurityAuthorizationError, CrossUserAccessError)):
             self.db._authorize_application_packet_atomic(
                 auth_grant=tampered_sess_grant,
-                session_manager=self.session_mgr,
             )
 
         app_a_check = self.db.get_user_application(app_a.id, self.user_a)
@@ -1204,7 +1200,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         with self.assertRaises(SecurityAuthorizationError):
             self.db._authorize_application_packet_atomic(
                 auth_grant=tampered_grant,
-                session_manager=self.session_mgr,
             )
         app2_check = self.db.get_user_application(app2.id, self.user_a)
         self.assertEqual(app2_check.status, "READY_FOR_REVIEW")
@@ -1247,7 +1242,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         with self.assertRaises(SecurityAuthorizationError):
             self.db._authorize_application_packet_atomic(
                 auth_grant=tampered_grant,
-                session_manager=self.session_mgr,
             )
 
     def test_direct_bypass_rejection_wrong_action_type(self):
@@ -1293,7 +1287,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         # First consumption succeeds
         approval = self.db._authorize_application_packet_atomic(
             auth_grant=grant,
-            session_manager=self.session_mgr,
         )
         self.assertIsNotNone(approval)
 
@@ -1301,7 +1294,6 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         with self.assertRaises(TicketAlreadyConsumedError):
             self.db._authorize_application_packet_atomic(
                 auth_grant=grant,
-                session_manager=self.session_mgr,
             )
 
     def test_legacy_public_method_rejection_record_packet_approval(self):

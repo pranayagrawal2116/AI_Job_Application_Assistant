@@ -269,6 +269,13 @@ When interacting with the browser via Playwright MCP:
   - Action ticket parser character structure validation: enforced regex validation (`^[a-zA-Z0-9_\-]+$`) on `key_id`, `nonce`, and `signature` in `SessionManager.parse_action_ticket()`, with positive timestamp integer validation preceding signature structure checks.
   - Verified with 10 new comprehensive automated tests across the test suites (totaling 663 passing tests across the entire repository, 100% pass rate), 0 pyflakes errors, 0 ruff errors on modified files, and clean git diff.
 
+- [x] **Architecture v2.1.1 Phase 7.2.2.3: Trusted Verifier Binding & Approval Grant Identity Integrity** (Complete)
+  - Elimination of caller-controlled verifier injection: completely removed per-call `session_manager` parameter from `DatabaseManager._authorize_application_packet_atomic()`; rejects unexpected keyword arguments with `SecurityAuthorizationError`; wires trusted `SessionManager` through `DatabaseManager.__init__(..., session_manager=None)` with strict instance verification (`isinstance(sm, SessionManager) and type(sm).__name__ == "SessionManager"`) and property fallback to `SessionManager.get_instance()`; enforces explicit verification prior to opening SQLite write locks, failing closed on False or None verifier returns.
+  - Cryptographic 12-attribute grant identity: included `approver_name` in server-side HMAC grant signatures; serialized grant payload using RFC 8785 canonical JSON bytes (`canonical_json_bytes`) across all 12 attributes (`action_type`, `application_id`, `approver_name`, `expires_at`, `grant_id`, `issued_at`, `key_id`, `packet_id`, `packet_version_hash`, `session_id`, `ticket_nonce`, `user_id`); verified submitted grant against complete active registered grant in `SessionManager._active_grants`, rejecting tampered attributes before consumption.
+  - Process-level thread safety: added `threading.Lock()` (`_grant_lock`) protecting the active-to-consumed grant transition in `SessionManager.verify_and_consume_approval_grant()`, guaranteeing exactly one success under concurrent multi-threaded execution while secondary threads raise `TicketAlreadyConsumedError`.
+  - Architecture constraints & in-memory limitation: accurately documented single-process deployment requirement, in-memory grant invalidation on process restarts, and sticky-session / centralized grant store requirements for multi-worker scaling.
+  - Verified with 17 new comprehensive automated tests in `test_phase_7_2_2_3_trusted_verifier.py` (totaling 680 passing tests across the entire repository, 100% pass rate), 0 pyflakes errors, 0 ruff errors on modified files, and clean git diff.
+
 ---
 
 ## 7. Approval Requirement
