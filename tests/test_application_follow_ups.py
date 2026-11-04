@@ -314,7 +314,8 @@ class TestFollowUpAtomicAuditing(BaseFollowUpTest):
         self.assertEqual(payload["follow_up_id"], fup.id)
         self.assertEqual(payload["follow_up_type"], "STATUS_INQUIRY")
         self.assertEqual(payload["follow_up_date"], "2026-11-15")
-        self.assertEqual(payload["description"], "Atomic check")
+        self.assertEqual(payload["action"], "SCHEDULED")
+        self.assertNotIn("description", payload)
 
     def test_complete_follow_up_emits_completed_event_atomically(self):
         fup = self.db.create_application_follow_up(
@@ -329,7 +330,11 @@ class TestFollowUpAtomicAuditing(BaseFollowUpTest):
         ev = comp_events[0]
         payload = json.loads(ev.event_payload_json)
         self.assertEqual(payload["follow_up_id"], fup.id)
-        self.assertEqual(payload["outcome_notes"], "Interview set")
+        self.assertEqual(payload["follow_up_type"], "STATUS_INQUIRY")
+        self.assertEqual(payload["follow_up_date"], "2026-11-15")
+        self.assertEqual(payload["action"], "COMPLETED")
+        self.assertIn("completed_at", payload)
+        self.assertNotIn("outcome_notes", payload)
 
     def test_delete_follow_up_emits_deleted_event_atomically(self):
         fup = self.db.create_application_follow_up(
@@ -344,8 +349,11 @@ class TestFollowUpAtomicAuditing(BaseFollowUpTest):
         ev = del_events[0]
         payload = json.loads(ev.event_payload_json)
         self.assertEqual(payload["follow_up_id"], fup.id)
+        self.assertEqual(payload["application_id"], self.app_a.id)
         self.assertEqual(payload["follow_up_type"], "STATUS_INQUIRY")
-        self.assertEqual(payload["description"], "To delete")
+        self.assertEqual(payload["follow_up_date"], "2026-11-15")
+        self.assertEqual(payload["action"], "DELETED")
+        self.assertNotIn("description", payload)
 
     def test_create_follow_up_rollback_on_event_failure(self):
         """If event insertion fails, the follow-up record insertion must roll back."""
@@ -653,7 +661,8 @@ class TestFollowUpTemplateGenerator(BaseFollowUpTest):
         self.assertIn("DeepMind Technologies", tpl.body)
         self.assertIn("submitted on 2026-11-02", tpl.body)
         self.assertIn("Alice Walker", tpl.body)
-        self.assertTrue(tpl.context_metadata["has_verified_recruiter"])
+        self.assertEqual(tpl.context_metadata["recruiter_name_source"], "candidate_provided")
+        self.assertFalse(tpl.context_metadata["has_verified_recruiter"])
 
     def test_status_inquiry_template_with_missing_contact_uses_placeholder(self):
         tpl = FollowUpTemplateGenerator.generate(
@@ -663,6 +672,7 @@ class TestFollowUpTemplateGenerator(BaseFollowUpTest):
             extra_context={},  # no recruiter name
         )
         self.assertIn("Dear [RECRUITER NAME],", tpl.body)
+        self.assertEqual(tpl.context_metadata["recruiter_name_source"], "placeholder")
         self.assertFalse(tpl.context_metadata["has_verified_recruiter"])
 
     def test_thank_you_note_template_with_verified_interviewer(self):
@@ -686,7 +696,8 @@ class TestFollowUpTemplateGenerator(BaseFollowUpTest):
         self.assertIn("Research Scientist", tpl.subject)
         self.assertIn("Google Brain", tpl.body)
         self.assertIn("on 2026-11-10", tpl.body)
-        self.assertTrue(tpl.context_metadata["has_verified_interviewer"])
+        self.assertEqual(tpl.context_metadata["interviewer_name_source"], "candidate_provided")
+        self.assertFalse(tpl.context_metadata["has_verified_interviewer"])
 
     def test_thank_you_note_template_missing_interviewer_uses_placeholder(self):
         app_interview = Application(
@@ -703,7 +714,9 @@ class TestFollowUpTemplateGenerator(BaseFollowUpTest):
             extra_context={},
         )
         self.assertIn("Dear [INTERVIEWER NAME],", tpl.body)
+        self.assertEqual(tpl.context_metadata["interviewer_name_source"], "placeholder")
         self.assertFalse(tpl.context_metadata["has_verified_interviewer"])
+        self.assertNotIn(" today", tpl.body)
 
     def test_recruiter_checkin_template(self):
         tpl = FollowUpTemplateGenerator.generate(
@@ -792,6 +805,554 @@ class TestFollowUpServiceSecurity(BaseFollowUpTest):
                 session_id=self.session_a.session_id,
                 follow_up_type="INVALID_TEMPLATE",
             )
+
+
+# =============================================================================
+# 6. PHASE 7.4.1.1 REMEDIATION: RECOMMENDATION DATE INTEGRITY
+# =============================================================================
+
+class TestFollowUpDateIntegrityRemediation(BaseFollowUpTest):
+    """Tests date integrity, missing date behavior, and removal of unsafe fallbacks."""
+
+    def test_submitted_missing_date_returns_structured_no_recommendation(self):
+        """SUBMITTED without submission date returns has_recommendation=False with clear rationale."""
+        app_sub_no_date = Application(
+            id=301,
+            user_id=self.user_a,
+            company_name="Acme Corp",
+            job_title="DevOps Engineer",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted=None,
+            updated_at="2026-11-01T12:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_sub_no_date,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+            extra_context={},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Authoritative submission date is missing or invalid", rec.rationale)
+        self.assertIsNone(rec.recommended_date)
+
+    def test_submitted_invalid_date_returns_structured_no_recommendation(self):
+        """SUBMITTED with unparseable submission date returns has_recommendation=False."""
+        app_sub_bad_date = Application(
+            id=302,
+            user_id=self.user_a,
+            company_name="Acme Corp",
+            job_title="DevOps Engineer",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted="not-a-valid-date",
+            updated_at="2026-11-01T12:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_sub_bad_date,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+            extra_context={"submission_timestamp": "garbage-timestamp"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Authoritative submission date is missing or invalid", rec.rationale)
+
+    def test_submitted_does_not_fall_back_to_updated_at(self):
+        """SUBMITTED never uses updated_at or ref_date when date_submitted is absent."""
+        app = Application(
+            id=303,
+            user_id=self.user_a,
+            company_name="Acme Corp",
+            job_title="DevOps Engineer",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted=None,
+            updated_at="2026-10-01T12:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertNotIn("2026-10", rec.rationale)
+
+    def test_assessment_missing_date_returns_structured_no_recommendation(self):
+        """ASSESSMENT without assessment date returns has_recommendation=False."""
+        app_assess = Application(
+            id=304,
+            user_id=self.user_a,
+            company_name="HackerRank Partner",
+            job_title="SWE",
+            status=ApplicationStatus.ASSESSMENT.value,
+            updated_at="2026-11-01T12:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_assess,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+            extra_context={},  # no assessment_date provided
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Assessment completion date is missing or invalid", rec.rationale)
+
+    def test_assessment_invalid_date_returns_structured_no_recommendation(self):
+        """ASSESSMENT with invalid date format returns has_recommendation=False."""
+        app_assess = Application(
+            id=305,
+            user_id=self.user_a,
+            company_name="HackerRank Partner",
+            job_title="SWE",
+            status=ApplicationStatus.ASSESSMENT.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_assess,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+            extra_context={"assessment_date": "invalid-date-string"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Assessment completion date is missing or invalid", rec.rationale)
+
+    def test_assessment_does_not_fall_back_to_updated_at(self):
+        """ASSESSMENT never substitutes updated_at for an assessment date."""
+        app_assess = Application(
+            id=306,
+            user_id=self.user_a,
+            company_name="HackerRank Partner",
+            job_title="SWE",
+            status=ApplicationStatus.ASSESSMENT.value,
+            updated_at="2026-10-15T08:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_assess,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+        )
+        self.assertFalse(rec.has_recommendation)
+
+    def test_interview_invalid_date_returns_no_recommendation(self):
+        """INTERVIEW with invalid date string returns has_recommendation=False."""
+        app_int = Application(
+            id=307,
+            user_id=self.user_a,
+            company_name="Meta",
+            job_title="Research Scientist",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_int,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+            extra_context={"interview_date": "not-a-date"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("No verified interview date recorded", rec.rationale)
+
+    def test_offer_missing_deadline_returns_no_recommendation(self):
+        """OFFER without expiration deadline returns has_recommendation=False."""
+        app_offer = Application(
+            id=308,
+            user_id=self.user_a,
+            company_name="Anthropic",
+            job_title="Alignment Engineer",
+            status=ApplicationStatus.OFFER.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_offer,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+            extra_context={},  # no deadline
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Offer decision deadline is not recorded", rec.rationale)
+
+    def test_offer_expired_deadline_returns_no_recommendation(self):
+        """OFFER with deadline in the past returns has_recommendation=False."""
+        app_offer = Application(
+            id=309,
+            user_id=self.user_a,
+            company_name="Anthropic",
+            job_title="Alignment Engineer",
+            status=ApplicationStatus.OFFER.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app_offer,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={"offer_deadline": "2026-11-08"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("is today or in the past", rec.rationale)
+
+
+# =============================================================================
+# 7. PHASE 7.4.1.1 REMEDIATION: TEMPLATE ACCURACY & FACTUALITY
+# =============================================================================
+
+class TestFollowUpTemplateAccuracyRemediation(BaseFollowUpTest):
+    """Tests template truthfulness, neutral wording, and source attribution."""
+
+    def test_thank_you_note_without_interview_date_has_no_today(self):
+        """Thank-you note without interview date never asserts interview happened 'today'."""
+        app_interview = Application(
+            id=401,
+            user_id=self.user_a,
+            company_name="OpenAI",
+            job_title="Research Engineer",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app_interview,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={},  # no interview_date
+        )
+        self.assertNotIn(" today", tpl.body)
+        self.assertNotIn("today", tpl.body.lower())
+        self.assertIn("Thank you for taking the time to speak with me regarding the Research Engineer position", tpl.body)
+
+    def test_thank_you_note_neutral_wording_no_unsupported_claims(self):
+        """Thank-you note removes unsupported claims about conversation enjoyment or ongoing initiatives."""
+        app_interview = Application(
+            id=402,
+            user_id=self.user_a,
+            company_name="OpenAI",
+            job_title="Research Engineer",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app_interview,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"interview_date": "2026-11-04"},
+        )
+        self.assertNotIn("enjoyed our conversation", tpl.body)
+        self.assertNotIn("ongoing initiatives", tpl.body)
+        self.assertIn("on 2026-11-04", tpl.body)
+        self.assertIn("remain very interested", tpl.body)
+
+    def test_candidate_provided_context_is_not_marked_verified(self):
+        """Candidate-provided names in extra_context are labeled candidate_provided and unverified."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            application=self.app_a,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"recruiter_name": "Candidate Provided Recruiter"},
+        )
+        self.assertEqual(tpl.context_metadata["recruiter_name_source"], "candidate_provided")
+        self.assertFalse(tpl.context_metadata["has_verified_recruiter"])
+
+    def test_missing_contact_uses_placeholders(self):
+        """Missing contact names cleanly default to standard bracketed placeholders."""
+        tpl_recruiter = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.RECRUITER_CHECKIN.value,
+            application=self.app_a,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={},
+        )
+        self.assertIn("Dear [RECRUITER NAME],", tpl_recruiter.body)
+        self.assertEqual(tpl_recruiter.context_metadata["recruiter_name_source"], "placeholder")
+
+        app_int = Application(id=403, user_id=self.user_a, company_name="Co", job_title="Eng")
+        tpl_interviewer = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app_int,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={},
+        )
+        self.assertIn("Dear [INTERVIEWER NAME],", tpl_interviewer.body)
+        self.assertEqual(tpl_interviewer.context_metadata["interviewer_name_source"], "placeholder")
+
+    def test_recruiter_checkin_neutral_wording(self):
+        """Recruiter check-in uses professional neutral inquiry without presuming promises or guidance."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.RECRUITER_CHECKIN.value,
+            application=self.app_a,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"recruiter_name": "John Doe"},
+        )
+        self.assertNotIn("ongoing guidance and support", tpl.body)
+        self.assertIn("reiterate my strong interest in the role", tpl.body)
+        self.assertIn("inquire whether there are any updates", tpl.body)
+
+
+# =============================================================================
+# 8. PHASE 7.4.1.1 REMEDIATION: ARCHIVED APPLICATION RESTRICTIONS
+# =============================================================================
+
+class TestFollowUpArchivedRestrictionRemediation(BaseFollowUpTest):
+    """Tests that archived applications are rejected by service recommendation and template generators."""
+
+    def setUp(self):
+        super().setUp()
+        # Create an archived application for Alice
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO applications (
+                    id, user_id, company_name, job_title, status,
+                    date_submitted, is_archived, notes
+                ) VALUES (501, 1, 'Legacy Corp', 'Legacy Developer',
+                          'SUBMITTED', '2026-11-01', 1, 'Archived position')
+                """
+            )
+        self.archived_app = self.db.get_user_application(501, self.user_a)
+
+    def test_owner_cannot_generate_recommendation_for_archived_application(self):
+        """recommend_application_follow_up raises ValidationError for archived application."""
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.recommend_application_follow_up(
+                application_id=self.archived_app.id,
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("archived", str(ctx.exception).lower())
+
+    def test_owner_cannot_generate_template_for_archived_application(self):
+        """generate_follow_up_template raises ValidationError for archived application."""
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.generate_follow_up_template(
+                application_id=self.archived_app.id,
+                session_id=self.session_a.session_id,
+                follow_up_type="STATUS_INQUIRY",
+            )
+        self.assertIn("archived", str(ctx.exception).lower())
+
+    def test_active_application_succeeds(self):
+        """Active (unarchived) application generates recommendation and template successfully."""
+        rec = self.service.recommend_application_follow_up(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            reference_date=date(2026, 11, 3),
+        )
+        self.assertTrue(rec["has_recommendation"])
+
+        tpl = self.service.generate_follow_up_template(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        self.assertIn("subject", tpl)
+
+
+# =============================================================================
+# 9. PHASE 7.4.1.1 REMEDIATION: AUDIT EVENT PRIVACY & MINIMIZATION
+# =============================================================================
+
+class TestFollowUpAuditPrivacyRemediation(BaseFollowUpTest):
+    """Tests that sensitive candidate strings are excluded from audit event payloads."""
+
+    def test_sensitive_string_not_in_scheduled_event_payload(self):
+        """Raw reminder description is excluded from FOLLOW_UP_SCHEDULED event payload."""
+        sensitive_desc = "TOP_SECRET_OFFER_DETAILS_AND_SALARY_TARGET_180K"
+        fup = self.db.create_application_follow_up(
+            application_id=self.app_a.id,
+            user_id=self.user_a,
+            follow_up_date="2026-11-20",
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            description=sensitive_desc,
+        )
+
+        # Stored description in database table is intact
+        self.assertEqual(fup.description, sensitive_desc)
+
+        # Inspect audit events in application_events
+        events = self.db.get_application_events(self.app_a.id, self.user_a)
+        sched_events = [e for e in events if e.event_type == "FOLLOW_UP_SCHEDULED"]
+        self.assertGreaterEqual(len(sched_events), 1)
+
+        payload = json.loads(sched_events[-1].event_payload_json)
+        self.assertNotIn("description", payload)
+        self.assertNotIn(sensitive_desc, sched_events[-1].event_payload_json)
+        self.assertEqual(payload["follow_up_id"], fup.id)
+        self.assertEqual(payload["follow_up_date"], "2026-11-20")
+        self.assertEqual(payload["follow_up_type"], "STATUS_INQUIRY")
+        self.assertEqual(payload["action"], "SCHEDULED")
+
+    def test_sensitive_string_not_in_completed_event_payload(self):
+        """Raw outcome notes are excluded from FOLLOW_UP_COMPLETED event payload."""
+        fup = self.db.create_application_follow_up(
+            application_id=self.app_a.id,
+            user_id=self.user_a,
+            follow_up_date="2026-11-20",
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            description="Routine follow-up",
+        )
+        sensitive_notes = "CONFIDENTIAL_INTERVIEW_DISCUSSIONS_REGARDING_PATENTS"
+        completed = self.db.complete_application_follow_up(
+            follow_up_id=fup.id,
+            user_id=self.user_a,
+            outcome_notes=sensitive_notes,
+        )
+
+        # Stored outcome notes in database table is intact
+        self.assertEqual(completed.outcome_notes, sensitive_notes)
+
+        events = self.db.get_application_events(self.app_a.id, self.user_a)
+        comp_events = [e for e in events if e.event_type == "FOLLOW_UP_COMPLETED"]
+        self.assertGreaterEqual(len(comp_events), 1)
+
+        payload = json.loads(comp_events[-1].event_payload_json)
+        self.assertNotIn("outcome_notes", payload)
+        self.assertNotIn(sensitive_notes, comp_events[-1].event_payload_json)
+        self.assertEqual(payload["follow_up_id"], fup.id)
+        self.assertEqual(payload["action"], "COMPLETED")
+        self.assertIn("completed_at", payload)
+
+    def test_sensitive_string_not_in_deleted_event_payload(self):
+        """Raw reminder description is excluded from FOLLOW_UP_DELETED event payload."""
+        sensitive_desc = "PRIVATE_MEDICAL_LEAVE_SCHEDULING_NOTE"
+        fup = self.db.create_application_follow_up(
+            application_id=self.app_a.id,
+            user_id=self.user_a,
+            follow_up_date="2026-11-20",
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            description=sensitive_desc,
+        )
+        self.db.delete_application_follow_up(fup.id, self.user_a)
+
+        events = self.db.get_application_events(self.app_a.id, self.user_a)
+        del_events = [e for e in events if e.event_type == "FOLLOW_UP_DELETED"]
+        self.assertGreaterEqual(len(del_events), 1)
+
+        payload = json.loads(del_events[-1].event_payload_json)
+        self.assertNotIn("description", payload)
+        self.assertNotIn(sensitive_desc, del_events[-1].event_payload_json)
+        self.assertEqual(payload["follow_up_id"], fup.id)
+        self.assertEqual(payload["action"], "DELETED")
+
+    def test_audit_hash_chain_validates_after_all_follow_up_mutations(self):
+        """Cryptographic hash chain validates after creation, completion, and deletion."""
+        f1 = self.db.create_application_follow_up(
+            self.app_a.id, self.user_a, "2026-11-21", FollowUpType.STATUS_INQUIRY.value, "Check 1"
+        )
+        self.db.complete_application_follow_up(f1.id, self.user_a, "Notes 1")
+        f2 = self.db.create_application_follow_up(
+            self.app_a.id, self.user_a, "2026-11-22", FollowUpType.THANK_YOU_NOTE.value, "Check 2"
+        )
+        self.db.delete_application_follow_up(f2.id, self.user_a)
+
+        is_valid, reason = self.db.verify_application_event_chain(self.app_a.id, self.user_a)
+        self.assertTrue(is_valid, f"Chain invalid: {reason}")
+
+
+# =============================================================================
+# 10. PHASE 7.4.1.1 REMEDIATION: CANDIDATE PROFILE EXTRACTION
+# =============================================================================
+
+class TestFollowUpCandidateProfileExtraction(BaseFollowUpTest):
+    """Tests candidate profile extraction, nested structures, and account fallbacks."""
+
+    def test_nested_profile_personal_information_full_name(self):
+        """Candidate name resolved correctly from profile_data.personal_information.full_name."""
+        res = self.service.generate_follow_up_template(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        self.assertIn("Alice Walker", res["body"])
+        self.assertIn("Alice Walker", res["subject"])
+
+    def test_flat_profile_full_name(self):
+        """Candidate name resolved correctly from flat profile_data.full_name."""
+        # Update user A's profile with flat structure
+        self.db.save_user_candidate_profile(
+            self.user_a,
+            {"full_name": "Alicia Keys", "skills": ["Music", "AI"]},
+        )
+        res = self.service.generate_follow_up_template(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        self.assertIn("Alicia Keys", res["body"])
+        self.assertIn("Alicia Keys", res["subject"])
+
+    def test_missing_profile_falls_back_to_account_user_full_name(self):
+        """If user has no candidate profile snapshot, falls back to account full_name."""
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO users (id, email, password_hash, password_salt, full_name, created_at)
+                VALUES (3, 'carol@example.com', 'fakehash', 'fakesalt', 'Carol Danvers', CURRENT_TIMESTAMP)
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO applications (
+                    id, user_id, company_name, job_title, status, is_archived
+                ) VALUES (301, 3, 'NASA', 'Pilot', 'SUBMITTED', 0)
+                """
+            )
+        session_carol = self.session_mgr.authenticate_candidate(
+            candidate_id="cand_carol",
+            candidate_name="Carol Danvers",
+            user_id=3,
+        )
+        res = self.service.generate_follow_up_template(
+            application_id=301,
+            session_id=session_carol.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        self.assertIn("Carol Danvers", res["body"])
+        self.assertIn("Carol Danvers", res["subject"])
+
+    def test_missing_profile_and_missing_account_name_falls_back_to_placeholder(self):
+        """If user has no candidate profile and account has empty name, uses placeholder."""
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO users (id, email, password_hash, password_salt, full_name, created_at)
+                VALUES (4, 'anon@example.com', 'fakehash', 'fakesalt', '', CURRENT_TIMESTAMP)
+                """
+            )
+            cursor.execute(
+                """
+                INSERT INTO applications (
+                    id, user_id, company_name, job_title, status, is_archived
+                ) VALUES (401, 4, 'Mystery Co', 'Agent', 'SUBMITTED', 0)
+                """
+            )
+        session_anon = self.session_mgr.authenticate_candidate(
+            candidate_id="cand_anon",
+            candidate_name="Anonymous",
+            user_id=4,
+        )
+        res = self.service.generate_follow_up_template(
+            application_id=401,
+            session_id=session_anon.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        self.assertIn("[CANDIDATE NAME]", res["body"])
+
+    def test_malformed_profile_does_not_crash(self):
+        """Malformed or minimal profile structure does not cause an exception."""
+        self.db.save_user_candidate_profile(
+            self.user_a,
+            {"random_key": "some_value"},
+        )
+        res = self.service.generate_follow_up_template(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        # Should fall back to user_a's account name ("Alice Walker")
+        self.assertIn("Alice Walker", res["body"])
+
+    def test_profile_wrapper_metadata_not_leaked(self):
+        """DB row wrapper columns (id, profile_hash, version) are not passed as candidate profile data."""
+        profile_row = self.db.get_user_candidate_profile(self.user_a)
+        self.assertIn("profile_data", profile_row)
+        self.assertIn("profile_hash", profile_row)
+
+        res = self.service.generate_follow_up_template(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            follow_up_type="STATUS_INQUIRY",
+        )
+        # The template subject/body should never contain the sha256 profile hash
+        self.assertNotIn(profile_row["profile_hash"], res["body"])
+        self.assertNotIn(profile_row["profile_hash"], res["subject"])
 
 
 if __name__ == "__main__":

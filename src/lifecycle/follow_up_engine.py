@@ -143,10 +143,14 @@ class FollowUpRecommendationEngine:
         # 1. SUBMITTED: Status inquiry 10 business days post-submission
         # ---------------------------------------------------------------------
         if status == "SUBMITTED":
-            sub_raw = context.get("submission_timestamp") or getattr(application, "date_submitted", None)
+            sub_raw = getattr(application, "date_submitted", None) or context.get("submission_timestamp") or context.get("submission_date")
             sub_date = cls.parse_date_safe(sub_raw)
             if not sub_date:
-                sub_date = cls.parse_date_safe(getattr(application, "updated_at", None)) or ref_date
+                return FollowUpRecommendation(
+                    has_recommendation=False,
+                    rationale="Authoritative submission date is missing or invalid. Please record a valid submission date to calculate status inquiry timing.",
+                    application_context=app_ctx,
+                )
 
             # Recommend 10 business days (approx 2 calendar weeks)
             rec_date = cls.add_business_days(sub_date, 10)
@@ -172,7 +176,7 @@ class FollowUpRecommendationEngine:
                 has_recommendation=True,
                 recommendation_type=FollowUpType.STATUS_INQUIRY.value,
                 recommended_date=rec_date.isoformat(),
-                rationale="Recommended status inquiry scheduled 10 business days post-submission to check review progress.",
+                rationale=f"Recommended status inquiry scheduled for {rec_date.isoformat()} (10 business days post-submission on {sub_date.isoformat()}) to check review progress.",
                 default_description=f"Status inquiry on {title} application with {company}",
                 application_context=app_ctx,
             )
@@ -216,7 +220,7 @@ class FollowUpRecommendationEngine:
                 has_recommendation=True,
                 recommendation_type=FollowUpType.THANK_YOU_NOTE.value,
                 recommended_date=rec_date.isoformat(),
-                rationale="Recommended thank-you note scheduled within 24 hours of the interview.",
+                rationale=f"Recommended thank-you note scheduled for {rec_date.isoformat()} (within 24 hours of interview on {int_date.isoformat()}).",
                 default_description=f"Send thank-you note following {title} interview with {company}",
                 application_context=app_ctx,
             )
@@ -225,12 +229,15 @@ class FollowUpRecommendationEngine:
         # 3. ASSESSMENT: Status inquiry 5-7 calendar days post-assessment
         # ---------------------------------------------------------------------
         elif status == "ASSESSMENT":
-            assess_raw = (
-                context.get("assessment_date")
-                or context.get("assessment_timestamp")
-                or getattr(application, "updated_at", None)
-            )
-            assess_date = cls.parse_date_safe(assess_raw) or ref_date
+            assess_raw = context.get("assessment_date") or context.get("assessment_timestamp")
+            assess_date = cls.parse_date_safe(assess_raw)
+
+            if not assess_date:
+                return FollowUpRecommendation(
+                    has_recommendation=False,
+                    rationale="Assessment completion date is missing or invalid. Please record an assessment completion date to calculate status inquiry timing.",
+                    application_context=app_ctx,
+                )
 
             rec_date = assess_date + timedelta(days=7)
             if rec_date < ref_date:
@@ -253,7 +260,7 @@ class FollowUpRecommendationEngine:
                 has_recommendation=True,
                 recommendation_type=FollowUpType.STATUS_INQUIRY.value,
                 recommended_date=rec_date.isoformat(),
-                rationale="Recommended status inquiry scheduled 7 calendar days after assessment completion.",
+                rationale=f"Recommended status inquiry scheduled for {rec_date.isoformat()} (7 calendar days after assessment completion on {assess_date.isoformat()}).",
                 default_description=f"Check assessment status for {title} with {company}",
                 application_context=app_ctx,
             )
@@ -299,7 +306,7 @@ class FollowUpRecommendationEngine:
                 has_recommendation=True,
                 recommendation_type=FollowUpType.RECRUITER_CHECKIN.value,
                 recommended_date=rec_date.isoformat(),
-                rationale=f"Decision check-in scheduled prior to offer expiration deadline on {deadline_date.isoformat()}.",
+                rationale=f"Decision check-in scheduled for {rec_date.isoformat()} (prior to offer expiration deadline on {deadline_date.isoformat()}).",
                 default_description=f"Decision check-in regarding offer for {title} with {company}",
                 application_context=app_ctx,
             )
@@ -342,21 +349,30 @@ class FollowUpTemplateGenerator:
         profile = candidate_profile or {}
         context = extra_context or {}
 
-        # 1. Resolve candidate name truthfully
-        candidate_name = (
-            profile.get("personal_information", {}).get("full_name")
-            or profile.get("full_name")
-            or context.get("candidate_name")
+        # Support unwrapped profile dict or DB row dict with 'profile_data'
+        p_data = profile.get("profile_data") if isinstance(profile.get("profile_data"), dict) else profile
+
+        # 1. Resolve candidate name truthfully (profile facts or context, fallback to placeholder)
+        cand_pinfo = p_data.get("personal_information") if isinstance(p_data, dict) else None
+        cand_pinfo_name = cand_pinfo.get("full_name") if isinstance(cand_pinfo, dict) else None
+        raw_name = (
+            context.get("candidate_name")
+            or cand_pinfo_name
+            or (p_data.get("full_name") if isinstance(p_data, dict) else None)
             or "[CANDIDATE NAME]"
-        ).strip()
+        )
+        candidate_name = str(raw_name).strip() if raw_name else "[CANDIDATE NAME]"
 
         # 2. Resolve application metadata
         company_name = (getattr(application, "company_name", None) or "[COMPANY NAME]").strip()
         job_title = (getattr(application, "job_title", None) or "[JOB TITLE]").strip()
 
         # 3. Resolve contact details (explicitly placeholder if not provided)
-        recruiter_name = (context.get("recruiter_name") or "[RECRUITER NAME]").strip()
-        interviewer_name = (context.get("interviewer_name") or "[INTERVIEWER NAME]").strip()
+        raw_recruiter = context.get("recruiter_name")
+        recruiter_name = raw_recruiter.strip() if isinstance(raw_recruiter, str) and raw_recruiter.strip() else "[RECRUITER NAME]"
+
+        raw_interviewer = context.get("interviewer_name")
+        interviewer_name = raw_interviewer.strip() if isinstance(raw_interviewer, str) and raw_interviewer.strip() else "[INTERVIEWER NAME]"
 
         # 4. Resolve dates
         sub_raw = getattr(application, "date_submitted", None) or context.get("submission_date")
@@ -365,14 +381,20 @@ class FollowUpTemplateGenerator:
         int_raw = context.get("interview_date")
         int_str = int_raw[:10] if int_raw and isinstance(int_raw, str) else None
 
+        # 5. Metadata: truthful attribution of context sources (candidate-provided context is not verified)
+        recruiter_source = "candidate_provided" if recruiter_name != "[RECRUITER NAME]" else "placeholder"
+        interviewer_source = "candidate_provided" if interviewer_name != "[INTERVIEWER NAME]" else "placeholder"
+
         metadata = {
             "template_type": follow_up_type,
             "application_id": getattr(application, "id", None),
             "company_name": company_name,
             "job_title": job_title,
             "candidate_name": candidate_name,
-            "has_verified_recruiter": recruiter_name != "[RECRUITER NAME]",
-            "has_verified_interviewer": interviewer_name != "[INTERVIEWER NAME]",
+            "recruiter_name_source": recruiter_source,
+            "interviewer_name_source": interviewer_source,
+            "has_verified_recruiter": False,  # Candidate-provided context is unverified
+            "has_verified_interviewer": False,  # Candidate-provided context is unverified
             "date_referenced": sub_str or int_str,
         }
 
@@ -386,7 +408,7 @@ class FollowUpTemplateGenerator:
                 f"Dear {recruiter_name},\n\n"
                 f"I hope this message finds you well.\n\n"
                 f"I am writing to respectfully check in on the status of my application for the {job_title} "
-                f"position at {company_name}{sub_phrase}. I remain very enthusiastic about the opportunity "
+                f"position at {company_name}{sub_phrase}. I remain very interested in the opportunity "
                 f"to contribute to your team.\n\n"
                 f"Please let me know if there are any additional details, portfolio samples, or documentation "
                 f"I can provide to support the evaluation process.\n\n"
@@ -406,15 +428,14 @@ class FollowUpTemplateGenerator:
         # ---------------------------------------------------------------------
         elif follow_up_type == FollowUpType.THANK_YOU_NOTE.value:
             subject = f"Thank You - {job_title} Interview - {candidate_name}"
-            int_phrase = f" on {int_str}" if int_str else " today"
+            int_phrase = f" on {int_str}" if int_str else ""
             body = (
                 f"Dear {interviewer_name},\n\n"
                 f"Thank you for taking the time to speak with me{int_phrase} regarding the {job_title} "
-                f"position at {company_name}. I truly enjoyed our conversation and learning more about "
-                f"the team's ongoing initiatives.\n\n"
-                f"Our discussion reinforced my enthusiasm for this role. I look forward to any next steps "
-                f"in the process, and please feel free to reach out if you need any additional information "
-                f"from my side.\n\n"
+                f"position at {company_name}.\n\n"
+                f"I remain very interested in the opportunity to contribute to your team. "
+                f"Please let me know if I can provide any additional information or materials to support "
+                f"the evaluation process.\n\n"
                 f"Thank you again for your time and consideration.\n\n"
                 f"Best regards,\n\n"
                 f"{candidate_name}"
@@ -433,11 +454,11 @@ class FollowUpTemplateGenerator:
             subject = f"Touching Base Regarding {job_title} - {candidate_name}"
             body = (
                 f"Dear {recruiter_name},\n\n"
-                f"I hope you are having a productive week.\n\n"
+                f"I hope this message finds you well.\n\n"
                 f"I am reaching out to briefly touch base regarding my candidacy for the {job_title} "
                 f"position at {company_name}. I wanted to reiterate my strong interest in the role "
-                f"and confirm whether there are any updates regarding next steps or decision timelines.\n\n"
-                f"Thank you for your ongoing guidance and support throughout the process.\n\n"
+                f"and inquire whether there are any updates regarding next steps or decision timelines.\n\n"
+                f"Thank you for your time and consideration.\n\n"
                 f"Sincerely,\n\n"
                 f"{candidate_name}"
             )

@@ -5197,12 +5197,12 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
             created = ApplicationFollowUp(**dict(cursor.fetchone()))
 
-            # Emit timeline event atomically within the same transaction
+            # Emit timeline event atomically within the same transaction (data minimized for privacy)
             event_payload = {
                 "follow_up_id": follow_up_id,
                 "follow_up_date": clean_date,
                 "follow_up_type": follow_up_type,
-                "description": clean_desc,
+                "action": "SCHEDULED",
             }
             self._insert_application_event_internal(
                 cursor=cursor,
@@ -5300,13 +5300,13 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
             completed = ApplicationFollowUp(**dict(cursor.fetchone()))
 
-            # Emit timeline event atomically within the same transaction
+            # Emit timeline event atomically within the same transaction (data minimized for privacy)
             event_payload = {
                 "follow_up_id": follow_up_id,
                 "follow_up_date": completed.follow_up_date,
                 "follow_up_type": completed.follow_up_type,
                 "completed_at": completed.completed_at,
-                "outcome_notes": outcome_notes,
+                "action": "COMPLETED",
             }
             self._insert_application_event_internal(
                 cursor=cursor,
@@ -5342,15 +5342,14 @@ class DatabaseManager:
             app_id = row["application_id"]
             f_type = row["follow_up_type"]
             f_date = row["follow_up_date"]
-            desc = row["description"]
 
-            # Emit deletion audit event before row deletion within the same transaction
+            # Emit deletion audit event before row deletion within the same transaction (data minimized for privacy)
             event_payload = {
                 "follow_up_id": follow_up_id,
                 "application_id": app_id,
                 "follow_up_type": f_type,
                 "follow_up_date": f_date,
-                "description": desc,
+                "action": "DELETED",
             }
             self._insert_application_event_internal(
                 cursor=cursor,

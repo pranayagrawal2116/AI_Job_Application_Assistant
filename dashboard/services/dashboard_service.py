@@ -2362,13 +2362,18 @@ class DashboardService:
         extra_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Calculates deterministic follow-up recommendations for a candidate application."""
-        from src.database.exceptions import ApplicationNotFoundError
+        from src.database.exceptions import ApplicationNotFoundError, ValidationError
         from src.lifecycle.follow_up_engine import FollowUpRecommendationEngine
 
         user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
         app = self.db.get_user_application(application_id=application_id, user_id=user_id)
         if not app:
             raise ApplicationNotFoundError(application_id)
+
+        if bool(getattr(app, "is_archived", 0)):
+            raise ValidationError(
+                f"Cannot generate follow-up recommendations for archived Application #{application_id}."
+            )
 
         existing_reminders = self.db.list_application_follow_ups(
             user_id=user_id,
@@ -2406,19 +2411,47 @@ class DashboardService:
         if not app:
             raise ApplicationNotFoundError(application_id)
 
+        if bool(getattr(app, "is_archived", 0)):
+            raise ValidationError(
+                f"Cannot generate follow-up templates for archived Application #{application_id}."
+            )
+
         clean_type = follow_up_type.strip().upper() if isinstance(follow_up_type, str) else ""
         if clean_type not in SUPPORTED_TEMPLATE_TYPES:
             raise ValidationError(
                 f"Unsupported follow-up template type '{follow_up_type}'. Supported: {list(SUPPORTED_TEMPLATE_TYPES)}"
             )
 
-        candidate_profile = self.db.get_user_candidate_profile(user_id) or {}
+        # Extract candidate profile cleanly without leaking DB wrapper metadata
+        profile_row = self.db.get_user_candidate_profile(user_id)
+        candidate_profile_data: Dict[str, Any] = {}
+        if profile_row and isinstance(profile_row, dict):
+            inner_data = profile_row.get("profile_data")
+            if isinstance(inner_data, dict):
+                candidate_profile_data = dict(inner_data)
+            elif "personal_information" in profile_row or "full_name" in profile_row:
+                candidate_profile_data = {
+                    k: v for k, v in profile_row.items()
+                    if k not in ("id", "user_id", "profile_hash", "version", "is_active", "last_updated")
+                }
 
-        merged_context = dict(extra_context or {})
-        if not candidate_profile.get("full_name") and not candidate_profile.get("personal_information", {}).get("full_name"):
+        # Resolve candidate full name with account fallback
+        cand_name: Optional[str] = None
+        if candidate_profile_data:
+            cand_pinfo = candidate_profile_data.get("personal_information")
+            if isinstance(cand_pinfo, dict) and cand_pinfo.get("full_name"):
+                cand_name = str(cand_pinfo["full_name"]).strip()
+            elif candidate_profile_data.get("full_name"):
+                cand_name = str(candidate_profile_data["full_name"]).strip()
+
+        if not cand_name:
             user_row = self.db.get_user_by_id(user_id)
             if user_row and user_row.get("full_name"):
-                merged_context["candidate_name"] = user_row["full_name"]
+                cand_name = str(user_row["full_name"]).strip()
+
+        merged_context = dict(extra_context or {})
+        if cand_name and "candidate_name" not in merged_context:
+            merged_context["candidate_name"] = cand_name
 
         if follow_up_id is not None:
             fup = self.db.get_application_follow_up(follow_up_id=follow_up_id, user_id=user_id)
@@ -2429,7 +2462,7 @@ class DashboardService:
         template = FollowUpTemplateGenerator.generate(
             follow_up_type=clean_type,
             application=app,
-            candidate_profile=candidate_profile,
+            candidate_profile=candidate_profile_data,
             extra_context=merged_context,
         )
         return template.to_dict()
