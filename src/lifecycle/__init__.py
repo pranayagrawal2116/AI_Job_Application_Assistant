@@ -5,5 +5,17 @@ and audit event mapping.
 """
 
 from src.lifecycle.state_machine import ApplicationStateMachine
+from src.lifecycle.follow_up_engine import (
+    FollowUpRecommendation,
+    FollowUpRecommendationEngine,
+    FollowUpTemplate,
+    FollowUpTemplateGenerator,
+)
 
-__all__ = ["ApplicationStateMachine"]
+__all__ = [
+    "ApplicationStateMachine",
+    "FollowUpRecommendation",
+    "FollowUpRecommendationEngine",
+    "FollowUpTemplate",
+    "FollowUpTemplateGenerator",
+]

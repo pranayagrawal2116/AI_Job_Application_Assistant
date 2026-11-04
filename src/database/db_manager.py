@@ -5140,7 +5140,11 @@ class DatabaseManager:
         description: str,
         outcome_notes: Optional[str] = None,
     ) -> ApplicationFollowUp:
-        """Schedules a candidate-controlled follow-up task."""
+        """Schedules a candidate-controlled follow-up task.
+
+        Atomically inserts the follow-up record and appends a FOLLOW_UP_SCHEDULED timeline
+        event within the same database transaction.
+        """
         valid_types = FollowUpType.list()
         if follow_up_type not in valid_types:
             raise ValidationError(
@@ -5148,6 +5152,14 @@ class DatabaseManager:
             )
         if not description or not description.strip():
             raise ValidationError("Follow-up description cannot be empty.")
+
+        clean_date = follow_up_date.strip()
+        try:
+            datetime.strptime(clean_date, "%Y-%m-%d")
+        except (ValueError, TypeError, AttributeError):
+            raise ValidationError(f"Invalid follow_up_date format '{follow_up_date}'. Expected 'YYYY-MM-DD'.")
+
+        clean_desc = description.strip()
 
         with self.transaction() as conn:
             cursor = conn.cursor()
@@ -5174,9 +5186,9 @@ class DatabaseManager:
                 (
                     application_id,
                     user_id,
-                    follow_up_date,
+                    clean_date,
                     follow_up_type,
-                    description.strip(),
+                    clean_desc,
                     outcome_notes,
                 ),
             )
@@ -5185,24 +5197,24 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
             created = ApplicationFollowUp(**dict(cursor.fetchone()))
 
-        # Emit timeline event outside or in transaction
-        try:
-            self.create_application_event(
+            # Emit timeline event atomically within the same transaction
+            event_payload = {
+                "follow_up_id": follow_up_id,
+                "follow_up_date": clean_date,
+                "follow_up_type": follow_up_type,
+                "description": clean_desc,
+            }
+            self._insert_application_event_internal(
+                cursor=cursor,
                 application_id=application_id,
                 user_id=user_id,
                 event_type="FOLLOW_UP_SCHEDULED",
                 actor_type="CANDIDATE",
                 actor_identifier=f"user_{user_id}",
-                event_payload={
-                    "follow_up_id": follow_up_id,
-                    "follow_up_date": follow_up_date,
-                    "follow_up_type": follow_up_type,
-                },
+                event_payload=event_payload,
             )
-        except Exception as e:
-            logger.warning(f"Could not record timeline event for follow-up #{follow_up_id}: {e}")
 
-        return created
+            return created
 
     def get_application_follow_up(
         self, follow_up_id: int, user_id: int
@@ -5256,7 +5268,11 @@ class DatabaseManager:
     def complete_application_follow_up(
         self, follow_up_id: int, user_id: int, outcome_notes: Optional[str] = None
     ) -> ApplicationFollowUp:
-        """Marks a candidate-scheduled follow-up as completed."""
+        """Marks a candidate-scheduled follow-up as completed.
+
+        Atomically updates completion status and appends a FOLLOW_UP_COMPLETED timeline
+        event within the same database transaction.
+        """
         with self.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
@@ -5284,29 +5300,35 @@ class DatabaseManager:
             cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
             completed = ApplicationFollowUp(**dict(cursor.fetchone()))
 
-        # Emit timeline event
-        try:
-            self.create_application_event(
+            # Emit timeline event atomically within the same transaction
+            event_payload = {
+                "follow_up_id": follow_up_id,
+                "follow_up_date": completed.follow_up_date,
+                "follow_up_type": completed.follow_up_type,
+                "completed_at": completed.completed_at,
+                "outcome_notes": outcome_notes,
+            }
+            self._insert_application_event_internal(
+                cursor=cursor,
                 application_id=completed.application_id,
                 user_id=user_id,
                 event_type="FOLLOW_UP_COMPLETED",
                 actor_type="CANDIDATE",
                 actor_identifier=f"user_{user_id}",
-                event_payload={
-                    "follow_up_id": follow_up_id,
-                    "outcome_notes": outcome_notes,
-                },
+                event_payload=event_payload,
             )
-        except Exception as e:
-            logger.warning(f"Could not record timeline event for completed follow-up #{follow_up_id}: {e}")
 
-        return completed
+            return completed
 
     def delete_application_follow_up(self, follow_up_id: int, user_id: int) -> bool:
-        """Deletes a candidate follow-up record, enforcing ownership."""
+        """Deletes a candidate follow-up record, enforcing ownership.
+
+        Atomically records a FOLLOW_UP_DELETED timeline event prior to deletion within the same
+        database transaction, ensuring that deletion remains auditable in the event chain.
+        """
         with self.transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT user_id FROM application_follow_ups WHERE id = ?", (follow_up_id,))
+            cursor.execute("SELECT * FROM application_follow_ups WHERE id = ?", (follow_up_id,))
             row = cursor.fetchone()
             if not row:
                 raise ValidationError(f"ApplicationFollowUp #{follow_up_id} not found.")
@@ -5316,6 +5338,29 @@ class DatabaseManager:
                     target_user_id=row["user_id"],
                     resource=f"ApplicationFollowUp #{follow_up_id}",
                 )
+
+            app_id = row["application_id"]
+            f_type = row["follow_up_type"]
+            f_date = row["follow_up_date"]
+            desc = row["description"]
+
+            # Emit deletion audit event before row deletion within the same transaction
+            event_payload = {
+                "follow_up_id": follow_up_id,
+                "application_id": app_id,
+                "follow_up_type": f_type,
+                "follow_up_date": f_date,
+                "description": desc,
+            }
+            self._insert_application_event_internal(
+                cursor=cursor,
+                application_id=app_id,
+                user_id=user_id,
+                event_type="FOLLOW_UP_DELETED",
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload=event_payload,
+            )
 
             cursor.execute("DELETE FROM application_follow_ups WHERE id = ? AND user_id = ?", (follow_up_id, user_id))
             return True

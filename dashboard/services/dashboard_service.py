@@ -1,6 +1,6 @@
 """Dashboard Service: Data access, business logic, and database operations for the Streamlit UI."""
 
-from datetime import datetime
+from datetime import date, datetime
 import hashlib
 import json
 from pathlib import Path
@@ -2352,6 +2352,87 @@ class DashboardService:
             follow_up_id=follow_up_id,
             user_id=user_id,
         )
+
+    def recommend_application_follow_up(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+        reference_date: Optional[date] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Calculates deterministic follow-up recommendations for a candidate application."""
+        from src.database.exceptions import ApplicationNotFoundError
+        from src.lifecycle.follow_up_engine import FollowUpRecommendationEngine
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        existing_reminders = self.db.list_application_follow_ups(
+            user_id=user_id,
+            application_id=application_id,
+            is_completed=False,
+            include_archived=False,
+        )
+
+        recommendation = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=existing_reminders,
+            reference_date=reference_date,
+            extra_context=extra_context,
+        )
+        return recommendation.to_dict()
+
+    def generate_follow_up_template(
+        self,
+        application_id: int,
+        session_id: str,
+        follow_up_type: str,
+        client_user_id: Optional[int] = None,
+        follow_up_id: Optional[int] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Generates a zero-hallucination, professional draft message for manual candidate sending."""
+        from src.database.exceptions import ApplicationNotFoundError, ValidationError
+        from src.lifecycle.follow_up_engine import (
+            SUPPORTED_TEMPLATE_TYPES,
+            FollowUpTemplateGenerator,
+        )
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        clean_type = follow_up_type.strip().upper() if isinstance(follow_up_type, str) else ""
+        if clean_type not in SUPPORTED_TEMPLATE_TYPES:
+            raise ValidationError(
+                f"Unsupported follow-up template type '{follow_up_type}'. Supported: {list(SUPPORTED_TEMPLATE_TYPES)}"
+            )
+
+        candidate_profile = self.db.get_user_candidate_profile(user_id) or {}
+
+        merged_context = dict(extra_context or {})
+        if not candidate_profile.get("full_name") and not candidate_profile.get("personal_information", {}).get("full_name"):
+            user_row = self.db.get_user_by_id(user_id)
+            if user_row and user_row.get("full_name"):
+                merged_context["candidate_name"] = user_row["full_name"]
+
+        if follow_up_id is not None:
+            fup = self.db.get_application_follow_up(follow_up_id=follow_up_id, user_id=user_id)
+            if fup:
+                if fup.follow_up_date and "submission_date" not in merged_context:
+                    merged_context["reminder_date"] = fup.follow_up_date
+
+        template = FollowUpTemplateGenerator.generate(
+            follow_up_type=clean_type,
+            application=app,
+            candidate_profile=candidate_profile,
+            extra_context=merged_context,
+        )
+        return template.to_dict()
 
     # -------------------------------------------------------------------------
     # PHASE 4: MULTI-USER JOB DESCRIPTION INGESTION & SNAPSHOT MANAGEMENT
