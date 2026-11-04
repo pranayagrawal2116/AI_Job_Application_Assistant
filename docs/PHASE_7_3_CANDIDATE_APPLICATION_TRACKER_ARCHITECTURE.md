@@ -5,7 +5,8 @@
 **Architecture Version:** v2.1.1
 **Project:** Universal AI Job Application Assistant
 **Document:** `docs/PHASE_7_3_CANDIDATE_APPLICATION_TRACKER_ARCHITECTURE.md`
-**Current Commit SHA:** `0deafd7582f571a1beae3586644405a9591d222d`
+**Source Audit Baseline Commit SHA:** `8b8be9bf96808a7186c0dbff74524c72862291ef`
+**Architecture Document Commit SHA:** `8b8be9bf96808a7186c0dbff74524c72862291ef`
 **Branch:** `main`
 **Phase:** 7.3.1 Audit Remediation — Candidate Application Tracker: Architecture & Design
 **Implementation Phase:** 7.3.2 (Pending User Architecture Review & Authorization)
@@ -50,17 +51,17 @@ Prior to authorizing Phase 7.3.2 implementation, an independent audit of the ini
 
 | Audit Item | Audit Finding & Gap | Classification | Remediation & Architectural Resolution |
 | :--- | :--- | :--- | :--- |
-| **AUDIT-A** | **Dashboard KPI Double-Counting & Archive Filtering**<br>Proposed metric logic incremented `submitted` for `IN_PROGRESS` applications. Archive behavior was not explicitly defined or queried in `list_user_applications`. | **Planned Phase 7.3.2 Functionality** | Updated `get_candidate_tracker_metrics()`: `SUBMITTED` counts only genuinely submitted applications; `IN_PROGRESS` does not increment `submitted`; both contribute to `active_pipeline`. Applications with `is_archived = 1` are excluded by default from KPIs and lists via a planned query enhancement. Offers remain separated from concluded applications. |
+| **AUDIT-A** | **Dashboard KPI Double-Counting & Archive Filtering**<br>Proposed metric logic incremented `submitted` for `IN_PROGRESS` applications. Archive behavior was not explicitly defined or queried in `list_user_applications` or follow-up counts. | **Planned Phase 7.3.2 Functionality** | Updated `get_candidate_tracker_metrics()`: `SUBMITTED` counts only genuinely submitted applications; `IN_PROGRESS` does not increment `submitted`; both contribute to `active_pipeline`. Applications with `is_archived = 1` are excluded by default from KPIs and lists via a planned query enhancement. Follow-up reminders belonging to archived applications are also excluded by default from due/overdue KPI counts via a candidate-scoped join in Phase 7.3.2. Offers remain separated from concluded applications. |
 | **AUDIT-B** | **Contradictory Kanban Grouping for `OFFER`**<br>Section 7 assigned `OFFER` to Column 5 ("Concluded"), while Section 4 assigned it to "Active Pipeline". | **Planned Phase 7.3.2 Functionality** | Standardized the canonical 5-column Kanban layout everywhere: 1. Preparation (`DRAFT`, `PREPARING`), 2. Review & Approval (`READY_FOR_REVIEW`, `APPROVED`), 3. Submitted & Active (`SUBMITTED`, `IN_PROGRESS`), 4. Assessment, Interview & Offers (`ASSESSMENT`, `INTERVIEW`, `OFFER`), 5. Concluded (`REJECTED`, `WITHDRAWN`, `CLOSED`). |
 | **AUDIT-C** | **Service Layer Capability Boundary**<br>Blueprint conflated existing `DatabaseManager` methods with non-existent `DashboardService` wrappers, and claimed complex query filters were already implemented. | **Existing vs. Planned Distinction** | Explicitly documented that `db.list_user_applications`, `db.get_user_application`, status transitions, timeline retrieval, hash verification, and manual submission backend **already exist**. Follow-up CRUD **already exists in `DatabaseManager`**, but candidate-facing wrappers in `DashboardService` **do not yet exist and are planned for Phase 7.3.2**. Employment-type filtering, multi-status grouping (`status_in`), and deadline sorting are documented as **planned query enhancements**. |
 | **AUDIT-D** | **Manual Submission Workflow & Ticket Lifetime Accuracy**<br>Blueprint claimed a 3600s ticket TTL, action-type in ticket string header, and a 16-step service method. | **Existing Implementation Alignment** | Corrected action ticket TTL to actual default: `ttl_seconds = 900` (15 min) in `SessionManager.issue_action_ticket`. Corrected ticket string format to `TKT-{key_id}-{nonce}.{timestamp}.{signature}`. Documented the exact **14-step operation** in `DashboardService.record_candidate_manual_submission()` while clearly distinguishing proposed UI interactions and validation. |
 | **AUDIT-E** | **Confirmation Proof Upload Security Gap**<br>Service currently accepts caller-supplied path and hash without a secure file upload pipeline. | **Deferred / Planned Security Specification** | Specified a secure upload pipeline architecture (file byte reception, 10MB cap, extension + magic bytes check, server-generated path in private candidate storage, server-side SHA-256, authenticated download gate). If not implemented safely in Phase 7.3.2, proof file upload will be **deferred**, retaining optional confirmation reference and candidate notes. |
-| **AUDIT-F** | **External URL Navigation Security Flaw**<br>`log_external_application_url_opened` currently calls `URLSafetyValidator.validate_url` before authentication and allows client URL substitution. | **Prerequisite Security Remediation** | Specified mandatory re-ordering before exposing the feature: 1. Resolve session, 2. Retrieve application, 3. Obtain stored canonical URL, 4. Validate URL, 5. Redact sensitive query/fragment, 6. Append audit event (status preserved!), 7. Return validated URL. Documented as a navigation request, not proof of employer visitation. Added regression tests. |
+| **AUDIT-F** | **External URL Navigation Security Flaw**<br>`log_external_application_url_opened` currently calls `URLSafetyValidator.validate_url` before authentication and allows client URL substitution. | **Prerequisite Security Remediation** | Specified mandatory re-ordering before exposing the feature: 1. Resolve session, 2. Retrieve application, 3. Obtain stored canonical URL, 4. Validate URL via URLSafetyValidator (`validated_url`), 5. Redact sensitive query/fragment for audit (`sanitized_url`), 6. Append audit event recording `sanitized_url` (status preserved!), 7. Return `validated_url` for browser destination. Explicitly distinguished `validated_url` (browser destination maintaining navigation behavior) from `sanitized_url` (redacted audit record). Documented that the event records a navigation request, not proof of employer visitation. Added regression tests. |
 | **AUDIT-G** | **Audit Integrity Badge Terminology**<br>Blueprint described hash verification as an absolute guarantee of authenticity. | **Refinement & Accurate Terminology** | Replaced badge text with: `Audit hash-chain consistency verified`. Documented that SHA-256 chain establishes internal sequence/hash consistency, but cannot independently prove external employer activity or defend against an attacker with direct SQL access who rewrites all rows. |
 | **AUDIT-H** | **Relational Match Data Provenance**<br>ER diagram incorrectly drew a direct `applications -> match_results` relationship. | **Relational Accuracy & Provenance** | Removed direct link. Documented that match results are linked via `prepared_packets.matching_result_id`. If unlinked, the UI displays match data as "Unavailable" rather than fabricating links. Work arrangement is derived from catalog job records when available, but not guaranteed for manual applications. |
 | **AUDIT-I** | **Multi-Worker Concurrency & Sticky Sessions**<br>Blueprint claimed full multi-worker operation based solely on the database nonce table. | **Operational Constraint Clarification** | Clarified that while consumed nonces are persistent, active sessions and issued tickets reside in process memory. Multi-worker scaling strictly requires sticky sessions or a future centralized session/grant store. |
 | **AUDIT-J** | **API & Authentication Boundary Clarification**<br>Blueprint presented REST routes with `session_id` query params as if required for Phase 7.3.2. | **Architecture Clarification** | Clarified that the frontend is pure Streamlit and consumes `DashboardService` methods directly in-process via `st.session_state`. REST routes are labeled as **conceptual future mappings**. Removed `session_id` from URL query strings in conceptual designs; specified `Authorization: Bearer` headers. |
-| **AUDIT-K** | **Documentation Precision & Product Naming**<br>Stale commit SHA in header and occurrences of "Antigravity" as product name. | **Documentation Precision** | Updated header commit SHA to `0deafd7582f571a1beae3586644405a9591d222d`. Replaced "Antigravity" with "Universal AI Job Application Assistant" or "the assistant". |
+| **AUDIT-K** | **Documentation Precision & Product Naming**<br>Stale commit SHA in header and occurrences of "Antigravity" as product name. | **Documentation Precision** | Updated header commit SHAs to accurately reflect the audited source baseline (`8b8be9bf96808a7186c0dbff74524c72862291ef`) and architecture document revision. Replaced "Antigravity" with "Universal AI Job Application Assistant" or "the assistant". |
 
 ---
 
@@ -202,7 +203,16 @@ The KPI calculation in `get_candidate_tracker_metrics()` must adhere strictly to
 2. `active_pipeline`: Reflects all actively advancing opportunities: `SUBMITTED`, `IN_PROGRESS`, `ASSESSMENT`, `INTERVIEW`, and `OFFER`.
 3. `offers`: Displayed as a dedicated metric chip, separated from concluded applications.
 4. `concluded`: Reflects terminal applications: `REJECTED`, `WITHDRAWN`, and `CLOSED`.
-5. **Archive Invariant:** By default, applications with `is_archived = 1` are **strictly excluded** from tracker KPIs and application lists. An explicit `include_archived=True` filter must be passed to include archived records.
+5. **Archive Invariant (Applications):** By default, applications with `is_archived = 1` are **strictly excluded** from tracker KPIs and application lists. An explicit `include_archived=True` filter must be passed to include archived records.
+6. **Follow-Up Reminder Archive Invariant:** Follow-up reminders belonging to archived applications (`applications.is_archived = 1`) are **strictly excluded** from `follow_ups_due` calculations by default. When `include_archived=True`, reminders for archived applications are included. Authenticated candidate ownership is strictly preserved. In Phase 7.3.2, `DatabaseManager.list_application_follow_ups` will be enhanced to accept `include_archived: bool = False` and execute a candidate-scoped join:
+   ```sql
+   SELECT f.* FROM application_follow_ups f
+   JOIN applications a ON f.application_id = a.id AND f.user_id = a.user_id
+   WHERE f.user_id = ?
+     AND (a.is_archived = 0 OR ? = 1)
+     AND f.is_completed = 0
+   ORDER BY f.follow_up_date ASC
+   ```
 
 ### Proposed Implementation for Phase 7.3.2:
 
@@ -220,6 +230,7 @@ def get_candidate_tracker_metrics(
     - 'active_pipeline' encompasses SUBMITTED, IN_PROGRESS, ASSESSMENT, INTERVIEW, OFFER.
     - 'offers' is tracked independently from concluded applications.
     - Archived applications (is_archived=1) are excluded by default.
+    - Follow-up reminders for archived applications are excluded by default.
     """
     user_id, _ = self.resolve_authenticated_candidate(session_id)
 
@@ -263,8 +274,12 @@ def get_candidate_tracker_metrics(
         elif stat in (ApplicationStatus.REJECTED, ApplicationStatus.WITHDRAWN, ApplicationStatus.CLOSED):
             counts["concluded"] += 1
 
-    # Follow-ups due today or overdue
-    follow_ups = self.db.list_application_follow_ups(user_id=user_id, is_completed=0)
+    # Follow-ups due today or overdue (excluding reminders for archived applications by default)
+    follow_ups = self.db.list_application_follow_ups(
+        user_id=user_id,
+        is_completed=0,
+        include_archived=include_archived,
+    )
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     counts["follow_ups_due"] = sum(1 for f in follow_ups if f.follow_up_date <= today_str)
 
@@ -458,9 +473,26 @@ This contains two security issues:
 1. It validates URLs before verifying candidate authentication.
 2. It accepts an arbitrary caller-supplied `url: str`, allowing a malicious client to log navigation events for arbitrary phishing or external URLs rather than the employer URL stored on the application.
 
+### Explicit Distinction: Validated Destination URL vs. Sanitized Audit URL
+
+To guarantee both browser navigation usability and audit event security, two distinct representations of the destination URL are maintained:
+
+1. **`validated_url` (Browser Destination):**
+   - The canonical employer URL after verification through `URLSafetyValidator.validate_url()`.
+   - Confirms that the scheme is `http` or `https`, the destination does not resolve to private/loopback/cloud metadata IP ranges, and no embedded user credentials are present.
+   - Preserves legitimate query parameters (e.g. `?reqId=12345&source=career_page`) and URL fragments needed for applicant navigation on employer ATS portals.
+   - **Returned strictly to the UI for browser navigation (`target="_blank", rel="noopener noreferrer"`).**
+
+2. **`sanitized_url` (Audit Event Payload):**
+   - The redacted representation generated by `_redact_sensitive_url(validated_url)`.
+   - URL fragments (`#...`) are completely stripped (set to `""`) to prevent client-side OAuth access tokens or state fragments from persisting in the database.
+   - Sensitive query parameter values (`token`, `secret`, `auth`, `key`, `password`, `session`, `jwt`, `code`, `sig`, `bearer`) are case-insensitively redacted and replaced with `"REDACTED"`.
+   - **Written strictly to the `application_events` audit event payload (`opened_url: sanitized_url`).**
+   - **Security Invariant:** The audit event payload must **never** receive unredacted sensitive query values or fragments.
+
 ### Mandatory Future Implementation Specification (Prerequisite for UI Exposure)
 
-Before exposing the external navigation button in Phase 7.3.2, `log_external_application_url_opened()` must be refactored to enforce this strict execution order:
+Before exposing the external navigation button in Phase 7.3.2, `log_external_application_url_opened()` must be refactored to enforce this strict 7-step execution order:
 
 ```python
 def log_external_application_url_opened(
@@ -472,13 +504,13 @@ def log_external_application_url_opened(
     """Logs external navigation request using the canonical stored application URL.
 
     Execution Order (Security Hardened):
-    1. Resolve candidate session & authenticate.
-    2. Retrieve candidate application (enforcing user ownership).
-    3. Obtain canonical stored external application URL (app.external_application_url).
-    4. Validate canonical URL via URLSafetyValidator (blocks SSRF, private IPs, bad schemes).
-    5. Redact sensitive query parameters and URL fragments.
-    6. Emit EXTERNAL_APPLICATION_URL_OPENED audit event (status preserved!).
-    7. Return sanitized validated URL for the UI to open in a new tab.
+    1. Authenticate candidate session first (resolve_authenticated_candidate).
+    2. Retrieve candidate application enforcing user ownership (get_user_application).
+    3. Read canonical stored employer URL (app.external_application_url).
+    4. Validate canonical URL via URLSafetyValidator (validated_url).
+    5. Redact sensitive query parameters and strip fragments for audit (sanitized_url).
+    6. Emit EXTERNAL_APPLICATION_URL_OPENED audit event with sanitized_url (status preserved!).
+    7. Return validated_url as the browser navigation destination.
     """
     # 1. Authenticate candidate session first
     user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
@@ -493,13 +525,13 @@ def log_external_application_url_opened(
     if not raw_url:
         raise ValidationError(f"Application #{application_id} has no external application URL configured.")
 
-    # 4. Validate canonical URL via URLSafetyValidator
+    # 4. Validate canonical URL via URLSafetyValidator (destination for browser)
     validated_url = URLSafetyValidator.validate_url(raw_url, resolver=self._resolve_url)
 
-    # 5. Redact sensitive tokens and strip fragments for audit logging
+    # 5. Redact sensitive tokens and strip fragments for audit logging only
     sanitized_url = self._redact_sensitive_url(validated_url)
 
-    # 6. Emit audit event: Status is strictly PRESERVED
+    # 6. Emit audit event: Status is strictly PRESERVED, payload receives sanitized_url
     self.db.create_application_event(
         application_id=application_id,
         user_id=user_id,
@@ -514,7 +546,7 @@ def log_external_application_url_opened(
         },
     )
 
-    # 7. Return safe validated URL for browser navigation
+    # 7. Return validated canonical destination for browser navigation
     return validated_url
 ```
 
@@ -526,6 +558,7 @@ def log_external_application_url_opened(
   - Unsafe stored URL raises `UnsafeURLError`.
   - Application status remains strictly unchanged (`APPROVED` is preserved).
   - Sensitive tokens and `#fragments` are redacted in the event payload.
+  - Browser destination receives the validated canonical URL.
 
 ---
 
@@ -608,13 +641,15 @@ def list_application_follow_ups(
     session_id: str,
     application_id: Optional[int] = None,
     is_completed: Optional[int] = None,
+    include_archived: bool = False,
 ) -> List[ApplicationFollowUp]:
-    """Lists follow-up reminders scoped to authenticated candidate."""
+    """Lists follow-up reminders scoped to candidate, filtering out archived applications by default."""
     user_id, _ = self.resolve_authenticated_candidate(session_id)
     return self.db.list_application_follow_ups(
         user_id=user_id,
         application_id=application_id,
         is_completed=is_completed,
+        include_archived=include_archived,
     )
 
 def complete_application_follow_up(
@@ -753,6 +788,7 @@ Phase 7.3.2 will be deemed complete when all the following criteria are empirica
   - Both contribute to `active_pipeline`.
   - `offers` is tracked independently from concluded applications.
   - Applications with `is_archived = 1` are excluded by default from KPIs and list queries.
+  - Follow-up reminders belonging to archived applications are excluded from `follow_ups_due` by default and included only when `include_archived=True`.
 - [ ] **AC-3 (List & Query Enhancements):**
   - Enhanced `list_user_applications` and `list_candidate_applications` supporting `include_archived`, `status_in`, `employment_type`, and `sort_by="deadline_asc"`.
   - Full-text search and pagination execute correctly.
@@ -762,7 +798,7 @@ Phase 7.3.2 will be deemed complete when all the following criteria are empirica
 - [ ] **AC-5 (Detail Card Completeness):** Displays core metadata, linked JD snapshot, linked resume version, match score (or "Unavailable" if unlinked), and active packet summary.
 - [ ] **AC-6 (Audit Timeline & Hash Consistency Badge):** Renders chronological event stream with actor attribution. Displays `Audit hash-chain consistency verified` when intact; failure injection displays a prominent red security alert.
 - [ ] **AC-7 (Read-Only Packet Review):** Candidates can inspect approved packets and download compiled PDF/DOCX files without state mutation.
-- [ ] **AC-8 (External Navigation Security Prerequisite):** `log_external_application_url_opened` enforces session authentication first, retrieves canonical stored URL, validates via `URLSafetyValidator`, redacts sensitive query/fragments, logs event, and strictly preserves application status.
+- [ ] **AC-8 (External Navigation Security Prerequisite):** `log_external_application_url_opened` enforces session authentication first, retrieves canonical stored URL, validates via `URLSafetyValidator`, redacts sensitive query/fragments for audit event (`sanitized_url`), returns validated destination URL to UI (`validated_url`), and strictly preserves application status.
 - [ ] **AC-9 (Manual Submission Workflow):** For `APPROVED` applications, confirms submission by selecting a valid channel, checking the confirmation box, and consuming a single-use action ticket (`ttl_seconds=900`), atomically updating status to `SUBMITTED`.
 - [ ] **AC-10 (Terminal Reopen Rationale):** Reopening a `REJECTED`, `WITHDRAWN`, or `CLOSED` application back to `IN_PROGRESS` strictly enforces a non-empty candidate rationale.
 - [ ] **AC-11 (Follow-up Reminder Service Methods):** Candidate-facing wrapper methods implemented in `DashboardService` with session scoping and ownership enforcement.
@@ -774,5 +810,6 @@ Phase 7.3.2 will be deemed complete when all the following criteria are empirica
 ## 16. Phase Status & Next Actions
 
 - **PHASE 7.3.1 AUDIT REMEDIATION:** COMPLETE.
+- **PHASE 7.3.1 DOCUMENTATION STATUS:** READY FOR FINAL APPROVAL.
 - **PHASE 7.3.2 IMPLEMENTATION:** NOT STARTED.
 - **USER ARCHITECTURE APPROVAL:** REQUIRED BEFORE PHASE 7.3.2 IMPLEMENTATION.
