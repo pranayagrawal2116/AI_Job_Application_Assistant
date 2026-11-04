@@ -14,8 +14,8 @@ import csv
 import html
 import io
 import json
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, date, datetime
+from typing import Any, Optional
 
 import streamlit as st
 
@@ -967,11 +967,13 @@ def render_follow_up_manager(
             if provide_int_date:
                 int_date_input = st.date_input(
                     "Interview Date",
+                    value=None,
                     key=f"rec_int_date_{user_id}_{app.id}",
                 )
-                extra_context["interview_date"] = int_date_input.isoformat()
-                extra_context["interview_date_source"] = "candidate_provided"
-                st.caption("🔒 *Date is labeled as candidate-provided and unverified; it is not persisted to the application record.*")
+                if int_date_input is not None:
+                    extra_context["interview_date"] = int_date_input.isoformat()
+                    extra_context["interview_date_source"] = "candidate_provided"
+                    st.caption("🔒 *Date is labeled as candidate-provided and unverified; it is not persisted to the application record.*")
     elif app.status == ApplicationStatus.ASSESSMENT.value:
         with st.container():
             st.caption("ℹ️ *To receive an assessment status inquiry recommendation, provide your assessment completion date.*")
@@ -982,9 +984,11 @@ def render_follow_up_manager(
             if provide_assess_date:
                 assess_date_input = st.date_input(
                     "Assessment Date",
+                    value=None,
                     key=f"rec_assess_date_{user_id}_{app.id}",
                 )
-                extra_context["assessment_date"] = assess_date_input.isoformat()
+                if assess_date_input is not None:
+                    extra_context["assessment_date"] = assess_date_input.isoformat()
 
     try:
         rec_res = service.recommend_application_follow_up(
@@ -1003,53 +1007,61 @@ def render_follow_up_manager(
             rec_rationale = rec_res.get("rationale") or ""
             rec_desc = rec_res.get("default_description") or ""
 
-            st.info(f"📋 **Recommended Action:** `{rec_type}` • **Proposed Date:** `{rec_date_str}`\n\n**Rationale:** {rec_rationale}")
-            st.caption("💡 *This is an algorithmic recommendation based on application status. It has NOT been scheduled. Review or edit details below before scheduling.*")
-
-            with st.expander("🗓️ Review & Schedule Proposed Reminder", expanded=False):
+            # Strict YYYY-MM-DD date parsing (Fail closed)
+            parsed_rec_date: Optional[date] = None
+            if rec_date_str and isinstance(rec_date_str, str) and len(rec_date_str.strip()) == 10:
                 try:
-                    default_d = datetime.strptime(rec_date_str, "%Y-%m-%d").date() if rec_date_str else datetime.now(UTC).date()
-                except Exception:
-                    default_d = datetime.now(UTC).date()
+                    parsed_rec_date = datetime.strptime(rec_date_str.strip(), "%Y-%m-%d").date()
+                except (ValueError, TypeError):
+                    parsed_rec_date = None
 
-                col_rec_d, col_rec_t = st.columns(2)
-                with col_rec_d:
-                    sched_date = st.date_input(
-                        "Reminder Date",
-                        value=default_d,
-                        key=f"rec_sched_date_{user_id}_{app.id}",
-                    )
-                with col_rec_t:
-                    type_opts = FollowUpType.list()
-                    type_idx = type_opts.index(rec_type) if rec_type in type_opts else 0
-                    sched_type = st.selectbox(
-                        "Reminder Type",
-                        options=type_opts,
-                        index=type_idx,
-                        key=f"rec_sched_type_{user_id}_{app.id}",
-                    )
-                sched_desc = st.text_input(
-                    "Task Description",
-                    value=rec_desc,
-                    key=f"rec_sched_desc_{user_id}_{app.id}",
-                )
+            if parsed_rec_date is not None:
+                st.info(f"📋 **Recommended Action:** `{rec_type}` • **Proposed Date:** `{rec_date_str}`\n\n**Rationale:** {rec_rationale}")
+                st.caption("💡 *This is an algorithmic recommendation based on application status. It has NOT been scheduled. Review or edit details below before scheduling.*")
 
-                if st.button("Schedule This Reminder", key=f"rec_sched_btn_{user_id}_{app.id}"):
-                    if not sched_desc or not sched_desc.strip():
-                        st.error("Please enter a description for the reminder.")
-                    else:
-                        try:
-                            service.create_application_follow_up(
-                                session_id=session_id,
-                                application_id=app.id,
-                                follow_up_date=sched_date.isoformat(),
-                                follow_up_type=sched_type,
-                                description=sched_desc.strip(),
-                            )
-                            st.success("Follow-up reminder scheduled successfully.")
-                            st.rerun()
-                        except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
-                            st.error(f"Cannot schedule reminder: {exc}")
+                with st.expander("🗓️ Review & Schedule Proposed Reminder", expanded=False):
+                    col_rec_d, col_rec_t = st.columns(2)
+                    with col_rec_d:
+                        sched_date = st.date_input(
+                            "Reminder Date",
+                            value=parsed_rec_date,
+                            key=f"rec_sched_date_{user_id}_{app.id}",
+                        )
+                    with col_rec_t:
+                        type_opts = FollowUpType.list()
+                        type_idx = type_opts.index(rec_type) if rec_type in type_opts else 0
+                        sched_type = st.selectbox(
+                            "Reminder Type",
+                            options=type_opts,
+                            index=type_idx,
+                            key=f"rec_sched_type_{user_id}_{app.id}",
+                        )
+                    sched_desc = st.text_input(
+                        "Task Description",
+                        value=rec_desc,
+                        key=f"rec_sched_desc_{user_id}_{app.id}",
+                    )
+
+                    if st.button("Schedule This Reminder", key=f"rec_sched_btn_{user_id}_{app.id}"):
+                        if not sched_desc or not sched_desc.strip():
+                            st.error("Please enter a description for the reminder.")
+                        elif sched_date is None:
+                            st.error("Please select a valid reminder date.")
+                        else:
+                            try:
+                                service.create_application_follow_up(
+                                    session_id=session_id,
+                                    application_id=app.id,
+                                    follow_up_date=sched_date.isoformat(),
+                                    follow_up_type=sched_type,
+                                    description=sched_desc.strip(),
+                                )
+                                st.success("Follow-up reminder scheduled successfully.")
+                                st.rerun()
+                            except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
+                                st.error(f"Cannot schedule reminder: {exc}")
+            else:
+                st.warning("⚠️ Recommendation has no valid proposed date; scheduling is unavailable.")
         else:
             rec_rationale = rec_res.get("rationale") or "No automatic follow-up recommendation configured for this status."
             st.caption(f"ℹ️ {rec_rationale}")
@@ -1099,10 +1111,12 @@ def render_follow_up_manager(
             if include_int_date:
                 int_date_val = st.date_input(
                     "Interview Date",
+                    value=None,
                     key=f"tpl_int_date_{user_id}_{app.id}",
                 )
-                tpl_ctx["interview_date"] = int_date_val.isoformat()
-                tpl_ctx["interview_date_source"] = "candidate_provided"
+                if int_date_val is not None:
+                    tpl_ctx["interview_date"] = int_date_val.isoformat()
+                    tpl_ctx["interview_date_source"] = "candidate_provided"
 
         if st.button("Generate Draft", key=f"gen_tpl_btn_{user_id}_{app.id}"):
             try:
@@ -1112,7 +1126,12 @@ def render_follow_up_manager(
                     follow_up_type=sel_template_type,
                     extra_context=tpl_ctx if tpl_ctx else None,
                 )
+                draft_rev = st.session_state.get(f"draft_rev_{user_id}_{app.id}", 0) + 1
+                st.session_state[f"draft_rev_{user_id}_{app.id}"] = draft_rev
                 st.session_state[f"generated_draft_{user_id}_{app.id}"] = draft_res
+                # Update widget session-state values from the new draft response before widgets are instantiated
+                st.session_state[f"draft_subj_{user_id}_{app.id}"] = draft_res.get("subject", "")
+                st.session_state[f"draft_body_{user_id}_{app.id}"] = draft_res.get("body", "")
                 st.success("Draft generated successfully. Review and edit below before manual sending.")
             except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
                 st.error(f"Cannot generate template: {exc}")
@@ -1120,14 +1139,20 @@ def render_follow_up_manager(
         draft_data = st.session_state.get(f"generated_draft_{user_id}_{app.id}")
         if draft_data:
             st.markdown("###### 📝 Generated Draft (Editable)")
+            draft_subj_val = st.session_state.get(
+                f"draft_subj_{user_id}_{app.id}", draft_data.get("subject", "")
+            )
+            draft_body_val = st.session_state.get(
+                f"draft_body_{user_id}_{app.id}", draft_data.get("body", "")
+            )
             st.text_input(
                 "Subject",
-                value=draft_data.get("subject", ""),
+                value=draft_subj_val,
                 key=f"draft_subj_{user_id}_{app.id}",
             )
             st.text_area(
                 "Body",
-                value=draft_data.get("body", ""),
+                value=draft_body_val,
                 height=220,
                 key=f"draft_body_{user_id}_{app.id}",
             )

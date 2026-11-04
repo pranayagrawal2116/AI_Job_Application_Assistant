@@ -1598,5 +1598,347 @@ class TestPhase742FollowUpUIIntegration(BaseTrackerUITest):
         mock_st.success.assert_called_with("Draft generated successfully. Review and edit below before manual sending.")
 
 
+# =============================================================================
+# CATEGORY K: PHASE 7.4.2.1 EXPLICIT DATE INPUT & DRAFT STATE REMEDIATION TESTS
+# =============================================================================
+
+class TestPhase7421DateAndDraftRemediation(BaseTrackerUITest):
+    """Verifies Phase 7.4.2.1 remediations:
+    - Finding A: Optional date widgets default to value=None and do not pass unentered dates.
+    - Finding B: Invalid recommendation dates fail closed without falling back to today's date.
+    - Finding C: Generated draft widgets refresh on template regeneration while preserving candidate edits on unrelated reruns.
+    """
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_interview_date_none_does_not_pass_candidate_context(self, mock_st):
+        """When interview date checkbox is checked but date_input returns None, no date is passed."""
+        app = self._create_app(self.user_a, "Int Co", "Dev", status="INTERVIEW")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"rec_int_chk_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = None
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        with patch.object(self.service, "recommend_application_follow_up", wraps=self.service.recommend_application_follow_up) as spy_rec:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_rec.assert_called_once()
+            call_kwargs = spy_rec.call_args[1]
+            self.assertIsNone(call_kwargs.get("extra_context"))
+
+        # Confirm st.date_input was invoked with value=None
+        date_input_calls = [
+            kwargs for args, kwargs in mock_st.date_input.call_args_list
+            if kwargs.get("key") == f"rec_int_date_{self.user_a}_{app.id}"
+        ]
+        self.assertEqual(len(date_input_calls), 1)
+        self.assertIsNone(date_input_calls[0].get("value"))
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_interview_date_selected_passes_candidate_provided_provenance(self, mock_st):
+        """When candidate actually selects an interview date, it is passed with candidate_provided provenance."""
+        app = self._create_app(self.user_a, "Int Co 2", "Dev", status="INTERVIEW")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"rec_int_chk_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = date(2026, 11, 4)
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        with patch.object(self.service, "recommend_application_follow_up", wraps=self.service.recommend_application_follow_up) as spy_rec:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_rec.assert_called_once()
+            call_kwargs = spy_rec.call_args[1]
+            extra_ctx = call_kwargs.get("extra_context", {})
+            self.assertEqual(extra_ctx.get("interview_date"), "2026-11-04")
+            self.assertEqual(extra_ctx.get("interview_date_source"), "candidate_provided")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_assessment_date_none_does_not_pass_candidate_context(self, mock_st):
+        """When assessment date checkbox is checked but date_input returns None, no date is passed."""
+        app = self._create_app(self.user_a, "Assess Co", "Dev", status="ASSESSMENT")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"rec_assess_chk_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = None
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        with patch.object(self.service, "recommend_application_follow_up", wraps=self.service.recommend_application_follow_up) as spy_rec:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_rec.assert_called_once()
+            call_kwargs = spy_rec.call_args[1]
+            self.assertIsNone(call_kwargs.get("extra_context"))
+
+        # Confirm st.date_input was invoked with value=None
+        date_input_calls = [
+            kwargs for args, kwargs in mock_st.date_input.call_args_list
+            if kwargs.get("key") == f"rec_assess_date_{self.user_a}_{app.id}"
+        ]
+        self.assertEqual(len(date_input_calls), 1)
+        self.assertIsNone(date_input_calls[0].get("value"))
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_assessment_date_selected_passes_assessment_date(self, mock_st):
+        """When candidate selects assessment date, it is passed in extra_context."""
+        app = self._create_app(self.user_a, "Assess Co 2", "Dev", status="ASSESSMENT")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"rec_assess_chk_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = date(2026, 11, 2)
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        with patch.object(self.service, "recommend_application_follow_up", wraps=self.service.recommend_application_follow_up) as spy_rec:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_rec.assert_called_once()
+            call_kwargs = spy_rec.call_args[1]
+            extra_ctx = call_kwargs.get("extra_context", {})
+            self.assertEqual(extra_ctx.get("assessment_date"), "2026-11-02")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_thank_you_template_date_none_produces_neutral_template(self, mock_st):
+        """When thank you note date checkbox is enabled but date is None, template is neutral and source is unavailable."""
+        app = self._create_app(self.user_a, "TY Co", "Dev", status="INTERVIEW")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        session_state_dict: dict[str, Any] = {}
+        mock_st.session_state = session_state_dict
+
+        mock_st.selectbox.side_effect = lambda label, options=None, index=0, key=None: (
+            "THANK_YOU_NOTE" if key == f"tpl_type_{self.user_a}_{app.id}" else (options or [""])[0]
+        )
+        mock_st.text_input.return_value = ""
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"tpl_include_date_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = None
+        mock_st.button.side_effect = lambda label, key=None: key == f"gen_tpl_btn_{self.user_a}_{app.id}"
+
+        with patch.object(self.service, "generate_follow_up_template", wraps=self.service.generate_follow_up_template) as spy_gen:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_gen.assert_called_once()
+            call_kwargs = spy_gen.call_args[1]
+            self.assertIsNone(call_kwargs.get("extra_context"))
+
+        # Verify draft metadata source is unavailable
+        draft = session_state_dict.get(f"generated_draft_{self.user_a}_{app.id}")
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft["context_metadata"].get("interview_date_source"), "unavailable")
+        self.assertNotIn(" on ", draft["body"])
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_thank_you_template_date_selected_passes_candidate_provided_date(self, mock_st):
+        """When candidate selects interview date for thank you note, it is passed with candidate_provided provenance."""
+        app = self._create_app(self.user_a, "TY Co 2", "Dev", status="INTERVIEW")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        session_state_dict: dict[str, Any] = {}
+        mock_st.session_state = session_state_dict
+
+        mock_st.selectbox.side_effect = lambda label, options=None, index=0, key=None: (
+            "THANK_YOU_NOTE" if key == f"tpl_type_{self.user_a}_{app.id}" else (options or [""])[0]
+        )
+        mock_st.text_input.return_value = ""
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"tpl_include_date_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = date(2026, 11, 4)
+        mock_st.button.side_effect = lambda label, key=None: key == f"gen_tpl_btn_{self.user_a}_{app.id}"
+
+        with patch.object(self.service, "generate_follow_up_template", wraps=self.service.generate_follow_up_template) as spy_gen:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_gen.assert_called_once()
+            call_kwargs = spy_gen.call_args[1]
+            extra_ctx = call_kwargs.get("extra_context", {})
+            self.assertEqual(extra_ctx.get("interview_date"), "2026-11-04")
+            self.assertEqual(extra_ctx.get("interview_date_source"), "candidate_provided")
+
+        draft = session_state_dict.get(f"generated_draft_{self.user_a}_{app.id}")
+        self.assertIsNotNone(draft)
+        self.assertEqual(draft["context_metadata"].get("interview_date_source"), "candidate_provided")
+        self.assertIn("2026-11-04", draft["body"])
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_recommendation_valid_date_renders_scheduling_controls(self, mock_st):
+        """A recommendation with a valid YYYY-MM-DD date renders scheduling controls initialized with that date."""
+        app = self._create_app(self.user_a, "Valid Date Co", "Dev", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        mock_rec = {
+            "has_recommendation": True,
+            "recommendation_type": "STATUS_INQUIRY",
+            "recommended_date": "2026-11-13",
+            "rationale": "Follow up after 10 business days.",
+            "default_description": "Check application status",
+        }
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        mock_st.expander.assert_any_call("🗓️ Review & Schedule Proposed Reminder", expanded=False)
+        date_calls = [
+            kwargs for args, kwargs in mock_st.date_input.call_args_list
+            if kwargs.get("key") == f"rec_sched_date_{self.user_a}_{app.id}"
+        ]
+        self.assertEqual(len(date_calls), 1)
+        self.assertEqual(date_calls[0].get("value"), date(2026, 11, 13))
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_recommendation_missing_date_fails_closed(self, mock_st):
+        """When recommendation has has_recommendation=True but recommended_date is missing, it fails closed."""
+        app = self._create_app(self.user_a, "No Date Co", "Dev", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        mock_rec = {
+            "has_recommendation": True,
+            "recommendation_type": "STATUS_INQUIRY",
+            "recommended_date": None,
+            "rationale": "Status inquiry",
+            "default_description": "Check status",
+        }
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        mock_st.warning.assert_any_call("⚠️ Recommendation has no valid proposed date; scheduling is unavailable.")
+        expander_titles = [call[0][0] for call in mock_st.expander.call_args_list]
+        self.assertNotIn("🗓️ Review & Schedule Proposed Reminder", expander_titles)
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_recommendation_malformed_and_impossible_dates_fail_closed(self, mock_st):
+        """Malformed and impossible dates (e.g. 2026-02-30) fail closed without rendering scheduling controls."""
+        app = self._create_app(self.user_a, "Bad Date Co", "Dev", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        for bad_date in ["2026-02-30", "not-a-date", "2026-11", "2026-13-45", "2026-11-15trailing"]:
+            mock_st.reset_mock()
+            mock_rec = {
+                "has_recommendation": True,
+                "recommendation_type": "STATUS_INQUIRY",
+                "recommended_date": bad_date,
+                "rationale": "Test bad date",
+                "default_description": "Desc",
+            }
+            with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec):
+                render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+            mock_st.warning.assert_any_call("⚠️ Recommendation has no valid proposed date; scheduling is unavailable.")
+            expander_titles = [call[0][0] for call in mock_st.expander.call_args_list]
+            self.assertNotIn("🗓️ Review & Schedule Proposed Reminder", expander_titles)
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_scheduling_button_when_date_invalid_does_not_create_reminder(self, mock_st):
+        """Even if button mock returns True for rec_sched_btn, invalid date blocks creation."""
+        app = self._create_app(self.user_a, "Blocked Sched Co", "Dev", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.button.side_effect = lambda label, key=None: key == f"rec_sched_btn_{self.user_a}_{app.id}"
+        mock_st.session_state = {}
+
+        mock_rec = {
+            "has_recommendation": True,
+            "recommendation_type": "STATUS_INQUIRY",
+            "recommended_date": "2026-02-30",
+            "rationale": "Impossible date",
+            "default_description": "Desc",
+        }
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec):
+            with patch.object(self.service, "create_application_follow_up", wraps=self.service.create_application_follow_up) as spy_create:
+                render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+                spy_create.assert_not_called()
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_draft_regeneration_resets_editable_widgets_and_preserves_edits(self, mock_st):
+        """Candidate edits persist on unrelated reruns, but template regeneration refreshes editable subject/body."""
+        app = self._create_app(self.user_a, "Regen Co", "Dev", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        session_state_dict: dict[str, Any] = {}
+        mock_st.session_state = session_state_dict
+
+        # Step 1: Generate STATUS_INQUIRY draft
+        mock_st.selectbox.side_effect = lambda label, options=None, index=0, key=None: (
+            "STATUS_INQUIRY" if key == f"tpl_type_{self.user_a}_{app.id}" else (options or [""])[0]
+        )
+        mock_st.text_input.side_effect = lambda label, value="", placeholder="", key=None: value or ""
+        mock_st.button.side_effect = lambda label, key=None: key == f"gen_tpl_btn_{self.user_a}_{app.id}"
+
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        first_draft = session_state_dict.get(f"generated_draft_{self.user_a}_{app.id}")
+        self.assertIsNotNone(first_draft)
+        self.assertIn("Inquiry Regarding Application", session_state_dict[f"draft_subj_{self.user_a}_{app.id}"])
+        self.assertIn("check in on the status", session_state_dict[f"draft_body_{self.user_a}_{app.id}"])
+
+        # Step 2: Simulate candidate editing subject and body
+        session_state_dict[f"draft_subj_{self.user_a}_{app.id}"] = "Candidate Custom Edited Subject"
+        session_state_dict[f"draft_body_{self.user_a}_{app.id}"] = "Candidate Custom Edited Body"
+
+        # Step 3: Unrelated rerun (button is not pressed)
+        mock_st.button.side_effect = lambda label, key=None: False
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        # Confirm edits persisted across unrelated rerun
+        self.assertEqual(session_state_dict[f"draft_subj_{self.user_a}_{app.id}"], "Candidate Custom Edited Subject")
+        self.assertEqual(session_state_dict[f"draft_body_{self.user_a}_{app.id}"], "Candidate Custom Edited Body")
+
+        # Step 4: Candidate generates THANK_YOU_NOTE draft for same application
+        mock_st.selectbox.side_effect = lambda label, options=None, index=0, key=None: (
+            "THANK_YOU_NOTE" if key == f"tpl_type_{self.user_a}_{app.id}" else (options or [""])[0]
+        )
+        mock_st.button.side_effect = lambda label, key=None: key == f"gen_tpl_btn_{self.user_a}_{app.id}"
+
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        # Step 5: Verify new draft replaced stale candidate edits
+        new_subj = session_state_dict[f"draft_subj_{self.user_a}_{app.id}"]
+        new_body = session_state_dict[f"draft_body_{self.user_a}_{app.id}"]
+        self.assertNotEqual(new_subj, "Candidate Custom Edited Subject")
+        self.assertNotEqual(new_body, "Candidate Custom Edited Body")
+        self.assertIn("Thank You", new_subj)
+        self.assertIn("Thank you for taking the time", new_body)
+
+        # Confirm metadata corresponds to THANK_YOU_NOTE
+        second_draft = session_state_dict.get(f"generated_draft_{self.user_a}_{app.id}")
+        self.assertIsNotNone(second_draft)
+
+        # Step 6: Candidate edits the newly generated draft
+        session_state_dict[f"draft_subj_{self.user_a}_{app.id}"] = "Thank You So Much (Edited)"
+        session_state_dict[f"draft_body_{self.user_a}_{app.id}"] = "Had a great interview (Edited)"
+
+        # Unrelated rerun again
+        mock_st.button.side_effect = lambda label, key=None: False
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        self.assertEqual(session_state_dict[f"draft_subj_{self.user_a}_{app.id}"], "Thank You So Much (Edited)")
+        self.assertEqual(session_state_dict[f"draft_body_{self.user_a}_{app.id}"], "Had a great interview (Edited)")
+
+
 if __name__ == "__main__":
     unittest.main()
