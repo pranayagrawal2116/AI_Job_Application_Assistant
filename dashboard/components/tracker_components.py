@@ -11,13 +11,17 @@ Provides reusable, modular presentation helpers for:
 from __future__ import annotations
 
 import csv
-from datetime import datetime, timezone
+import html
 import io
-from typing import Any, Dict, List, Optional
+import json
+from datetime import UTC, datetime
+from typing import Any
+
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
 from src.database.exceptions import (
+    DatabaseError,
     InvalidStatusTransitionError,
     SecurityAuthorizationError,
     ValidationError,
@@ -31,12 +35,11 @@ from src.database.models import (
 )
 from src.lifecycle.state_machine import ApplicationStateMachine
 
-
 # =============================================================================
 # STATUS BADGES & CANONICAL GROUPINGS
 # =============================================================================
 
-STATUS_COLOR_MAP: Dict[str, str] = {
+STATUS_COLOR_MAP: dict[str, str] = {
     "DRAFT": "#6B7280",              # Gray
     "PREPARING": "#3B82F6",          # Blue
     "READY_FOR_REVIEW": "#8B5CF6",   # Purple
@@ -51,7 +54,7 @@ STATUS_COLOR_MAP: Dict[str, str] = {
     "CLOSED": "#4B5563",             # Dark Gray
 }
 
-KANBAN_COLUMNS: List[Dict[str, Any]] = [
+KANBAN_COLUMNS: list[dict[str, Any]] = [
     {
         "id": "col_prep",
         "title": "1. Preparation",
@@ -89,19 +92,45 @@ def format_status_badge(status_str: str) -> str:
     """Formats a canonical status with human-readable styling."""
     try:
         norm = ApplicationStateMachine.normalize_status(status_str).value
-    except Exception:
+    except (KeyError, ValueError, AttributeError):
         norm = status_str.upper()
     return f"`{norm}`"
 
 
 # =============================================================================
-# CSV EXPORT HELPER
+# CSV EXPORT HELPER & FORMULA INJECTION SANITIZATION
 # =============================================================================
 
-def build_tracker_csv_export(applications: List[Application]) -> str:
+FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def sanitize_csv_cell(val: Any) -> Any:
+    """Sanitizes text values to prevent spreadsheet formula injection (CSV Injection).
+
+    If a text value begins with '=', '+', '-', '@', tab, or carriage return
+    (or has formula trigger characters after leading whitespace), prefixes it
+    with a single quote (') so spreadsheet processors treat it as a string literal.
+    Preserves numbers, booleans, None, and safe text unaltered.
+    """
+    if val is None:
+        return ""
+    if not isinstance(val, str):
+        return val
+    if not val:
+        return ""
+    if val.startswith(FORMULA_PREFIXES):
+        return "'" + val
+    stripped = val.lstrip()
+    if stripped and stripped.startswith(("=", "+", "-", "@")):
+        return "'" + val
+    return val
+
+
+def build_tracker_csv_export(applications: list[Application]) -> str:
     """Serializes candidate-owned applications into CSV format.
 
     Excludes all tokens, action tickets, secrets, and internal filesystem paths.
+    Sanitizes untrusted text values against formula injection.
     """
     output = io.StringIO()
     writer = csv.writer(output, quoting=csv.QUOTE_MINIMAL)
@@ -127,18 +156,18 @@ def build_tracker_csv_export(applications: List[Application]) -> str:
     for app in applications:
         writer.writerow([
             app.id,
-            app.company_name or "",
-            app.job_title or "",
-            app.status or "",
-            app.target_role or "",
-            app.employment_type or "",
-            app.location or "",
-            app.salary_range or "",
-            app.application_deadline or "",
-            app.date_prepared or "",
-            app.date_submitted or "",
-            app.created_at or "",
-            app.updated_at or "",
+            sanitize_csv_cell(app.company_name),
+            sanitize_csv_cell(app.job_title),
+            sanitize_csv_cell(app.status),
+            sanitize_csv_cell(app.target_role),
+            sanitize_csv_cell(app.employment_type),
+            sanitize_csv_cell(app.location),
+            sanitize_csv_cell(app.salary_range),
+            sanitize_csv_cell(app.application_deadline),
+            sanitize_csv_cell(app.date_prepared),
+            sanitize_csv_cell(app.date_submitted),
+            sanitize_csv_cell(app.created_at),
+            sanitize_csv_cell(app.updated_at),
             bool(app.is_archived),
         ])
 
@@ -155,7 +184,7 @@ def render_tracker_header(user_id: int) -> None:
     st.caption("Monitor and manage your applications from preparation through interviews, offers, and final outcomes.")
 
 
-def render_tracker_metrics_bar(metrics: Dict[str, int]) -> None:
+def render_tracker_metrics_bar(metrics: dict[str, int]) -> None:
     """Renders the authoritative 10 KPI metric cards directly from backend keys."""
     # Row 1: Pipeline Pipeline Stages
     col1, col2, col3, col4, col5 = st.columns(5)
@@ -192,15 +221,15 @@ def render_follow_up_alert_bar(
     service: DashboardService,
     session_id: str,
     user_id: int,
-    pending_follow_ups: List[ApplicationFollowUp],
-    app_map: Dict[int, Application],
+    pending_follow_ups: list[ApplicationFollowUp],
+    app_map: dict[int, Application],
 ) -> None:
     """Renders pending reminders alert bar with quick Mark Complete actions."""
     if not pending_follow_ups:
         st.info("You have no outstanding follow-up reminders.")
         return
 
-    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today_str = datetime.now(UTC).strftime("%Y-%m-%d")
     overdue_count = sum(1 for f in pending_follow_ups if f.follow_up_date < today_str)
     today_count = sum(1 for f in pending_follow_ups if f.follow_up_date == today_str)
 
@@ -240,7 +269,7 @@ def render_follow_up_alert_bar(
                             )
                             st.success("Reminder marked complete.")
                             st.rerun()
-                        except Exception as exc:
+                        except (DatabaseError, KeyError, ValueError) as exc:
                             st.error(f"Error completing reminder: {exc}")
 
 
@@ -250,8 +279,8 @@ def render_follow_up_alert_bar(
 
 def render_tracker_filter_toolbar(
     user_id: int,
-    applications_for_export: List[Application],
-) -> Dict[str, Any]:
+    applications_for_export: list[Application],
+) -> dict[str, Any]:
     """Renders the view switcher, search, category filter, sort, and export controls."""
     col_view, col_search, col_cat, col_emp, col_sort, col_actions = st.columns([2, 3, 2, 2, 2, 2])
 
@@ -286,7 +315,7 @@ def render_tracker_filter_toolbar(
         )
 
     with col_emp:
-        emp_options = ["All Types", "Full-time", "Part-time", "Contract", "Internship", "Remote"]
+        emp_options = ["All Types", "Full-time", "Part-time", "Contract", "Internship", "Temporary"]
         selected_emp = st.selectbox(
             "Employment Type",
             options=emp_options,
@@ -325,7 +354,7 @@ def render_tracker_filter_toolbar(
         )
 
     # Map category to status_in list
-    status_in: Optional[List[str]] = None
+    status_in: list[str] | None = None
     if selected_category == "Preparation":
         status_in = [ApplicationStatus.DRAFT.value, ApplicationStatus.PREPARING.value]
     elif selected_category == "Review & Approval":
@@ -365,7 +394,7 @@ def render_lifecycle_timeline_view(
             application_id=app_id,
             session_id=session_id,
         )
-    except Exception as exc:
+    except (DatabaseError, KeyError, ValueError) as exc:
         st.error(f"Cannot load application timeline: {exc}")
         return
 
@@ -384,7 +413,14 @@ def render_lifecycle_timeline_view(
 
     st.markdown("##### Chronological Audit Event Chain")
     for event in events:
-        payload = event.event_payload or {}
+        payload = {}
+        if getattr(event, "event_payload_json", None):
+            try:
+                payload = json.loads(event.event_payload_json) if isinstance(event.event_payload_json, str) else event.event_payload_json
+            except (json.JSONDecodeError, ValueError, TypeError):
+                payload = {}
+        elif getattr(event, "event_payload", None):
+            payload = event.event_payload or {}
         old_s = payload.get("old_status")
         new_s = payload.get("new_status")
         status_flow = f" (`{old_s}` ➔ `{new_s}`)" if old_s and new_s else ""
@@ -394,13 +430,15 @@ def render_lifecycle_timeline_view(
             st.caption(f"#{event.sequence_no} • `{event.created_at or 'Timestamp N/A'}`")
         with col_desc:
             st.markdown(f"**{event.event_type}**{status_flow}")
+            if event.event_type == "EXTERNAL_APPLICATION_URL_OPENED":
+                st.caption("ℹ️ *Employer portal destination validated; navigation requested, visit not verified*")
             st.caption(f"**Actor:** `{event.actor_type}` ({event.actor_identifier})")
             # Safe payload details
             safe_notes = payload.get("note") or payload.get("notes") or payload.get("reason") or payload.get("reopen_rationale")
             if safe_notes:
                 st.caption(f"📝 *Notes:* {safe_notes}")
             if payload.get("opened_url"):
-                st.caption(f"🌐 *Employer URL Opened:* `{payload['opened_url']}`")
+                st.caption(f"🌐 *Employer portal destination validated; navigation requested, visit not verified:* `{payload['opened_url']}`")
             if payload.get("channel"):
                 st.caption(f"📬 *Submission Channel:* `{payload['channel']}` | *Ref:* `{payload.get('reference') or 'N/A'}`")
 
@@ -421,7 +459,7 @@ def render_prepared_packets_view(
             application_id=app_id,
             session_id=session_id,
         )
-    except Exception as exc:
+    except (DatabaseError, KeyError, ValueError) as exc:
         st.error(f"Cannot load prepared packets: {exc}")
         return
 
@@ -451,7 +489,7 @@ def render_prepared_packets_view(
                     packet_id=pkt_id,
                     session_id=session_id,
                 )
-            except Exception as exc:
+            except (DatabaseError, KeyError, ValueError) as exc:
                 st.error(f"Error reading packet #{pkt_id}: {exc}")
                 continue
 
@@ -575,7 +613,7 @@ def render_prepared_packets_view(
                                 mime=mime_type,
                                 key=f"dl_btn_{user_id}_{pkt_id}_{doc_type}",
                             )
-                        except Exception as exc:
+                        except (DatabaseError, OSError, ValueError) as exc:
                             st.caption(f"{label} unavailable: {exc}")
                     col_idx += 1
 
@@ -601,19 +639,23 @@ def render_external_navigation_action(
         return
 
     st.caption(f"**Configured Destination:** `{app.external_application_url}`")
+    st.caption(
+        "ℹ️ *Note: Validating destination safety and logging navigation preparation records that you requested "
+        "the portal link, but does not prove or verify that you visited, logged into, or submitted via the external employer portal.*"
+    )
     session_url_key = f"validated_url_{user_id}_{app.id}"
 
     col_btn, col_link = st.columns([2, 3])
     with col_btn:
-        if st.button("Prepare Verified Portal Link", key=f"prep_url_btn_{user_id}_{app.id}"):
+        if st.button("Validate and Prepare Employer Link", key=f"prep_url_btn_{user_id}_{app.id}"):
             try:
                 validated_url = service.log_external_application_url_opened(
                     application_id=app.id,
                     session_id=session_id,
                 )
                 st.session_state[session_url_key] = validated_url
-                st.success("Destination URL verified & security audit logged.")
-            except Exception as exc:
+                st.success("Employer portal destination validated & navigation preparation logged. (Note: External portal visit cannot be independently verified.)")
+            except (DatabaseError, ValueError) as exc:
                 st.error(f"Cannot verify destination URL: {exc}")
 
     with col_link:
@@ -636,7 +678,7 @@ def render_manual_submission_section(
     """Renders the strict cryptographic manual submission confirmation workflow for APPROVED applications."""
     try:
         norm_status = ApplicationStateMachine.normalize_status(app.status)
-    except Exception:
+    except (KeyError, ValueError, AttributeError):
         norm_status = None
 
     if norm_status != ApplicationStatus.APPROVED:
@@ -709,7 +751,7 @@ def render_manual_submission_section(
                     submission_ticket=ticket,
                     candidate_confirmed=True,
                     submission_channel=channel,
-                    submission_timestamp=datetime.now(timezone.utc).isoformat(),
+                    submission_timestamp=datetime.now(UTC).isoformat(),
                     confirmation_reference=conf_ref.strip() if conf_ref else None,
                     candidate_notes=notes_input.strip() if notes_input else None,
                 )
@@ -717,7 +759,7 @@ def render_manual_submission_section(
                 st.success("Manual submission successfully confirmed! Application status updated to SUBMITTED.")
                 st.rerun()
 
-            except Exception as exc:
+            except (DatabaseError, ValueError) as exc:
                 st.error(f"Manual submission confirmation failed: {exc}")
 
 
@@ -739,7 +781,7 @@ def render_lifecycle_status_actions(
             current_status=app.status,
             include_gate_protected=False,  # Excludes APPROVED and SUBMITTED
         )
-    except Exception as exc:
+    except (DatabaseError, KeyError, ValueError) as exc:
         st.error(f"Cannot resolve state transitions: {exc}")
         return
 
@@ -750,7 +792,7 @@ def render_lifecycle_status_actions(
     # Check if application is currently in a terminal status
     try:
         is_terminal = ApplicationStateMachine.normalize_status(app.status) in ApplicationStateMachine.TERMINAL_STATUSES
-    except Exception:
+    except (KeyError, ValueError, AttributeError):
         is_terminal = False
 
     col_target, col_notes, col_btn = st.columns([2, 3, 2])
@@ -801,7 +843,7 @@ def render_lifecycle_status_actions(
                 st.rerun()
             except (InvalidStatusTransitionError, SecurityAuthorizationError, ValidationError) as exc:
                 st.error(f"Transition rejected: {exc}")
-            except Exception as exc:
+            except (DatabaseError, ValueError) as exc:
                 st.error(f"Error transitioning status: {exc}")
 
 
@@ -825,7 +867,7 @@ def render_follow_up_manager(
             application_id=app.id,
             include_archived=include_archived,
         )
-    except Exception as exc:
+    except (DatabaseError, KeyError, ValueError) as exc:
         st.error(f"Cannot load reminders: {exc}")
         app_follow_ups = []
 
@@ -853,7 +895,7 @@ def render_follow_up_manager(
                                     )
                                     st.success("Reminder completed.")
                                     st.rerun()
-                                except Exception as exc:
+                                except (DatabaseError, ValueError) as exc:
                                     st.error(f"Error: {exc}")
 
                     with st.popover("Delete", key=f"fup_del_pop_{user_id}_{f.id}"):
@@ -863,10 +905,11 @@ def render_follow_up_manager(
                                 service.delete_application_follow_up(
                                     session_id=session_id,
                                     follow_up_id=f.id,
+                                    outcome_notes=outcome.strip() if outcome else None,
                                 )
                                 st.success("Reminder deleted.")
                                 st.rerun()
-                            except Exception as exc:
+                            except (DatabaseError, ValueError) as exc:
                                 st.error(f"Error deleting: {exc}")
                 st.divider()
     else:
@@ -902,7 +945,7 @@ def render_follow_up_manager(
                     )
                     st.success("Follow-up reminder scheduled successfully.")
                     st.rerun()
-                except Exception as exc:
+                except (DatabaseError, ValueError) as exc:
                     st.error(f"Cannot schedule reminder: {exc}")
 
 
@@ -944,7 +987,7 @@ def render_archive_action(
                     )
                     st.success("Application successfully archived.")
                     st.rerun()
-                except Exception as exc:
+                except (DatabaseError, ValueError) as exc:
                     st.error(f"Error archiving application: {exc}")
 
 
@@ -1057,7 +1100,7 @@ def render_application_card(
 # =============================================================================
 
 def render_kanban_board_view(
-    applications: List[Application],
+    applications: list[Application],
     service: DashboardService,
     session_id: str,
     user_id: int,
@@ -1065,15 +1108,15 @@ def render_kanban_board_view(
 ) -> None:
     """Renders the exact canonical 5-column Kanban board without drag-and-drop state bypass."""
     st.markdown("### 📊 Application Kanban Board")
-    st.caption("Track opportunities across five canonical stages. Transitions require authorized workflow actions.")
+    st.caption(f"Showing all {len(applications)} matching applications across five canonical stages. Transitions require authorized workflow actions.")
 
     # Group applications into the 5 columns
-    col_apps: Dict[str, List[Application]] = {col["id"]: [] for col in KANBAN_COLUMNS}
+    col_apps: dict[str, list[Application]] = {col["id"]: [] for col in KANBAN_COLUMNS}
 
     for app in applications:
         try:
             norm = ApplicationStateMachine.normalize_status(app.status).value
-        except Exception:
+        except (KeyError, ValueError, AttributeError):
             norm = app.status
 
         placed = False
@@ -1103,14 +1146,20 @@ def render_kanban_board_view(
             else:
                 for app in apps_in_col:
                     color = STATUS_COLOR_MAP.get(app.status, "#6B7280")
+                    if not (isinstance(color, str) and color.startswith("#") and len(color) == 7 and all(c in "0123456789ABCDEFabcdef" for c in color[1:])):
+                        color = "#6B7280"
                     border_style = f"border-left: 4px solid {color}; padding: 10px; margin-bottom: 12px; background-color: #FAFAFA; border-radius: 4px;"
+
+                    safe_title = html.escape(str(app.job_title or "Untitled Role"), quote=True)
+                    safe_company = html.escape(str(app.company_name or "Unknown Company"), quote=True)
+                    safe_status = html.escape(str(app.status or "DRAFT"), quote=True)
 
                     st.markdown(
                         f"""
                         <div style="{border_style}">
-                            <strong>{app.job_title}</strong><br>
-                            <span style="color: #4B5563;">{app.company_name}</span><br>
-                            <small>Status: <code>{app.status}</code></small>
+                            <strong>{safe_title}</strong><br>
+                            <span style="color: #4B5563;">{safe_company}</span><br>
+                            <small>Status: <code>{safe_status}</code></small>
                         </div>
                         """,
                         unsafe_allow_html=True,

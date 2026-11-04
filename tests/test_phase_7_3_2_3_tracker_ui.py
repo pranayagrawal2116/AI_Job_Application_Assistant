@@ -16,10 +16,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from pathlib import Path
 import tempfile
-from typing import Any, Dict, List, Optional
 import unittest
+from datetime import UTC
+from pathlib import Path
+from typing import Any
 from unittest.mock import MagicMock, patch
 
 from dashboard.components.tracker_components import (
@@ -39,12 +40,17 @@ from dashboard.components.tracker_components import (
     render_tracker_filter_toolbar,
     render_tracker_header,
     render_tracker_metrics_bar,
+    sanitize_csv_cell,
 )
 from dashboard.services.dashboard_service import DashboardService
 from dashboard.views.application_tracker import render_application_tracker
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
+    ApplicationNotFoundError,
+    CrossUserAccessError,
     SecurityAuthorizationError,
+    UnconfirmedSubmissionError,
+    ValidationError,
 )
 from src.database.models import (
     Application,
@@ -115,14 +121,14 @@ class BaseTrackerUITest(unittest.TestCase):
         title: str,
         status: str = "DRAFT",
         is_archived: int = 0,
-        target_role: Optional[str] = None,
-        employment_type: Optional[str] = None,
-        location: Optional[str] = None,
-        salary_range: Optional[str] = None,
-        application_deadline: Optional[str] = None,
-        external_url: Optional[str] = None,
-        job_description_id: Optional[int] = None,
-        resume_id: Optional[int] = None,
+        target_role: str | None = None,
+        employment_type: str | None = None,
+        location: str | None = None,
+        salary_range: str | None = None,
+        application_deadline: str | None = None,
+        external_url: str | None = None,
+        job_description_id: int | None = None,
+        resume_id: int | None = None,
     ) -> Application:
         """Helper to directly insert and return an application model."""
         with self.db.transaction() as conn:
@@ -153,8 +159,8 @@ class BaseTrackerUITest(unittest.TestCase):
         user_id: int,
         version_num: int = 1,
         is_active: bool = True,
-        attachments_manifest: Optional[List[Dict[str, Any]]] = None,
-        matching_result_id: Optional[int] = None,
+        attachments_manifest: list[dict[str, Any]] | None = None,
+        matching_result_id: int | None = None,
     ) -> PreparedPacket:
         """Helper to insert a prepared packet revision."""
         payload = {
@@ -220,9 +226,9 @@ class TestAuthenticationAndIsolation(BaseTrackerUITest):
     @patch("dashboard.views.application_tracker.st")
     def test_expired_session_blocks_tracker_access(self, mock_st):
         """Expired session triggers SessionExpiredError and blocks access."""
-        from datetime import datetime, timezone, timedelta
+        from datetime import datetime, timedelta
         # Artificially expire session_a
-        self.session_a.expires_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+        self.session_a.expires_at = datetime.now(UTC) - timedelta(minutes=5)
         mock_st.session_state = {"authenticated_session_id": self.session_a.session_id}
 
         with patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service):
@@ -266,6 +272,51 @@ class TestAuthenticationAndIsolation(BaseTrackerUITest):
         mock_st.session_state = {"authenticated_session_id": self.session_b.session_id}
         with patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service):
             render_application_tracker()
+
+    def test_candidate_a_cannot_access_candidate_b_application_detail(self):
+        """Candidate A cannot retrieve Candidate B's application."""
+        app_b = self._create_app(self.user_b, "Bob Corp", "Engineer")
+        with self.assertRaises((CrossUserAccessError, ApplicationNotFoundError)):
+            self.service.get_candidate_application(app_b.id, session_id=self.session_a.session_id)
+
+    def test_candidate_a_cannot_access_candidate_b_timeline(self):
+        """Candidate A cannot retrieve Candidate B's application timeline."""
+        app_b = self._create_app(self.user_b, "Bob Corp", "Engineer")
+        with self.assertRaises((CrossUserAccessError, ApplicationNotFoundError)):
+            self.service.get_application_timeline(app_b.id, session_id=self.session_a.session_id)
+
+    def test_candidate_a_cannot_access_candidate_b_packet_documents(self):
+        """Candidate A cannot download Candidate B's packet documents."""
+        app_b = self._create_app(self.user_b, "Bob Corp", "Engineer")
+        pkt_b = self._create_packet(app_b.id, self.user_b, version_num=1)
+        with self.assertRaises((CrossUserAccessError, ApplicationNotFoundError)):
+            self.service.get_candidate_packet_document(
+                application_id=app_b.id,
+                packet_id=pkt_b.id,
+                document_type="tailored_resume",
+                session_id=self.session_a.session_id,
+            )
+
+    def test_candidate_a_cannot_access_or_modify_candidate_b_follow_ups(self):
+        """Candidate A cannot list or complete Candidate B's follow-up reminders."""
+        app_b = self._create_app(self.user_b, "Bob Corp", "Engineer")
+        fup_b = self.service.create_application_follow_up(
+            session_id=self.session_b.session_id,
+            application_id=app_b.id,
+            follow_up_date="2026-11-10",
+            follow_up_type="PORTFOLIO_UPDATE",
+            description="Prepare system design",
+        )
+        # Candidate A listing follow-ups does not see Bob's reminder
+        fups_a = self.service.list_application_follow_ups(session_id=self.session_a.session_id)
+        self.assertNotIn(fup_b.id, [f.id for f in fups_a])
+
+        # Candidate A attempting to complete Bob's reminder is blocked
+        with self.assertRaises((CrossUserAccessError, ApplicationNotFoundError)):
+            self.service.complete_application_follow_up(
+                session_id=self.session_a.session_id,
+                follow_up_id=fup_b.id,
+            )
 
 
 # =============================================================================
@@ -386,14 +437,46 @@ class TestListViewAndFiltering(BaseTrackerUITest):
         self.assertEqual(len(prep_apps), 1)
         self.assertEqual(prep_apps[0].company_name, "C1")
 
-    def test_employment_type_filtering(self):
-        """Filtering by employment_type returns only matching applications."""
-        self._create_app(self.user_a, "C1", "R1", employment_type="Full-time")
-        self._create_app(self.user_a, "C2", "R2", employment_type="Internship")
+    def test_employment_type_filtering_all_parser_types(self):
+        """Filtering by employment_type against all parser output types returns exact matches."""
+        parser_emp_types = ["Full-time", "Part-time", "Contract", "Internship", "Temporary"]
+        for emp_type in parser_emp_types:
+            self._create_app(self.user_a, f"Company {emp_type}", f"Role {emp_type}", employment_type=emp_type)
 
-        full_time = self.service.list_candidate_applications(self.session_a.session_id, employment_type="Full-time")
-        self.assertEqual(len(full_time), 1)
-        self.assertEqual(full_time[0].company_name, "C1")
+        for emp_type in parser_emp_types:
+            results = self.service.list_candidate_applications(
+                self.session_a.session_id,
+                employment_type=emp_type,
+            )
+            self.assertEqual(len(results), 1, f"Expected 1 match for {emp_type}")
+            self.assertEqual(results[0].employment_type, emp_type)
+            self.assertEqual(results[0].company_name, f"Company {emp_type}")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_toolbar_employment_type_options_excludes_work_arrangement_and_includes_temporary(self, mock_st):
+        """Toolbar employment type dropdown represents parser types without work arrangements."""
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.radio.return_value = "List View"
+        mock_st.text_input.return_value = ""
+        mock_st.selectbox.side_effect = ["All Statuses", "All Types", "Last Updated (Newest)"]
+        mock_st.checkbox.return_value = False
+        mock_st.download_button.return_value = False
+
+        render_tracker_filter_toolbar(self.user_a, [])
+
+        # Find selectbox call for Employment Type
+        emp_call = None
+        for call_args in mock_st.selectbox.call_args_list:
+            if call_args[0] and call_args[0][0] == "Employment Type":
+                emp_call = call_args
+                break
+        self.assertIsNotNone(emp_call, "Employment Type selectbox must be called")
+        options = emp_call[1].get("options", [])
+        self.assertEqual(options, ["All Types", "Full-time", "Part-time", "Contract", "Internship", "Temporary"])
+        self.assertNotIn("Remote", options)
+        self.assertNotIn("Hybrid", options)
+        self.assertNotIn("On-site", options)
+        self.assertIn("Temporary", options)
 
     def test_supported_sort_orders(self):
         """All whitelisted sort options execute cleanly."""
@@ -495,6 +578,67 @@ class TestKanbanBoard(BaseTrackerUITest):
                 session_id=self.session_a.session_id,
                 new_status="APPROVED",
             )
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_kanban_escapes_malicious_company_title_status(self, mock_st):
+        """Dynamic candidate and job content is properly escaped in Kanban card HTML."""
+        malicious_app = self._create_app(
+            self.user_a,
+            '<img src=x onerror=alert("xss")>',
+            '<script>alert("pwn")</script>',
+            status="DRAFT",
+        )
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.tabs.return_value = [MagicMock(), MagicMock(), MagicMock()]
+
+        render_kanban_board_view([malicious_app], self.service, self.session_a.session_id, self.user_a, False)
+
+        # Inspect all calls to st.markdown with unsafe_allow_html=True
+        html_rendered = []
+        for call_args in mock_st.markdown.call_args_list:
+            if call_args[1].get("unsafe_allow_html"):
+                html_rendered.append(call_args[0][0])
+
+        combined_html = "\n".join(html_rendered)
+        # Verify that unescaped tags are not present
+        self.assertNotIn('<script>alert("pwn")</script>', combined_html)
+        self.assertNotIn('<img src=x onerror=alert("xss")>', combined_html)
+
+        # Verify that escaped entities are present
+        self.assertIn('&lt;script&gt;alert(&quot;pwn&quot;)&lt;/script&gt;', combined_html)
+        self.assertIn('&lt;img src=x onerror=alert(&quot;xss&quot;)&gt;', combined_html)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_kanban_loads_all_applications_without_silent_truncation(self, mock_st):
+        """Kanban board view queries with limit=None so >200 applications are not silently omitted."""
+        # Create 205 applications
+        for i in range(205):
+            self._create_app(self.user_a, f"Company {i:03d}", f"Role {i:03d}")
+
+        mock_st.session_state = {"authenticated_session_id": self.session_a.session_id}
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.tabs.return_value = [MagicMock(), MagicMock(), MagicMock()]
+
+        toolbar_ret = {
+            "view_mode": "Kanban Board",
+            "search_term": None,
+            "status_in": None,
+            "employment_type": None,
+            "sort_by": "updated_at_desc",
+            "include_archived": False,
+        }
+
+        with (
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_tracker_filter_toolbar", return_value=toolbar_ret),
+            patch("dashboard.views.application_tracker.render_kanban_board_view") as mock_kanban_render,
+        ):
+            render_application_tracker()
+            mock_kanban_render.assert_called_once()
+            apps_passed = mock_kanban_render.call_args[0][0]
+            self.assertEqual(len(apps_passed), 205, "All 205 applications must be passed to Kanban board without truncation")
 
 
 # =============================================================================
@@ -643,6 +787,62 @@ class TestTimelineAndPacketReview(BaseTrackerUITest):
         self.assertNotIn("file_path", manifest_out[0])
         self.assertNotIn("/var/server", json.dumps(detail))
 
+    @patch("dashboard.components.tracker_components.st")
+    def test_honest_navigation_audit_language_and_status_preservation(self, mock_st):
+        """Timeline rendering uses truthful language and never claims navigation is a confirmed visit."""
+        app = self._create_app(
+            self.user_a,
+            "Nav Co",
+            "Software Engineer",
+            status="PREPARING",
+            external_url="https://example.com/apply/123",
+        )
+        # Call log_external_application_url_opened
+        validated_url = self.service.log_external_application_url_opened(
+            application_id=app.id,
+            session_id=self.session_a.session_id,
+        )
+        self.assertEqual(validated_url, "https://example.com/apply/123")
+
+        # Verify status is strictly preserved
+        app_db = self.db.get_user_application(app.id, self.user_a)
+        self.assertEqual(app_db.status, "PREPARING")
+
+        # Render timeline view
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        render_lifecycle_timeline_view(self.service, self.session_a.session_id, app.id, self.user_a)
+
+        # Inspect caption calls for honest wording
+        captions_rendered = [call[0][0] for call in mock_st.caption.call_args_list if call[0]]
+        combined_captions = " ".join(captions_rendered)
+
+        self.assertIn("Employer portal destination validated; navigation requested, visit not verified", combined_captions)
+        self.assertNotIn("Employer URL Opened:", combined_captions)
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_render_external_navigation_action_honest_language(self, mock_st):
+        """External navigation action displays truthful preparation language."""
+        app = self._create_app(
+            self.user_a,
+            "Nav Co 2",
+            "Data Engineer",
+            external_url="https://example.com/jobs/456",
+        )
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.button.return_value = False
+
+        render_external_navigation_action(self.service, self.session_a.session_id, app, self.user_a)
+
+        # Check button label
+        btn_args = [call[0][0] for call in mock_st.button.call_args_list if call[0]]
+        self.assertIn("Validate and Prepare Employer Link", btn_args)
+        self.assertNotIn("Prepare Verified Portal Link", btn_args)
+
+        # Check honest advisory caption
+        captions_rendered = [call[0][0] for call in mock_st.caption.call_args_list if call[0]]
+        combined_captions = " ".join(captions_rendered)
+        self.assertIn("does not prove or verify that you visited, logged into, or submitted", combined_captions)
+
 
 # =============================================================================
 # CATEGORY F: ANTI-AUTOMATION MANUAL SUBMISSION CONFIRMATION TESTS
@@ -693,7 +893,7 @@ class TestManualSubmissionConfirmation(BaseTrackerUITest):
             application_id=self.app.id,
             packet_hash=self.packet.packet_version_hash,
         )
-        with self.assertRaises(Exception):
+        with self.assertRaises(UnconfirmedSubmissionError):
             self.service.record_candidate_manual_submission(
                 application_id=self.app.id,
                 session_id=self.session_a.session_id,
@@ -722,6 +922,53 @@ class TestManualSubmissionConfirmation(BaseTrackerUITest):
         # Check DB status
         app_db = self.db.get_user_application(self.app.id, self.user_a)
         self.assertEqual(app_db.status, "SUBMITTED")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_ui_manual_submission_positive_path(self, mock_st):
+        """UI manual submission positive path issues ticket and transitions to SUBMITTED."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = "REF-2026-XYZ"
+        mock_st.text_area.return_value = "Applied directly on career site."
+        mock_st.button.return_value = True
+
+        render_manual_submission_section(self.service, self.session_a.session_id, self.app, self.user_a)
+
+        # Verify DB status transitioned to SUBMITTED
+        app_db = self.db.get_user_application(self.app.id, self.user_a)
+        self.assertEqual(app_db.status, "SUBMITTED")
+        mock_st.success.assert_called()
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_ui_manual_submission_negative_unchecked_confirmation(self, mock_st):
+        """UI manual submission without explicit confirmation checkbox raises error and blocks transition."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = False  # Unchecked
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = ""
+        mock_st.text_area.return_value = ""
+        mock_st.button.return_value = True
+
+        render_manual_submission_section(self.service, self.session_a.session_id, self.app, self.user_a)
+
+        # Status must remain APPROVED
+        app_db = self.db.get_user_application(self.app.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
+        mock_st.error.assert_called_with("You must explicitly check the confirmation checkbox to authorize manual submission.")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_ui_manual_submission_negative_non_approved_statuses(self, mock_st):
+        """Non-APPROVED applications do not render manual submission confirmation UI."""
+        non_approved_statuses = ["DRAFT", "PREPARING", "READY_FOR_REVIEW", "SUBMITTED", "IN_PROGRESS", "REJECTED", "WITHDRAWN", "CLOSED"]
+        for stat in non_approved_statuses:
+            mock_st.reset_mock()
+            mock_app = self._create_app(self.user_a, f"Co {stat}", "Role", status=stat)
+            render_manual_submission_section(self.service, self.session_a.session_id, mock_app, self.user_a)
+            mock_st.checkbox.assert_not_called()
+            mock_st.button.assert_not_called()
 
 
 # =============================================================================
@@ -762,7 +1009,7 @@ class TestStatusTransitions(BaseTrackerUITest):
         app = self._create_app(self.user_a, "Concluded Co", "Dev", status="REJECTED")
 
         # Missing rationale fails
-        with self.assertRaises(Exception):
+        with self.assertRaises(ValidationError):
             self.service.transition_application_status(
                 application_id=app.id,
                 session_id=self.session_a.session_id,
@@ -870,6 +1117,57 @@ class TestFollowUpAndArchive(BaseTrackerUITest):
         self.assertNotIn("session_id", csv_str)
         self.assertNotIn("token", csv_str)
         self.assertNotIn("file_path", csv_str)
+
+    def test_sanitize_csv_cell_formula_injection_protection(self):
+        """sanitize_csv_cell prefixes formula trigger characters with single quote."""
+        # Equal sign
+        self.assertEqual(sanitize_csv_cell("=1+1"), "'=1+1")
+        self.assertEqual(sanitize_csv_cell("=cmd|' /C calc'!A0"), "'=cmd|' /C calc'!A0")
+        # Plus sign
+        self.assertEqual(sanitize_csv_cell("+1+1"), "'+1+1")
+        # Minus sign
+        self.assertEqual(sanitize_csv_cell("-2+3"), "'-2+3")
+        # At sign
+        self.assertEqual(sanitize_csv_cell("@SUM(A1:A5)"), "'@SUM(A1:A5)")
+        # Tab and carriage return
+        self.assertEqual(sanitize_csv_cell("\t=cmd"), "'\t=cmd")
+        self.assertEqual(sanitize_csv_cell("\r+2+2"), "'\r+2+2")
+        # Leading whitespace before trigger
+        self.assertEqual(sanitize_csv_cell("   =alert()"), "'   =alert()")
+        # Safe text values unaltered
+        self.assertEqual(sanitize_csv_cell("Google LLC"), "Google LLC")
+        self.assertEqual(sanitize_csv_cell("Software Engineer"), "Software Engineer")
+        self.assertEqual(sanitize_csv_cell("San Francisco, CA"), "San Francisco, CA")
+        self.assertEqual(sanitize_csv_cell("2026-11-04"), "2026-11-04")
+        # Numeric, boolean, None values unaltered
+        self.assertEqual(sanitize_csv_cell(123), 123)
+        self.assertEqual(sanitize_csv_cell(0), 0)
+        self.assertEqual(sanitize_csv_cell(True), True)
+        self.assertEqual(sanitize_csv_cell(None), "")
+        self.assertEqual(sanitize_csv_cell(""), "")
+
+    def test_csv_export_sanitizes_formula_injection_and_protects_secrets(self):
+        """CSV export neutralizes formula injection across candidate/job fields while preserving secrets isolation."""
+        app = self._create_app(
+            self.user_a,
+            "=cmd|' /C calc'!A0",
+            "+1+1",
+            status="SUBMITTED",
+            target_role="@EXPLOIT",
+            location="-Remote",
+            salary_range="\t$150,000",
+        )
+        csv_str = build_tracker_csv_export([app])
+        # Formula injection characters must be sanitized with quote
+        self.assertIn("'=cmd", csv_str)
+        self.assertIn("'+1+1", csv_str)
+        self.assertIn("'-Remote", csv_str)
+        self.assertIn("'@EXPLOIT", csv_str)
+        self.assertIn("'\t$150,000", csv_str)
+        # Verify internal secrets and filesystem storage paths are excluded
+        self.assertNotIn("session_id", csv_str)
+        self.assertNotIn("token", csv_str)
+        self.assertNotIn("storage", csv_str)
 
 
 # =============================================================================

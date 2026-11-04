@@ -211,7 +211,7 @@ def render_application_tracker() -> None:
                 session_id=session_id,
                 search_term=search_term,
                 sort_by=sort_by,
-                limit=200,
+                limit=None,
                 offset=0,
                 include_archived=include_archived,
                 status_in=status_in,

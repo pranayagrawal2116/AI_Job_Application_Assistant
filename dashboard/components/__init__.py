@@ -11,6 +11,7 @@ from dashboard.components.tracker_components import (
     render_tracker_filter_toolbar,
     render_tracker_header,
     render_tracker_metrics_bar,
+    sanitize_csv_cell,
 )
 
 __all__ = [
@@ -24,5 +25,6 @@ __all__ = [
     "render_tracker_filter_toolbar",
     "render_tracker_header",
     "render_tracker_metrics_bar",
+    "sanitize_csv_cell",
 ]
 
