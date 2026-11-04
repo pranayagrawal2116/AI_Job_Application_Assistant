@@ -1,6 +1,7 @@
 """Dashboard Service: Data access, business logic, and database operations for the Streamlit UI."""
 
 from datetime import datetime
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -13,6 +14,7 @@ from src.database.exceptions import (
     DatabaseError,
     DuplicateResumeError,
     FileSecurityError,
+    InvalidFileFormatError,
     InvalidStatusError,
     InvalidStatusTransitionError,
     ResumeInUseError,
@@ -46,12 +48,17 @@ class DashboardService:
         self,
         db_manager: Optional[DatabaseManager] = None,
         url_resolver: Optional[Callable[[str, int], List[str]]] = None,
+        storage_base_dir: Optional[Union[str, Path]] = None,
     ):
         self.logger = logger
         self.db = db_manager or DatabaseManager()
         self.matcher = JobMatcher(db_manager=self.db)
         self.coordinator = SearchCoordinator(db_manager=self.db, job_matcher=self.matcher)
         self.url_resolver = url_resolver
+        from src.security.file_security import DEFAULT_USER_STORAGE_BASE
+        self.storage_base_dir = (
+            Path(storage_base_dir).resolve() if storage_base_dir else DEFAULT_USER_STORAGE_BASE.resolve()
+        )
 
     def _resolve_url(self, hostname: str, port: int) -> List[str]:
         """Resolves hostname via injected url_resolver or socket.getaddrinfo with test domain mapping."""
@@ -74,9 +81,13 @@ class DashboardService:
             raise UnsafeURLError(f"Unable to resolve domain '{hostname}': {e}")
 
     @classmethod
-    def get_instance(cls, db_manager: Optional[DatabaseManager] = None) -> "DashboardService":
+    def get_instance(
+        cls,
+        db_manager: Optional[DatabaseManager] = None,
+        storage_base_dir: Optional[Union[str, Path]] = None,
+    ) -> "DashboardService":
         if cls._instance is None:
-            cls._instance = cls(db_manager=db_manager)
+            cls._instance = cls(db_manager=db_manager, storage_base_dir=storage_base_dir)
         return cls._instance
 
     # -------------------------------------------------------------------------
@@ -1137,7 +1148,6 @@ class DashboardService:
         client_user_id: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Retrieves the event timeline and cryptographic chain verification for an application."""
-        from src.database.exceptions import ApplicationNotFoundError
         user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
         app = self.db.get_user_application(application_id=application_id, user_id=user_id)
         if not app:
@@ -1145,13 +1155,490 @@ class DashboardService:
 
         events = self.db.get_application_events(application_id=application_id, user_id=user_id)
         chain_valid, msg = self.db.verify_application_event_chain(application_id=application_id, user_id=user_id)
+        if chain_valid:
+            if events:
+                ver_msg = f"Audit hash-chain consistency verified ({len(events)} events cryptographically linked)"
+            else:
+                ver_msg = "Audit hash-chain consistency verified (No events found for this application)"
+        else:
+            ver_msg = f"Audit hash-chain inconsistency detected: {msg}"
+
         return {
             "application_id": application_id,
             "user_id": user_id,
             "events": events,
             "chain_valid": chain_valid,
-            "verification_message": msg,
+            "verification_message": ver_msg,
         }
+
+    def list_candidate_prepared_packets(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Lists historical revisions of prepared packets for an application owned by the authenticated candidate.
+
+        Enforces:
+        - Authenticated candidate session resolution.
+        - Candidate application ownership verification.
+        - Retrieval of all packet revisions (active, historical inactive, legacy).
+        - Exact approval provenance verification matching packet_id and packet_version_hash.
+        - Stable ordering: latest revision first (version_num descending).
+        - Strictly non-mutating.
+        """
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        packets = self.db.list_prepared_packets(application_id=application_id, user_id=user_id)
+        if not packets:
+            return []
+
+        # Sort stable reverse chronological by version_num descending
+        packets = sorted(packets, key=lambda p: (p.version_num or 0), reverse=True)
+
+        result: List[Dict[str, Any]] = []
+        for packet in packets:
+            # Check exact approval provenance
+            approval = self.db.get_packet_approval(packet_id=packet.id, user_id=user_id)
+            is_approved = False
+            approval_id = None
+            approved_at = None
+            approver_name = None
+            is_consumed = False
+            consumed_at = None
+
+            if (
+                approval is not None
+                and approval.packet_version_hash == packet.packet_version_hash
+                and approval.application_id == application_id
+            ):
+                is_approved = True
+                approval_id = approval.id
+                approved_at = approval.approved_at
+                approver_name = approval.approver_name
+                is_consumed = bool(approval.is_consumed)
+                consumed_at = approval.consumed_at
+
+            result.append({
+                "packet_id": packet.id,
+                "application_id": packet.application_id,
+                "version_num": packet.version_num,
+                "packet_version_hash": packet.packet_version_hash,
+                "created_at": packet.created_at,
+                "is_active_revision": bool(packet.is_active_revision),
+                "is_legacy": packet.is_legacy,
+                "is_approved": is_approved,
+                "approval_id": approval_id,
+                "approved_at": approved_at,
+                "approver_name": approver_name,
+                "is_consumed": is_consumed,
+                "consumed_at": consumed_at,
+                "matching_result_id": packet.matching_result_id,
+                "original_resume_id": packet.original_resume_id,
+                "job_description_id": packet.job_description_id,
+                "candidate_profile_version": packet.candidate_profile_version,
+                "template_id": packet.template_id,
+            })
+
+        return result
+
+    def get_candidate_prepared_packet(
+        self,
+        application_id: int,
+        packet_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Retrieves exact contents, metadata, and read-only integrity status for a prepared packet revision.
+
+        Enforces:
+        - Authenticated candidate session resolution.
+        - Application ownership verification.
+        - Packet ownership verification (CrossUserAccessError on mismatch).
+        - Cross-application protection (packet.application_id == application_id).
+        - Read-only historical integrity check against canonical snapshot hash.
+        - Exact approval provenance matching packet_id, hash, and application.
+        - Strictly non-mutating (does not alter packet active status, approvals, or application state).
+        """
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        packet = self.db.get_prepared_packet(packet_id=packet_id, user_id=user_id)
+        if not packet:
+            raise ApplicationNotFoundError(f"Prepared packet #{packet_id} not found.")
+
+        if packet.application_id != application_id:
+            raise SecurityAuthorizationError(
+                f"Security violation: Packet #{packet_id} belongs to Application #{packet.application_id}, "
+                f"not requested Application #{application_id}."
+            )
+
+        # Historical read-only integrity evaluation
+        integrity_valid = False
+        verification_message = ""
+        snapshot_payload: Optional[Dict[str, Any]] = None
+
+        if packet.is_legacy or not packet.canonical_snapshot_json:
+            integrity_valid = False
+            verification_message = "Legacy packet record: canonical snapshot JSON is unavailable for cryptographic verification."
+        else:
+            recomputed_hash = hashlib.sha256(packet.canonical_snapshot_json.encode("utf-8")).hexdigest()
+            if recomputed_hash == packet.packet_version_hash:
+                integrity_valid = True
+                verification_message = "Packet integrity verified."
+                try:
+                    snapshot_payload = json.loads(packet.canonical_snapshot_json)
+                except Exception:
+                    snapshot_payload = None
+            else:
+                integrity_valid = False
+                verification_message = (
+                    f"Integrity check failed: Recomputed hash ({recomputed_hash}) does not match "
+                    f"packet version hash ({packet.packet_version_hash}). Possible tampering detected."
+                )
+
+        # Exact approval provenance
+        approval = self.db.get_packet_approval(packet_id=packet.id, user_id=user_id)
+        approval_info: Dict[str, Any] = {
+            "is_approved": False,
+            "approval_id": None,
+            "approved_at": None,
+            "approver_name": None,
+            "is_consumed": False,
+            "consumed_at": None,
+            "session_id": None,
+        }
+        if (
+            approval is not None
+            and approval.packet_version_hash == packet.packet_version_hash
+            and approval.application_id == application_id
+        ):
+            approval_info = {
+                "is_approved": True,
+                "approval_id": approval.id,
+                "approved_at": approval.approved_at,
+                "approver_name": approval.approver_name,
+                "is_consumed": bool(approval.is_consumed),
+                "consumed_at": approval.consumed_at,
+                "session_id": approval.session_id,
+            }
+
+        # Extract materials from snapshot or attributes
+        tailored_resume_data = {}
+        cover_letter_data = {}
+        screening_questions_data: List[Dict[str, Any]] = []
+        attachments_manifest_list: List[Dict[str, Any]] = []
+
+        if snapshot_payload:
+            tailored_resume_data = snapshot_payload.get("tailored_resume") or {}
+            cover_letter_data = snapshot_payload.get("cover_letter") or {}
+            screening_questions_data = snapshot_payload.get("screening_questions") or []
+            attachments_manifest_list = snapshot_payload.get("attachments_manifest") or []
+        else:
+            # Fallback for legacy records or tampered snapshots
+            if packet.screening_answers_json:
+                try:
+                    parsed_qa = json.loads(packet.screening_answers_json)
+                    if isinstance(parsed_qa, list):
+                        screening_questions_data = parsed_qa
+                except Exception:
+                    pass
+            if packet.attachments_manifest_json:
+                try:
+                    parsed_att = json.loads(packet.attachments_manifest_json)
+                    if isinstance(parsed_att, list):
+                        attachments_manifest_list = parsed_att
+                except Exception:
+                    pass
+
+        # Determine document availability
+        documents_available: Dict[str, bool] = {
+            "tailored_resume_pdf": False,
+            "tailored_resume_docx": False,
+            "cover_letter_pdf": False,
+            "cover_letter_docx": False,
+            "screening_qa_pdf": False,
+            "screening_qa_docx": False,
+            "consolidated_packet_pdf": False,
+            "consolidated_packet_docx": False,
+            "original_resume": False,
+        }
+        for att in attachments_manifest_list:
+            art_type = att.get("artifact_type")
+            if art_type in documents_available:
+                documents_available[art_type] = True
+
+        if packet.tailored_resume_path:
+            if packet.tailored_resume_path.lower().endswith(".pdf"):
+                documents_available["tailored_resume_pdf"] = True
+            elif packet.tailored_resume_path.lower().endswith(".docx"):
+                documents_available["tailored_resume_docx"] = True
+        if packet.cover_letter_path:
+            if packet.cover_letter_path.lower().endswith(".pdf"):
+                documents_available["cover_letter_pdf"] = True
+            elif packet.cover_letter_path.lower().endswith(".docx"):
+                documents_available["cover_letter_docx"] = True
+
+        return {
+            "packet_id": packet.id,
+            "application_id": packet.application_id,
+            "user_id": packet.user_id,
+            "version_num": packet.version_num,
+            "packet_version_hash": packet.packet_version_hash,
+            "created_at": packet.created_at,
+            "is_active_revision": bool(packet.is_active_revision),
+            "is_legacy": packet.is_legacy,
+            "integrity_valid": integrity_valid,
+            "verification_message": verification_message,
+            "approval": approval_info,
+            "metadata": {
+                "matching_result_id": packet.matching_result_id,
+                "original_resume_id": packet.original_resume_id,
+                "original_resume_version_num": packet.original_resume_version_num,
+                "original_resume_hash": packet.original_resume_hash,
+                "job_description_id": packet.job_description_id,
+                "job_description_snapshot_hash": packet.job_description_snapshot_hash,
+                "candidate_profile_version": packet.candidate_profile_version,
+                "candidate_profile_hash": packet.candidate_profile_hash,
+                "template_id": packet.template_id,
+                "template_version": packet.template_version,
+                "matching_engine_version": packet.matching_engine_version,
+                "scoring_profile": packet.scoring_profile,
+                "scoring_configuration_version": packet.scoring_configuration_version,
+            },
+            "tailored_resume": tailored_resume_data,
+            "cover_letter": cover_letter_data,
+            "screening_questions": screening_questions_data,
+            "attachments_manifest": attachments_manifest_list,
+            "documents_available": documents_available,
+        }
+
+    def get_candidate_packet_document(
+        self,
+        application_id: int,
+        packet_id: int,
+        document_type: str,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Tuple[bytes, str, str]:
+        """Retrieves and validates an authoritative compiled packet document (PDF or DOCX).
+
+        Enforces the mandatory 14-step authorization and verification sequence:
+        1. Validate active authenticated candidate session.
+        2. Derive candidate user_id strictly from validated session.
+        3. Retrieve application with candidate ownership enforcement.
+        4. Retrieve packet with candidate ownership enforcement.
+        5. Verify packet belongs to application.
+        6. Verify requested document type is supported.
+        7. Resolve document locator exclusively from server-side metadata.
+        8. Resolve filesystem location safely.
+        9. Verify final path remains within candidate's approved private storage boundary.
+        10. Reject traversal (..), absolute path substitution, and symlink escapes.
+        11. Verify file exists and is a regular file.
+        12. Verify expected SHA-256 hash against authoritative packet metadata.
+        13. Verify actual file format matches expected PDF/DOCX magic bytes.
+        14. Return (file_bytes, safe_filename, mime_type).
+        """
+        from src.security.file_security import FileSecurityValidator
+
+        # 1 & 2. Authenticate session and derive user_id
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        # 3. Retrieve application with ownership check
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        # 4. Retrieve packet with ownership check
+        packet = self.db.get_prepared_packet(packet_id=packet_id, user_id=user_id)
+        if not packet:
+            raise ApplicationNotFoundError(f"Prepared packet #{packet_id} not found.")
+
+        # 5. Verify packet belongs to application
+        if packet.application_id != application_id:
+            raise SecurityAuthorizationError(
+                f"Security violation: Packet #{packet_id} belongs to Application #{packet.application_id}, "
+                f"not requested Application #{application_id}."
+            )
+
+        # 6. Verify requested document type is supported
+        if not document_type or not isinstance(document_type, str):
+            raise ValidationError("Document type must be a non-empty string.")
+
+        norm_type = document_type.strip().lower()
+        supported_types = {
+            "tailored_resume_pdf",
+            "tailored_resume_docx",
+            "cover_letter_pdf",
+            "cover_letter_docx",
+            "screening_qa_pdf",
+            "screening_qa_docx",
+            "consolidated_packet_pdf",
+            "consolidated_packet_docx",
+            "original_resume",
+            # Common short aliases
+            "resume_pdf",
+            "resume_docx",
+            "cover_pdf",
+            "cover_docx",
+            "qa_pdf",
+            "qa_docx",
+            "packet_pdf",
+            "packet_docx",
+            "tailored_resume",
+            "cover_letter",
+            "screening_qa",
+            "packet",
+        }
+        if norm_type not in supported_types:
+            raise ValidationError(
+                f"Unsupported document type: '{document_type}'. "
+                "Only compiled PDF and DOCX packet materials are supported."
+            )
+
+        # Normalize aliases to canonical artifact types
+        canonical_map = {
+            "resume_pdf": "tailored_resume_pdf",
+            "resume_docx": "tailored_resume_docx",
+            "tailored_resume": "tailored_resume_pdf",
+            "cover_pdf": "cover_letter_pdf",
+            "cover_docx": "cover_letter_docx",
+            "cover_letter": "cover_letter_pdf",
+            "qa_pdf": "screening_qa_pdf",
+            "qa_docx": "screening_qa_docx",
+            "screening_qa": "screening_qa_pdf",
+            "packet_pdf": "consolidated_packet_pdf",
+            "packet_docx": "consolidated_packet_docx",
+            "packet": "consolidated_packet_pdf",
+        }
+        target_art_type = canonical_map.get(norm_type, norm_type)
+
+        # 7. Resolve document locator exclusively from server-side metadata
+        raw_path_str: Optional[str] = None
+        expected_hash: Optional[str] = None
+        display_filename: Optional[str] = None
+        expected_format: Optional[str] = None
+
+        manifest_entries: List[Dict[str, Any]] = []
+        if packet.canonical_snapshot_json:
+            try:
+                snap = json.loads(packet.canonical_snapshot_json)
+                manifest_entries = snap.get("attachments_manifest") or []
+            except Exception:
+                pass
+        if not manifest_entries and packet.attachments_manifest_json:
+            try:
+                parsed_m = json.loads(packet.attachments_manifest_json)
+                if isinstance(parsed_m, list):
+                    manifest_entries = parsed_m
+            except Exception:
+                pass
+
+        for entry in manifest_entries:
+            art = entry.get("artifact_type")
+            if art == target_art_type:
+                raw_path_str = entry.get("file_path")
+                expected_hash = entry.get("file_hash") or entry.get("sha256_hash")
+                display_filename = entry.get("filename") or entry.get("stored_filename")
+                expected_format = entry.get("format")
+                break
+
+        # Fallback to direct packet columns if not in manifest
+        if not raw_path_str:
+            if target_art_type in ("tailored_resume_pdf", "tailored_resume_docx"):
+                raw_path_str = packet.tailored_resume_path
+                expected_hash = packet.tailored_resume_hash
+                if raw_path_str:
+                    display_filename = Path(raw_path_str).name
+                    expected_format = "PDF" if raw_path_str.lower().endswith(".pdf") else "DOCX"
+            elif target_art_type in ("cover_letter_pdf", "cover_letter_docx"):
+                raw_path_str = packet.cover_letter_path
+                expected_hash = packet.cover_letter_hash
+                if raw_path_str:
+                    display_filename = Path(raw_path_str).name
+                    expected_format = "PDF" if raw_path_str.lower().endswith(".pdf") else "DOCX"
+
+        if not raw_path_str:
+            raise FileNotFoundError(
+                f"Requested document '{document_type}' is unavailable for Packet #{packet_id}."
+            )
+
+        if not expected_hash:
+            raise SecurityAuthorizationError(
+                f"Document '{document_type}' lacks an authoritative integrity hash in packet metadata. "
+                "Download rejected under strict security policy."
+            )
+
+        # 8. Resolve filesystem location safely and reject traversal
+        if ".." in raw_path_str:
+            raise SecurityAuthorizationError(
+                f"Path traversal detected in document locator: '{raw_path_str}'"
+            )
+        if "\x00" in raw_path_str:
+            raise SecurityAuthorizationError("Invalid character in document path locator.")
+
+        raw_path = Path(raw_path_str)
+        target_path = raw_path.resolve()
+
+        # 9 & 10. Verify containment within candidate's approved private storage boundary
+        candidate_sandbox = (self.storage_base_dir / str(user_id)).resolve()
+        try:
+            target_path.relative_to(candidate_sandbox)
+        except ValueError:
+            raise SecurityAuthorizationError(
+                f"Security violation: Resolved document path '{target_path}' escapes candidate #{user_id} "
+                f"private storage boundary '{candidate_sandbox}'."
+            )
+
+        # 11. Verify file exists and is regular file
+        if not target_path.exists() or not target_path.is_file():
+            raise FileNotFoundError(
+                f"Stored document file not found on disk: '{target_path.name}'"
+            )
+
+        # 12. Verify SHA-256 against authoritative expected hash
+        file_bytes = target_path.read_bytes()
+        actual_hash = hashlib.sha256(file_bytes).hexdigest()
+        if actual_hash.lower() != expected_hash.lower():
+            raise SecurityAuthorizationError(
+                f"Document integrity verification failed: expected hash '{expected_hash}', "
+                f"got '{actual_hash}'. File on disk does not match immutable packet manifest."
+            )
+
+        # 13. Verify file format and magic bytes
+        file_ext = target_path.suffix.lower()
+        if expected_format:
+            fmt_upper = expected_format.upper()
+        else:
+            fmt_upper = "PDF" if file_ext == ".pdf" else "DOCX"
+
+        if fmt_upper == "PDF" or file_ext == ".pdf":
+            if not file_bytes.startswith(b"%PDF-"):
+                raise InvalidFileFormatError(
+                    f"File format validation failed for '{target_path.name}': missing valid PDF magic bytes."
+                )
+            mime_type = "application/pdf"
+        elif fmt_upper == "DOCX" or file_ext == ".docx":
+            if not file_bytes.startswith(b"PK\x03\x04"):
+                raise InvalidFileFormatError(
+                    f"File format validation failed for '{target_path.name}': missing valid DOCX magic bytes."
+                )
+            mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        else:
+            raise InvalidFileFormatError(
+                f"Unsupported document format '{fmt_upper}' for '{target_path.name}'. Only PDF and DOCX are allowed."
+            )
+
+        # 14. Return (file_bytes, safe_filename, mime_type)
+        safe_filename = FileSecurityValidator.sanitize_filename(display_filename or target_path.name)
+        return file_bytes, safe_filename, mime_type
 
     def issue_manual_submission_ticket(
         self,
