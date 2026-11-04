@@ -25,8 +25,19 @@ def render_job_description_analyzer():
         "with strict SSRF defense, document safety, zero-hallucination provenance, and immutable snapshot versioning."
     )
 
+    raw_uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
+    if not raw_uid:
+        st.error("🔒 Authentication required. Please sign in to analyze and ingest job descriptions.")
+        st.info("Log in with your candidate credentials to manage your job descriptions.")
+        return
+
+    try:
+        user_id = int(raw_uid)
+    except (ValueError, TypeError):
+        st.error("🔒 Invalid user session. Please sign in again.")
+        return
+
     service = DashboardService.get_instance()
-    user_id = st.session_state.get("user_id", 1)
 
     tab_paste, tab_upload, tab_url, tab_library = st.tabs([
         "📝 Paste Description Text",

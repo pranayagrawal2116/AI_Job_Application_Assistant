@@ -1,0 +1,43 @@
+name: CI & Regression Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint & Test Suite (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.13"]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyflakes ruff pytest
+
+      - name: Run code quality linter (ruff)
+        run: |
+          ruff check --select F821,F822,F823 dashboard/ src/ tests/
+
+      - name: Run comprehensive test suite (pytest)
+        run: |
+          python -m pytest -v

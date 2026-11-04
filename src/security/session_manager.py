@@ -25,8 +25,6 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("SessionManager")
 
-DEFAULT_DEV_SECRET = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-
 
 class KeyRotationManager:
     """Manages HMAC signing keys with support for Graceful (Mode A) and Emergency (Mode B) rotation."""
@@ -173,6 +171,7 @@ class SessionManager:
         self._active_grants: Dict[str, Dict[str, Any]] = {}
         self._consumed_grants: Set[str] = set()
         self._grant_lock = threading.Lock()
+        self._session_lock = threading.RLock()
         self._active_key_id = active_key_id or os.environ.get("ACTION_TICKET_ACTIVE_KEY_ID", "v1")
         self._rotation_keys: Dict[str, bytes] = {}
 
@@ -416,39 +415,42 @@ class SessionManager:
             csrf_token=secrets.token_hex(32),
             is_active=True,
         )
-        self._sessions[session_id] = session
+        with self._session_lock:
+            self._sessions[session_id] = session
         logger.info("Authenticated candidate session created: %s... for %s (User #%s)", session_id[:8], clean_name, str(derived_user_id))
         return session
 
     def regenerate_session_id(self, old_session_id: str) -> CandidateSession:
         """Session fixation protection: issues a new session ID and revokes the old ID."""
-        session = self.validate_session(old_session_id)
-        new_session_id = secrets.token_hex(32)
+        with self._session_lock:
+            session = self.validate_session(old_session_id)
+            new_session_id = secrets.token_hex(32)
 
-        del self._sessions[old_session_id]
-        session.session_id = new_session_id
-        session.touch()
-        self._sessions[new_session_id] = session
-        logger.info("Regenerated session ID for User #%s (%s... -> %s...)", str(session.user_id), old_session_id[:8], new_session_id[:8])
-        return session
+            del self._sessions[old_session_id]
+            session.session_id = new_session_id
+            session.touch()
+            self._sessions[new_session_id] = session
+            logger.info("Regenerated session ID for User #%s (%s... -> %s...)", str(session.user_id), old_session_id[:8], new_session_id[:8])
+            return session
 
     def validate_session(self, session_id: Optional[str]) -> CandidateSession:
         """Validates that a session exists, is active, and is unexpired."""
-        if not session_id or session_id not in self._sessions:
-            raise InvalidSessionError("Missing or invalid candidate session.")
+        with self._session_lock:
+            if not session_id or session_id not in self._sessions:
+                raise InvalidSessionError("Missing or invalid candidate session.")
 
-        session = self._sessions[session_id]
+            session = self._sessions[session_id]
 
-        if session.is_expired:
-            session.is_active = False
-            logger.warning("Candidate session %s... expired.", session_id[:8])
-            raise SessionExpiredError(f"Candidate session {session_id[:8]}... has expired. Re-authentication required.")
+            if session.is_expired:
+                session.is_active = False
+                logger.warning("Candidate session %s... expired.", session_id[:8])
+                raise SessionExpiredError(f"Candidate session {session_id[:8]}... has expired. Re-authentication required.")
 
-        if not session.is_active:
-            raise InvalidSessionError("Candidate session has been revoked or deactivated.")
+            if not session.is_active:
+                raise InvalidSessionError("Candidate session has been revoked or deactivated.")
 
-        session.touch()
-        return session
+            session.touch()
+            return session
 
     def validate_csrf_token(self, session_id: str, csrf_token: Optional[str]) -> bool:
         """Validates CSRF token for state-changing operations."""
@@ -466,29 +468,30 @@ class SessionManager:
         ttl_seconds: int = 900,
     ) -> str:
         """Issues a single-use cryptographically signed action ticket bound to active key_id."""
-        session = self.validate_session(session_id)
+        with self._session_lock:
+            session = self.validate_session(session_id)
 
-        if not action_type or not packet_hash:
-            raise ValueError("action_type and packet_hash are mandatory for ticket issuance.")
+            if not action_type or not packet_hash:
+                raise ValueError("action_type and packet_hash are mandatory for ticket issuance.")
 
-        nonce = secrets.token_hex(16)
-        timestamp = int(time.time())
-        key_id, signing_key = self.key_rotation_mgr.get_signing_key()
+            nonce = secrets.token_hex(16)
+            timestamp = int(time.time())
+            key_id, signing_key = self.key_rotation_mgr.get_signing_key()
 
-        message = f"{session.session_id}:{key_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-        signature = hmac.new(signing_key, message.encode("utf-8"), hashlib.sha256).hexdigest()
+            message = f"{session.session_id}:{key_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+            signature = hmac.new(signing_key, message.encode("utf-8"), hashlib.sha256).hexdigest()
 
-        ticket_str = f"TKT-{key_id}-{nonce}.{timestamp}.{signature}"
-        session.issued_tickets[nonce] = {
-            "key_id": key_id,
-            "action_type": action_type,
-            "application_id": application_id,
-            "packet_hash": packet_hash,
-            "timestamp": timestamp,
-            "ttl": ttl_seconds,
-        }
-        logger.info("Issued single-use action ticket for %s (Key %s, App #%d, Nonce %s...)", action_type, key_id, application_id, nonce[:8])
-        return ticket_str
+            ticket_str = f"TKT-{key_id}-{nonce}.{timestamp}.{signature}"
+            session.issued_tickets[nonce] = {
+                "key_id": key_id,
+                "action_type": action_type,
+                "application_id": application_id,
+                "packet_hash": packet_hash,
+                "timestamp": timestamp,
+                "ttl": ttl_seconds,
+            }
+            logger.info("Issued single-use action ticket for %s (Key %s, App #%d, Nonce %s...)", action_type, key_id, application_id, nonce[:8])
+            return ticket_str
 
     @classmethod
     def parse_action_ticket(cls, ticket_str: str) -> Tuple[str, str, int, str]:
@@ -617,108 +620,110 @@ class SessionManager:
             logger.error("Ticket verification rejected: key '%s' has been revoked or expired: %s", key_id, err)
             return False, f"Authorization rejected: Action ticket signed with revoked or retired key '{key_id}'. Key rotation in effect. Fresh candidate authorization required.", None
 
-        if nonce in session.consumed_tickets:
-            logger.warning("Replay attack detected: Ticket nonce %s... already consumed.", nonce[:8])
-            return False, "Authorization rejected: Replay attack detected. Action ticket has already been used.", None
+        with self._session_lock:
+            if nonce in session.consumed_tickets:
+                logger.warning("Replay attack detected: Ticket nonce %s... already consumed.", nonce[:8])
+                return False, "Authorization rejected: Replay attack detected. Action ticket has already been used.", None
 
-        if nonce not in session.issued_tickets:
-            return False, "Authorization rejected: Unrecognized or unissued action ticket.", None
+            if nonce not in session.issued_tickets:
+                return False, "Authorization rejected: Unrecognized or unissued action ticket.", None
 
-        meta = session.issued_tickets[nonce]
+            meta = session.issued_tickets[nonce]
 
-        now = time.time()
-        if now - timestamp > meta["ttl"]:
-            return False, "Authorization rejected: Action ticket has expired.", None
+            now = time.time()
+            if now - timestamp > meta["ttl"]:
+                return False, "Authorization rejected: Action ticket has expired.", None
 
-        if meta.get("action_type") != "HUMAN_APPROVAL":
-            return False, f"Authorization rejected: Ticket scope mismatch. Expected HUMAN_APPROVAL, got {meta.get('action_type')}.", None
-        if meta.get("application_id") != application_id:
-            return False, f"Authorization rejected: Ticket application ID mismatch. Expected {application_id}, got {meta.get('application_id')}.", None
-        if meta.get("packet_hash") != packet_hash:
-            return False, "Authorization rejected: Ticket packet version mismatch. Application packet was modified after ticket issuance.", None
+            if meta.get("action_type") != "HUMAN_APPROVAL":
+                return False, f"Authorization rejected: Ticket scope mismatch. Expected HUMAN_APPROVAL, got {meta.get('action_type')}.", None
+            if meta.get("application_id") != application_id:
+                return False, f"Authorization rejected: Ticket application ID mismatch. Expected {application_id}, got {meta.get('application_id')}.", None
+            if meta.get("packet_hash") != packet_hash:
+                return False, "Authorization rejected: Ticket packet version mismatch. Application packet was modified after ticket issuance.", None
 
-        expected_msg = f"{session.session_id}:{key_id}:HUMAN_APPROVAL:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-        expected_sig = hmac.new(key_secret, expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+            expected_msg = f"{session.session_id}:{key_id}:HUMAN_APPROVAL:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+            expected_sig = hmac.new(key_secret, expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
-        if not hmac.compare_digest(signature, expected_sig):
-            legacy_msg = f"{session.session_id}:HUMAN_APPROVAL:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-            legacy_sig = hmac.new(key_secret, legacy_msg.encode("utf-8"), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(signature, legacy_sig):
-                logger.error("Action ticket signature forgery attempt detected.")
-                return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt).", None
+            if not hmac.compare_digest(signature, expected_sig):
+                legacy_msg = f"{session.session_id}:HUMAN_APPROVAL:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+                legacy_sig = hmac.new(key_secret, legacy_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(signature, legacy_sig):
+                    logger.error("Action ticket signature forgery attempt detected.")
+                    return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt).", None
 
-        # Persistent database nonce consumption if db_manager provided
-        if db_manager is not None and hasattr(db_manager, "consume_action_nonce_persistently"):
-            try:
-                db_manager.consume_action_nonce_persistently(
-                    ticket_nonce=nonce,
-                    key_id=key_id,
-                    user_id=session.user_id or 0,
-                    action_type="HUMAN_APPROVAL",
-                )
-            except TicketAlreadyConsumedError as err:
-                return False, f"Authorization rejected: {err}", None
-            except Exception as e:
-                logger.error("Persistent nonce check failed: %s", e)
-                return False, f"Authorization rejected: Persistent nonce registration failed: {e}", None
+            # Persistent database nonce consumption if db_manager provided
+            if db_manager is not None and hasattr(db_manager, "consume_action_nonce_persistently"):
+                try:
+                    db_manager.consume_action_nonce_persistently(
+                        ticket_nonce=nonce,
+                        key_id=key_id,
+                        user_id=session.user_id or 0,
+                        action_type="HUMAN_APPROVAL",
+                    )
+                except TicketAlreadyConsumedError as err:
+                    return False, f"Authorization rejected: {err}", None
+                except Exception as e:
+                    logger.error("Persistent nonce check failed: %s", e)
+                    return False, f"Authorization rejected: Persistent nonce registration failed: {e}", None
 
-        # Consume ticket in memory
-        del session.issued_tickets[nonce]
-        session.consumed_tickets.add(nonce)
+            # Consume ticket in memory
+            del session.issued_tickets[nonce]
+            session.consumed_tickets.add(nonce)
 
-        grant_id = secrets.token_hex(16)
-        issued_at = int(time.time())
-        expires_at = issued_at + grant_ttl_seconds
-        user_id = session.user_id or 0
+            grant_id = secrets.token_hex(16)
+            issued_at = int(time.time())
+            expires_at = issued_at + grant_ttl_seconds
+            user_id = session.user_id or 0
 
-        grant_sig = self._compute_grant_signature(
-            key_id=key_id,
-            grant_id=grant_id,
-            user_id=user_id,
-            session_id=session.session_id,
-            application_id=application_id,
-            packet_id=packet_id,
-            packet_hash=packet_hash,
-            ticket_nonce=nonce,
-            action_type="HUMAN_APPROVAL",
-            issued_at=issued_at,
-            expires_at=expires_at,
-            approver_name=approver_name,
-        )
+            grant_sig = self._compute_grant_signature(
+                key_id=key_id,
+                grant_id=grant_id,
+                user_id=user_id,
+                session_id=session.session_id,
+                application_id=application_id,
+                packet_id=packet_id,
+                packet_hash=packet_hash,
+                ticket_nonce=nonce,
+                action_type="HUMAN_APPROVAL",
+                issued_at=issued_at,
+                expires_at=expires_at,
+                approver_name=approver_name,
+            )
 
-        from src.database.models import VerifiedApprovalGrant
-        grant = VerifiedApprovalGrant(
-            grant_id=grant_id,
-            user_id=user_id,
-            session_id=session.session_id,
-            application_id=application_id,
-            packet_id=packet_id,
-            packet_version_hash=packet_hash,
-            ticket_nonce=nonce,
-            key_id=key_id,
-            action_type="HUMAN_APPROVAL",
-            issued_at=issued_at,
-            expires_at=expires_at,
-            grant_signature=grant_sig,
-            approver_name=approver_name,
-        )
+            from src.database.models import VerifiedApprovalGrant
+            grant = VerifiedApprovalGrant(
+                grant_id=grant_id,
+                user_id=user_id,
+                session_id=session.session_id,
+                application_id=application_id,
+                packet_id=packet_id,
+                packet_version_hash=packet_hash,
+                ticket_nonce=nonce,
+                key_id=key_id,
+                action_type="HUMAN_APPROVAL",
+                issued_at=issued_at,
+                expires_at=expires_at,
+                grant_signature=grant_sig,
+                approver_name=approver_name,
+            )
 
-        session.active_grants[grant_id] = grant
-        self._active_grants[grant_id] = {
-            "grant": grant,
-            "session_id": session.session_id,
-            "expires_at": expires_at,
-        }
-        session.latest_approval_grant = grant
+            session.active_grants[grant_id] = grant
+            with self._grant_lock:
+                self._active_grants[grant_id] = {
+                    "grant": grant,
+                    "session_id": session.session_id,
+                    "expires_at": expires_at,
+                }
+            session.latest_approval_grant = grant
 
-        logger.info(
-            "Issued VerifiedApprovalGrant #%s for User #%d, App #%d, Packet #%d",
-            grant_id[:8],
-            user_id,
-            application_id,
-            packet_id,
-        )
-        return True, "Approval grant issued successfully.", grant
+            logger.info(
+                "Issued VerifiedApprovalGrant #%s for User #%d, App #%d, Packet #%d",
+                grant_id[:8],
+                user_id,
+                application_id,
+                packet_id,
+            )
+            return True, "Approval grant issued successfully.", grant
 
     def verify_and_consume_approval_grant(
         self,
@@ -858,120 +863,163 @@ class SessionManager:
             logger.error("Ticket verification rejected: key '%s' has been revoked or expired: %s", key_id, err)
             return False, f"Authorization rejected: Action ticket signed with revoked or retired key '{key_id}'. Key rotation in effect. Fresh candidate authorization required."
 
-        # Check for in-memory replay
-        if nonce in session.consumed_tickets:
-            logger.warning("Replay attack detected: Ticket nonce %s... already consumed.", nonce[:8])
-            return False, "Authorization rejected: Replay attack detected. Action ticket has already been used."
+        with self._session_lock:
+            if nonce in session.consumed_tickets:
+                logger.warning("Replay attack detected: Ticket nonce %s... already consumed.", nonce[:8])
+                return False, "Authorization rejected: Replay attack detected. Action ticket has already been used."
 
-        if nonce not in session.issued_tickets:
-            return False, "Authorization rejected: Unrecognized or unissued action ticket."
+            if nonce not in session.issued_tickets:
+                return False, "Authorization rejected: Unrecognized or unissued action ticket."
 
-        meta = session.issued_tickets[nonce]
+            meta = session.issued_tickets[nonce]
 
-        # Check expiry
-        now = time.time()
-        if now - timestamp > meta["ttl"]:
-            return False, "Authorization rejected: Action ticket has expired."
+            # Check expiry
+            now = time.time()
+            if now - timestamp > meta["ttl"]:
+                return False, "Authorization rejected: Action ticket has expired."
 
-        # Verify HMAC cryptographic signature
-        expected_msg = f"{session.session_id}:{key_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-        expected_sig = hmac.new(key_secret, expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+            # Verify HMAC cryptographic signature
+            expected_msg = f"{session.session_id}:{key_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+            expected_sig = hmac.new(key_secret, expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
-        if not hmac.compare_digest(signature, expected_sig):
-            # Check legacy message format without key_id
-            legacy_msg = f"{session.session_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
-            legacy_sig = hmac.new(key_secret, legacy_msg.encode("utf-8"), hashlib.sha256).hexdigest()
-            if not hmac.compare_digest(signature, legacy_sig):
-                logger.error("Action ticket signature forgery attempt detected.")
-                return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt)."
+            if not hmac.compare_digest(signature, expected_sig):
+                # Check legacy message format without key_id
+                legacy_msg = f"{session.session_id}:{action_type}:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+                legacy_sig = hmac.new(key_secret, legacy_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+                if not hmac.compare_digest(signature, legacy_sig):
+                    logger.error("Action ticket signature forgery attempt detected.")
+                    return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt)."
 
-        # Verify exact scope binding
-        if meta["action_type"] != action_type:
-            return False, f"Authorization rejected: Ticket scope mismatch. Expected {action_type}, got {meta['action_type']}."
-        if meta["application_id"] != application_id:
-            return False, f"Authorization rejected: Ticket application ID mismatch. Expected {application_id}, got {meta['application_id']}."
-        if meta["packet_hash"] != packet_hash:
-            return False, "Authorization rejected: Ticket packet version mismatch. Application packet was modified after ticket issuance."
+            # Verify exact scope binding
+            if meta["action_type"] != action_type:
+                return False, f"Authorization rejected: Ticket scope mismatch. Expected {action_type}, got {meta['action_type']}."
+            if meta["application_id"] != application_id:
+                return False, f"Authorization rejected: Ticket application ID mismatch. Expected {application_id}, got {meta['application_id']}."
+            if meta["packet_hash"] != packet_hash:
+                return False, "Authorization rejected: Ticket packet version mismatch. Application packet was modified after ticket issuance."
 
-        # Persistent database nonce consumption if db_manager provided
-        if db_manager is not None and hasattr(db_manager, "consume_action_nonce_persistently"):
-            try:
-                db_manager.consume_action_nonce_persistently(
+            # Persistent database nonce consumption if db_manager provided
+            if db_manager is not None and hasattr(db_manager, "consume_action_nonce_persistently"):
+                try:
+                    db_manager.consume_action_nonce_persistently(
+                        ticket_nonce=nonce,
+                        key_id=key_id,
+                        user_id=session.user_id or 0,
+                        action_type=action_type,
+                    )
+                except TicketAlreadyConsumedError as err:
+                    return False, f"Authorization rejected: {err}"
+                except Exception as e:
+                    logger.error("Persistent nonce check failed: %s", e)
+                    return False, f"Authorization rejected: Persistent nonce registration failed: {e}"
+
+            # Consume ticket in memory
+            del session.issued_tickets[nonce]
+            session.consumed_tickets.add(nonce)
+
+            if action_type == "HUMAN_APPROVAL":
+                grant_id = secrets.token_hex(16)
+                issued_at = int(time.time())
+                expires_at = issued_at + 120
+                user_id = session.user_id or 0
+                grant_sig = self._compute_grant_signature(
+                    key_id=key_id,
+                    grant_id=grant_id,
+                    user_id=user_id,
+                    session_id=session.session_id,
+                    application_id=application_id,
+                    packet_id=0,
+                    packet_hash=packet_hash,
+                    ticket_nonce=nonce,
+                    action_type="HUMAN_APPROVAL",
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                    approver_name="Human Candidate",
+                )
+                from src.database.models import VerifiedApprovalGrant
+                grant = VerifiedApprovalGrant(
+                    grant_id=grant_id,
+                    user_id=user_id,
+                    session_id=session.session_id,
+                    application_id=application_id,
+                    packet_id=0,
+                    packet_version_hash=packet_hash,
                     ticket_nonce=nonce,
                     key_id=key_id,
-                    user_id=session.user_id or 0,
-                    action_type=action_type,
+                    action_type="HUMAN_APPROVAL",
+                    issued_at=issued_at,
+                    expires_at=expires_at,
+                    grant_signature=grant_sig,
+                    approver_name="Human Candidate",
                 )
-            except TicketAlreadyConsumedError as err:
-                return False, f"Authorization rejected: {err}"
-            except Exception as e:
-                logger.error("Persistent nonce check failed: %s", e)
-                return False, f"Authorization rejected: Persistent nonce registration failed: {e}"
+                session.active_grants[grant_id] = grant
+                with self._grant_lock:
+                    self._active_grants[grant_id] = {
+                        "grant": grant,
+                        "session_id": session.session_id,
+                        "expires_at": expires_at,
+                    }
+                session.latest_approval_grant = grant
 
-        # Consume ticket in memory
-        del session.issued_tickets[nonce]
-        session.consumed_tickets.add(nonce)
-
-        if action_type == "HUMAN_APPROVAL":
-            grant_id = secrets.token_hex(16)
-            issued_at = int(time.time())
-            expires_at = issued_at + 120
-            user_id = session.user_id or 0
-            grant_sig = self._compute_grant_signature(
-                key_id=key_id,
-                grant_id=grant_id,
-                user_id=user_id,
-                session_id=session.session_id,
-                application_id=application_id,
-                packet_id=0,
-                packet_hash=packet_hash,
-                ticket_nonce=nonce,
-                action_type="HUMAN_APPROVAL",
-                issued_at=issued_at,
-                expires_at=expires_at,
-                approver_name="Human Candidate",
-            )
-            from src.database.models import VerifiedApprovalGrant
-            grant = VerifiedApprovalGrant(
-                grant_id=grant_id,
-                user_id=user_id,
-                session_id=session.session_id,
-                application_id=application_id,
-                packet_id=0,
-                packet_version_hash=packet_hash,
-                ticket_nonce=nonce,
-                key_id=key_id,
-                action_type="HUMAN_APPROVAL",
-                issued_at=issued_at,
-                expires_at=expires_at,
-                grant_signature=grant_sig,
-                approver_name="Human Candidate",
-            )
-            session.active_grants[grant_id] = grant
-            self._active_grants[grant_id] = {
-                "grant": grant,
-                "session_id": session.session_id,
-                "expires_at": expires_at,
-            }
-            session.latest_approval_grant = grant
-
-        logger.info("Successfully consumed action ticket for %s (Key %s, App #%d, Nonce %s...)", action_type, key_id, application_id, nonce[:8])
-        return True, "Action ticket successfully verified and consumed."
+            logger.info("Successfully consumed action ticket for %s (Key %s, App #%d, Nonce %s...)", action_type, key_id, application_id, nonce[:8])
+            return True, "Action ticket successfully verified and consumed."
 
     def revoke_session(self, session_id: str) -> bool:
-        """Explicitly revokes an active candidate session."""
-        if session_id in self._sessions:
-            self._sessions[session_id].is_active = False
-            logger.info("Revoked candidate session %s...", session_id[:8])
-            return True
-        return False
+        """Explicitly revokes an active candidate session and purges active grants."""
+        with self._session_lock:
+            if session_id in self._sessions:
+                session = self._sessions[session_id]
+                session.is_active = False
+                session.active_grants.clear()
+                with self._grant_lock:
+                    grants_to_purge = [
+                        gid for gid, ginfo in self._active_grants.items()
+                        if ginfo.get("session_id") == session_id
+                    ]
+                    for gid in grants_to_purge:
+                        del self._active_grants[gid]
+                logger.info("Revoked candidate session %s...", session_id[:8])
+                return True
+            return False
 
     def revoke_user_sessions(self, user_id: int) -> int:
-        """Revokes all active sessions belonging to a specific user (e.g. after password reset)."""
-        revoked_count = 0
-        for session in list(self._sessions.values()):
-            if session.user_id == user_id and session.is_active:
-                session.is_active = False
-                revoked_count += 1
-                logger.info("Purged session %s... for User #%d", session.session_id[:8], user_id)
-        return revoked_count
+        """Revokes all active sessions belonging to a specific user and purges their active grants."""
+        with self._session_lock:
+            revoked_count = 0
+            revoked_session_ids = set()
+            for session in list(self._sessions.values()):
+                if session.user_id == user_id and session.is_active:
+                    session.is_active = False
+                    session.active_grants.clear()
+                    revoked_session_ids.add(session.session_id)
+                    revoked_count += 1
+                    logger.info("Purged session %s... for User #%d", session.session_id[:8], user_id)
+            if revoked_session_ids:
+                with self._grant_lock:
+                    grants_to_purge = [
+                        gid for gid, ginfo in self._active_grants.items()
+                        if ginfo.get("session_id") in revoked_session_ids
+                    ]
+                    for gid in grants_to_purge:
+                        del self._active_grants[gid]
+            return revoked_count
+
+    def purge_expired_sessions(self) -> int:
+        """Purges expired candidate sessions and expired active grants from memory."""
+        now = time.time()
+        purged_count = 0
+        with self._session_lock:
+            expired_session_ids = set()
+            for sid, session in list(self._sessions.items()):
+                if session.is_expired or not session.is_active:
+                    expired_session_ids.add(sid)
+                    del self._sessions[sid]
+                    purged_count += 1
+            with self._grant_lock:
+                grants_to_purge = [
+                    gid for gid, ginfo in self._active_grants.items()
+                    if ginfo.get("expires_at", 0) <= now or ginfo.get("session_id") in expired_session_ids
+                ]
+                for gid in grants_to_purge:
+                    del self._active_grants[gid]
+        return purged_count

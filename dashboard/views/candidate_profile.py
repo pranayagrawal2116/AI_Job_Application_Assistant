@@ -12,9 +12,15 @@ from src.preparer.profile_updater import ProfileUpdater
 from src.preparer.resume_parser import ResumeParser, VerificationStatus
 
 
-def get_current_user_id() -> int:
-    """Returns the active user_id from session state or default."""
-    return st.session_state.get("user_id", 1)
+def get_current_user_id() -> int | None:
+    """Returns the authenticated user_id from session state. Fails closed if not authenticated."""
+    uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
+    if uid is not None:
+        try:
+            return int(uid)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
 def render_candidate_profile():
@@ -25,8 +31,13 @@ def render_candidate_profile():
         "and maintain your universal professional profile."
     )
 
-    service = DashboardService.get_instance()
     user_id = get_current_user_id()
+    if not user_id:
+        st.error("🔒 Authentication required. Please sign in to access your Candidate Profile.")
+        st.info("Log in with your candidate credentials to manage your profile and resumes.")
+        return
+
+    service = DashboardService.get_instance()
 
     # Load active profile strictly for the authenticated user from SQLite
     db_record = service.db.get_user_candidate_profile(user_id)

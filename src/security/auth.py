@@ -6,7 +6,7 @@ import hmac
 import os
 import re
 import secrets
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, Optional, Tuple
 
 try:
     from argon2 import PasswordHasher
@@ -20,11 +20,9 @@ from src.database.exceptions import (
     AccountLockedError,
     AuthenticationFailedError,
     DuplicateUserError,
-    RateLimitExceededError,
     SecurityAuthorizationError,
     TokenAlreadyUsedError,
     TokenExpiredError,
-    UserNotFoundError,
     ValidationError,
 )
 from src.database.models import User
@@ -123,7 +121,16 @@ class AuthManager:
         self.db = db_manager or DatabaseManager()
         self.pwd_sec = PasswordSecurity()
         self.email_dispatcher = email_dispatcher
-        self.pepper = os.environ.get("PASSWORD_RESET_PEPPER", DEFAULT_PWD_PEPPER)
+        app_env = os.environ.get("APP_ENV", "development").lower()
+        env_pepper = os.environ.get("PASSWORD_RESET_PEPPER")
+        if env_pepper:
+            self.pepper = env_pepper
+        elif app_env == "production":
+            raise SecurityAuthorizationError(
+                "PASSWORD_RESET_PEPPER must be explicitly configured in production environment."
+            )
+        else:
+            self.pepper = DEFAULT_PWD_PEPPER
         self._reset_attempts: Dict[str, list[float]] = {}  # In-memory rate limiting tracker
 
     @staticmethod

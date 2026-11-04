@@ -220,7 +220,12 @@ class DashboardService:
             self.logger.warning("Invalid application status '%s': %s", new_status, e)
             return False, str(e)
 
-        if target_status in (ApplicationStatus.APPLIED, ApplicationStatus.AWAITING_APPROVAL):
+        if target_status in (
+            ApplicationStatus.APPLIED,
+            ApplicationStatus.AWAITING_APPROVAL,
+            ApplicationStatus.APPROVED,
+            ApplicationStatus.SUBMITTED,
+        ):
             return (
                 False,
                 f"Direct status transition to '{target_status.value}' is prohibited. "
@@ -645,6 +650,13 @@ class DashboardService:
             )
 
         return sess
+
+    def logout_candidate(self, session_id: str) -> bool:
+        """Logs out candidate by explicitly revoking active session and purging active grants."""
+        if not session_id or not isinstance(session_id, str):
+            return False
+        from src.security.session_manager import SessionManager
+        return SessionManager.get_instance().revoke_session(session_id.strip())
 
     def issue_approval_ticket(self, session_id: str, job_id: int, packet_hash: str) -> str:
         """Issues an authenticated single-use ticket for application approval."""
