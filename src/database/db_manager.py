@@ -3028,10 +3028,17 @@ class DatabaseManager:
         sort_by: Optional[str] = None,
         limit: Optional[int] = None,
         offset: int = 0,
+        include_archived: bool = False,
+        status_in: Optional[List[str]] = None,
+        employment_type: Optional[str] = None,
     ) -> List[Application]:
-        """Lists applications belonging to a user, optionally filtered by status and search term, with sorting and pagination."""
+        """Lists applications belonging to a user, with status, archive, employment type, search filtering, sorting and pagination."""
         query = "SELECT * FROM applications WHERE user_id = ?"
         params: List[Any] = [user_id]
+
+        if not include_archived:
+            query += " AND is_archived = 0"
+
         if status:
             from src.lifecycle.state_machine import ApplicationStateMachine
             try:
@@ -3040,26 +3047,64 @@ class DatabaseManager:
                 norm_status = status
             query += " AND status = ?"
             params.append(norm_status)
+        elif status_in:
+            from src.lifecycle.state_machine import ApplicationStateMachine
+            norm_statuses = []
+            for s in status_in:
+                if not s or not isinstance(s, str):
+                    continue
+                try:
+                    norm_statuses.append(ApplicationStateMachine.normalize_status(s).value)
+                except Exception:
+                    norm_statuses.append(s.strip())
+            if norm_statuses:
+                placeholders = ", ".join(["?"] * len(norm_statuses))
+                query += f" AND status IN ({placeholders})"
+                params.extend(norm_statuses)
+
+        if employment_type and employment_type.strip():
+            query += " AND employment_type = ?"
+            params.append(employment_type.strip())
+
         if search_term and search_term.strip():
             term = f"%{search_term.strip()}%"
             query += " AND (company_name LIKE ? OR job_title LIKE ? OR notes LIKE ?)"
             params.extend([term, term, term])
 
-        # Sorting
-        if sort_by == "created_at_asc":
-            query += " ORDER BY created_at ASC"
-        elif sort_by == "created_at_desc":
-            query += " ORDER BY created_at DESC"
-        elif sort_by == "company_name":
-            query += " ORDER BY company_name ASC, updated_at DESC"
-        elif sort_by == "job_title":
-            query += " ORDER BY job_title ASC, updated_at DESC"
+        # Sorting whitelist
+        ALLOWED_SORT_ORDERS = {
+            "updated_at_desc": "updated_at DESC",
+            "created_at_desc": "created_at DESC",
+            "created_at_asc": "created_at ASC",
+            "deadline_asc": "application_deadline ASC NULLS LAST",
+            "company_name_asc": "company_name ASC, updated_at DESC",
+            "job_title_asc": "job_title ASC, updated_at DESC",
+            "company_name": "company_name ASC, updated_at DESC",
+            "job_title": "job_title ASC, updated_at DESC",
+        }
+
+        if sort_by and sort_by.strip():
+            clean_sort = sort_by.strip().lower()
+            if clean_sort not in ALLOWED_SORT_ORDERS:
+                raise ValidationError(
+                    f"Invalid sort_by value '{sort_by}'. Allowed options: {sorted(ALLOWED_SORT_ORDERS.keys())}"
+                )
+            query += f" ORDER BY {ALLOWED_SORT_ORDERS[clean_sort]}"
         else:
             query += " ORDER BY updated_at DESC"
 
         if limit is not None:
+            if not isinstance(limit, int) or limit < 0:
+                raise ValidationError("limit must be a non-negative integer.")
+            if not isinstance(offset, int) or offset < 0:
+                raise ValidationError("offset must be a non-negative integer.")
             query += " LIMIT ? OFFSET ?"
             params.extend([limit, offset])
+        elif offset > 0:
+            if not isinstance(offset, int) or offset < 0:
+                raise ValidationError("offset must be a non-negative integer.")
+            query += " LIMIT -1 OFFSET ?"
+            params.append(offset)
 
         with self.connection() as conn:
             cursor = conn.cursor()
@@ -5119,19 +5164,28 @@ class DatabaseManager:
         user_id: int,
         application_id: Optional[int] = None,
         is_completed: Optional[bool] = None,
+        include_archived: bool = False,
     ) -> List[ApplicationFollowUp]:
-        """Lists follow-up reminders for a user, optionally filtered by application and completion."""
+        """Lists follow-up reminders for a user, optionally filtered by application, completion, and archive state."""
         with self.connection() as conn:
             cursor = conn.cursor()
-            query = "SELECT * FROM application_follow_ups WHERE user_id = ?"
-            params: List[Any] = [user_id]
+            query = """
+                SELECT f.*
+                FROM application_follow_ups f
+                JOIN applications a
+                  ON f.application_id = a.id
+                 AND f.user_id = a.user_id
+                WHERE f.user_id = ?
+                  AND (a.is_archived = 0 OR ? = 1)
+            """
+            params: List[Any] = [user_id, 1 if include_archived else 0]
             if application_id is not None:
-                query += " AND application_id = ?"
+                query += " AND f.application_id = ?"
                 params.append(application_id)
             if is_completed is not None:
-                query += " AND is_completed = ?"
+                query += " AND f.is_completed = ?"
                 params.append(1 if is_completed else 0)
-            query += " ORDER BY follow_up_date ASC"
+            query += " ORDER BY f.follow_up_date ASC"
 
             cursor.execute(query, params)
             return [ApplicationFollowUp(**dict(row)) for row in cursor.fetchall()]

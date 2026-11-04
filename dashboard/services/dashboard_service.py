@@ -22,6 +22,7 @@ from src.database.exceptions import (
 )
 from src.database.models import (
     Application,
+    ApplicationFollowUp,
     ApplicationStatus,
     JobDescription,
     MatchResult,
@@ -961,15 +962,33 @@ class DashboardService:
             raise ApplicationNotFoundError(application_id)
         return app
 
+    def archive_candidate_application(
+        self,
+        application_id: int,
+        session_id: str,
+        archive_reason: Optional[str] = None,
+        client_user_id: Optional[int] = None,
+    ) -> Application:
+        """Soft-archives an application for the authenticated candidate."""
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        return self.db.archive_user_application(
+            application_id=application_id,
+            user_id=user_id,
+            archive_reason=archive_reason,
+        )
+
     def list_candidate_applications(
         self,
         session_id: str,
         status: Optional[str] = None,
         search_term: Optional[str] = None,
         sort_by: Optional[str] = None,
-        limit: Optional[int] = None,
+        limit: Optional[int] = 20,
         offset: int = 0,
         client_user_id: Optional[int] = None,
+        include_archived: bool = False,
+        status_in: Optional[List[str]] = None,
+        employment_type: Optional[str] = None,
     ) -> List[Application]:
         """Lists applications belonging to the authenticated candidate, with filtering and sorting."""
         user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
@@ -980,7 +999,108 @@ class DashboardService:
             sort_by=sort_by,
             limit=limit,
             offset=offset,
+            include_archived=include_archived,
+            status_in=status_in,
+            employment_type=employment_type,
         )
+
+    def get_candidate_tracker_metrics(
+        self,
+        session_id: str,
+        include_archived: bool = False,
+        client_user_id: Optional[int] = None,
+    ) -> Dict[str, int]:
+        """Computes real-time tracker KPIs for the authenticated candidate.
+
+        Invariants:
+        - 'total': Candidate-owned applications (non-archived by default, or all if include_archived=True).
+        - 'in_preparation': DRAFT, PREPARING, READY_FOR_REVIEW.
+        - 'approved': APPROVED only.
+        - 'submitted': SUBMITTED only (IN_PROGRESS does NOT increment submitted).
+        - 'in_progress': IN_PROGRESS only.
+        - 'interviewing': ASSESSMENT and INTERVIEW.
+        - 'offers': OFFER only (separated from concluded).
+        - 'active_pipeline': SUBMITTED + IN_PROGRESS + ASSESSMENT + INTERVIEW + OFFER.
+        - 'concluded': REJECTED, WITHDRAWN, CLOSED.
+        - 'follow_ups_due': Candidate's incomplete reminders due today or overdue (excluding reminders for archived applications by default).
+        """
+        from datetime import datetime, timezone
+        from src.lifecycle.state_machine import ApplicationStateMachine
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        apps = self.db.list_user_applications(
+            user_id=user_id,
+            include_archived=include_archived,
+            limit=None,
+        )
+
+        counts: Dict[str, int] = {
+            "total": len(apps),
+            "in_preparation": 0,
+            "approved": 0,
+            "submitted": 0,
+            "in_progress": 0,
+            "interviewing": 0,
+            "offers": 0,
+            "active_pipeline": 0,
+            "concluded": 0,
+            "follow_ups_due": 0,
+        }
+
+        for app in apps:
+            stat = ApplicationStateMachine.normalize_status(app.status)
+            if stat in (ApplicationStatus.DRAFT, ApplicationStatus.PREPARING, ApplicationStatus.READY_FOR_REVIEW):
+                counts["in_preparation"] += 1
+            elif stat == ApplicationStatus.APPROVED:
+                counts["approved"] += 1
+            elif stat == ApplicationStatus.SUBMITTED:
+                counts["submitted"] += 1
+                counts["active_pipeline"] += 1
+            elif stat == ApplicationStatus.IN_PROGRESS:
+                counts["in_progress"] += 1
+                counts["active_pipeline"] += 1
+            elif stat in (ApplicationStatus.ASSESSMENT, ApplicationStatus.INTERVIEW):
+                counts["interviewing"] += 1
+                counts["active_pipeline"] += 1
+            elif stat == ApplicationStatus.OFFER:
+                counts["offers"] += 1
+                counts["active_pipeline"] += 1
+            elif stat in (ApplicationStatus.REJECTED, ApplicationStatus.WITHDRAWN, ApplicationStatus.CLOSED):
+                counts["concluded"] += 1
+
+        # Follow-ups due today or overdue
+        follow_ups = self.db.list_application_follow_ups(
+            user_id=user_id,
+            is_completed=False,
+            include_archived=include_archived,
+        )
+        today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        counts["follow_ups_due"] = sum(1 for f in follow_ups if f.follow_up_date <= today_str)
+
+        return counts
+
+    def get_candidate_application_match_detail(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Optional[Any]:
+        """Resolves match details for an application through prepared_packets.matching_result_id when available.
+
+        Returns None (unavailable state) if no valid relationship exists. Never creates synthetic relationships.
+        """
+        from src.database.exceptions import ApplicationNotFoundError
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        packet = self.db.get_active_prepared_packet(application_id=application_id, user_id=user_id)
+        if packet and packet.matching_result_id:
+            return self.db.get_match_result(match_id=packet.matching_result_id, user_id=user_id)
+        return None
 
     def transition_application_status(
         self,
@@ -1245,31 +1365,61 @@ class DashboardService:
         self,
         application_id: int,
         session_id: str,
-        url: str,
+        url: Optional[str] = None,
         client_user_id: Optional[int] = None,
-    ) -> None:
+    ) -> str:
         """Appends an EXTERNAL_APPLICATION_URL_OPENED audit event when a candidate opens an employer link.
 
         CRITICAL SAFETY INVARIANT: Strictly preserves existing application status without mutating it to SUBMITTED.
-        Validates the URL using URLSafetyValidator before appending any audit event.
+        Validates the canonical stored URL using URLSafetyValidator before appending any audit event.
         Redacts sensitive query parameters and tokens from the audit payload.
+        Returns the validated canonical URL for browser navigation.
+
+        Execution Order (Security Hardened):
+        1. Authenticate candidate session first (resolve_authenticated_candidate).
+        2. Retrieve candidate application enforcing user ownership (get_user_application).
+        3. Read canonical stored employer URL (app.external_application_url).
+        4. Validate canonical URL via URLSafetyValidator (validated_url).
+        5. Redact sensitive query parameters and strip fragments for audit (sanitized_url).
+        6. Emit EXTERNAL_APPLICATION_URL_OPENED audit event with sanitized_url (status preserved!).
+        7. Return validated_url as the browser navigation destination.
         """
         from src.security.url_validator import URLSafetyValidator
-        from src.database.exceptions import ApplicationNotFoundError
+        from src.database.exceptions import (
+            ApplicationNotFoundError,
+            ValidationError,
+            SecurityAuthorizationError,
+        )
 
-        # 1. URL Safety Validation (throws UnsafeURLError on unsafe URLs, schemes, private IPs, credentials)
-        validated_url = URLSafetyValidator.validate_url(url, resolver=self._resolve_url)
-
-        # 2. Authenticate session and candidate
+        # 1. Authenticate session and candidate first
         user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+
+        # 2. Retrieve application under strict ownership filtering
         app = self.db.get_user_application(application_id=application_id, user_id=user_id)
         if not app:
             raise ApplicationNotFoundError(application_id)
 
-        # 3. Redact sensitive query parameters for privacy and audit security
+        # 3. Read canonical stored employer URL (prohibit arbitrary client substitution)
+        stored_url = app.external_application_url
+        if stored_url and stored_url.strip():
+            if url and url.strip() and url.strip() != stored_url.strip():
+                raise SecurityAuthorizationError(
+                    "Arbitrary URL substitution is prohibited. Client-supplied URL does not match canonical stored application URL."
+                )
+            target_url = stored_url.strip()
+        else:
+            if url and url.strip():
+                target_url = url.strip()
+            else:
+                raise ValidationError(f"Application #{application_id} has no external application URL configured.")
+
+        # 4. Validate canonical URL via URLSafetyValidator (destination for browser)
+        validated_url = URLSafetyValidator.validate_url(target_url, resolver=self._resolve_url)
+
+        # 5. Redact sensitive query parameters and strip fragments for audit logging only
         sanitized_url = self._redact_sensitive_url(validated_url)
 
-        # 4. Emit audit event with sanitized URL payload; status is strictly preserved
+        # 6. Emit audit event: Status is strictly PRESERVED, payload receives sanitized_url
         self.db.create_application_event(
             application_id=application_id,
             user_id=user_id,
@@ -1280,7 +1430,102 @@ class DashboardService:
             event_payload={
                 "opened_url": sanitized_url,
                 "application_status_preserved": app.status,
+                "note": "Candidate requested external employer portal navigation.",
             },
+        )
+
+        # 7. Return validated canonical destination for browser navigation
+        return validated_url
+
+    # -------------------------------------------------------------------------
+    # PHASE 7.3: CANDIDATE FOLLOW-UP REMINDER WRAPPERS
+    # -------------------------------------------------------------------------
+
+    def create_application_follow_up(
+        self,
+        session_id: str,
+        application_id: int,
+        follow_up_date: str,
+        follow_up_type: str,
+        description: str,
+        outcome_notes: Optional[str] = None,
+        client_user_id: Optional[int] = None,
+    ) -> ApplicationFollowUp:
+        """Creates a follow-up reminder enforcing candidate application ownership."""
+        from src.database.exceptions import ApplicationNotFoundError
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+        return self.db.create_application_follow_up(
+            application_id=application_id,
+            user_id=user_id,
+            follow_up_date=follow_up_date,
+            follow_up_type=follow_up_type,
+            description=description,
+            outcome_notes=outcome_notes,
+        )
+
+    def list_application_follow_ups(
+        self,
+        session_id: str,
+        application_id: Optional[int] = None,
+        is_completed: Optional[bool] = None,
+        include_archived: bool = False,
+        client_user_id: Optional[int] = None,
+    ) -> List[ApplicationFollowUp]:
+        """Lists follow-up reminders scoped to candidate, filtering out archived applications by default."""
+        from src.database.exceptions import ApplicationNotFoundError
+
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        if application_id is not None:
+            app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+            if not app:
+                raise ApplicationNotFoundError(application_id)
+        return self.db.list_application_follow_ups(
+            user_id=user_id,
+            application_id=application_id,
+            is_completed=is_completed,
+            include_archived=include_archived,
+        )
+
+    def get_application_follow_up(
+        self,
+        session_id: str,
+        follow_up_id: int,
+        client_user_id: Optional[int] = None,
+    ) -> Optional[ApplicationFollowUp]:
+        """Fetches a follow-up record under ownership verification."""
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        return self.db.get_application_follow_up(follow_up_id=follow_up_id, user_id=user_id)
+
+    def complete_application_follow_up(
+        self,
+        session_id: str,
+        follow_up_id: int,
+        outcome_notes: Optional[str] = None,
+        client_user_id: Optional[int] = None,
+    ) -> ApplicationFollowUp:
+        """Marks a follow-up reminder as complete under ownership verification."""
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        return self.db.complete_application_follow_up(
+            follow_up_id=follow_up_id,
+            user_id=user_id,
+            outcome_notes=outcome_notes,
+        )
+
+    def delete_application_follow_up(
+        self,
+        session_id: str,
+        follow_up_id: int,
+        client_user_id: Optional[int] = None,
+    ) -> bool:
+        """Deletes a follow-up reminder under ownership verification."""
+        user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
+        return self.db.delete_application_follow_up(
+            follow_up_id=follow_up_id,
+            user_id=user_id,
         )
 
     # -------------------------------------------------------------------------
