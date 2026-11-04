@@ -130,9 +130,9 @@ class DatabaseManager:
 
         from src.security.session_manager import SessionManager
         if session_manager is not None:
-            if not isinstance(session_manager, SessionManager) or type(session_manager).__name__ != "SessionManager":
+            if type(session_manager) is not SessionManager:
                 raise SecurityAuthorizationError(
-                    f"Invalid verifier configuration: session_manager must be an authentic SessionManager instance, got {type(session_manager).__name__}."
+                    f"Invalid verifier configuration: session_manager must be an exact SessionManager instance, got {type(session_manager)}."
                 )
         self._session_manager = session_manager
 
@@ -145,9 +145,12 @@ class DatabaseManager:
     @property
     def session_manager(self) -> Any:
         from src.security.session_manager import SessionManager
-        if self._session_manager is None:
-            return SessionManager.get_instance()
-        return self._session_manager
+        sm = self._session_manager if self._session_manager is not None else SessionManager.get_instance()
+        if type(sm) is not SessionManager:
+            raise SecurityAuthorizationError(
+                f"Invalid verifier configuration: session_manager must be an exact SessionManager instance, got {type(sm)}."
+            )
+        return sm
 
     def get_connection(self, timeout: Optional[float] = None) -> sqlite3.Connection:
         """Creates and configures a new SQLite connection."""
@@ -2280,8 +2283,8 @@ class DatabaseManager:
 
         trusted_sm = self.session_manager
         from src.security.session_manager import SessionManager
-        if not isinstance(trusted_sm, SessionManager) or type(trusted_sm).__name__ != "SessionManager":
-            raise SecurityAuthorizationError("Invalid verifier configuration: Trusted SessionManager instance required.")
+        if type(trusted_sm) is not SessionManager:
+            raise SecurityAuthorizationError("Invalid verifier configuration: Exact trusted SessionManager instance required.")
 
         try:
             verif_res = trusted_sm.verify_and_consume_approval_grant(grant)

@@ -12,6 +12,7 @@ from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
     CrossUserAccessError,
     InvalidSessionError,
+    SecurityAuthorizationError,
     SessionExpiredError,
     ValidationError,
 )
@@ -75,10 +76,30 @@ class HumanApprovalGate:
         session_manager: Optional[SessionManager] = None,
     ):
         from src.security.session_manager import SessionManager
-        self.session_manager = session_manager or SessionManager.get_instance()
-        self.db = db_manager or DatabaseManager(session_manager=self.session_manager)
-        if getattr(self.db, "_session_manager", None) is None:
-            self.db._session_manager = self.session_manager
+        sm = session_manager if session_manager is not None else SessionManager.get_instance()
+        if type(sm) is not SessionManager:
+            raise SecurityAuthorizationError(
+                f"Invalid verifier configuration: HumanApprovalGate.session_manager must be an exact SessionManager instance, got {type(sm)}."
+            )
+        self.session_manager = sm
+
+        if db_manager is None:
+            self.db = DatabaseManager(session_manager=self.session_manager)
+        else:
+            self.db = db_manager
+            db_sm = getattr(self.db, "_session_manager", None)
+            if db_sm is None:
+                # Wire the genuine instance
+                self.db._session_manager = self.session_manager
+            else:
+                if type(db_sm) is not SessionManager:
+                    raise SecurityAuthorizationError(
+                        f"Invalid verifier configuration: DatabaseManager._session_manager must be an exact SessionManager instance, got {type(db_sm)}."
+                    )
+                if db_sm is not self.session_manager:
+                    raise SecurityAuthorizationError(
+                        "SessionManager identity mismatch: DatabaseManager and HumanApprovalGate must share the exact same SessionManager instance."
+                    )
 
     # -------------------------------------------------------------------------
     # MULTI-USER UNIVERSAL PREPARED PACKET METHODS (Architecture v2.1.1)

@@ -78,6 +78,7 @@ class TestSecurityAndAuthorization(unittest.TestCase):
     def setUp(self):
         SessionManager.reset_instance()
         self.session_mgr = SessionManager()
+        self.db._session_manager = self.session_mgr
         self.gate = HumanApprovalGate(db_manager=self.db, session_manager=self.session_mgr)
         self.candidate_name = "Pranay Anup Agrawal"
         self.candidate_id = "candidate_pranay"

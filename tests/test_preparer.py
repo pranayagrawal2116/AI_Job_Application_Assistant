@@ -95,6 +95,7 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         self.prefiller = FormPrefiller(candidate_profile=self.profile)
         SessionManager.reset_instance()
         self.session_mgr = SessionManager()
+        self.db._session_manager = self.session_mgr
         self.session = self.session_mgr.authenticate_candidate(
             candidate_id="candidate_pranay",
             candidate_name="Pranay Agrawal",

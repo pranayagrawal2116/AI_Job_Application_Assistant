@@ -40,7 +40,7 @@ class TestApplicationLifecycleServiceBase(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "test_lifecycle.db")
         self.db = DatabaseManager(self.db_path)
-        self.service = DashboardService(db_manager=self.db)
+        self.service = DashboardService(db_manager=self.db, url_resolver=lambda h, p: ["93.184.215.14"])
         self.session_mgr = SessionManager.get_instance()
 
         # Seed two distinct candidate users in DB

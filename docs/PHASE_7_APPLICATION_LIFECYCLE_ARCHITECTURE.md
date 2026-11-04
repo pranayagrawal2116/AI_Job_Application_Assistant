@@ -1102,3 +1102,41 @@ Phase 7.2.2.3 closes the remaining security vulnerabilities identified during in
 - **Process Memory Bound**: In-flight `VerifiedApprovalGrant` records and consumed grant IDs are retained in `SessionManager` process memory (`_active_grants`, `_consumed_grants`).
 - **Process Restart Invalidation**: Restarting the backend application process clears in-memory active grants. Any outstanding, unconsumed grants become invalid and will be rejected with `SecurityAuthorizationError` ("Unrecognized, unissued, or forged approval grant"), requiring the candidate to perform a fresh authorization via the Human Approval Gate.
 - **Multi-Worker Deployment Requirement**: In a multi-worker deployment model (e.g., multiple Gunicorn/Uvicorn worker processes), sticky sessions (routing requests for a given candidate session to the same process) or a shared centralized session/grant store is required. In the current single-process SQLite architecture, this constraint is satisfied by design.
+
+---
+
+## 28. Phase 7.2.2.4 Hardening: Exact Trusted Verifier Type Enforcement & SessionManager Consistency
+
+Phase 7.2.2.4 closes the verifier-substitution attack vector where a custom subclass named `SessionManager` could attempt to bypass grant verification, and enforces strict object identity consistency between `HumanApprovalGate` and `DatabaseManager`.
+
+### 28.1 Exact Verifier Type Identity Enforcement (`type(sm) is SessionManager`)
+- **Elimination of Subclass and Spoofing Attacks**: Replaced loose `isinstance(sm, SessionManager) and type(sm).__name__ == "SessionManager"` checks with exact Python type identity:
+  `type(session_manager) is SessionManager`
+  This explicitly rejects:
+  1. Every subclass of `SessionManager`, including subclasses deliberately named `SessionManager` that override `verify_and_consume_approval_grant()`.
+  2. Objects with a spoofed class name (`__name__ = "SessionManager"`).
+  3. Proxy objects, wrappers, and duck-typed verifier substitutes.
+  4. Arbitrary verifier objects attempting to return `(True, "Accepted")`.
+- **Multi-Layer Defense in Depth**:
+  - **Constructor Check**: `DatabaseManager.__init__(..., session_manager=None)` enforces `type(session_manager) is SessionManager`, raising `SecurityAuthorizationError` on invalid types.
+  - **Property Check**: `DatabaseManager.session_manager` property validates that the active or singleton instance satisfies `type(sm) is SessionManager`.
+  - **Verification-Boundary Check**: `_authorize_application_packet_atomic()` explicitly verifies `type(trusted_sm) is SessionManager` before requesting any SQLite write lock or connection.
+- **Private Reference Preservation**: The trusted `SessionManager` reference is held strictly private (`self._session_manager`) within `DatabaseManager`. No per-call verifier argument is permitted, and unexpected kwargs are rejected before database access.
+
+### 28.2 SessionManager Object Identity Consistency
+- **Shared Object Identity Invariant**: `HumanApprovalGate` and `DatabaseManager` must operate against the exact same in-memory registry of candidate sessions and issued grants (`self.db.session_manager is self.session_manager`).
+- **Composition Root Invariant**:
+  - `HumanApprovalGate.session_manager` must be an exact genuine `SessionManager` instance (`type(sm) is SessionManager`).
+  - If `DatabaseManager` initially lacks a configured instance (`_session_manager is None`), `HumanApprovalGate` automatically wires its own genuine instance:
+    `self.db._session_manager = self.session_manager`
+  - If `DatabaseManager` was already configured with an instance, `HumanApprovalGate` validates:
+    1. Exact type: `type(db_sm) is SessionManager`.
+    2. Exact identity: `db_sm is self.session_manager`.
+    If a different genuine `SessionManager` instance is detected, `HumanApprovalGate` rejects the configuration with `SecurityAuthorizationError` ("SessionManager identity mismatch: DatabaseManager and HumanApprovalGate must share the exact same SessionManager instance.").
+  - This invariant prevents dual-registry split-brain conditions where tickets issued by one session manager are verified against another, or where grants cannot be consumed.
+
+### 28.3 Approved Application Initialization Pattern
+In standard application initialization (such as `DashboardService` or production CLI pipelines):
+- Instantiate a shared `DatabaseManager(session_manager=shared_sm)`.
+- Pass `db_manager` to `HumanApprovalGate(db_manager=db)`.
+- Alternatively, instantiate `DatabaseManager()` and let `HumanApprovalGate` automatically wire the genuine singleton instance to the database upon composition. Both approaches guarantee that `gate.session_manager is db.session_manager`.

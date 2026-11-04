@@ -276,6 +276,11 @@ When interacting with the browser via Playwright MCP:
   - Architecture constraints & in-memory limitation: accurately documented single-process deployment requirement, in-memory grant invalidation on process restarts, and sticky-session / centralized grant store requirements for multi-worker scaling.
   - Verified with 17 new comprehensive automated tests in `test_phase_7_2_2_3_trusted_verifier.py` (totaling 680 passing tests across the entire repository, 100% pass rate), 0 pyflakes errors, 0 ruff errors on modified files, and clean git diff.
 
+- [x] **Architecture v2.1.1 Phase 7.2.2.4: Exact Trusted Verifier Type Enforcement & SessionManager Consistency** (Complete)
+  - Exact SessionManager type identity enforcement: replaced loose inheritance and class-name checks with exact type identity (`type(session_manager) is SessionManager`) across `DatabaseManager.__init__()`, `DatabaseManager.session_manager` property, `DatabaseManager._authorize_application_packet_atomic()`, and `HumanApprovalGate.__init__()`; explicitly rejects all subclasses (even if named `SessionManager`), spoofed types, proxies, and duck-typed objects at both initialization and the verification boundary.
+  - Shared SessionManager identity consistency: enforced invariant that `HumanApprovalGate.session_manager` and `DatabaseManager.session_manager` reference the exact same instance (`gate.session_manager is db.session_manager`); automatically wires the genuine instance if `DatabaseManager` initially lacks a verifier; rejects mismatched genuine instances with `SecurityAuthorizationError` ("SessionManager identity mismatch: DatabaseManager and HumanApprovalGate must share the exact same SessionManager instance.") to prevent dual-registry split-brain authorization bugs.
+  - Verified with 10 new comprehensive automated tests in `test_phase_7_2_2_4_exact_verifier.py` (totaling 690 passing tests across the entire repository, 100% pass rate), 0 pyflakes errors, 0 ruff errors on modified files, and clean git diff.
+
 ---
 
 ## 7. Approval Requirement
