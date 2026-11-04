@@ -5027,6 +5027,67 @@ class DatabaseManager:
 
             return updated
 
+    def attach_confirmation_proof(
+        self,
+        confirmation_id: int,
+        user_id: int,
+        confirmation_doc_path: str,
+        confirmation_doc_hash: str,
+        file_format: str,
+        safe_filename: str,
+    ) -> SubmissionConfirmation:
+        """Attaches a verified submission confirmation proof document to an existing confirmation record.
+
+        Atomically updates confirmation_doc_path and confirmation_doc_hash and emits a
+        SUBMISSION_CONFIRMATION_PROOF_ATTACHED timeline event in the same transaction.
+        The event payload strictly records metadata and hashes without exposing server filesystem paths.
+        """
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (confirmation_id,))
+            row = cursor.fetchone()
+            if not row:
+                raise ValidationError(f"SubmissionConfirmation #{confirmation_id} not found.")
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"SubmissionConfirmation #{confirmation_id}",
+                )
+
+            cursor.execute(
+                """
+                UPDATE submission_confirmations
+                SET confirmation_doc_path = ?,
+                    confirmation_doc_hash = ?
+                WHERE id = ? AND user_id = ?
+                """,
+                (confirmation_doc_path, confirmation_doc_hash, confirmation_id, user_id),
+            )
+            cursor.execute("SELECT * FROM submission_confirmations WHERE id = ?", (confirmation_id,))
+            updated = SubmissionConfirmation(**dict(cursor.fetchone()))
+
+            # Emit timeline event atomically within the same transaction without leaking storage paths
+            proof_payload = {
+                "confirmation_id": confirmation_id,
+                "proof_attached": True,
+                "file_format": file_format,
+                "confirmation_doc_hash": confirmation_doc_hash,
+                "safe_filename": safe_filename,
+                "description": "Candidate submission confirmation evidence attached",
+            }
+            self._insert_application_event_internal(
+                cursor=cursor,
+                application_id=updated.application_id,
+                user_id=user_id,
+                event_type="SUBMISSION_CONFIRMATION_PROOF_ATTACHED",
+                actor_type="CANDIDATE",
+                actor_identifier=f"user_{user_id}",
+                event_payload=proof_payload,
+            )
+
+            return updated
+
     def get_submission_confirmation(
         self, application_id: int, user_id: int, active_only: bool = True
     ) -> Optional[SubmissionConfirmation]:

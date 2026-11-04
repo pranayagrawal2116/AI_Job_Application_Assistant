@@ -1759,6 +1759,8 @@ class DashboardService:
         confirmation_doc_hash: Optional[str] = None,
         candidate_notes: Optional[str] = None,
         client_user_id: Optional[int] = None,
+        proof_bytes: Optional[bytes] = None,
+        proof_filename: Optional[str] = None,
     ) -> SubmissionConfirmation:
         """Executes the strict 16-step candidate manual submission workflow.
 
@@ -1769,12 +1771,16 @@ class DashboardService:
         4. Valid unconsumed human approval record for the exact packet hash.
         5. Mandatory candidate confirmation boolean (unconfirmed submission rejected).
         6. Controlled submission channel validation.
-        7. Cryptographic action ticket verification and single-use consumption.
-        8. Atomic database transition to SUBMITTED, approval consumption, and SUBMISSION_CONFIRMED event.
+        7. Pre-validation of optional confirmation evidence before ticket consumption.
+        8. Cryptographic action ticket verification and single-use consumption.
+        9. Atomic storage of evidence document inside candidate private storage sandbox.
+        10. Atomic database transition to SUBMITTED, approval consumption, and SUBMISSION_CONFIRMED event.
+        11. File rollback on database persistence failure.
         """
         from src.security.session_manager import SessionManager
         from src.lifecycle.state_machine import ApplicationStateMachine
         from src.database.models import SubmissionChannel
+        from src.security.file_security import FileSecurityValidator
         from src.database.exceptions import (
             ApplicationNotFoundError,
             SecurityAuthorizationError,
@@ -1856,6 +1862,16 @@ class DashboardService:
                 f"Invalid submission channel '{submission_channel}'. Allowed: {SubmissionChannel.list()}"
             )
 
+        # Pre-validate optional proof bytes BEFORE consuming action ticket
+        validator = FileSecurityValidator(base_storage_dir=self.storage_base_dir)
+        final_doc_path = None
+        final_doc_hash = None
+        saved_proof_path = None
+
+        if proof_bytes is not None:
+            safe_name = proof_filename or "proof.pdf"
+            validator.validate_confirmation_proof(proof_bytes, safe_name)
+
         # 13. Verify and consume the fresh MANUAL_SUBMISSION action ticket
         session_mgr = SessionManager.get_instance()
         valid, msg = session_mgr.verify_and_consume_action_ticket(
@@ -1869,21 +1885,276 @@ class DashboardService:
         if not valid:
             raise SecurityAuthorizationError(f"Submission ticket verification failed: {msg}")
 
+        # Save proof file atomically after ticket consumption
+        if proof_bytes is not None:
+            safe_name = proof_filename or "proof.pdf"
+            storage_filename, detected_format, _, file_hash = validator.save_user_confirmation_file(
+                user_id=user_id,
+                application_id=application_id,
+                file_bytes=proof_bytes,
+                original_filename=safe_name,
+            )
+            final_doc_path = f"confirmations/{storage_filename}"
+            final_doc_hash = file_hash
+            saved_proof_path = validator.get_user_confirmations_dir(user_id) / storage_filename
+
         # 14. Call atomic database submission confirmation with transition_status=True
-        confirmation = self.db.create_submission_confirmation(
-            application_id=application_id,
-            user_id=user_id,
-            submission_channel=submission_channel,
-            packet_id=packet_id,
-            submission_timestamp=submission_timestamp,
-            confirmation_reference=confirmation_reference,
-            confirmation_doc_path=confirmation_doc_path,
-            confirmation_doc_hash=confirmation_doc_hash,
-            candidate_notes=candidate_notes,
-            transition_status=True,
-        )
+        try:
+            confirmation = self.db.create_submission_confirmation(
+                application_id=application_id,
+                user_id=user_id,
+                submission_channel=submission_channel,
+                packet_id=packet_id,
+                submission_timestamp=submission_timestamp,
+                confirmation_reference=confirmation_reference,
+                confirmation_doc_path=final_doc_path,
+                confirmation_doc_hash=final_doc_hash,
+                candidate_notes=candidate_notes,
+                transition_status=True,
+            )
+        except Exception:
+            if saved_proof_path and saved_proof_path.exists():
+                try:
+                    saved_proof_path.unlink()
+                except OSError:
+                    pass
+            raise
 
         return confirmation
+
+    def attach_submission_confirmation_proof(
+        self,
+        application_id: int,
+        session_id: str,
+        file_bytes: bytes,
+        original_filename: str,
+        client_user_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Validates and attaches confirmation evidence to an existing submission confirmation.
+
+        Responsibilities:
+        1. Resolve authenticated candidate identity using resolve_authenticated_candidate().
+        2. Retrieve candidate-owned application.
+        3. Retrieve applicable active submission confirmation.
+        4. Verify confirmation belongs to authenticated candidate and requested application.
+        5. Validate raw uploaded bytes, size (<=10MB), magic bytes, and structural integrity.
+        6. Enforce private containment in data/users/<user_id>/confirmations/.
+        7. Save file atomically with server-generated unique filename.
+        8. Atomically update confirmation record and emit timeline event without leaking server paths.
+        9. Return sanitized confirmation metadata.
+        """
+        from src.security.file_security import FileSecurityValidator
+        from src.database.exceptions import (
+            ApplicationNotFoundError,
+            CrossUserAccessError,
+            ValidationError,
+        )
+
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        conf = self.db.get_submission_confirmation(application_id=application_id, user_id=user_id, active_only=True)
+        if not conf or conf.id is None:
+            raise ValidationError(
+                f"No active submission confirmation found for Application #{application_id}. Confirm submission first."
+            )
+
+        if conf.user_id != user_id or conf.application_id != application_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=conf.user_id,
+                resource=f"SubmissionConfirmation #{conf.id}",
+            )
+
+        validator = FileSecurityValidator(base_storage_dir=self.storage_base_dir)
+        detected_format, file_hash = validator.validate_confirmation_proof(file_bytes, original_filename)
+
+        storage_filename, detected_format, _, file_hash = validator.save_user_confirmation_file(
+            user_id=user_id,
+            application_id=application_id,
+            file_bytes=file_bytes,
+            original_filename=original_filename,
+        )
+        saved_rel_path = f"confirmations/{storage_filename}"
+        user_dir = validator.get_user_confirmations_dir(user_id)
+        target_path = (user_dir / storage_filename).resolve()
+
+        safe_filename = validator.sanitize_filename(original_filename)
+
+        try:
+            updated = self.db.attach_confirmation_proof(
+                confirmation_id=conf.id,
+                user_id=user_id,
+                confirmation_doc_path=saved_rel_path,
+                confirmation_doc_hash=file_hash,
+                file_format=detected_format,
+                safe_filename=safe_filename,
+            )
+        except Exception:
+            if target_path.exists():
+                try:
+                    target_path.unlink()
+                except OSError:
+                    pass
+            raise
+
+        return {
+            "confirmation_id": updated.id,
+            "application_id": application_id,
+            "submission_channel": updated.submission_channel,
+            "submission_timestamp": updated.submission_timestamp,
+            "confirmation_reference": updated.confirmation_reference,
+            "has_proof": True,
+            "proof_format": detected_format,
+            "proof_hash": file_hash,
+            "safe_filename": safe_filename,
+        }
+
+    def get_candidate_submission_confirmation_proof(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Tuple[bytes, str, str]:
+        """Retrieves and cryptographically verifies candidate submission confirmation proof document.
+
+        Enforces:
+        1. Authenticated session resolution.
+        2. Application and confirmation ownership.
+        3. Strict sandbox containment inside data/users/<user_id>/confirmations/.
+        4. Traversal, absolute path, null byte, and symlink escape defenses.
+        5. File existence and regular file verification.
+        6. SHA-256 integrity comparison against stored hash.
+        7. Magic-byte and structural verification before returning.
+        8. Returns (file_bytes, safe_filename, mime_type).
+        """
+        import hashlib
+        from src.security.file_security import FileSecurityValidator
+        from src.database.exceptions import (
+            ApplicationNotFoundError,
+            CorruptedFileError,
+            CrossUserAccessError,
+            SecurityAuthorizationError,
+            ValidationError,
+        )
+
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        conf = self.db.get_submission_confirmation(application_id=application_id, user_id=user_id, active_only=True)
+        if not conf:
+            raise ValidationError(f"No active submission confirmation found for Application #{application_id}.")
+
+        if conf.user_id != user_id or conf.application_id != application_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=conf.user_id,
+                resource=f"SubmissionConfirmation #{conf.id}",
+            )
+
+        if not conf.confirmation_doc_path or not conf.confirmation_doc_hash:
+            raise ValidationError(f"No confirmation evidence document attached to Application #{application_id}.")
+
+        stored_path_str = str(conf.confirmation_doc_path)
+        if "\x00" in stored_path_str or Path(stored_path_str).is_absolute():
+            raise SecurityAuthorizationError("Illegal confirmation document storage path.")
+        if ".." in stored_path_str:
+            raise SecurityAuthorizationError("Path traversal detected in confirmation document storage path.")
+
+        candidate_sandbox = (self.storage_base_dir / str(user_id)).resolve()
+        user_confirmations_dir = (candidate_sandbox / "confirmations").resolve()
+        raw_path = Path(stored_path_str)
+
+        if raw_path.parts and raw_path.parts[0] == "confirmations":
+            target_path = (candidate_sandbox / raw_path).resolve()
+        else:
+            target_path = (user_confirmations_dir / raw_path.name).resolve()
+
+        try:
+            target_path.relative_to(candidate_sandbox)
+        except ValueError:
+            raise SecurityAuthorizationError(
+                f"Security violation: Requested evidence escapes candidate #{user_id} private storage boundary."
+            )
+
+        if target_path.is_symlink():
+            raise SecurityAuthorizationError("Symlink access rejected.")
+
+        if not target_path.is_file():
+            raise FileNotFoundError("Confirmation evidence file not found on disk.")
+
+        with open(target_path, "rb") as f:
+            file_bytes = f.read()
+
+        actual_hash = hashlib.sha256(file_bytes).hexdigest()
+        if actual_hash != conf.confirmation_doc_hash:
+            raise CorruptedFileError("Integrity check failed: Confirmation document hash mismatch.")
+
+        validator = FileSecurityValidator(base_storage_dir=self.storage_base_dir)
+        detected_format, _ = validator.validate_confirmation_proof(file_bytes, target_path.name)
+
+        mime_map = {
+            "pdf": "application/pdf",
+            "png": "image/png",
+            "jpeg": "image/jpeg",
+            "jpg": "image/jpeg",
+        }
+        mime_type = mime_map.get(detected_format, "application/octet-stream")
+        safe_filename = f"submission_proof_{application_id}.{detected_format}"
+
+        return file_bytes, safe_filename, mime_type
+
+    def get_candidate_submission_confirmation(
+        self,
+        application_id: int,
+        session_id: str,
+        client_user_id: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieves sanitized candidate-facing submission confirmation metadata.
+
+        Never exposes internal server filesystem paths or storage locators.
+        """
+        from src.database.exceptions import ApplicationNotFoundError, CrossUserAccessError
+
+        user_id, sess = self.resolve_authenticated_candidate(session_id, client_user_id)
+        app = self.db.get_user_application(application_id=application_id, user_id=user_id)
+        if not app:
+            raise ApplicationNotFoundError(application_id)
+
+        conf = self.db.get_submission_confirmation(application_id=application_id, user_id=user_id, active_only=True)
+        if not conf:
+            return None
+
+        if conf.user_id != user_id or conf.application_id != application_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=conf.user_id,
+                resource=f"SubmissionConfirmation #{conf.id}",
+            )
+
+        has_proof = bool(conf.confirmation_doc_path and conf.confirmation_doc_hash)
+        safe_display_name = None
+        if has_proof and conf.confirmation_doc_path:
+            ext = Path(conf.confirmation_doc_path).suffix.lstrip(".").lower() or "proof"
+            safe_display_name = f"submission_proof_{application_id}.{ext}"
+
+        return {
+            "id": conf.id,
+            "confirmation_id": conf.id,
+            "application_id": conf.application_id,
+            "submission_channel": conf.submission_channel,
+            "submission_timestamp": conf.submission_timestamp,
+            "confirmation_reference": conf.confirmation_reference,
+            "has_proof": has_proof,
+            "safe_display_name": safe_display_name,
+            "candidate_notes": conf.candidate_notes,
+            "is_active_confirmation": bool(conf.is_active_confirmation),
+            "created_at": conf.created_at,
+        }
 
     @staticmethod
     def _redact_sensitive_url(url: str) -> str:

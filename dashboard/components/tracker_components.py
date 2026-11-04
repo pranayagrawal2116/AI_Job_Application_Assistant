@@ -722,6 +722,13 @@ def render_manual_submission_section(
             height=70,
         )
 
+        proof_file = st.file_uploader(
+            "Upload Optional Submission Confirmation Evidence",
+            type=["pdf", "png", "jpg", "jpeg"],
+            help="Optional: Upload an employer confirmation email/PDF or receipt screenshot (PDF, PNG, JPEG up to 10 MB).",
+            key=f"sub_proof_file_{user_id}_{app.id}",
+        )
+
         if st.button("Confirm Submission & Transition to SUBMITTED", type="primary", key=f"sub_submit_btn_{user_id}_{app.id}"):
             if not confirm_checked:
                 st.error("You must explicitly check the confirmation checkbox to authorize manual submission.")
@@ -744,6 +751,17 @@ def render_manual_submission_section(
                     packet_hash=active_packet.packet_version_hash,
                 )
 
+                # Extract optional uploaded proof bytes safely
+                proof_bytes = None
+                proof_filename = None
+                if proof_file is not None:
+                    raw_val = getattr(proof_file, "getvalue", None)
+                    if callable(raw_val):
+                        val = raw_val()
+                        if isinstance(val, (bytes, bytearray)) and len(val) > 0:
+                            proof_bytes = bytes(val)
+                            proof_filename = getattr(proof_file, "name", "proof.pdf")
+
                 # 3. Atomically record submission confirmation
                 service.record_candidate_manual_submission(
                     application_id=app.id,
@@ -754,9 +772,14 @@ def render_manual_submission_section(
                     submission_timestamp=datetime.now(UTC).isoformat(),
                     confirmation_reference=conf_ref.strip() if conf_ref else None,
                     candidate_notes=notes_input.strip() if notes_input else None,
+                    proof_bytes=proof_bytes,
+                    proof_filename=proof_filename,
                 )
 
-                st.success("Manual submission successfully confirmed! Application status updated to SUBMITTED.")
+                if proof_bytes is not None:
+                    st.success("Manual submission successfully confirmed with evidence attached! Application status updated to SUBMITTED.")
+                else:
+                    st.success("Manual submission successfully confirmed! Application status updated to SUBMITTED.")
                 st.rerun()
 
             except (DatabaseError, ValueError) as exc:
@@ -992,7 +1015,88 @@ def render_archive_action(
 
 
 # =============================================================================
-# 11. APPLICATION DETAIL CARD (List View)
+# 11. SUBMISSION CONFIRMATION & EVIDENCE DETAILS
+# =============================================================================
+
+def render_submission_confirmation_details(
+    service: DashboardService,
+    session_id: str,
+    app: Application,
+    user_id: int,
+) -> None:
+    """Renders candidate-facing submission confirmation metadata and verified proof download controls."""
+    try:
+        conf_meta = service.get_candidate_submission_confirmation(
+            application_id=app.id,
+            session_id=session_id,
+        )
+    except (DatabaseError, KeyError, ValueError, AttributeError) as exc:
+        st.error(f"Unable to load submission confirmation: {exc}")
+        return
+
+    if not conf_meta:
+        return
+
+    st.markdown("---")
+    st.markdown("##### 📄 Submission Confirmation & Evidence")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown(f"**Submitted Channel:** `{conf_meta['submission_channel']}`")
+        st.markdown(f"**Submission Timestamp:** `{conf_meta['submission_timestamp']}`")
+    with col_b:
+        conf_ref_display = conf_meta.get("confirmation_reference") or "None recorded"
+        st.markdown(f"**Confirmation Reference:** `{conf_ref_display}`")
+        if conf_meta.get("candidate_notes"):
+            st.markdown(f"**Notes:** {conf_meta['candidate_notes']}")
+
+    if conf_meta.get("has_proof"):
+        st.markdown(f"**Confirmation Evidence:** `{conf_meta['safe_display_name']}` *(Integrity Verified)*")
+        try:
+            file_bytes, safe_filename, mime_type = service.get_candidate_submission_confirmation_proof(
+                application_id=app.id,
+                session_id=session_id,
+            )
+            st.download_button(
+                label=f"⬇️ Download Submission Evidence ({safe_filename})",
+                data=file_bytes,
+                file_name=safe_filename,
+                mime=mime_type,
+                key=f"dl_proof_{user_id}_{app.id}_{conf_meta['confirmation_id']}",
+            )
+        except (DatabaseError, OSError, ValueError, KeyError) as exc:
+            st.error(f"Unable to load verified confirmation evidence: {exc}")
+    else:
+        st.info("No confirmation evidence document attached.")
+        with st.expander("📎 Attach Confirmation Evidence", expanded=False):
+            attach_file = st.file_uploader(
+                "Select confirmation proof (PDF, PNG, JPEG up to 10 MB)",
+                type=["pdf", "png", "jpg", "jpeg"],
+                key=f"attach_proof_{user_id}_{app.id}",
+            )
+            if st.button("Upload & Attach Proof", key=f"btn_attach_proof_{user_id}_{app.id}"):
+                if attach_file is not None:
+                    raw_val = getattr(attach_file, "getvalue", None)
+                    raw_bytes = raw_val() if callable(raw_val) else None
+                    if isinstance(raw_bytes, (bytes, bytearray)) and len(raw_bytes) > 0:
+                        try:
+                            service.attach_submission_confirmation_proof(
+                                application_id=app.id,
+                                session_id=session_id,
+                                file_bytes=bytes(raw_bytes),
+                                original_filename=getattr(attach_file, "name", "proof.pdf"),
+                            )
+                            st.success("Evidence document successfully verified and attached!")
+                            st.rerun()
+                        except (DatabaseError, ValueError, OSError) as exc:
+                            st.error(f"Failed to attach evidence: {exc}")
+                    else:
+                        st.warning("Selected file is empty.")
+                else:
+                    st.warning("Please select a file to upload.")
+
+
+# =============================================================================
+# 12. APPLICATION DETAIL CARD (List View)
 # =============================================================================
 
 def render_application_card(
@@ -1058,6 +1162,8 @@ def render_application_card(
                 st.caption(f"**Linked Job Description ID:** #{app.job_description_id}")
             if app.resume_id:
                 st.caption(f"**Linked Resume ID:** #{app.resume_id}")
+
+            render_submission_confirmation_details(service, session_id, app, user_id)
 
         with tab_match:
             if match_detail and hasattr(match_detail, "overall_score"):

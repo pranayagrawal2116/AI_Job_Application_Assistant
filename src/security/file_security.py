@@ -12,14 +12,16 @@ Enforces:
 import hashlib
 import io
 import os
-from pathlib import Path
 import re
 import secrets
-from typing import Optional, Tuple
 import uuid
+import warnings
 import zipfile
+from datetime import UTC, datetime
+from pathlib import Path
 
 from docx import Document
+from PIL import Image
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
@@ -36,16 +38,20 @@ logger = setup_logger("FileSecurity")
 
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_UNCOMPRESSED_DOCX_BYTES = 50 * 1024 * 1024  # 50 MB zip decompression ceiling
+MAX_CONFIRMATION_IMAGE_PIXELS = 25_000_000  # 25 megapixels safe decompression ceiling
 DEFAULT_USER_STORAGE_BASE = Path(__file__).resolve().parent.parent.parent / "data" / "users"
 
 PDF_MAGIC = b"%PDF-"
 DOCX_MAGIC = b"PK\x03\x04"
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
+ALLOWED_CONFIRMATION_EXTENSIONS = (".pdf", ".png", ".jpg", ".jpeg")
 
 
 class FileSecurityValidator:
     """Validates document security, structural integrity, and isolated filesystem persistence."""
 
-    def __init__(self, base_storage_dir: Optional[Path] = None):
+    def __init__(self, base_storage_dir: Path | None = None):
         self.base_storage_dir = Path(base_storage_dir) if base_storage_dir else DEFAULT_USER_STORAGE_BASE
 
     def get_user_resumes_dir(self, user_id: int) -> Path:
@@ -61,6 +67,14 @@ class FileSecurityValidator:
         if not user_id or int(user_id) <= 0:
             raise ValidationError(f"Invalid user_id: {user_id}")
         user_dir = (self.base_storage_dir / str(user_id) / "job_descriptions").resolve()
+        user_dir.mkdir(parents=True, exist_ok=True)
+        return user_dir
+
+    def get_user_confirmations_dir(self, user_id: int) -> Path:
+        """Returns the isolated private directory for a user's submission confirmations."""
+        if not user_id or int(user_id) <= 0:
+            raise ValidationError(f"Invalid user_id: {user_id}")
+        user_dir = (self.base_storage_dir / str(user_id) / "confirmations").resolve()
         user_dir.mkdir(parents=True, exist_ok=True)
         return user_dir
 
@@ -86,6 +100,17 @@ class FileSecurityValidator:
         return f"{uuid.uuid4()}.{clean_ext}"
 
     @staticmethod
+    def generate_confirmation_storage_filename(application_id: int, detected_format: str) -> str:
+        """Generates a secure server-generated filename for confirmation proof.
+
+        Format: proof_<application_id>_<timestamp>_<uuid>.<ext>
+        """
+        ts = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        u = uuid.uuid4().hex[:16]
+        clean_ext = "jpg" if detected_format == "jpeg" else detected_format
+        return f"proof_{application_id}_{ts}_{u}.{clean_ext}"
+
+    @staticmethod
     def validate_path_containment(target_path: Path, base_dir: Path) -> None:
         """Asserts that target_path is strictly located inside base_dir, preventing path traversal."""
         resolved_target = Path(target_path).resolve()
@@ -96,7 +121,7 @@ class FileSecurityValidator:
             from src.database.exceptions import FileSecurityError
             raise FileSecurityError(f"Path traversal detected: '{target_path}' escapes directory '{base_dir}'.")
 
-    def save_file(self, file_bytes: bytes, dest_path: Path, user_id: Optional[int] = None) -> Path:
+    def save_file(self, file_bytes: bytes, dest_path: Path, user_id: int | None = None) -> Path:
         """Atomically saves bytes to dest_path using a temporary write and fsync."""
         dest = Path(dest_path).resolve()
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -116,7 +141,7 @@ class FileSecurityValidator:
                 except Exception:
                     pass
 
-    def validate_file(self, file_bytes: bytes, original_filename: str) -> Tuple[str, str]:
+    def validate_file(self, file_bytes: bytes, original_filename: str) -> tuple[str, str]:
         """Validates file size, format extension, magic bytes, and structural integrity.
         
         Returns:
@@ -218,12 +243,157 @@ class FileSecurityValidator:
 
         return "docx"
 
+    def _validate_image_structure(self, file_bytes: bytes, expected_format: str) -> None:
+        """Deeply inspects image headers, pixel limits, and stream readability using Pillow."""
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", Image.DecompressionBombWarning)
+            orig_max = Image.MAX_IMAGE_PIXELS
+            Image.MAX_IMAGE_PIXELS = MAX_CONFIRMATION_IMAGE_PIXELS
+            try:
+                stream = io.BytesIO(file_bytes)
+                img = Image.open(stream)
+                if img.format != expected_format:
+                    raise InvalidFileFormatError(
+                        f"Image format mismatch: detected '{img.format}', expected '{expected_format}'."
+                    )
+                width, height = img.size
+                if width <= 0 or height <= 0:
+                    raise CorruptedFileError("Invalid image dimensions (zero or negative).")
+                if width * height > MAX_CONFIRMATION_IMAGE_PIXELS:
+                    raise CorruptedFileError(
+                        f"Image dimensions ({width}x{height} = {width * height} pixels) exceed safe maximum ({MAX_CONFIRMATION_IMAGE_PIXELS} pixels)."
+                    )
+                img.verify()
+
+                # Re-open stream and load pixel data to ensure valid chunks and no truncation
+                stream.seek(0)
+                img_decode = Image.open(stream)
+                img_decode.load()
+            except (Image.DecompressionBombError, Image.DecompressionBombWarning) as e:
+                raise CorruptedFileError(f"Image exceeds safe decompression limits (possible decompression bomb): {e}")
+            except (InvalidFileFormatError, CorruptedFileError):
+                raise
+            except (OSError, ValueError, RuntimeError) as e:
+                raise CorruptedFileError(f"Malformed or corrupted image document: {e}")
+            finally:
+                Image.MAX_IMAGE_PIXELS = orig_max
+
+    def validate_confirmation_proof(self, file_bytes: bytes, original_filename: str) -> tuple[str, str]:
+        """Validates confirmation evidence size, extension, magic bytes, and structural integrity.
+
+        Allowed formats: .pdf, .png, .jpg, .jpeg.
+        Explicitly rejects: .docx, scripts, executables, HTML, SVG, ZIP, corrupted/malformed images.
+
+        Returns:
+            Tuple[detected_format: str ('pdf' | 'png' | 'jpeg'), file_hash: str]
+        """
+        if not file_bytes:
+            raise ValidationError("File content is empty (0 bytes).")
+
+        # 1. Size Limit Check (10 MB)
+        file_size = len(file_bytes)
+        if file_size > MAX_FILE_SIZE_BYTES:
+            raise FileTooLargeError(
+                f"File size ({file_size / (1024*1024):.2f} MB) exceeds maximum allowed limit of 10 MB."
+            )
+
+        # 2. Path Traversal & Filename Check
+        if "\x00" in original_filename or ".." in original_filename:
+            raise ValidationError(f"Path traversal attempt detected in filename: '{original_filename}'")
+
+        clean_ext = Path(original_filename).suffix.lower()
+        if clean_ext not in ALLOWED_CONFIRMATION_EXTENSIONS:
+            raise InvalidFileFormatError(
+                f"Unsupported file extension '{clean_ext}'. Only .pdf, .png, .jpg, and .jpeg files are accepted for confirmation evidence."
+            )
+
+        # 3. Check for obvious non-allowed magic bytes like ZIP / DOCX / EXE
+        if file_bytes.startswith(DOCX_MAGIC):
+            raise InvalidFileFormatError("ZIP/DOCX archive files are rejected for confirmation evidence.")
+        if file_bytes.startswith(b"MZ"):
+            raise InvalidFileFormatError("Executable files are rejected.")
+        if file_bytes.strip().lower().startswith((b"<html", b"<!doctype html", b"<svg")):
+            raise InvalidFileFormatError("HTML/SVG files are rejected for confirmation evidence.")
+
+        # 4. Magic-Bytes & Structural Inspection
+        if clean_ext == ".pdf":
+            if not file_bytes.startswith(PDF_MAGIC):
+                raise InvalidFileFormatError("Invalid PDF header magic bytes.")
+            detected_format = self._validate_pdf_structure(file_bytes)
+        elif clean_ext == ".png":
+            if not file_bytes.startswith(PNG_MAGIC):
+                raise InvalidFileFormatError("Invalid PNG header magic bytes.")
+            self._validate_image_structure(file_bytes, expected_format="PNG")
+            detected_format = "png"
+        elif clean_ext in (".jpg", ".jpeg"):
+            if not file_bytes.startswith(JPEG_MAGIC):
+                raise InvalidFileFormatError("Invalid JPEG header magic bytes.")
+            self._validate_image_structure(file_bytes, expected_format="JPEG")
+            detected_format = "jpeg"
+        else:
+            raise InvalidFileFormatError(f"Unsupported file format '{clean_ext}'.")
+
+        # 5. Check for extension and format mismatch
+        if detected_format == "pdf" and file_bytes.startswith((PNG_MAGIC, JPEG_MAGIC)):
+            raise InvalidFileFormatError("Extension and actual file format mismatch.")
+        if detected_format in ("png", "jpeg") and file_bytes.startswith(PDF_MAGIC):
+            raise InvalidFileFormatError("Extension and actual file format mismatch.")
+
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
+        return detected_format, file_hash
+
+    def save_user_confirmation_file(
+        self,
+        user_id: int,
+        application_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+    ) -> tuple[str, str, int, str]:
+        """Atomically stores a validated submission confirmation proof file in private user directory.
+
+        Returns:
+            Tuple[storage_filename: str, file_format: str, file_size_bytes: int, file_hash: str]
+        """
+        detected_format, file_hash = self.validate_confirmation_proof(file_bytes, original_filename)
+        user_dir = self.get_user_confirmations_dir(user_id)
+
+        storage_filename = self.generate_confirmation_storage_filename(application_id, detected_format)
+        final_path = (user_dir / storage_filename).resolve()
+        self.validate_path_containment(final_path, user_dir)
+        temp_path = user_dir / f"{storage_filename}.tmp_{secrets.token_hex(4)}"
+
+        try:
+            with open(temp_path, "wb") as f:
+                f.write(file_bytes)
+                f.flush()
+                os.fsync(f.fileno())
+
+            os.replace(temp_path, final_path)
+            logger.info(
+                "Securely persisted confirmation proof for User #%d, App #%d: '%s' -> %s (%d bytes, SHA-256: %s)",
+                user_id,
+                application_id,
+                self.sanitize_filename(original_filename),
+                storage_filename,
+                len(file_bytes),
+                file_hash[:12],
+            )
+            return storage_filename, detected_format, len(file_bytes), file_hash
+        except Exception as e:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+            logger.error("Failed to write confirmation proof file atomically: %s", e)
+            raise
+
     def save_user_resume_file(
         self,
         user_id: int,
         file_bytes: bytes,
         original_filename: str,
-    ) -> Tuple[str, str, int, str]:
+    ) -> tuple[str, str, int, str]:
         """Atomically stores a validated resume file in private user directory using a UUID filename.
         
         Returns:
@@ -297,8 +467,8 @@ class FileSecurityValidator:
         user_id: int,
         file_bytes: bytes,
         original_filename: str,
-        user_base_dir: Optional[Path] = None,
-    ) -> Tuple[str, str, int, str]:
+        user_base_dir: Path | None = None,
+    ) -> tuple[str, str, int, str]:
         """Atomically stores a validated job description file in private user directory using a UUID filename.
 
         Returns:
@@ -341,7 +511,7 @@ class FileSecurityValidator:
         self,
         user_id: int,
         storage_filename: str,
-        user_base_dir: Optional[Path] = None,
+        user_base_dir: Path | None = None,
     ) -> Path:
         """Resolves and validates storage path within user's isolated job descriptions directory."""
         if ".." in storage_filename or "/" in storage_filename or "\\" in storage_filename:
@@ -365,7 +535,7 @@ class FileSecurityValidator:
         self,
         user_id: int,
         storage_filename: str,
-        user_base_dir: Optional[Path] = None,
+        user_base_dir: Path | None = None,
     ) -> bool:
         """Securely deletes a physical job description file from user's storage."""
         try:
