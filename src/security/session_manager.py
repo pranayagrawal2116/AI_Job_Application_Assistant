@@ -11,6 +11,7 @@ import time
 from typing import Any, Dict, Optional, Set, Tuple, Union
 
 from src.database.exceptions import (
+    CrossUserAccessError,
     InvalidSessionError,
     InvalidTicketError,
     KeyRevokedError,
@@ -135,6 +136,9 @@ class CandidateSession:
     is_active: bool = True
     issued_tickets: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     consumed_tickets: Set[str] = field(default_factory=set)
+    active_grants: Dict[str, Any] = field(default_factory=dict)
+    consumed_grants: Set[str] = field(default_factory=set)
+    latest_approval_grant: Optional[Any] = None
 
     @property
     def is_expired(self) -> bool:
@@ -164,6 +168,8 @@ class SessionManager:
         rotation_keys: Optional[Dict[str, bytes]] = None,
     ):
         self._sessions: Dict[str, CandidateSession] = {}
+        self._active_grants: Dict[str, Dict[str, Any]] = {}
+        self._consumed_grants: Set[str] = set()
         self._active_key_id = active_key_id or os.environ.get("ACTION_TICKET_ACTIVE_KEY_ID", "v1")
         self._rotation_keys: Dict[str, bytes] = {}
 
@@ -493,6 +499,8 @@ class SessionManager:
         Raises:
             ValueError: If the ticket is missing, malformed, or has an invalid structure or timestamp.
         """
+        import re
+
         if not ticket_str or not isinstance(ticket_str, str) or not ticket_str.strip():
             raise ValueError("Missing action ticket.")
 
@@ -506,13 +514,15 @@ class SessionManager:
             raise ValueError("Invalid action ticket structure.")
 
         header_nonce, ts_str, signature = parts
+        if not signature or not signature.strip():
+            raise ValueError("Missing signature in action ticket.")
+
         try:
             timestamp = int(ts_str)
+            if timestamp <= 0:
+                raise ValueError()
         except ValueError:
             raise ValueError("Corrupt timestamp in action ticket.")
-
-        if not signature:
-            raise ValueError("Missing signature in action ticket.")
 
         if "-" in header_nonce:
             key_id, nonce = header_nonce.rsplit("-", 1)
@@ -520,10 +530,252 @@ class SessionManager:
             key_id = "v1"
             nonce = header_nonce
 
-        if not key_id.strip() or not nonce.strip():
+        key_id = key_id.strip()
+        nonce = nonce.strip()
+        if not key_id or not nonce:
             raise ValueError("Action ticket missing key_id or nonce.")
 
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", key_id):
+            raise ValueError("Malformed key_id in action ticket.")
+
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", nonce):
+            raise ValueError("Malformed nonce in action ticket.")
+
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", signature.strip()):
+            raise ValueError("Malformed signature in action ticket.")
+
         return key_id, nonce, timestamp, signature
+
+    def _compute_grant_signature(
+        self,
+        key_id: str,
+        grant_id: str,
+        user_id: int,
+        session_id: str,
+        application_id: int,
+        packet_id: int,
+        packet_hash: str,
+        ticket_nonce: str,
+        action_type: str,
+        issued_at: int,
+        expires_at: int,
+    ) -> str:
+        """Computes server-side HMAC signature for a VerifiedApprovalGrant."""
+        key_secret = self.key_rotation_mgr.get_verification_key(key_id)
+        message = (
+            f"GRANT:{grant_id}:{user_id}:{session_id}:{application_id}:"
+            f"{packet_id}:{packet_hash}:{ticket_nonce}:{key_id}:{action_type}:"
+            f"{issued_at}:{expires_at}"
+        )
+        return hmac.new(key_secret, message.encode("utf-8"), hashlib.sha256).hexdigest()
+
+    def verify_and_issue_approval_grant(
+        self,
+        session_id: str,
+        ticket_str: Optional[str],
+        application_id: int,
+        packet_id: int,
+        packet_hash: str,
+        approver_name: str = "Human Candidate",
+        db_manager: Optional[Any] = None,
+        grant_ttl_seconds: int = 120,
+    ) -> Tuple[bool, str, Optional[Any]]:
+        """Cryptographically verifies and consumes a HUMAN_APPROVAL ticket and issues a VerifiedApprovalGrant."""
+        try:
+            session = self.validate_session(session_id)
+        except (InvalidSessionError, SessionExpiredError) as e:
+            return False, f"Authorization rejected: {e}", None
+
+        if not ticket_str or not isinstance(ticket_str, str):
+            return False, "Authorization rejected: Missing action ticket.", None
+
+        if ticket_str in ("CANDIDATE_VERIFIED_DASHBOARD_APPROVAL", "CANDIDATE_VERIFIED_MANUAL_SUBMISSION"):
+            return False, "Authorization rejected: Static constant token rejected. Authenticated session ticket required.", None
+
+        try:
+            key_id, nonce, timestamp, signature = self.parse_action_ticket(ticket_str)
+        except ValueError as err:
+            return False, f"Authorization rejected: {err}", None
+
+        try:
+            key_secret = self.key_rotation_mgr.get_verification_key(key_id)
+        except KeyRevokedError as err:
+            logger.error("Ticket verification rejected: key '%s' has been revoked or expired: %s", key_id, err)
+            return False, f"Authorization rejected: Action ticket signed with revoked or retired key '{key_id}'. Key rotation in effect. Fresh candidate authorization required.", None
+
+        if nonce in session.consumed_tickets:
+            logger.warning("Replay attack detected: Ticket nonce %s... already consumed.", nonce[:8])
+            return False, "Authorization rejected: Replay attack detected. Action ticket has already been used.", None
+
+        if nonce not in session.issued_tickets:
+            return False, "Authorization rejected: Unrecognized or unissued action ticket.", None
+
+        meta = session.issued_tickets[nonce]
+
+        now = time.time()
+        if now - timestamp > meta["ttl"]:
+            return False, "Authorization rejected: Action ticket has expired.", None
+
+        if meta.get("action_type") != "HUMAN_APPROVAL":
+            return False, f"Authorization rejected: Ticket scope mismatch. Expected HUMAN_APPROVAL, got {meta.get('action_type')}.", None
+        if meta.get("application_id") != application_id:
+            return False, f"Authorization rejected: Ticket application ID mismatch. Expected {application_id}, got {meta.get('application_id')}.", None
+        if meta.get("packet_hash") != packet_hash:
+            return False, "Authorization rejected: Ticket packet version mismatch. Application packet was modified after ticket issuance.", None
+
+        expected_msg = f"{session.session_id}:{key_id}:HUMAN_APPROVAL:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+        expected_sig = hmac.new(key_secret, expected_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+        if not hmac.compare_digest(signature, expected_sig):
+            legacy_msg = f"{session.session_id}:HUMAN_APPROVAL:{application_id}:{packet_hash}:{nonce}:{timestamp}"
+            legacy_sig = hmac.new(key_secret, legacy_msg.encode("utf-8"), hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(signature, legacy_sig):
+                logger.error("Action ticket signature forgery attempt detected.")
+                return False, "Authorization rejected: Cryptographic signature mismatch (ticket forgery attempt).", None
+
+        # Persistent database nonce consumption if db_manager provided
+        if db_manager is not None and hasattr(db_manager, "consume_action_nonce_persistently"):
+            try:
+                db_manager.consume_action_nonce_persistently(
+                    ticket_nonce=nonce,
+                    key_id=key_id,
+                    user_id=session.user_id or 0,
+                    action_type="HUMAN_APPROVAL",
+                )
+            except TicketAlreadyConsumedError as err:
+                return False, f"Authorization rejected: {err}", None
+            except Exception as e:
+                logger.error("Persistent nonce check failed: %s", e)
+                return False, f"Authorization rejected: Persistent nonce registration failed: {e}", None
+
+        # Consume ticket in memory
+        del session.issued_tickets[nonce]
+        session.consumed_tickets.add(nonce)
+
+        grant_id = secrets.token_hex(16)
+        issued_at = int(time.time())
+        expires_at = issued_at + grant_ttl_seconds
+        user_id = session.user_id or 0
+
+        grant_sig = self._compute_grant_signature(
+            key_id=key_id,
+            grant_id=grant_id,
+            user_id=user_id,
+            session_id=session.session_id,
+            application_id=application_id,
+            packet_id=packet_id,
+            packet_hash=packet_hash,
+            ticket_nonce=nonce,
+            action_type="HUMAN_APPROVAL",
+            issued_at=issued_at,
+            expires_at=expires_at,
+        )
+
+        from src.database.models import VerifiedApprovalGrant
+        grant = VerifiedApprovalGrant(
+            grant_id=grant_id,
+            user_id=user_id,
+            session_id=session.session_id,
+            application_id=application_id,
+            packet_id=packet_id,
+            packet_version_hash=packet_hash,
+            ticket_nonce=nonce,
+            key_id=key_id,
+            action_type="HUMAN_APPROVAL",
+            issued_at=issued_at,
+            expires_at=expires_at,
+            grant_signature=grant_sig,
+            approver_name=approver_name,
+        )
+
+        session.active_grants[grant_id] = grant
+        self._active_grants[grant_id] = {
+            "grant": grant,
+            "session_id": session.session_id,
+            "expires_at": expires_at,
+        }
+        session.latest_approval_grant = grant
+
+        logger.info(
+            "Issued VerifiedApprovalGrant #%s for User #%d, App #%d, Packet #%d",
+            grant_id[:8],
+            user_id,
+            application_id,
+            packet_id,
+        )
+        return True, "Approval grant issued successfully.", grant
+
+    def verify_and_consume_approval_grant(
+        self,
+        grant: Any,
+    ) -> Tuple[bool, str]:
+        """Validates that an approval grant was legitimately issued by this SessionManager,
+        is cryptographically intact, bound to an active session, unexpired, and consumes it single-use.
+        """
+        from src.database.models import VerifiedApprovalGrant
+        if grant is None or not isinstance(grant, VerifiedApprovalGrant):
+            raise SecurityAuthorizationError("Authorization rejected: Invalid or missing authorization grant evidence.")
+
+        if not grant.grant_id or not grant.session_id or not grant.ticket_nonce or not grant.key_id or not grant.grant_signature:
+            raise SecurityAuthorizationError("Authorization rejected: Approval grant missing required cryptographic metadata.")
+
+        if grant.action_type != "HUMAN_APPROVAL":
+            raise SecurityAuthorizationError(f"Authorization rejected: Grant action mismatch. Expected HUMAN_APPROVAL, got '{grant.action_type}'.")
+
+        # Replay check
+        if grant.grant_id in self._consumed_grants:
+            raise TicketAlreadyConsumedError("Authorization rejected: Approval grant has already been consumed (replay attempt).")
+
+        if grant.grant_id not in self._active_grants:
+            raise SecurityAuthorizationError("Authorization rejected: Unrecognized, unissued, or forged approval grant.")
+
+        # Expiry check
+        now = time.time()
+        if now > grant.expires_at:
+            raise SecurityAuthorizationError("Authorization rejected: Approval grant has expired.")
+
+        # Key & HMAC signature check
+        try:
+            self.key_rotation_mgr.get_verification_key(grant.key_id)
+        except KeyRevokedError as err:
+            raise SecurityAuthorizationError(f"Authorization rejected: Grant signed with revoked key '{grant.key_id}': {err}")
+
+        expected_sig = self._compute_grant_signature(
+            key_id=grant.key_id,
+            grant_id=grant.grant_id,
+            user_id=grant.user_id,
+            session_id=grant.session_id,
+            application_id=grant.application_id,
+            packet_id=grant.packet_id,
+            packet_hash=grant.packet_version_hash,
+            ticket_nonce=grant.ticket_nonce,
+            action_type=grant.action_type,
+            issued_at=grant.issued_at,
+            expires_at=grant.expires_at,
+        )
+        if not hmac.compare_digest(grant.grant_signature, expected_sig):
+            raise SecurityAuthorizationError("Authorization rejected: Cryptographic grant signature mismatch (forgery attempt).")
+
+        # Session validation
+        session = self.validate_session(grant.session_id)
+        if session.user_id != grant.user_id:
+            raise CrossUserAccessError(
+                user_id=grant.user_id,
+                target_user_id=session.user_id or 0,
+                resource="Approval Grant",
+            )
+
+        if grant.ticket_nonce not in session.consumed_tickets:
+            raise SecurityAuthorizationError("Authorization rejected: Underlying ticket nonce was not consumed by this session.")
+
+        # Single-use consumption
+        del self._active_grants[grant.grant_id]
+        self._consumed_grants.add(grant.grant_id)
+        session.active_grants.pop(grant.grant_id, None)
+        session.consumed_grants.add(grant.grant_id)
+
+        logger.info("Successfully verified and consumed approval grant #%s...", grant.grant_id[:8])
+        return True, "Approval grant verified and consumed."
 
     def verify_and_consume_action_ticket(
         self,
@@ -612,6 +864,49 @@ class SessionManager:
         # Consume ticket in memory
         del session.issued_tickets[nonce]
         session.consumed_tickets.add(nonce)
+
+        if action_type == "HUMAN_APPROVAL":
+            grant_id = secrets.token_hex(16)
+            issued_at = int(time.time())
+            expires_at = issued_at + 120
+            user_id = session.user_id or 0
+            grant_sig = self._compute_grant_signature(
+                key_id=key_id,
+                grant_id=grant_id,
+                user_id=user_id,
+                session_id=session.session_id,
+                application_id=application_id,
+                packet_id=0,
+                packet_hash=packet_hash,
+                ticket_nonce=nonce,
+                action_type="HUMAN_APPROVAL",
+                issued_at=issued_at,
+                expires_at=expires_at,
+            )
+            from src.database.models import VerifiedApprovalGrant
+            grant = VerifiedApprovalGrant(
+                grant_id=grant_id,
+                user_id=user_id,
+                session_id=session.session_id,
+                application_id=application_id,
+                packet_id=0,
+                packet_version_hash=packet_hash,
+                ticket_nonce=nonce,
+                key_id=key_id,
+                action_type="HUMAN_APPROVAL",
+                issued_at=issued_at,
+                expires_at=expires_at,
+                grant_signature=grant_sig,
+                approver_name="Human Candidate",
+            )
+            session.active_grants[grant_id] = grant
+            self._active_grants[grant_id] = {
+                "grant": grant,
+                "session_id": session.session_id,
+                "expires_at": expires_at,
+            }
+            session.latest_approval_grant = grant
+
         logger.info("Successfully consumed action ticket for %s (Key %s, App #%d, Nonce %s...)", action_type, key_id, application_id, nonce[:8])
         return True, "Action ticket successfully verified and consumed."
 

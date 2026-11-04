@@ -1026,3 +1026,41 @@ Verified that any failure during the atomic approval transaction results in a cl
 ### 25.4 Real SQLite Multi-Connection Lock Contention
 - **Unmocked Concurrency Verification**: Added `test_real_sqlite_write_lock_contention_between_connections` using two independent connections against a temporary file-backed SQLite database.
 - **Non-Masking Behavior**: Connection A holds `BEGIN IMMEDIATE` while Connection B invokes `immediate_transaction(timeout=0.05)`. Demonstrates that SQLite raises `sqlite3.OperationalError: database is locked`, that Connection B skips `ROLLBACK` in autocommit mode, that the original error is preserved without being masked, that Connection B closes cleanly, and that Connection B successfully acquires the immediate write transaction once Connection A releases the lock.
+
+---
+
+## 26. Phase 7.2.2.2 Hardening: Verified Approval Grant Enforcement & Audit Rollback Invariants
+
+Phase 7.2.2.2 closes the remaining approval authorization boundaries, eliminates raw-argument fallbacks, introduces cryptographically verifiable approval grants, hardens rollback assertion invariants with full event snapshots and cryptographic chain verification, and adds comprehensive direct-bypass regression tests.
+
+### 26.1 Verifiable Approval Authorization Grants (`VerifiedApprovalGrant`)
+- **HMAC-SHA256 Grant Signature**: Introduced `VerifiedApprovalGrant` dataclass in `src.database.models`. Each grant is cryptographically signed server-side by `SessionManager._compute_grant_signature()` using the active key secret across canonical grant fields (`grant_id`, `user_id`, `session_id`, `application_id`, `packet_id`, `packet_version_hash`, `ticket_nonce`, `key_id`, `action_type="HUMAN_APPROVAL"`, `issued_at`, `expires_at`).
+- **Controlled Issuance (`verify_and_issue_approval_grant`)**: Action tickets can only be converted into a `VerifiedApprovalGrant` via `SessionManager.verify_and_issue_approval_grant()`. The ticket nonce is verified, validated against key revocation, checked for expiry, validated against ticket scope, bound to the authenticated candidate session, registered in `session.consumed_tickets`, and stored in `SessionManager._active_grants`.
+- **Single-Use Consumption (`verify_and_consume_approval_grant`)**: Before acquiring an immediate write transaction, `DatabaseManager` calls `SessionManager.verify_and_consume_approval_grant()`. The method verifies active grant registration, checks expiration, recomputes and verifies HMAC signature, validates session user binding (`CrossUserAccessError` on user mismatch), verifies underlying ticket nonce consumption, and atomically deletes the grant from `_active_grants` while adding to `_consumed_grants`. Replay attempts raise `TicketAlreadyConsumedError`.
+
+### 26.2 Elimination of Raw-Argument Fallbacks in `DatabaseManager`
+- **Removal of Direct Kwargs**: `DatabaseManager._authorize_application_packet_atomic` was refactored to require a verified grant (`auth_grant: Optional[VerifiedApprovalGrant] = None`). All fallback parameters (`application_id`, `user_id`, `packet_id`, `packet_version_hash`, `ticket_nonce`, `key_id`, `approver_name`, `session_id`) were eliminated.
+- **Strict Keyword Rejection**: Supplying unexpected kwargs or caller-supplied bypass flags immediately raises `SecurityAuthorizationError` before any database connection or write lock is requested.
+- **Prohibited Public Entry Point**: `DatabaseManager.record_packet_approval()` was deprecated and strictly prohibited without verified grant evidence, raising `SecurityAuthorizationError` on direct invocation. Legacy test fixtures were migrated to direct SQL seeding.
+
+### 26.3 Hardened Rollback Assertion Helper & Cryptographic Verification
+- **Full Event Row Snapshotting**: `_assert_approval_rolled_back_and_verifiable` captures and compares full pre-existing event row attributes (`id`, `sequence_no`, `event_type`, `previous_status`, `new_status`, `event_payload_json`, `created_at`, `previous_event_hash`, `event_hash`).
+- **Cryptographic Hash Chain Verification**: Every rollback assertion explicitly executes `DatabaseManager.verify_application_event_chain(app_id, user_id, raise_on_error=True)`, verifying contiguous sequence numbers (`1..N`) and valid hash linkages from `GENESIS`.
+- **Consumption Invariance on Failure**: When an immediate write transaction aborts or fails during commit, the in-memory ticket nonce and approval grant remain consumed, preventing replay attacks while allowing retry with a fresh ticket.
+
+### 26.4 Dedicated Direct-Bypass Regression Suite (Tests A through J)
+Added 10 comprehensive tests to `tests/test_phase_7_2_2_approval_atomicity.py`:
+- **Test A**: Raw field kwargs bypass without grant rejected (`SecurityAuthorizationError`).
+- **Test B**: Missing context (`auth_grant=None`) rejected immediately (`SecurityAuthorizationError`).
+- **Test C**: Forged context (fabricated grant with invented signature/grant_id) rejected (`SecurityAuthorizationError`).
+- **Test D**: Wrong user or session cross-user access rejected (`SecurityAuthorizationError` / `CrossUserAccessError`).
+- **Test E**: Application ID tampering rejected (`SecurityAuthorizationError`).
+- **Test F**: Packet hash tampering rejected (`SecurityAuthorizationError`).
+- **Test G**: Non-`HUMAN_APPROVAL` action tickets rejected (`Ticket scope mismatch`).
+- **Test H**: Consumed grant replay rejected (`TicketAlreadyConsumedError`).
+- **Test I**: Legacy public `record_packet_approval()` rejected (`SecurityAuthorizationError`).
+- **Test J**: Valid candidate workflow preservation succeeds with exactly 1 approval, 1 log, status updated to `APPROVED`, 1 timeline event (`PACKET_HUMAN_APPROVED`), and valid event chain.
+
+### 26.5 Action Ticket Parser Validation
+- **Regex Enforcement**: Enforced regex validation on `key_id` (`^[a-zA-Z0-9_\-]+$`), `nonce` (`^[a-zA-Z0-9_\-]+$`), and `signature` (`^[a-zA-Z0-9_\-]+$`) in `SessionManager.parse_action_ticket()`.
+- **Precedence Integrity**: Positive integer timestamp validation precedes signature structure validation, ensuring malformed timestamps trigger `Corrupt timestamp in action ticket`.

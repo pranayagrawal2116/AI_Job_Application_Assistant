@@ -350,19 +350,22 @@ class TestPhase61Hardening(unittest.TestCase):
     # =========================================================================
 
     def test_record_packet_approval_validates_application_ownership(self):
-        """DatabaseManager.record_packet_approval rejects if application belongs to another user."""
+        """DatabaseManager._record_packet_approval_internal rejects if application belongs to another user."""
         app_b = self.db.get_or_create_application_workspace(user_id=self.user_b.id, job_description_id=self.jd_b.id)
         with self.assertRaises(CrossUserAccessError):
-            self.db.record_packet_approval(
-                application_id=app_b.id,
-                user_id=self.user_a.id,  # User A attempting to approve User B's application
-                packet_version_hash="dummy_hash",
-                ticket_nonce="nonce_test_cross",
-                approver_name="Candidate Alpha",
-            )
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                self.db._record_packet_approval_internal(
+                    cursor=cursor,
+                    application_id=app_b.id,
+                    user_id=self.user_a.id,  # User A attempting to approve User B's application
+                    packet_version_hash="dummy_hash",
+                    ticket_nonce="nonce_test_cross",
+                    approver_name="Candidate Alpha",
+                )
 
     def test_record_packet_approval_validates_packet_ownership(self):
-        """DatabaseManager.record_packet_approval rejects if packet_id belongs to another user."""
+        """DatabaseManager._record_packet_approval_internal rejects if packet_id belongs to another user."""
         app_a = self.db.get_or_create_application_workspace(user_id=self.user_a.id, job_description_id=self.jd_a.id)
         app_b = self.db.get_or_create_application_workspace(user_id=self.user_b.id, job_description_id=self.jd_b.id)
         tailored = UniversalTailoredResumeGenerator().generate(user_id=self.user_b.id, candidate_profile={}, job_description={})
@@ -379,17 +382,20 @@ class TestPhase61Hardening(unittest.TestCase):
         )
 
         with self.assertRaises(CrossUserAccessError):
-            self.db.record_packet_approval(
-                application_id=app_a.id,
-                user_id=self.user_a.id,
-                packet_id=pkt_b.id,  # Packet belongs to User B
-                packet_version_hash=pkt_b.packet_version_hash,
-                ticket_nonce="nonce_test_pkt_cross",
-                approver_name="Candidate Alpha",
-            )
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                self.db._record_packet_approval_internal(
+                    cursor=cursor,
+                    application_id=app_a.id,
+                    user_id=self.user_a.id,
+                    packet_id=pkt_b.id,  # Packet belongs to User B
+                    packet_version_hash=pkt_b.packet_version_hash,
+                    ticket_nonce="nonce_test_pkt_cross",
+                    approver_name="Candidate Alpha",
+                )
 
     def test_record_packet_approval_validates_packet_application_id(self):
-        """DatabaseManager.record_packet_approval rejects if packet does not belong to that application."""
+        """DatabaseManager._record_packet_approval_internal rejects if packet does not belong to that application."""
         app1 = self.db.get_or_create_application_workspace(user_id=self.user_a.id, job_description_id=self.jd_a.id)
         jd2 = self.db.create_job_description(user_id=self.user_a.id, company_name="C2", job_title="T2", raw_content="x", parsed_data={})
         app2 = self.db.get_or_create_application_workspace(user_id=self.user_a.id, job_description_id=jd2.id)
@@ -408,18 +414,21 @@ class TestPhase61Hardening(unittest.TestCase):
         )
 
         with self.assertRaises(ValidationError) as ctx:
-            self.db.record_packet_approval(
-                application_id=app2.id,  # App 2
-                user_id=self.user_a.id,
-                packet_id=pkt1.id,  # Packet belongs to App 1
-                packet_version_hash=pkt1.packet_version_hash,
-                ticket_nonce="nonce_mismatch_app",
-                approver_name="Candidate Alpha",
-            )
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                self.db._record_packet_approval_internal(
+                    cursor=cursor,
+                    application_id=app2.id,  # App 2
+                    user_id=self.user_a.id,
+                    packet_id=pkt1.id,  # Packet belongs to App 1
+                    packet_version_hash=pkt1.packet_version_hash,
+                    ticket_nonce="nonce_mismatch_app",
+                    approver_name="Candidate Alpha",
+                )
         self.assertIn("belongs to Application", str(ctx.exception))
 
     def test_record_packet_approval_validates_hash_match(self):
-        """DatabaseManager.record_packet_approval rejects if packet_version_hash doesn't match."""
+        """DatabaseManager._record_packet_approval_internal rejects if packet_version_hash doesn't match."""
         app = self.db.get_or_create_application_workspace(user_id=self.user_a.id, job_description_id=self.jd_a.id)
         tailored = UniversalTailoredResumeGenerator().generate(user_id=self.user_a.id, candidate_profile={}, job_description={})
         cl = CoverLetterGenerator().generate_universal_cover_letter(user_id=self.user_a.id, candidate_profile={}, job_description={})
@@ -435,18 +444,21 @@ class TestPhase61Hardening(unittest.TestCase):
         )
 
         with self.assertRaises(ValidationError) as ctx:
-            self.db.record_packet_approval(
-                application_id=app.id,
-                user_id=self.user_a.id,
-                packet_id=pkt.id,
-                packet_version_hash="wrong_hash_12345",
-                ticket_nonce="nonce_wrong_hash",
-                approver_name="Candidate Alpha",
-            )
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                self.db._record_packet_approval_internal(
+                    cursor=cursor,
+                    application_id=app.id,
+                    user_id=self.user_a.id,
+                    packet_id=pkt.id,
+                    packet_version_hash="wrong_hash_12345",
+                    ticket_nonce="nonce_wrong_hash",
+                    approver_name="Candidate Alpha",
+                )
         self.assertIn("hash mismatch", str(ctx.exception).lower())
 
     def test_record_packet_approval_rejects_inactive_revision(self):
-        """DatabaseManager.record_packet_approval rejects if packet is not the active revision."""
+        """DatabaseManager._record_packet_approval_internal rejects if packet is not the active revision."""
         app = self.db.get_or_create_application_workspace(user_id=self.user_a.id, job_description_id=self.jd_a.id)
         tailored = UniversalTailoredResumeGenerator().generate(user_id=self.user_a.id, candidate_profile={}, job_description={})
         cl = CoverLetterGenerator().generate_universal_cover_letter(user_id=self.user_a.id, candidate_profile={}, job_description={})
@@ -474,14 +486,17 @@ class TestPhase61Hardening(unittest.TestCase):
         self.assertTrue(pkt2.is_active_revision)
 
         with self.assertRaises(ValidationError) as ctx:
-            self.db.record_packet_approval(
-                application_id=app.id,
-                user_id=self.user_a.id,
-                packet_id=pkt1.id,  # Deactivated revision
-                packet_version_hash=pkt1.packet_version_hash,
-                ticket_nonce="nonce_inactive_rev",
-                approver_name="Candidate Alpha",
-            )
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                self.db._record_packet_approval_internal(
+                    cursor=cursor,
+                    application_id=app.id,
+                    user_id=self.user_a.id,
+                    packet_id=pkt1.id,  # Deactivated revision
+                    packet_version_hash=pkt1.packet_version_hash,
+                    ticket_nonce="nonce_inactive_rev",
+                    approver_name="Candidate Alpha",
+                )
         self.assertIn("not the active revision", str(ctx.exception))
 
     # =========================================================================

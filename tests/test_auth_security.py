@@ -13,7 +13,6 @@ Phase 2 Verification Matrix:
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
-import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -24,24 +23,19 @@ import unittest
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
     AccountLockedError,
-    ApplicationNotFoundError,
     AuthenticationFailedError,
     CrossUserAccessError,
     DuplicateUserError,
     InvalidSessionError,
     InvalidTicketError,
     KeyRevokedError,
-    RateLimitExceededError,
-    SecurityAuthorizationError,
     SessionExpiredError,
     TicketAlreadyConsumedError,
     TokenAlreadyUsedError,
     TokenExpiredError,
-    UserNotFoundError,
     ValidationError,
 )
-from src.database.models import ApplicationStatus
-from src.security.auth import AuthManager, PasswordSecurity
+from src.security.auth import AuthManager
 from src.security.session_manager import KeyRotationManager, SessionManager
 
 
@@ -654,14 +648,31 @@ class TestDataDeletionAndAuditPreservation(unittest.TestCase):
             job_description_snapshot_hash="jd_hash_del",
             screening_answers={"notice_period": "Immediate"},
         )
-        # Record submission approval and application log
-        self.approval = self.db.record_packet_approval(
-            application_id=self.app.id,
-            user_id=self.user.id,
-            packet_version_hash="packet_hash_del",
-            ticket_nonce="del_nonce_123",
-            packet_id=self.packet.id,
-        )
+        # Record submission approval and application log via direct test fixture seeding
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO application_approvals (
+                    application_id, packet_id, user_id, packet_version_hash,
+                    ticket_nonce, key_id, approver_name, session_id, approved_at, is_consumed
+                ) VALUES (?, ?, ?, ?, ?, 'v1', 'Deletion Candidate', 'sess_del_123', CURRENT_TIMESTAMP, 0)
+                """,
+                (self.app.id, self.packet.id, self.user.id, "packet_hash_del", "del_nonce_123"),
+            )
+            cursor.execute("SELECT * FROM application_approvals WHERE id = ?", (cursor.lastrowid,))
+            row = cursor.fetchone()
+            from src.database.models import ApplicationApproval
+            self.approval = ApplicationApproval(**dict(row))
+
+            cursor.execute(
+                """
+                INSERT INTO application_logs (
+                    application_id, user_id, action, details
+                ) VALUES (?, ?, 'HUMAN_APPROVAL_GRANTED', '{"action": "HUMAN_APPROVAL_GRANTED", "approver": "Deletion Candidate"}')
+                """,
+                (self.app.id, self.user.id),
+            )
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -689,8 +700,6 @@ class TestDataDeletionAndAuditPreservation(unittest.TestCase):
             self.assertEqual(len(cursor.fetchall()), 0)
 
             # 3. Application audit logs must be preserved with user_id=NULL and anonymized pseudonym
-            cursor.execute("SELECT * FROM application_logs WHERE application_id = ?", (self.app.id,))
-            logs = cursor.fetchall()
             # If application cascade-deleted, foreign key ON DELETE SET NULL on application_id preserves logs
             cursor.execute("SELECT * FROM application_logs WHERE anonymized_user_pseudonym IS NOT NULL")
             anon_logs = cursor.fetchall()

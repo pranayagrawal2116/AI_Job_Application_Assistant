@@ -50,7 +50,7 @@ from src.database.models import (
     PreparedPacket,
     SubmissionChannel,
     SubmissionConfirmation,
-    VerifiedApprovalContext,
+    VerifiedApprovalGrant,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
@@ -2214,69 +2214,70 @@ class DatabaseManager:
 
     def record_packet_approval(
         self,
-        application_id: int,
-        user_id: int,
-        packet_version_hash: str,
-        ticket_nonce: str,
-        key_id: str = "v1",
-        approver_name: str = "Human Candidate",
-        session_id: str = "",
-        packet_id: Optional[int] = None,
+        *args: Any,
+        auth_grant: Optional[VerifiedApprovalGrant] = None,
+        **kwargs: Any,
     ) -> ApplicationApproval:
-        """Records an explicit human approval record for an application packet.
+        """DEPRECATED / PROHIBITED: Direct creation of approval records without verified authorization evidence is prohibited.
 
-        Validates user ownership and ensures automated agents cannot approve.
+        All human packet approvals must proceed exclusively through HumanApprovalGate.authorize_universal_packet()
+        with a cryptographically verified single-use approval grant.
         """
-        with self.transaction() as conn:
-            cursor = conn.cursor()
-            return self._record_packet_approval_internal(
-                cursor=cursor,
-                application_id=application_id,
-                user_id=user_id,
-                packet_version_hash=packet_version_hash,
-                ticket_nonce=ticket_nonce,
-                key_id=key_id,
-                approver_name=approver_name,
-                session_id=session_id,
-                packet_id=packet_id,
+        if auth_grant is None:
+            raise SecurityAuthorizationError(
+                "Direct invocation of record_packet_approval() without verified authorization evidence is prohibited. "
+                "Human packet approval must proceed exclusively through HumanApprovalGate.authorize_universal_packet()."
             )
+        return self._authorize_application_packet_atomic(auth_grant=auth_grant)
 
     def _authorize_application_packet_atomic(
         self,
-        application_id: Optional[int] = None,
-        user_id: Optional[int] = None,
-        packet_id: Optional[int] = None,
-        packet_version_hash: str = "",
-        ticket_nonce: str = "",
-        key_id: str = "v1",
-        approver_name: str = "Human Candidate",
-        session_id: str = "",
-        auth_context: Optional[VerifiedApprovalContext] = None,
+        auth_grant: Optional[VerifiedApprovalGrant] = None,
+        session_manager: Optional[Any] = None,
+        **kwargs: Any,
     ) -> ApplicationApproval:
         """Internal atomic persistence helper for human approvals under an immediate write lock.
 
         TRUSTED WORKFLOW INVARIANT:
         This internal method may ONLY be invoked by HumanApprovalGate after successful cryptographic
         session validation, active packet integrity verification, candidate confirmation, and action ticket consumption.
+        It requires a cryptographically verified, single-use VerifiedApprovalGrant.
         It is strictly NOT exposed as a public service API.
 
         Target status is derived exclusively from the application's current status (READY_FOR_REVIEW -> APPROVED,
         or legacy Application Prepared -> Awaiting Approval) and is strictly non-caller-selectable.
         """
+        grant = auth_grant or kwargs.pop("auth_context", None)
+        if kwargs:
+            raise SecurityAuthorizationError(
+                f"Raw parameter bypass rejected: _authorize_application_packet_atomic accepts only a VerifiedApprovalGrant, got unexpected: {list(kwargs.keys())}."
+            )
+
+        if grant is None:
+            raise SecurityAuthorizationError(
+                "Missing authorization evidence: A valid, cryptographically verified VerifiedApprovalGrant is mandatory."
+            )
+
+        if not isinstance(grant, VerifiedApprovalGrant):
+            raise SecurityAuthorizationError(
+                f"Invalid authorization evidence: Expected VerifiedApprovalGrant, got {type(grant).__name__}."
+            )
+
+        from src.security.session_manager import SessionManager
+        sm = session_manager or SessionManager.get_instance()
+        # Verify and consume the grant single-use
+        sm.verify_and_consume_approval_grant(grant)
+
+        application_id = grant.application_id
+        user_id = grant.user_id
+        packet_id = grant.packet_id
+        packet_version_hash = grant.packet_version_hash
+        ticket_nonce = grant.ticket_nonce
+        key_id = grant.key_id
+        approver_name = grant.approver_name
+        session_id = grant.session_id
+
         from src.lifecycle.state_machine import ApplicationStateMachine
-
-        if auth_context is not None:
-            application_id = auth_context.application_id
-            user_id = auth_context.user_id
-            packet_id = auth_context.packet_id
-            packet_version_hash = auth_context.packet_version_hash
-            ticket_nonce = auth_context.ticket_nonce
-            key_id = auth_context.key_id
-            approver_name = auth_context.approver_name
-            session_id = auth_context.session_id
-
-        if application_id is None or user_id is None:
-            raise ValidationError("application_id and user_id are mandatory for approval persistence.")
 
         with self.immediate_transaction() as conn:
             cursor = conn.cursor()
@@ -2333,30 +2334,34 @@ class DatabaseManager:
             cursor.execute(
                 """
                 UPDATE applications
-                SET status = ?, updated_at = CURRENT_TIMESTAMP
+                SET status = ?,
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND user_id = ?
                 """,
                 (new_status, application_id, user_id),
             )
 
-            # 4. Insert PACKET_HUMAN_APPROVED timeline event
+            # 4. Append immutable timeline event PACKET_HUMAN_APPROVED
+            event_payload = {
+                "approval_id": approval.id,
+                "packet_id": packet_id,
+                "packet_version_hash": packet_version_hash,
+                "ticket_nonce": ticket_nonce,
+                "key_id": key_id,
+                "approver": approver_name,
+                "session_id": session_id,
+            }
             self._insert_application_event_internal(
                 cursor=cursor,
                 application_id=application_id,
                 user_id=user_id,
                 event_type="PACKET_HUMAN_APPROVED",
-                new_status=new_status,
                 previous_status=current_status,
+                new_status=new_status,
                 actor_type="CANDIDATE",
-                actor_identifier=approver_name.strip(),
+                actor_identifier=approver_name,
                 session_reference=session_id,
-                event_payload={
-                    "approver": approver_name.strip(),
-                    "packet_id": packet_id,
-                    "packet_version_hash": packet_version_hash,
-                    "ticket_nonce": ticket_nonce,
-                    "key_id": key_id,
-                },
+                event_payload=event_payload,
             )
 
             return approval

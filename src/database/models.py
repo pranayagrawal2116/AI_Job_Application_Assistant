@@ -545,20 +545,32 @@ class MatchResult:
 
 
 @dataclass(frozen=True)
-class VerifiedApprovalContext:
-    """Internal trusted capability proving cryptographically verified human approval.
+class VerifiedApprovalGrant:
+    """Verifiable, single-use approval grant issued exclusively by SessionManager.
 
-    Issued exclusively by HumanApprovalGate after successful session validation,
-    packet integrity verification, candidate confirmation, and single-use action ticket consumption.
-    Required by DatabaseManager._authorize_application_packet_atomic.
+    Proof that a HUMAN_APPROVAL action ticket was cryptographically verified,
+    bound to the candidate session, and consumed.
+    Contains cryptographic server signature and issuance metadata preventing forgery.
     """
-    application_id: int
+    grant_id: str
     user_id: int
-    packet_id: Optional[int]
+    session_id: str
+    application_id: int
+    packet_id: int
     packet_version_hash: str
     ticket_nonce: str
     key_id: str
-    approver_name: str
-    session_id: str
+    action_type: str = "HUMAN_APPROVAL"
+    issued_at: int = 0
+    expires_at: int = 0
+    grant_signature: str = ""
+    approver_name: str = "Human Candidate"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+# Backward-compatible alias
+VerifiedApprovalContext = VerifiedApprovalGrant
 
 

@@ -39,17 +39,20 @@ import json
 import os
 import sqlite3
 import tempfile
+from typing import Any
 import unittest
 from unittest.mock import patch
 
 from dashboard.services.dashboard_service import DashboardService
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
+    CrossUserAccessError,
     InvalidStatusTransitionError,
     SecurityAuthorizationError,
+    TicketAlreadyConsumedError,
     ValidationError,
 )
-from src.database.models import ApplicationStatus, VerifiedApprovalContext
+from src.database.models import ApplicationStatus, VerifiedApprovalGrant
 from src.lifecycle.state_machine import ApplicationStateMachine
 from src.preparer.approval_gate import HumanApprovalGate
 from src.security.session_manager import SessionManager
@@ -139,25 +142,42 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
             cursor.execute(
                 """
                 INSERT INTO prepared_packets (
-                    id, application_id, user_id, version_num, packet_version_hash,
+                    application_id, user_id, version_num, packet_version_hash,
                     original_resume_hash, job_description_snapshot_hash, screening_answers_json,
                     canonical_snapshot_json, is_active_revision
-                ) VALUES (201, ?, ?, 1, ?, 'dummy_hash_resume_abc123', 'jd_snap_hash', '[]', ?, 1)
+                ) VALUES (?, ?, 1, ?, 'dummy_hash_resume_abc123', 'jd_snap_hash', '[]', ?, 1)
                 """,
                 (app.id, user_id, snap_hash, snap_bytes.decode("utf-8")),
             )
         packet = self.db.get_active_prepared_packet(app.id, user_id)
         return app, packet, snap_hash
 
+    def _snapshot_application_events(self, app_id: int):
+        events = self.db.get_application_events(app_id, self.user_a)
+        return [
+            {
+                "id": e.id,
+                "sequence_no": e.sequence_no,
+                "event_type": e.event_type,
+                "previous_status": e.previous_status,
+                "new_status": e.new_status,
+                "event_payload_json": e.event_payload_json,
+                "created_at": e.created_at,
+                "previous_event_hash": e.previous_event_hash,
+                "event_hash": e.event_hash,
+            }
+            for e in events
+        ]
+
     def _assert_approval_rolled_back_and_verifiable(
         self,
         app_id: int,
-        initial_event_count: int,
+        initial_events_or_snapshot: Any,
         ticket: str,
         packet_id: int,
         snap_hash: str,
     ):
-        """Common assertions for all 7 failure-injection tests."""
+        """Common assertions for all failure-injection and rollback tests."""
         # 1. Zero approvals added
         with self.db.connection() as conn:
             cursor = conn.cursor()
@@ -179,16 +199,29 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         events = self.db.get_application_events(app_id, self.user_a)
         self.assertEqual(len([e for e in events if e.event_type == "PACKET_HUMAN_APPROVED"]), 0)
 
-        # 5. Pre-existing timeline events unchanged in count
-        self.assertEqual(len(events), initial_event_count)
+        # 5. Pre-existing timeline events unchanged in count and attributes
+        if isinstance(initial_events_or_snapshot, list):
+            self.assertEqual(len(events), len(initial_events_or_snapshot))
+            for current_evt, snap in zip(events, initial_events_or_snapshot):
+                self.assertEqual(current_evt.id, snap["id"])
+                self.assertEqual(current_evt.sequence_no, snap["sequence_no"])
+                self.assertEqual(current_evt.event_type, snap["event_type"])
+                self.assertEqual(current_evt.previous_status, snap["previous_status"])
+                self.assertEqual(current_evt.new_status, snap["new_status"])
+                self.assertEqual(current_evt.event_payload_json, snap["event_payload_json"])
+                self.assertEqual(current_evt.created_at, snap["created_at"])
+                self.assertEqual(current_evt.previous_event_hash, snap["previous_event_hash"])
+                self.assertEqual(current_evt.event_hash, snap["event_hash"])
+        else:
+            self.assertEqual(len(events), initial_events_or_snapshot)
 
         # 6. Sequence numbers contiguous (1..N)
         seqs = [e.sequence_no for e in events]
         self.assertEqual(seqs, list(range(1, len(events) + 1)))
 
-        # 7. Hash chain intact and valid
-        for i in range(1, len(events)):
-            self.assertEqual(events[i].previous_event_hash, events[i - 1].event_hash)
+        # 7. Hash chain intact and cryptographically verifiable
+        valid, err = self.db.verify_application_event_chain(app_id, self.user_a, raise_on_error=True)
+        self.assertTrue(valid, f"Event chain verification failed: {err}")
 
         # 8 & 9. Failed ticket was consumed in memory and cannot be replayed
         succ_replay, msg_replay, _ = self.gate.authorize_universal_packet(
@@ -230,8 +263,8 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         )
 
     def test_internal_method_requires_verified_context(self):
-        """_authorize_application_packet_atomic requires auth_context or explicit parameters."""
-        with self.assertRaises((ValidationError, ValueError)):
+        """_authorize_application_packet_atomic requires a valid VerifiedApprovalGrant."""
+        with self.assertRaises((SecurityAuthorizationError, ValidationError, ValueError)):
             self.db._authorize_application_packet_atomic(auth_context=None)
 
     def test_generic_transition_cannot_authorize_approval(self):
@@ -308,7 +341,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
             packet_hash=snap_hash,
         )
         parts = valid_ticket.split(".")
-        forged_ticket = f"{parts[0]}.{parts[1]}.badsignaturedeadbeef012345"
+        forged_ticket = f"{parts[0]}.{parts[1]}.{'deadbeef' * 8}"
         succ, msg, _ = self.gate.authorize_universal_packet(
             user_id=self.user_a,
             application_id=app.id,
@@ -492,19 +525,28 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
                 packet_hash=snap_hash,
             )
 
-            # Direct internal call with VerifiedApprovalContext raises InvalidStatusTransitionError
-            auth_ctx = VerifiedApprovalContext(
-                application_id=app.id,
-                user_id=self.user_a,
-                packet_id=packet.id,
-                packet_version_hash=snap_hash,
-                ticket_nonce=f"nonce_{invalid_status}",
-                key_id="v1",
-                approver_name="Candidate One",
+            # Direct internal call with legitimate grant raises InvalidStatusTransitionError
+            # when application is in an invalid status
+            internal_ticket = self.session_mgr.issue_action_ticket(
                 session_id=self.session_a.session_id,
+                action_type="HUMAN_APPROVAL",
+                application_id=app.id,
+                packet_hash=snap_hash,
             )
+            v_ok, v_msg, auth_grant = self.session_mgr.verify_and_issue_approval_grant(
+                session_id=self.session_a.session_id,
+                ticket_str=internal_ticket,
+                application_id=app.id,
+                packet_id=packet.id,
+                packet_hash=snap_hash,
+                approver_name="Candidate One",
+            )
+            self.assertTrue(v_ok, f"Grant issuance failed: {v_msg}")
             with self.assertRaises(InvalidStatusTransitionError):
-                self.db._authorize_application_packet_atomic(auth_context=auth_ctx)
+                self.db._authorize_application_packet_atomic(
+                    auth_grant=auth_grant,
+                    session_manager=self.session_mgr,
+                )
 
             # Via gate
             succ, msg, _ = self.gate.authorize_universal_packet(
@@ -538,7 +580,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_a_approval_row_insert_fails(self):
         """Test A: If application_approvals insert fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         # Add trigger to fail approval insert
         with self.db.transaction() as conn:
@@ -596,7 +638,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_b_application_log_insert_fails(self):
         """Test B: If application_logs insert fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         # Add trigger to fail log insert
         with self.db.transaction() as conn:
@@ -654,7 +696,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_c_status_update_fails(self):
         """Test C: If applications status update fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         # Add trigger to fail status update
         with self.db.transaction() as conn:
@@ -712,7 +754,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_d_event_canonicalization_fails(self):
         """Test D: If event payload canonicalization fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         ticket = self.session_mgr.issue_action_ticket(
             session_id=self.session_a.session_id,
@@ -764,7 +806,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_e_event_hash_computation_fails(self):
         """Test E: If event hash computation fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         ticket = self.session_mgr.issue_action_ticket(
             session_id=self.session_a.session_id,
@@ -816,7 +858,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_f_event_insertion_fails(self):
         """Test F: If application_events insert fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         # Add trigger to fail event insert
         with self.db.transaction() as conn:
@@ -874,7 +916,7 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
     def test_failure_injection_g_transaction_commit_fails(self):
         """Test G: If transaction COMMIT fails, all writes rollback and retry succeeds."""
         app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
-        initial_events = len(self.db.get_application_events(app.id, self.user_a))
+        initial_events = self._snapshot_application_events(app.id)
 
         ticket = self.session_mgr.issue_action_ticket(
             session_id=self.session_a.session_id,
@@ -986,6 +1028,342 @@ class TestPhase722ApprovalAtomicity(unittest.TestCase):
         )
         self.assertFalse(succ2)
         self.assertIn("already been used", msg2)
+
+    # =========================================================================
+    # 4. DIRECT-BYPASS REGRESSION TESTS (TESTS A THROUGH J)
+    # =========================================================================
+
+    def test_direct_bypass_rejection_raw_fields(self):
+        """Test A: Raw field kwargs bypass without a VerifiedApprovalGrant is rejected before write lock."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        with self.assertRaises(SecurityAuthorizationError):
+            self.db._authorize_application_packet_atomic(
+                application_id=app.id,
+                user_id=self.user_a,
+                packet_id=packet.id,
+                packet_version_hash=snap_hash,
+                ticket_nonce="raw_bypass_nonce",
+                key_id="v1",
+                approver_name="Bypass Attacker",
+                session_id=self.session_a.session_id,
+            )
+        # Verify no database state mutated
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM application_approvals WHERE application_id = ?", (app.id,))
+            self.assertEqual(cursor.fetchone()[0], 0)
+            cursor.execute("SELECT COUNT(*) FROM application_logs WHERE application_id = ?", (app.id,))
+            self.assertEqual(cursor.fetchone()[0], 0)
+        app_check = self.db.get_user_application(app.id, self.user_a)
+        self.assertEqual(app_check.status, "READY_FOR_REVIEW")
+
+    def test_direct_bypass_rejection_missing_grant(self):
+        """Test B: Calling _authorize_application_packet_atomic with auth_grant=None is rejected immediately."""
+        with self.assertRaises(SecurityAuthorizationError):
+            self.db._authorize_application_packet_atomic(auth_grant=None)
+
+    def test_direct_bypass_rejection_forged_grant(self):
+        """Test C: Fabricating a VerifiedApprovalGrant directly with fake signature/grant_id is rejected."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        forged_grant = VerifiedApprovalGrant(
+            grant_id="invented_grant_id_1234567890abcdef",
+            user_id=self.user_a,
+            session_id=self.session_a.session_id,
+            application_id=app.id,
+            packet_id=packet.id,
+            packet_version_hash=snap_hash,
+            ticket_nonce="invented_nonce_123",
+            key_id="v1",
+            action_type="HUMAN_APPROVAL",
+            issued_at=int(os.environ.get("MOCK_TIME", 1700000000)),
+            expires_at=int(os.environ.get("MOCK_TIME", 1700000000)) + 300,
+            grant_signature="deadbeef" * 8,
+            approver_name="Candidate One",
+        )
+        with self.assertRaises(SecurityAuthorizationError):
+            self.db._authorize_application_packet_atomic(
+                auth_grant=forged_grant,
+                session_manager=self.session_mgr,
+            )
+        # Verify 0 approvals exist
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM application_approvals WHERE application_id = ?", (app.id,))
+            self.assertEqual(cursor.fetchone()[0], 0)
+
+    def test_direct_bypass_rejection_wrong_user_or_session(self):
+        """Test D: An approval grant issued for User B cannot authorize User A's application."""
+        app_a, packet_a, snap_hash_a = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        app_b, packet_b, snap_hash_b = self._setup_app_and_packet(self.user_b, "READY_FOR_REVIEW")
+
+        ticket_b = self.session_mgr.issue_action_ticket(
+            session_id=self.session_b.session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=app_b.id,
+            packet_hash=snap_hash_b,
+        )
+        ok_b, msg_b, grant_b = self.session_mgr.verify_and_issue_approval_grant(
+            session_id=self.session_b.session_id,
+            ticket_str=ticket_b,
+            application_id=app_b.id,
+            packet_id=packet_b.id,
+            packet_hash=snap_hash_b,
+            approver_name="Candidate Two",
+        )
+        self.assertTrue(ok_b)
+
+        # 1. Attacker tampers User B's grant to point to User A's application
+        tampered_app_grant = VerifiedApprovalGrant(
+            grant_id=grant_b.grant_id,
+            user_id=grant_b.user_id,
+            session_id=grant_b.session_id,
+            application_id=app_a.id,
+            packet_id=grant_b.packet_id,
+            packet_version_hash=grant_b.packet_version_hash,
+            ticket_nonce=grant_b.ticket_nonce,
+            key_id=grant_b.key_id,
+            action_type=grant_b.action_type,
+            issued_at=grant_b.issued_at,
+            expires_at=grant_b.expires_at,
+            grant_signature=grant_b.grant_signature,
+            approver_name=grant_b.approver_name,
+        )
+        with self.assertRaises(SecurityAuthorizationError):
+            self.db._authorize_application_packet_atomic(
+                auth_grant=tampered_app_grant,
+                session_manager=self.session_mgr,
+            )
+
+        # 2. Attacker tampers User B's grant to bind to User A's session
+        tampered_sess_grant = VerifiedApprovalGrant(
+            grant_id=grant_b.grant_id,
+            user_id=self.user_b,
+            session_id=self.session_a.session_id,
+            application_id=app_b.id,
+            packet_id=grant_b.packet_id,
+            packet_version_hash=grant_b.packet_version_hash,
+            ticket_nonce=grant_b.ticket_nonce,
+            key_id=grant_b.key_id,
+            action_type=grant_b.action_type,
+            issued_at=grant_b.issued_at,
+            expires_at=grant_b.expires_at,
+            grant_signature=grant_b.grant_signature,
+            approver_name=grant_b.approver_name,
+        )
+        with self.assertRaises((SecurityAuthorizationError, CrossUserAccessError)):
+            self.db._authorize_application_packet_atomic(
+                auth_grant=tampered_sess_grant,
+                session_manager=self.session_mgr,
+            )
+
+        app_a_check = self.db.get_user_application(app_a.id, self.user_a)
+        self.assertEqual(app_a_check.status, "READY_FOR_REVIEW")
+
+    def test_direct_bypass_rejection_wrong_application(self):
+        """Test E: A grant issued for Application 1 cannot authorize Application 2."""
+        app1, packet1, snap_hash1 = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        app2 = self.db.create_user_application(
+            user_id=self.user_a,
+            company_name="Second Company",
+            job_title="Software Architect",
+            status="READY_FOR_REVIEW",
+        )
+
+        ticket1 = self.session_mgr.issue_action_ticket(
+            session_id=self.session_a.session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=app1.id,
+            packet_hash=snap_hash1,
+        )
+        ok1, msg1, grant1 = self.session_mgr.verify_and_issue_approval_grant(
+            session_id=self.session_a.session_id,
+            ticket_str=ticket1,
+            application_id=app1.id,
+            packet_id=packet1.id,
+            packet_hash=snap_hash1,
+            approver_name="Candidate One",
+        )
+        self.assertTrue(ok1)
+
+        # Altering grant's application_id fails HMAC grant signature verification
+        tampered_grant = VerifiedApprovalGrant(
+            grant_id=grant1.grant_id,
+            user_id=grant1.user_id,
+            session_id=grant1.session_id,
+            application_id=app2.id,
+            packet_id=grant1.packet_id,
+            packet_version_hash=grant1.packet_version_hash,
+            ticket_nonce=grant1.ticket_nonce,
+            key_id=grant1.key_id,
+            action_type=grant1.action_type,
+            issued_at=grant1.issued_at,
+            expires_at=grant1.expires_at,
+            grant_signature=grant1.grant_signature,
+            approver_name=grant1.approver_name,
+        )
+        with self.assertRaises(SecurityAuthorizationError):
+            self.db._authorize_application_packet_atomic(
+                auth_grant=tampered_grant,
+                session_manager=self.session_mgr,
+            )
+        app2_check = self.db.get_user_application(app2.id, self.user_a)
+        self.assertEqual(app2_check.status, "READY_FOR_REVIEW")
+
+    def test_direct_bypass_rejection_wrong_packet_or_hash(self):
+        """Test F: A grant with tampered packet hash or deactivated packet is rejected."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        ticket = self.session_mgr.issue_action_ticket(
+            session_id=self.session_a.session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=app.id,
+            packet_hash=snap_hash,
+        )
+        ok, msg, grant = self.session_mgr.verify_and_issue_approval_grant(
+            session_id=self.session_a.session_id,
+            ticket_str=ticket,
+            application_id=app.id,
+            packet_id=packet.id,
+            packet_hash=snap_hash,
+            approver_name="Candidate One",
+        )
+        self.assertTrue(ok)
+
+        # Tampering with packet_version_hash causes HMAC grant signature verification to fail
+        tampered_grant = VerifiedApprovalGrant(
+            grant_id=grant.grant_id,
+            user_id=grant.user_id,
+            session_id=grant.session_id,
+            application_id=grant.application_id,
+            packet_id=grant.packet_id,
+            packet_version_hash="tampered_different_packet_hash_xyz",
+            ticket_nonce=grant.ticket_nonce,
+            key_id=grant.key_id,
+            action_type=grant.action_type,
+            issued_at=grant.issued_at,
+            expires_at=grant.expires_at,
+            grant_signature=grant.grant_signature,
+            approver_name=grant.approver_name,
+        )
+        with self.assertRaises(SecurityAuthorizationError):
+            self.db._authorize_application_packet_atomic(
+                auth_grant=tampered_grant,
+                session_manager=self.session_mgr,
+            )
+
+    def test_direct_bypass_rejection_wrong_action_type(self):
+        """Test G: Non-HUMAN_APPROVAL action tickets cannot issue an approval grant."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        export_ticket = self.session_mgr.issue_action_ticket(
+            session_id=self.session_a.session_id,
+            action_type="DATA_EXPORT",
+            application_id=app.id,
+            packet_hash=snap_hash,
+        )
+        ok, msg, grant = self.session_mgr.verify_and_issue_approval_grant(
+            session_id=self.session_a.session_id,
+            ticket_str=export_ticket,
+            application_id=app.id,
+            packet_id=packet.id,
+            packet_hash=snap_hash,
+            approver_name="Candidate One",
+        )
+        self.assertFalse(ok)
+        self.assertIn("Ticket scope mismatch", msg)
+        self.assertIsNone(grant)
+
+    def test_direct_bypass_rejection_grant_replay(self):
+        """Test H: Once an approval grant is consumed, reusing it triggers TicketAlreadyConsumedError."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        ticket = self.session_mgr.issue_action_ticket(
+            session_id=self.session_a.session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=app.id,
+            packet_hash=snap_hash,
+        )
+        ok, msg, grant = self.session_mgr.verify_and_issue_approval_grant(
+            session_id=self.session_a.session_id,
+            ticket_str=ticket,
+            application_id=app.id,
+            packet_id=packet.id,
+            packet_hash=snap_hash,
+            approver_name="Candidate One",
+        )
+        self.assertTrue(ok)
+
+        # First consumption succeeds
+        approval = self.db._authorize_application_packet_atomic(
+            auth_grant=grant,
+            session_manager=self.session_mgr,
+        )
+        self.assertIsNotNone(approval)
+
+        # Second consumption replay fails
+        with self.assertRaises(TicketAlreadyConsumedError):
+            self.db._authorize_application_packet_atomic(
+                auth_grant=grant,
+                session_manager=self.session_mgr,
+            )
+
+    def test_legacy_public_method_rejection_record_packet_approval(self):
+        """Test I: Direct call to record_packet_approval without VerifiedApprovalGrant is rejected."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            self.db.record_packet_approval(
+                application_id=app.id,
+                user_id=self.user_a,
+                packet_id=packet.id,
+                packet_version_hash=snap_hash,
+                ticket_nonce="legacy_bypass_nonce",
+                approver_name="Candidate One",
+            )
+        self.assertIn("prohibited", str(ctx.exception).lower())
+
+    def test_valid_workflow_preservation_single_use_success(self):
+        """Test J: Legitimate human approval workflow preserves all 4 records and passes event chain validation."""
+        app, packet, snap_hash = self._setup_app_and_packet(self.user_a, "READY_FOR_REVIEW")
+        ticket = self.session_mgr.issue_action_ticket(
+            session_id=self.session_a.session_id,
+            action_type="HUMAN_APPROVAL",
+            application_id=app.id,
+            packet_hash=snap_hash,
+        )
+        succ, msg, approval = self.gate.authorize_universal_packet(
+            user_id=self.user_a,
+            application_id=app.id,
+            packet_id=packet.id,
+            approver_name="Candidate One",
+            session_id=self.session_a.session_id,
+            action_ticket=ticket,
+            candidate_confirmed=True,
+        )
+        self.assertTrue(succ, f"Approval failed: {msg}")
+        self.assertIsNotNone(approval)
+
+        # Exactly 1 approval record
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM application_approvals WHERE application_id = ?", (app.id,))
+            self.assertEqual(cursor.fetchone()[0], 1)
+
+            # Exactly 1 log record with HUMAN_APPROVAL_GRANTED
+            cursor.execute(
+                "SELECT COUNT(*) FROM application_logs WHERE application_id = ? AND action = 'HUMAN_APPROVAL_GRANTED'",
+                (app.id,),
+            )
+            self.assertEqual(cursor.fetchone()[0], 1)
+
+        # Status updated to APPROVED
+        app_fresh = self.db.get_user_application(app.id, self.user_a)
+        self.assertEqual(app_fresh.status, ApplicationStatus.APPROVED.value)
+
+        # Exactly 1 PACKET_HUMAN_APPROVED event
+        events = self.db.get_application_events(app.id, self.user_a)
+        approved_events = [e for e in events if e.event_type == "PACKET_HUMAN_APPROVED"]
+        self.assertEqual(len(approved_events), 1)
+
+        # Cryptographic chain valid
+        valid, err = self.db.verify_application_event_chain(app.id, self.user_a, raise_on_error=True)
+        self.assertTrue(valid, f"Chain verification failed: {err}")
 
     def service_mock_update_status(self, app_id: int, new_status: str):
         with self.db.transaction() as conn:

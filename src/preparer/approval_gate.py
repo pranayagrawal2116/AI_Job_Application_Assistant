@@ -20,7 +20,6 @@ from src.database.models import (
     ApplicationStatus,
     Job,
     PreparedPacket,
-    VerifiedApprovalContext,
 )
 from src.preparer.cover_letter_generator import CoverLetter
 from src.preparer.document_generator import GeneratedDocument
@@ -496,31 +495,23 @@ class HumanApprovalGate:
         except ValueError as parse_err:
             return False, f"Approval rejected: {parse_err}", None
 
-        # 4. Verify & Consume HMAC Action Ticket
-        valid_ticket, ticket_msg = self.session_manager.verify_and_consume_action_ticket(
+        # 4. Verify Action Ticket and Issue Cryptographic VerifiedApprovalGrant
+        valid_grant, grant_msg, auth_grant = self.session_manager.verify_and_issue_approval_grant(
             session_id=session_id,
             ticket_str=action_ticket,
-            action_type="HUMAN_APPROVAL",
             application_id=application_id,
+            packet_id=packet.id or 0,
             packet_hash=packet.packet_version_hash,
+            approver_name=cleaned_approver,
         )
-        if not valid_ticket:
-            return False, f"Approval rejected: {ticket_msg}", None
+        if not valid_grant or auth_grant is None:
+            return False, f"Approval rejected: {grant_msg}", None
 
         # 5. Atomically authorize packet, advance status, and record timeline audit event
         try:
-            auth_context = VerifiedApprovalContext(
-                application_id=application_id,
-                user_id=user_id,
-                packet_id=packet.id,
-                packet_version_hash=packet.packet_version_hash,
-                ticket_nonce=nonce,
-                key_id=key_id,
-                approver_name=cleaned_approver,
-                session_id=session_id,
-            )
             approval = self.db._authorize_application_packet_atomic(
-                auth_context=auth_context
+                auth_grant=auth_grant,
+                session_manager=self.session_manager,
             )
         except Exception as exc:
             logger.error("Error authorizing application packet atomically: %s", exc, exc_info=True)
