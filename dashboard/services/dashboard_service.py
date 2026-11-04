@@ -2435,23 +2435,15 @@ class DashboardService:
                     if k not in ("id", "user_id", "profile_hash", "version", "is_active", "last_updated")
                 }
 
-        # Resolve candidate full name with account fallback
-        cand_name: Optional[str] = None
-        if candidate_profile_data:
-            cand_pinfo = candidate_profile_data.get("personal_information")
-            if isinstance(cand_pinfo, dict) and cand_pinfo.get("full_name"):
-                cand_name = str(cand_pinfo["full_name"]).strip()
-            elif candidate_profile_data.get("full_name"):
-                cand_name = str(candidate_profile_data["full_name"]).strip()
-
-        if not cand_name:
-            user_row = self.db.get_user_by_id(user_id)
-            if user_row and user_row.get("full_name"):
-                cand_name = str(user_row["full_name"]).strip()
+        trusted_account_name: Optional[str] = None
+        user_row = self.db.get_user_by_id(user_id)
+        if user_row and user_row.get("full_name") and str(user_row.get("full_name")).strip():
+            trusted_account_name = str(user_row["full_name"]).strip()
 
         merged_context = dict(extra_context or {})
-        if cand_name and "candidate_name" not in merged_context:
-            merged_context["candidate_name"] = cand_name
+        # Preserve trusted account name in internal context
+        if trusted_account_name:
+            merged_context["_trusted_account_name"] = trusted_account_name
 
         if follow_up_id is not None:
             fup = self.db.get_application_follow_up(follow_up_id=follow_up_id, user_id=user_id)
@@ -2464,6 +2456,7 @@ class DashboardService:
             application=app,
             candidate_profile=candidate_profile_data,
             extra_context=merged_context,
+            trusted_account_name=trusted_account_name,
         )
         return template.to_dict()
 

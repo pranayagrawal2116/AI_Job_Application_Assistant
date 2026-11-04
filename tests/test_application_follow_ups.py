@@ -535,7 +535,7 @@ class TestFollowUpRecommendationEngine(BaseFollowUpTest):
             extra_context={},  # no interview_date provided
         )
         self.assertFalse(rec.has_recommendation)
-        self.assertIn("No verified interview date", rec.rationale)
+        self.assertIn("Interview date is missing or invalid", rec.rationale)
 
     def test_interview_past_date_returns_no_recommendation(self):
         app_interview = Application(
@@ -944,7 +944,7 @@ class TestFollowUpDateIntegrityRemediation(BaseFollowUpTest):
             extra_context={"interview_date": "not-a-date"},
         )
         self.assertFalse(rec.has_recommendation)
-        self.assertIn("No verified interview date recorded", rec.rationale)
+        self.assertIn("Interview date is missing or invalid", rec.rationale)
 
     def test_offer_missing_deadline_returns_no_recommendation(self):
         """OFFER without expiration deadline returns has_recommendation=False."""
@@ -1353,6 +1353,386 @@ class TestFollowUpCandidateProfileExtraction(BaseFollowUpTest):
         # The template subject/body should never contain the sha256 profile hash
         self.assertNotIn(profile_row["profile_hash"], res["body"])
         self.assertNotIn(profile_row["profile_hash"], res["subject"])
+
+
+# =============================================================================
+# 11. PHASE 7.4.1.2 REMEDIATION: FINAL DATA PROVENANCE & STRICT VALIDATION
+# =============================================================================
+
+class TestFollowUpProvenanceRemediationPhase7412(BaseFollowUpTest):
+    """Tests Phase 7.4.1.2 data provenance hardening across submission, identity, and interview dates."""
+
+    # -------------------------------------------------------------------------
+    # Finding A: Remove caller-context submission-date fallback
+    # -------------------------------------------------------------------------
+
+    def test_submitted_valid_date_submitted_produces_recommendation(self):
+        """Authoritative application.date_submitted produces 10 business days recommendation."""
+        app = Application(
+            id=601,
+            user_id=self.user_a,
+            company_name="DeepMind",
+            job_title="Scientist",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted="2026-11-02T09:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 3),
+        )
+        self.assertTrue(rec.has_recommendation)
+        self.assertEqual(rec.recommended_date, "2026-11-16")
+        self.assertIn("10 business days", rec.rationale)
+
+    def test_submitted_missing_date_submitted_ignores_context_submission_date(self):
+        """Missing date_submitted with valid extra_context['submission_date'] produces no recommendation."""
+        app = Application(
+            id=602,
+            user_id=self.user_a,
+            company_name="DeepMind",
+            job_title="Scientist",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted=None,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 3),
+            extra_context={"submission_date": "2026-11-02"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIsNone(rec.recommended_date)
+        self.assertIn("Authoritative submission date is missing or invalid", rec.rationale)
+
+    def test_submitted_missing_date_submitted_ignores_context_submission_timestamp(self):
+        """Missing date_submitted with valid extra_context['submission_timestamp'] produces no recommendation."""
+        app = Application(
+            id=603,
+            user_id=self.user_a,
+            company_name="DeepMind",
+            job_title="Scientist",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted=None,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 3),
+            extra_context={"submission_timestamp": "2026-11-02T10:00:00Z"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIsNone(rec.recommended_date)
+        self.assertIn("Authoritative submission date is missing or invalid", rec.rationale)
+
+    def test_submitted_invalid_date_submitted_does_not_fall_back_to_context(self):
+        """Invalid date_submitted produces no recommendation even if context has a valid date."""
+        app = Application(
+            id=604,
+            user_id=self.user_a,
+            company_name="DeepMind",
+            job_title="Scientist",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted="unparseable-date",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 3),
+            extra_context={"submission_date": "2026-11-02", "submission_timestamp": "2026-11-02T10:00:00Z"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIsNone(rec.recommended_date)
+        self.assertIn("Authoritative submission date is missing or invalid", rec.rationale)
+
+    def test_submitted_never_substitutes_updated_at_or_reference_date(self):
+        """Neither updated_at nor reference_date can substitute for a missing date_submitted."""
+        app = Application(
+            id=605,
+            user_id=self.user_a,
+            company_name="DeepMind",
+            job_title="Scientist",
+            status=ApplicationStatus.SUBMITTED.value,
+            date_submitted=None,
+            updated_at="2026-11-01T12:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 4),
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIsNone(rec.recommended_date)
+
+    # -------------------------------------------------------------------------
+    # Finding B: Protect canonical candidate identity in templates
+    # -------------------------------------------------------------------------
+
+    def test_profile_personal_info_name_precedes_conflicting_context_name(self):
+        """candidate_profile personal_information.full_name strictly overrides caller extra_context['candidate_name']."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            application=self.app_a,
+            candidate_profile={"personal_information": {"full_name": "Alice Walker Verified"}},
+            extra_context={"candidate_name": "Impersonator Name"},
+            trusted_account_name="Account Name",
+        )
+        self.assertIn("Alice Walker Verified", tpl.body)
+        self.assertIn("Alice Walker Verified", tpl.subject)
+        self.assertNotIn("Impersonator Name", tpl.body)
+        self.assertNotIn("Impersonator Name", tpl.subject)
+
+    def test_flat_profile_name_precedes_conflicting_context_name(self):
+        """Flat candidate_profile full_name strictly overrides caller extra_context['candidate_name']."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            application=self.app_a,
+            candidate_profile={"full_name": "Alice Flat Verified"},
+            extra_context={"candidate_name": "Fake Caller Name"},
+            trusted_account_name="Account Name",
+        )
+        self.assertIn("Alice Flat Verified", tpl.body)
+        self.assertIn("Alice Flat Verified", tpl.subject)
+        self.assertNotIn("Fake Caller Name", tpl.body)
+        self.assertNotIn("Fake Caller Name", tpl.subject)
+
+    def test_account_name_fallback_precedes_untrusted_caller_context(self):
+        """When profile has no usable name, trusted account name is used, ignoring caller extra_context."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            application=self.app_a,
+            candidate_profile={"skills": ["Python"]},  # no name in profile
+            extra_context={"candidate_name": "Unauthorized Alias"},
+            trusted_account_name="Trusted User Name",
+        )
+        self.assertIn("Trusted User Name", tpl.body)
+        self.assertIn("Trusted User Name", tpl.subject)
+        self.assertNotIn("Unauthorized Alias", tpl.body)
+
+    def test_placeholder_used_when_neither_profile_nor_account_has_name(self):
+        """When neither profile nor account has usable name, defaults to [CANDIDATE NAME], ignoring caller context."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            application=self.app_a,
+            candidate_profile={},
+            extra_context={"candidate_name": "Injected Name"},
+            trusted_account_name="",
+        )
+        self.assertIn("[CANDIDATE NAME]", tpl.body)
+        self.assertNotIn("Injected Name", tpl.body)
+
+    def test_whitespace_and_malformed_profile_names_handled_safely(self):
+        """Whitespace-only profile names fall back to trusted account name or placeholder."""
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.STATUS_INQUIRY.value,
+            application=self.app_a,
+            candidate_profile={"personal_information": {"full_name": "   "}},
+            trusted_account_name="Fallback Alice",
+        )
+        self.assertIn("Fallback Alice", tpl.body)
+
+    def test_service_generate_template_blocks_caller_candidate_name_impersonation(self):
+        """DashboardService.generate_follow_up_template prevents caller extra_context from impersonating user."""
+        res = self.service.generate_follow_up_template(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            follow_up_type="STATUS_INQUIRY",
+            extra_context={"candidate_name": "Malicious Impersonator"},
+        )
+        self.assertIn("Alice Walker", res["body"])
+        self.assertNotIn("Malicious Impersonator", res["body"])
+
+    # -------------------------------------------------------------------------
+    # Finding C: Validate interview-date provenance and template formatting
+    # -------------------------------------------------------------------------
+
+    def test_interview_valid_authoritative_stored_date(self):
+        """Authoritative interview_date on application model is recognized and labeled as application_record."""
+        app = Application(
+            id=610,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        app.interview_date = "2026-11-10"  # Stored application field
+
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+        )
+        self.assertTrue(rec.has_recommendation)
+        self.assertEqual(rec.recommended_date, "2026-11-11")
+        self.assertEqual(rec.application_context.get("interview_date_source"), "application_record")
+
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app,
+            candidate_profile={"full_name": "Alice Walker"},
+        )
+        self.assertIn("on 2026-11-10", tpl.body)
+        self.assertEqual(tpl.context_metadata.get("interview_date_source"), "application_record")
+        self.assertEqual(tpl.context_metadata.get("date_referenced"), "2026-11-10")
+
+    def test_interview_valid_candidate_provided_date(self):
+        """Candidate-provided interview date in context is recognized as candidate_provided and unverified."""
+        app = Application(
+            id=611,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={"interview_date": "2026-11-10"},
+        )
+        self.assertTrue(rec.has_recommendation)
+        self.assertEqual(rec.application_context.get("interview_date_source"), "candidate_provided")
+        self.assertIn("candidate-provided", rec.rationale)
+
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"interview_date": "2026-11-10"},
+        )
+        self.assertIn("on 2026-11-10", tpl.body)
+        self.assertEqual(tpl.context_metadata.get("interview_date_source"), "candidate_provided")
+        self.assertFalse(tpl.context_metadata.get("has_verified_interviewer"))
+
+    def test_interview_missing_date_uses_neutral_wording_and_unavailable_metadata(self):
+        """Missing interview date produces no recommendation and template uses neutral wording with unavailable metadata."""
+        app = Application(
+            id=612,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Interview date is missing or invalid", rec.rationale)
+
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={},
+        )
+        self.assertNotIn(" today", tpl.body)
+        self.assertNotIn(" on ", tpl.body)
+        self.assertEqual(tpl.context_metadata.get("interview_date_source"), "unavailable")
+        self.assertIsNone(tpl.context_metadata.get("date_referenced"))
+
+    def test_interview_invalid_date_strings_rejected(self):
+        """Invalid strings such as 'not-a-date' are rejected by both engine and template generator."""
+        app = Application(
+            id=613,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={"interview_date": "not-a-date"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Interview date is missing or invalid", rec.rationale)
+
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"interview_date": "not-a-date"},
+        )
+        self.assertNotIn("not-a-date", tpl.body)
+        self.assertNotIn(" on ", tpl.body)
+        self.assertEqual(tpl.context_metadata.get("interview_date_source"), "unavailable")
+        self.assertIsNone(tpl.context_metadata.get("date_referenced"))
+
+    def test_interview_impossible_date_rejected(self):
+        """Impossible dates such as '2026-99-99' are rejected by both engine and template generator."""
+        app = Application(
+            id=614,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={"interview_date": "2026-99-99"},
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIn("Interview date is missing or invalid", rec.rationale)
+
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"interview_date": "2026-99-99"},
+        )
+        self.assertNotIn("2026-99-99", tpl.body)
+        self.assertEqual(tpl.context_metadata.get("interview_date_source"), "unavailable")
+        self.assertIsNone(tpl.context_metadata.get("date_referenced"))
+
+    def test_interview_arbitrary_malformed_timestamps_rejected(self):
+        """Malformed timestamps with trailing garbage (e.g. '2026-11-10garbage') are rejected."""
+        app = Application(
+            id=615,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={"interview_date": "2026-11-10garbage"},
+        )
+        self.assertFalse(rec.has_recommendation)
+
+        tpl = FollowUpTemplateGenerator.generate(
+            follow_up_type=FollowUpType.THANK_YOU_NOTE.value,
+            application=app,
+            candidate_profile={"full_name": "Alice Walker"},
+            extra_context={"interview_date": "2026-11-10garbage"},
+        )
+        self.assertNotIn("2026-11-10garbage", tpl.body)
+        self.assertEqual(tpl.context_metadata.get("interview_date_source"), "unavailable")
+
+    def test_interview_no_fallback_to_updated_at_or_current_date(self):
+        """Interview recommendation never falls back to updated_at or current date."""
+        app = Application(
+            id=616,
+            user_id=self.user_a,
+            company_name="Google",
+            job_title="SWE",
+            status=ApplicationStatus.INTERVIEW.value,
+            updated_at="2026-11-09T10:00:00Z",
+        )
+        rec = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+        )
+        self.assertFalse(rec.has_recommendation)
+        self.assertIsNone(rec.recommended_date)
 
 
 if __name__ == "__main__":
