@@ -923,7 +923,7 @@ class TestConfirmationProofUI(BaseConfirmationProofTest):
         mock_st.selectbox.return_value = "COMPANY_PORTAL"
         mock_st.text_input.return_value = ""
         mock_st.text_area.return_value = ""
-        mock_st.button.return_value = False
+        mock_st.button.return_value = True
 
         render_manual_submission_section(self.service, self.session_a.session_id, self.app_a, self.user_a)
 

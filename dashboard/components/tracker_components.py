@@ -18,6 +18,7 @@ from datetime import UTC, date, datetime
 from typing import Any
 
 import streamlit as st
+from streamlit.errors import StreamlitAPIException
 
 from dashboard.services.dashboard_service import DashboardService
 from src.database.exceptions import (
@@ -798,23 +799,22 @@ def render_external_navigation_action(
 # 7. MANUAL SUBMISSION CONFIRMATION DIALOG / SECTION
 # =============================================================================
 
-def render_manual_submission_section(
+def render_manual_submission_dialog_content(
     service: DashboardService,
     session_id: str,
     app: Application,
     user_id: int,
 ) -> None:
-    """Renders the strict cryptographic manual submission confirmation workflow for APPROVED applications."""
+    """Renders the modal dialog contents for manual submission confirmation."""
     try:
         norm_status = ApplicationStateMachine.normalize_status(app.status)
     except (KeyError, ValueError, AttributeError):
         norm_status = None
 
     if norm_status != ApplicationStatus.APPROVED:
+        st.error("Only applications in APPROVED status can be confirmed for submission.")
         return
 
-    st.markdown("---")
-    st.markdown("### 🚀 Confirm Manual Job Submission")
     st.warning(
         "⚠️ **Human-in-the-Loop Governance Notice:**\n\n"
         "The assistant **never** submits job applications automatically. "
@@ -873,7 +873,7 @@ def render_manual_submission_section(
                     st.error("No active prepared packet found for this application. Prepare and approve materials first.")
                     return
 
-                # 2. Issue fresh action ticket bound to application and active packet hash
+                # 2. Issue fresh action ticket bound to application and active packet hash ONLY at confirmation time
                 ticket = service.issue_manual_submission_ticket(
                     session_id=session_id,
                     application_id=app.id,
@@ -913,6 +913,64 @@ def render_manual_submission_section(
 
             except (DatabaseError, ValueError) as exc:
                 st.error(f"Manual submission confirmation failed: {exc}")
+
+
+if hasattr(st, "dialog"):
+    @st.dialog("🚀 Confirm Manual Job Submission", width="medium")
+    def _confirm_manual_submission_dialog_decorated(
+        service: DashboardService,
+        session_id: str,
+        app: Application,
+        user_id: int,
+    ) -> None:
+        render_manual_submission_dialog_content(service, session_id, app, user_id)
+else:
+    def _confirm_manual_submission_dialog_decorated(
+        service: DashboardService,
+        session_id: str,
+        app: Application,
+        user_id: int,
+    ) -> None:
+        render_manual_submission_dialog_content(service, session_id, app, user_id)
+
+
+def confirm_manual_submission_dialog(
+    service: DashboardService,
+    session_id: str,
+    app: Application,
+    user_id: int,
+) -> None:
+    """Invokes the modal submission confirmation dialog, falling back to direct rendering in headless test environments."""
+    try:
+        _confirm_manual_submission_dialog_decorated(service, session_id, app, user_id)
+    except (StreamlitAPIException, Exception):  # noqa: BLE001
+        render_manual_submission_dialog_content(service, session_id, app, user_id)
+
+
+def render_manual_submission_section(
+    service: DashboardService,
+    session_id: str,
+    app: Application,
+    user_id: int,
+) -> None:
+    """Renders the manual submission section with modal dialog trigger for APPROVED applications."""
+    try:
+        norm_status = ApplicationStateMachine.normalize_status(app.status)
+    except (KeyError, ValueError, AttributeError):
+        norm_status = None
+
+    if norm_status != ApplicationStatus.APPROVED:
+        return
+
+    st.markdown("---")
+    st.markdown("##### 🚀 Confirm Manual Job Submission")
+    st.caption(
+        "Human-in-the-Loop Safeguard: Applications are never submitted automatically. "
+        "Complete and submit your application on the employer website, then open the confirmation dialog."
+    )
+
+    if st.button("🚀 Open Manual Submission Confirmation", key=f"open_sub_modal_btn_{user_id}_{app.id}", type="primary"):
+        confirm_manual_submission_dialog(service, session_id, app, user_id)
 
 
 # =============================================================================

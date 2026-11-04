@@ -137,7 +137,7 @@ def render_application_preparer():
                 st.warning("⚠️ No saved job descriptions found. Add a job description in the 'Job Analyzer & Ingestion' view first.")
                 selected_jd_id = None
             else:
-                jd_options = {jd.id: f"{jd.company_name} — {jd.role_title} (#{jd.id})" for jd in user_jds}
+                jd_options = {jd.id: f"{jd.company_name} — {getattr(jd, 'job_title', getattr(jd, 'role_title', 'Role'))} (#{jd.id})" for jd in user_jds}
                 selected_jd_id = st.selectbox(
                     "Select Target Job Opportunity",
                     options=list(jd_options.keys()),
@@ -245,12 +245,15 @@ def render_application_preparer():
 
         if gen_resume_btn or "tailored_resume" not in st.session_state:
             with st.spinner("Analyzing job requirements and tailoring verified credentials..."):
+                jd_parsed = (selected_jd.to_dict().get("parsed_data") if selected_jd else {}) or {}
+                if not isinstance(jd_parsed, dict):
+                    jd_parsed = {}
                 jd_dict = {
                     "id": selected_jd.id if selected_jd else None,
                     "company_name": selected_jd.company_name if selected_jd else app.company_name,
-                    "role_title": selected_jd.role_title if selected_jd else app.job_title,
-                    "required_skills": selected_jd.required_skills if selected_jd else [],
-                    "preferred_skills": selected_jd.preferred_skills if selected_jd else [],
+                    "role_title": getattr(selected_jd, "job_title", getattr(selected_jd, "role_title", app.job_title)) if selected_jd else app.job_title,
+                    "required_skills": jd_parsed.get("required_skills") or getattr(selected_jd, "required_skills", []),
+                    "preferred_skills": jd_parsed.get("preferred_skills") or getattr(selected_jd, "preferred_skills", []),
                 }
                 match_dict = latest_match.to_dict() if latest_match else None
                 tailored: TailoredResume = service.generate_tailored_resume(
@@ -352,7 +355,7 @@ def render_application_preparer():
             with st.spinner("Synthesizing personalized cover letter from verified qualifications..."):
                 jd_dict = {
                     "company_name": selected_jd.company_name if selected_jd else app.company_name,
-                    "role_title": selected_jd.role_title if selected_jd else app.job_title,
+                    "role_title": getattr(selected_jd, "job_title", getattr(selected_jd, "role_title", app.job_title)) if selected_jd else app.job_title,
                 }
                 match_dict = latest_match.to_dict() if latest_match else None
                 cl = service.generate_universal_cover_letter(
@@ -409,7 +412,7 @@ def render_application_preparer():
             with st.spinner("Classifying and generating evidence-grounded answers..."):
                 jd_dict = {
                     "company_name": selected_jd.company_name if selected_jd else app.company_name,
-                    "role_title": selected_jd.role_title if selected_jd else app.job_title,
+                    "role_title": getattr(selected_jd, "job_title", getattr(selected_jd, "role_title", app.job_title)) if selected_jd else app.job_title,
                 }
                 char_lim = int(char_limit_input) if char_limit_input > 0 else None
                 answered_list = service.batch_answer_screening_questions(

@@ -28,6 +28,8 @@ from dashboard.components.tracker_components import (
 )
 from dashboard.services.dashboard_service import DashboardService
 from src.database.exceptions import (
+    ApplicationNotFoundError,
+    CrossUserAccessError,
     DatabaseError,
     SecurityAuthorizationError,
 )
@@ -135,15 +137,41 @@ def render_application_tracker() -> None:
     # -------------------------------------------------------------------------
     # 5. VIEW 4 & 5 — LIST VIEW / KANBAN BOARD
     # -------------------------------------------------------------------------
-    selected_app_id = st.session_state.get("tracker_selected_app_id")
-    if selected_app_id:
+    raw_selected_app_id = st.session_state.get("tracker_selected_app_id")
+    focused_app = None
+    if raw_selected_app_id is not None:
+        try:
+            valid_id = int(raw_selected_app_id)
+            if valid_id > 0:
+                candidate_app = service.db.get_user_application(valid_id, user_id)
+                if candidate_app and candidate_app.user_id == user_id:
+                    focused_app = candidate_app
+                else:
+                    st.session_state.pop("tracker_selected_app_id", None)
+            else:
+                st.session_state.pop("tracker_selected_app_id", None)
+        except (ApplicationNotFoundError, CrossUserAccessError, DatabaseError, ValueError, TypeError):
+            st.session_state.pop("tracker_selected_app_id", None)
+            focused_app = None
+
+    if focused_app is not None:
         c_foc1, c_foc2 = st.columns([5, 1])
         with c_foc1:
-            st.info(f"🎯 **Targeted Application Focus:** Showing Application #{selected_app_id} transferred from Application Preparer.")
+            st.info(f"🎯 **Targeted Application Focus:** Showing Application #{focused_app.id} transferred from Application Preparer.")
         with c_foc2:
             if st.button("✕ Clear Focus", key=f"clear_foc_{user_id}"):
                 st.session_state.pop("tracker_selected_app_id", None)
                 st.rerun()
+
+        render_application_card(
+            focused_app,
+            service,
+            session_id,
+            user_id,
+            include_archived=bool(focused_app.is_archived),
+            expanded=True,
+        )
+        st.divider()
 
     if view_mode == "List View":
         # Pagination Management
@@ -196,8 +224,9 @@ def render_application_tracker() -> None:
         st.markdown(f"**Showing {start_idx}–{end_idx} of {total_matching} Tracked Opportunities**")
 
         for app in apps:
-            is_target = bool(selected_app_id and app.id == selected_app_id)
-            render_application_card(app, service, session_id, user_id, include_archived, expanded=is_target)
+            if focused_app is not None and app.id == focused_app.id:
+                continue
+            render_application_card(app, service, session_id, user_id, include_archived, expanded=False)
 
         # Pagination controls
         total_pages = max(1, (total_matching + page_size - 1) // page_size)
@@ -232,4 +261,8 @@ def render_application_tracker() -> None:
             st.error(f"Cannot load applications for Kanban Board: {exc}")
             return
 
-        render_kanban_board_view(kanban_apps, service, session_id, user_id, include_archived, follow_ups=pending_follow_ups)
+        kanban_display_apps = [
+            app for app in kanban_apps
+            if not (focused_app is not None and app.id == focused_app.id)
+        ]
+        render_kanban_board_view(kanban_display_apps, service, session_id, user_id, include_archived, follow_ups=pending_follow_ups)

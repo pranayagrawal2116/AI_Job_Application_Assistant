@@ -14,6 +14,7 @@ Covers the complete 8-category test specification:
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import tempfile
@@ -22,6 +23,10 @@ from datetime import UTC, date
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import Paragraph, SimpleDocTemplate
 
 from dashboard.components.tracker_components import (
     KANBAN_COLUMNS,
@@ -37,6 +42,7 @@ from dashboard.components.tracker_components import (
     render_lifecycle_status_actions,
     render_lifecycle_stepper,
     render_lifecycle_timeline_view,
+    render_manual_submission_dialog_content,
     render_manual_submission_section,
     render_prepared_packets_view,
     render_tracker_filter_toolbar,
@@ -45,6 +51,7 @@ from dashboard.components.tracker_components import (
     sanitize_csv_cell,
 )
 from dashboard.services.dashboard_service import DashboardService
+from dashboard.views.application_preparer import render_application_preparer
 from dashboard.views.application_tracker import render_application_tracker
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
@@ -1288,6 +1295,11 @@ class TestComponentRendering(BaseTrackerUITest):
         mock_st.button.return_value = False
 
         render_manual_submission_section(self.service, self.session_a.session_id, app_approved, self.user_a)
+        mock_st.button.assert_called_with("🚀 Open Manual Submission Confirmation", key=f"open_sub_modal_btn_{self.user_a}_{app_approved.id}", type="primary")
+
+        # When button is clicked, confirmation dialog content is rendered
+        mock_st.button.return_value = True
+        render_manual_submission_section(self.service, self.session_a.session_id, app_approved, self.user_a)
         mock_st.warning.assert_called()
 
     @patch("dashboard.components.tracker_components.st")
@@ -2315,6 +2327,544 @@ class TestPhase75LifecycleOverhaul(BaseTrackerUITest):
             mock_st.session_state["tracker_selected_app_id"] = app.id
 
         self.assertEqual(mock_st.session_state.get("tracker_selected_app_id"), app.id)
+
+
+class TestPhase751Remediation(BaseTrackerUITest):
+    """Rigorous acceptance tests for Phase 7.5.1 Remediation:
+    Finding A — Modal Manual Submission Confirmation
+    Finding B — Guaranteed Preparer to Tracker Focus Navigation & Deduplication
+    Finding C — Real Application Preparer Tab 7 & Tab 8 Integration
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.app_approved = self._create_app(self.user_a, "Anthropic", "Research Scientist", status="APPROVED")
+        self.packet = self._create_packet(self.app_approved.id, self.user_a, version_num=1, is_active=True)
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                """
+                INSERT INTO application_approvals (
+                    application_id, packet_id, user_id, packet_version_hash,
+                    ticket_nonce, key_id, approver_name, session_id, approved_at, is_consumed
+                ) VALUES (?, ?, ?, ?, 'n1', 'k1', 'Alice Candidate', ?, CURRENT_TIMESTAMP, 0)
+                """,
+                (self.app_approved.id, self.packet.id, self.user_a, self.packet.packet_version_hash, self.session_a.session_id),
+            )
+
+    # -------------------------------------------------------------------------
+    # FINDING A: MODAL MANUAL SUBMISSION TESTS
+    # -------------------------------------------------------------------------
+    @patch("dashboard.components.tracker_components.st")
+    def test_manual_submission_dialog_trigger_only_approved(self, mock_st):
+        """Button to open submission confirmation dialog is ONLY rendered when application status is APPROVED."""
+        for non_appr_status in ["DRAFT", "PREPARING", "READY_FOR_REVIEW", "SUBMITTED", "IN_PROGRESS", "REJECTED"]:
+            mock_st.reset_mock()
+            other_app = self._create_app(self.user_a, "Other Co", "Role", status=non_appr_status)
+            render_manual_submission_section(self.service, self.session_a.session_id, other_app, self.user_a)
+            # Button is never rendered for non-APPROVED applications
+            mock_st.button.assert_not_called()
+
+        # For APPROVED application, button IS rendered with distinct key
+        mock_st.reset_mock()
+        mock_st.button.return_value = False
+        render_manual_submission_section(self.service, self.session_a.session_id, self.app_approved, self.user_a)
+        mock_st.button.assert_called_with(
+            "🚀 Open Manual Submission Confirmation",
+            key=f"open_sub_modal_btn_{self.user_a}_{self.app_approved.id}",
+            type="primary",
+        )
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_manual_submission_dialog_dismissal_no_mutation(self, mock_st):
+        """Opening or dismissing the dialog without clicking Submit causes zero state changes or tickets."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True  # Checkbox checked but submit NOT clicked
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = ""
+        mock_st.text_area.return_value = ""
+        mock_st.file_uploader.return_value = None
+        mock_st.button.return_value = False  # Did not click submit
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app_approved, self.user_a)
+
+        # Verify application status remains APPROVED
+        app_db = self.db.get_user_application(self.app_approved.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
+        # Verify no events were created
+        events = self.db.get_application_events(application_id=self.app_approved.id, user_id=self.user_a)
+        self.assertEqual(len(events), 0)
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_manual_submission_dialog_validation_and_submission(self, mock_st):
+        """Unchecked confirmation fails with error; valid confirmation transitions status to SUBMITTED."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = "REF-2026-SUBMIT"
+        mock_st.text_area.return_value = "Applied on career site."
+        mock_st.file_uploader.return_value = None
+        mock_st.button.return_value = True
+
+        # 1. Unchecked checkbox -> error, no transition
+        mock_st.checkbox.return_value = False
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app_approved, self.user_a)
+        mock_st.error.assert_called_with("You must explicitly check the confirmation checkbox to authorize manual submission.")
+        app_db = self.db.get_user_application(self.app_approved.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
+
+        # 2. Checked checkbox -> transitions to SUBMITTED and calls rerun
+        mock_st.checkbox.return_value = True
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app_approved, self.user_a)
+        app_db = self.db.get_user_application(self.app_approved.id, self.user_a)
+        self.assertEqual(app_db.status, "SUBMITTED")
+        mock_st.rerun.assert_called()
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_manual_submission_dialog_missing_packet_hash_blocks_transition(self, mock_st):
+        """Application in APPROVED status without active prepared packet cannot issue ticket or transition."""
+        app_without_packet = self._create_app(self.user_a, "No Packet Co", "Engineer", status="APPROVED")
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True
+        mock_st.selectbox.return_value = "COMPANY_PORTAL"
+        mock_st.text_input.return_value = ""
+        mock_st.text_area.return_value = ""
+        mock_st.file_uploader.return_value = None
+        mock_st.button.return_value = True
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, app_without_packet, self.user_a)
+        mock_st.error.assert_called_with("No active prepared packet found for this application. Prepare and approve materials first.")
+        app_db = self.db.get_user_application(app_without_packet.id, self.user_a)
+        self.assertEqual(app_db.status, "APPROVED")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_manual_submission_dialog_proof_upload_and_channels(self, mock_st):
+        """File proof upload (PDF) and channel selections are correctly handled and persisted."""
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.columns.return_value = [MagicMock(), MagicMock()]
+        mock_st.checkbox.return_value = True
+        mock_st.selectbox.return_value = "LINKEDIN"
+        mock_st.text_input.return_value = "CONF-PROOF-123"
+        mock_st.text_area.return_value = "Applied via LinkedIn Easy Apply with tailored PDF."
+
+        # Create valid PDF bytes for proof file
+        pdf_stream = io.BytesIO()
+        p_doc = SimpleDocTemplate(pdf_stream, pagesize=letter)
+        p_doc.build([Paragraph("Confirmation Receipt Proof Content", getSampleStyleSheet()["Normal"])])
+        valid_proof_bytes = pdf_stream.getvalue()
+
+        # Mock uploaded PDF proof file
+        mock_file = MagicMock()
+        mock_file.name = "confirmation_receipt.pdf"
+        mock_file.getvalue.return_value = valid_proof_bytes
+        mock_st.file_uploader.return_value = mock_file
+        mock_st.button.return_value = True
+
+        render_manual_submission_dialog_content(self.service, self.session_a.session_id, self.app_approved, self.user_a)
+
+        app_db = self.db.get_user_application(self.app_approved.id, self.user_a)
+        self.assertEqual(app_db.status, "SUBMITTED")
+        # Check confirmation record in DB
+        confs = self.db.list_submission_confirmations(self.app_approved.id, self.user_a)
+        self.assertTrue(len(confs) > 0)
+        conf = confs[0]
+        self.assertEqual(conf.submission_channel, "LINKEDIN")
+        self.assertEqual(conf.confirmation_reference, "CONF-PROOF-123")
+        self.assertIsNotNone(conf.confirmation_doc_hash)
+
+        # Check proof was recorded in events
+        events = self.db.get_application_events(application_id=self.app_approved.id, user_id=self.user_a)
+        sub_event = next(e for e in events if e.event_type == "SUBMISSION_CONFIRMED")
+        event_data = json.loads(sub_event.event_payload_json) if isinstance(sub_event.event_payload_json, str) else sub_event.event_payload_json
+        self.assertEqual(event_data.get("submission_channel"), "LINKEDIN")
+        self.assertEqual(event_data.get("confirmation_reference"), "CONF-PROOF-123")
+
+    # -------------------------------------------------------------------------
+    # FINDING B: TARGETED FOCUS & DEDUPLICATION TESTS
+    # -------------------------------------------------------------------------
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_on_page(self, mock_st):
+        """Application on the current page is rendered in dedicated top focus section and omitted from list below."""
+        app1 = self._create_app(self.user_a, "AppOne", "Engineer", status="SUBMITTED")
+        app2 = self._create_app(self.user_a, "AppTwo", "Designer", status="APPROVED")
+        app3 = self._create_app(self.user_a, "AppThree", "Manager", status="INTERVIEW")
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": app2.id,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        with (
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+        ):
+            render_application_tracker()
+
+            # Focus banner rendered
+            info_calls = [str(call[0][0]) for call in mock_st.info.call_args_list]
+            self.assertTrue(any(f"Showing Application #{app2.id}" in c for c in info_calls))
+
+            # Verify render_application_card was called with expanded=True for app2
+            called_apps = [(call[0][0].id, call[1].get("expanded")) for call in mock_render_card.call_args_list]
+            # app2 should be called once with expanded=True (top section)
+            self.assertIn((app2.id, True), called_apps)
+            # app2 must NOT be rendered with expanded=False in the list below (deduplicated)
+            self.assertNotIn((app2.id, False), called_apps)
+            # app1 and app3 are rendered with expanded=False
+            self.assertIn((app1.id, False), called_apps)
+            self.assertIn((app3.id, False), called_apps)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_outside_page(self, mock_st):
+        """Application on page 2 (beyond page size 20) is still rendered in dedicated focus section."""
+        apps = [self._create_app(self.user_a, f"Co_{i}", f"Role_{i}", status="SUBMITTED") for i in range(25)]
+        target_app = apps[24]  # 25th app, would be on page 2
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": target_app.id,
+            f"tracker_page_{self.user_a}": 0,  # Page 1 (offset 0, limit 20)
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        with (
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+        ):
+            render_application_tracker()
+
+            # Verify target_app is rendered expanded at the top
+            called_apps = [(call[0][0].id, call[1].get("expanded")) for call in mock_render_card.call_args_list]
+            self.assertIn((target_app.id, True), called_apps)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_search_filtered_out(self, mock_st):
+        """Application excluded by search term filter is still rendered in dedicated focus section."""
+        target_app = self._create_app(self.user_a, "TargetCorp", "Specialist", status="SUBMITTED")
+        other_app = self._create_app(self.user_a, "ZetaCorp", "Analyst", status="SUBMITTED")
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": target_app.id,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        # Filter toolbar returns search for "ZetaCorp" which excludes "TargetCorp"
+        filter_dict = {
+            "view_mode": "List View",
+            "search_term": "ZetaCorp",
+            "status_in": None,
+            "employment_type": None,
+            "sort_by": "updated_at_desc",
+            "include_archived": False,
+        }
+        with (
+            patch("dashboard.views.application_tracker.render_tracker_filter_toolbar", return_value=filter_dict),
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+        ):
+            render_application_tracker()
+
+            # target_app is STILL rendered in top focused section
+            called_apps = [(call[0][0].id, call[1].get("expanded")) for call in mock_render_card.call_args_list]
+            self.assertIn((target_app.id, True), called_apps)
+            self.assertIn((other_app.id, False), called_apps)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_status_filtered_out(self, mock_st):
+        """Application excluded by status filter is still rendered in dedicated focus section."""
+        target_app = self._create_app(self.user_a, "OfferCorp", "Lead", status="OFFER")
+        other_app = self._create_app(self.user_a, "ActiveCorp", "Lead", status="SUBMITTED")
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": target_app.id,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        # Status filter only includes SUBMITTED, excluding OFFER
+        filter_dict = {
+            "view_mode": "List View",
+            "search_term": None,
+            "status_in": ["SUBMITTED"],
+            "employment_type": None,
+            "sort_by": "updated_at_desc",
+            "include_archived": False,
+        }
+        with (
+            patch("dashboard.views.application_tracker.render_tracker_filter_toolbar", return_value=filter_dict),
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+        ):
+            render_application_tracker()
+
+            called_apps = [(call[0][0].id, call[1].get("expanded")) for call in mock_render_card.call_args_list]
+            self.assertIn((target_app.id, True), called_apps)
+            self.assertIn((other_app.id, False), called_apps)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_kanban_mode(self, mock_st):
+        """In Kanban mode, focused application renders in dedicated section and is omitted from board columns."""
+        app1 = self._create_app(self.user_a, "KanbanApp1", "Role1", status="SUBMITTED")
+        app2 = self._create_app(self.user_a, "KanbanApp2", "Role2", status="APPROVED")
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": app2.id,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        filter_dict = {
+            "view_mode": "Kanban Board",
+            "search_term": None,
+            "status_in": None,
+            "employment_type": None,
+            "sort_by": "updated_at_desc",
+            "include_archived": False,
+        }
+        with (
+            patch("dashboard.views.application_tracker.render_tracker_filter_toolbar", return_value=filter_dict),
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+            patch("dashboard.views.application_tracker.render_kanban_board_view") as mock_kanban_view,
+        ):
+            render_application_tracker()
+
+            # app2 rendered expanded in focus section
+            called_apps = [(call[0][0].id, call[1].get("expanded")) for call in mock_render_card.call_args_list]
+            self.assertIn((app2.id, True), called_apps)
+
+            # In kanban view call, app2 is omitted from displayed apps (deduplicated)
+            kanban_apps_arg = mock_kanban_view.call_args[0][0]
+            kanban_ids = [a.id for a in kanban_apps_arg]
+            self.assertNotIn(app2.id, kanban_ids)
+            self.assertIn(app1.id, kanban_ids)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_archived(self, mock_st):
+        """Archived application is rendered in dedicated focus section with include_archived=True."""
+        archived_app = self._create_app(self.user_a, "ArchivedCorp", "Role", status="CLOSED", is_archived=1)
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": archived_app.id,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        with (
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+        ):
+            render_application_tracker()
+
+            # Verify rendered with include_archived=True
+            call = next(c for c in mock_render_card.call_args_list if c[0][0].id == archived_app.id)
+            self.assertTrue(call[1].get("include_archived"))
+            self.assertTrue(call[1].get("expanded"))
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_cross_user_fails_safe(self, mock_st):
+        """Cross-user application ID in session state fails safe, clears session state, and displays nothing."""
+        bob_app = self._create_app(self.user_b, "BobCorp", "SecretRole", status="SUBMITTED")
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": bob_app.id,  # Bob's application
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        with (
+            patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service),
+            patch("dashboard.views.application_tracker.render_application_card") as mock_render_card,
+        ):
+            render_application_tracker()
+
+            # tracker_selected_app_id MUST be popped/cleared
+            self.assertNotIn("tracker_selected_app_id", mock_st.session_state)
+            # Bob's app MUST NOT be rendered
+            rendered_ids = [call[0][0].id for call in mock_render_card.call_args_list]
+            self.assertNotIn(bob_app.id, rendered_ids)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_invalid_id_cleared_safely(self, mock_st):
+        """Non-numeric or non-existent IDs in session state are safely cleared without exceptions."""
+        for bad_id in ["not_a_number", -99, 0, 999999]:
+            session_state = {
+                "authenticated_session_id": self.session_a.session_id,
+                "authenticated_user_id": self.user_a,
+                "tracker_selected_app_id": bad_id,
+            }
+            mock_st.session_state = session_state
+            mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+            mock_st.button.return_value = False
+
+            with patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service):
+                render_application_tracker()
+                self.assertNotIn("tracker_selected_app_id", mock_st.session_state)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_targeted_navigation_clear_focus_button(self, mock_st):
+        """Clicking '✕ Clear Focus' removes tracker_selected_app_id from session state and reruns."""
+        app = self._create_app(self.user_a, "FocusClearCo", "Role", status="SUBMITTED")
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": app.id,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        # Button returns True when key matches clear focus
+        mock_st.button.side_effect = lambda label, key=None, **kw: key == f"clear_foc_{self.user_a}"
+
+        with patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service):
+            render_application_tracker()
+
+            self.assertNotIn("tracker_selected_app_id", mock_st.session_state)
+            mock_st.rerun.assert_called()
+
+    # -------------------------------------------------------------------------
+    # FINDING C: REAL PREPARER INTEGRATION TESTS
+    # -------------------------------------------------------------------------
+    @patch("dashboard.views.application_preparer.st")
+    def test_preparer_tab7_real_integration_navigates_to_tracker(self, mock_st):
+        """Executing actual render_application_preparer() on Tab 7 sets tracker_selected_app_id and navigates."""
+        # Setup JD and Resume for User A
+        jd = self.db.create_job_description(
+            user_id=self.user_a,
+            company_name="PreparerTab7Co",
+            job_title="Lead Architect",
+            raw_content="Looking for a Lead Architect with Python expertise.",
+            parsed_data={"required_skills": ["Python"]},
+        )
+        pdf_stream = io.BytesIO()
+        p_doc = SimpleDocTemplate(pdf_stream, pagesize=letter)
+        p_doc.build([Paragraph("Valid Alice Resume Content", getSampleStyleSheet()["Normal"])])
+        valid_resume_bytes = pdf_stream.getvalue()
+
+        resume = self.db.upload_user_resume(
+            user_id=self.user_a,
+            file_bytes=valid_resume_bytes,
+            original_filename="alice_resume.pdf",
+            user_base_dir=self.storage_base,
+        )
+        self.db.save_user_candidate_profile(self.user_a, {
+            "personal": {"full_name": "Alice Candidate", "email": "alice@example.com"},
+            "work_experience": [{"employer": "TechCorp", "job_title": "Engineer", "duration": "2 years"}],
+            "skills": ["Python"],
+        })
+        # Create application workspace in APPROVED status
+        app = self.service.get_or_create_application_workspace(
+            user_id=self.user_a,
+            job_description_id=jd.id,
+            resume_id=resume["id"],
+        )
+        with self.db.transaction() as conn:
+            conn.cursor().execute("UPDATE applications SET status = 'APPROVED' WHERE id = ?", (app.id,))
+        app.status = "APPROVED"
+
+        # Setup prepared packet
+        self._create_packet(app.id, self.user_a, version_num=1, is_active=True)
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
+        mock_st.selectbox.side_effect = lambda label, options, **kw: options[0] if options else None
+        mock_st.form_submit_button.return_value = False
+        mock_st.number_input.return_value = 0
+        mock_st.text_area.side_effect = lambda label, value="", **kw: value
+        # Click the Tab 7 open tracker button
+        mock_st.button.side_effect = lambda label, key=None, **kw: key == f"open_tracker_tab7_{app.id}"
+
+        with patch("dashboard.views.application_preparer.DashboardService.get_instance", return_value=self.service):
+            render_application_preparer()
+
+        # Verify real preparer code path set tracker_selected_app_id and navigated
+        self.assertEqual(mock_st.session_state.get("tracker_selected_app_id"), app.id)
+        mock_st.switch_page.assert_called_with("dashboard/views/application_tracker.py")
+
+    @patch("dashboard.views.application_preparer.st")
+    def test_preparer_tab8_real_integration_navigates_to_tracker(self, mock_st):
+        """Executing actual render_application_preparer() on Tab 8 sets tracker_selected_app_id and navigates."""
+        jd = self.db.create_job_description(
+            user_id=self.user_a,
+            company_name="PreparerTab8Co",
+            job_title="Staff Engineer",
+            raw_content="Looking for a Staff Engineer with cloud infrastructure skills.",
+            parsed_data={"required_skills": ["Cloud"]},
+        )
+        pdf_stream = io.BytesIO()
+        p_doc = SimpleDocTemplate(pdf_stream, pagesize=letter)
+        p_doc.build([Paragraph("Valid Alice Resume Content", getSampleStyleSheet()["Normal"])])
+        valid_resume_bytes = pdf_stream.getvalue()
+
+        resume = self.db.upload_user_resume(
+            user_id=self.user_a,
+            file_bytes=valid_resume_bytes,
+            original_filename="alice_resume.pdf",
+            user_base_dir=self.storage_base,
+        )
+        self.db.save_user_candidate_profile(self.user_a, {
+            "personal": {"full_name": "Alice Candidate", "email": "alice@example.com"},
+            "work_experience": [{"employer": "TechCorp", "job_title": "Engineer", "duration": "2 years"}],
+            "skills": ["Cloud"],
+        })
+        app = self.service.get_or_create_application_workspace(
+            user_id=self.user_a,
+            job_description_id=jd.id,
+            resume_id=resume["id"],
+        )
+        # Create packet revision
+        self._create_packet(app.id, self.user_a, version_num=1, is_active=True)
+
+        session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+        }
+        mock_st.session_state = session_state
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
+        mock_st.selectbox.side_effect = lambda label, options, **kw: options[0] if options else None
+        mock_st.form_submit_button.return_value = False
+        mock_st.number_input.return_value = 0
+        mock_st.text_area.side_effect = lambda label, value="", **kw: value
+        mock_st.switch_page.side_effect = Exception("switch_page headless fallback")
+        # Click the Tab 8 open tracker button
+        mock_st.button.side_effect = lambda label, key=None, **kw: key == f"open_tracker_tab8_{app.id}"
+
+        with patch("dashboard.views.application_preparer.DashboardService.get_instance", return_value=self.service):
+            render_application_preparer()
+
+        # Verify real preparer code path set tracker_selected_app_id and navigated via fallback
+        self.assertEqual(mock_st.session_state.get("tracker_selected_app_id"), app.id)
+        self.assertEqual(mock_st.session_state.get("active_view"), "application_tracker")
+        mock_st.rerun.assert_called()
 
 
 if __name__ == "__main__":
