@@ -73,7 +73,9 @@ class TestApplicationPreparationEngine(unittest.TestCase):
             y -= 15
             c.setFont("Helvetica", 10)
             c.drawString(50, y, "Medical Chatbot")
-            c.drawString(50, y - 15, "Sarita ABDM Project")
+            c.drawString(50, y - 15, "Built a Python-based medical chatbot project focused on conversational access to health-related information.")
+            c.drawString(50, y - 30, "Sarita ABDM – Milestone 2 Integration")
+            c.drawString(50, y - 45, "Worked on healthcare interoperability workflows involving ABDM consent management and data exchange.")
             c.save()
 
         # Create a synthetic DOCX resume for testing DOCX parsing
