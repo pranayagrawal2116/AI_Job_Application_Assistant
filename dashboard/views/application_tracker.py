@@ -135,6 +135,16 @@ def render_application_tracker() -> None:
     # -------------------------------------------------------------------------
     # 5. VIEW 4 & 5 — LIST VIEW / KANBAN BOARD
     # -------------------------------------------------------------------------
+    selected_app_id = st.session_state.get("tracker_selected_app_id")
+    if selected_app_id:
+        c_foc1, c_foc2 = st.columns([5, 1])
+        with c_foc1:
+            st.info(f"🎯 **Targeted Application Focus:** Showing Application #{selected_app_id} transferred from Application Preparer.")
+        with c_foc2:
+            if st.button("✕ Clear Focus", key=f"clear_foc_{user_id}"):
+                st.session_state.pop("tracker_selected_app_id", None)
+                st.rerun()
+
     if view_mode == "List View":
         # Pagination Management
         page_key = f"tracker_page_{user_id}"
@@ -186,7 +196,8 @@ def render_application_tracker() -> None:
         st.markdown(f"**Showing {start_idx}–{end_idx} of {total_matching} Tracked Opportunities**")
 
         for app in apps:
-            render_application_card(app, service, session_id, user_id, include_archived)
+            is_target = bool(selected_app_id and app.id == selected_app_id)
+            render_application_card(app, service, session_id, user_id, include_archived, expanded=is_target)
 
         # Pagination controls
         total_pages = max(1, (total_matching + page_size - 1) // page_size)
@@ -221,4 +232,4 @@ def render_application_tracker() -> None:
             st.error(f"Cannot load applications for Kanban Board: {exc}")
             return
 
-        render_kanban_board_view(kanban_apps, service, session_id, user_id, include_archived)
+        render_kanban_board_view(kanban_apps, service, session_id, user_id, include_archived, follow_ups=pending_follow_ups)

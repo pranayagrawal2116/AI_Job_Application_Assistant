@@ -363,6 +363,21 @@ When interacting with the browser via Playwright MCP:
   - Regenerated template draft session state refresh (Finding C): Updated draft generation handler to immediately refresh `st.session_state[f"draft_subj_{user_id}_{app.id}"]` and `st.session_state[f"draft_body_{user_id}_{app.id}"]` with the newly generated subject and body, and incremented `draft_rev`; configured editable text widgets to draw their values directly from these session state keys; ensures regenerating a template updates the displayed text areas immediately while preserving candidate edits across unrelated script reruns.
   - Comprehensive verification: Added 11 new targeted UI and regression tests in `TestPhase7421DateAndDraftRemediation` to `tests/test_phase_7_3_2_3_tracker_ui.py` covering all three findings (91/91 tracker UI tests passing, 100%); 115/115 follow-up tests passing; 1036/1036 full repository tests passing (100% pass rate); 0 pyflakes errors, 0 ruff errors, and clean git diff check.
 
+- [x] **Architecture v2.1.1 Phase 7.5: Streamlit Application Tracker & Lifecycle UI Overhaul** (Complete)
+  - Application Tracker UI Overhaul: Comprehensive card overview, status badges, follow-up reminder chips, preparation/submission dates, deadline, location, salary, employment type, target role, candidate notes, and submission confirmation details.
+  - Five-Column Canonical Kanban Board: Strict grouping (`col_prep` for DRAFT/PREPARING, `col_appr` for READY_FOR_REVIEW/APPROVED, `col_sub` for SUBMITTED/IN_PROGRESS, `col_int` for ASSESSMENT/INTERVIEW/OFFER, `col_term` for REJECTED/WITHDRAWN/CLOSED), overdue/due-today chips on Kanban cards, clean empty columns, and zero drag-and-drop state mutation.
+  - Lifecycle Stepper & Timeline: Visual 5-stage lifecycle stepper (`render_lifecycle_stepper`) displaying current status, completed milestones, pending stages, terminal state indicator (`🛑`), offer stage banner (`🎉`), and reopening events with candidate rationale (`🔄`).
+  - Manual Submission Confirmation Workflow: Numbered step-by-step layout (Step 1: External portal navigation, Step 2: Channel, ref, notes & proof upload, Step 3: Explicit authorization with single-use action ticket) accessible only in `APPROVED` state.
+  - Follow-Up Reminder Status Chips & Audit Findings:
+    - Reminders categorized by urgency (`get_application_follow_up_chips`): Overdue (`🔴`), Due Today (`🟠`), Upcoming (`🔵`), Completed (`✅`).
+    - Finding F1 Resolution: Refreshed scheduling date widget when upstream proposed recommendation date changes (`prev_rec_date != rec_date_str`), preserving manual candidate edits while recommendation date remains unchanged.
+    - Finding F2 Resolution: Enforced candidate-provided assessment date provenance parity in `src/lifecycle/follow_up_engine.py` (`assessment_date_source == "candidate_provided"`) and `dashboard/components/tracker_components.py`.
+  - Application Preparer & Tracker Interoperability:
+    - Tab 7: Displayed human-approved status banner when packet is authorized; provided "📋 Open in Application Tracker" button navigating to tracker and setting `tracker_selected_app_id`.
+    - Tab 8: Active revision display and "📋 View in Tracker" navigation button.
+    - Application Tracker Targeted Focus: Handled `tracker_selected_app_id` with focus banner, "✕ Clear Focus" action, and targeted card auto-expansion (`expanded=True`).
+  - Comprehensive Verification: Added 8 dedicated unit and integration tests in `TestPhase75LifecycleOverhaul` to `tests/test_phase_7_3_2_3_tracker_ui.py` (99/99 tracker UI tests passing, 100%); 115/115 follow-up tests passing; 1,044/1,044 full repository tests passing (100% pass rate); 0 pyflakes errors, 0 ruff errors on modified files, and clean git diff check.
+
 ---
 
 ## 7. Approval Requirement

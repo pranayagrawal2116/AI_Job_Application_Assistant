@@ -4,11 +4,14 @@ screening question assistance, document generation, and human approval workflow.
 
 from __future__ import annotations
 
+from datetime import UTC
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
+
 import streamlit as st
 
 from dashboard.services.dashboard_service import DashboardService
+from src.database.exceptions import DatabaseError
 from src.database.models import ApplicationStatus
 from src.preparer.cover_letter_generator import CareerLevel, LetterTone
 from src.preparer.document_generator import DocumentTemplate
@@ -16,7 +19,7 @@ from src.preparer.question_answerer import AnswerState, ScreeningQAPacket
 from src.preparer.tailored_resume_generator import TailoredResume
 
 
-def get_current_user_id() -> Optional[int]:
+def get_current_user_id() -> int | None:
     """Returns the authenticated user_id from session state. Fails closed if not authenticated."""
     uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
     if uid is not None:
@@ -28,14 +31,14 @@ def get_current_user_id() -> Optional[int]:
 
 
 def build_real_attachments_manifest(
-    selected_res_meta: Dict[str, Any],
-    generated_docs: Dict[str, Any],
-) -> List[Dict[str, Any]]:
+    selected_res_meta: dict[str, Any],
+    generated_docs: dict[str, Any],
+) -> list[dict[str, Any]]:
     """Inspects actual files on disk to build a cryptographic, tamper-evident attachment manifest."""
     import hashlib
-    from datetime import datetime, timezone
+    from datetime import datetime
 
-    manifest: List[Dict[str, Any]] = []
+    manifest: list[dict[str, Any]] = []
 
     # 1. Original Source Resume File
     res_path_str = selected_res_meta.get("storage_path") or selected_res_meta.get("file_path")
@@ -52,7 +55,7 @@ def build_real_attachments_manifest(
             "size_kb": f"{st_res.st_size / 1024:.1f} KB",
             "file_hash": hashlib.sha256(file_bytes).hexdigest(),
             "file_path": str(p),
-            "timestamp": datetime.fromtimestamp(st_res.st_mtime, tz=timezone.utc).isoformat(),
+            "timestamp": datetime.fromtimestamp(st_res.st_mtime, tz=UTC).isoformat(),
         })
 
     # 2. Generated Documents (Tailored Resume, Cover Letter, Screening QA, Packet)
@@ -81,7 +84,7 @@ def build_real_attachments_manifest(
                 "size_kb": f"{st_doc.st_size / 1024:.1f} KB",
                 "file_hash": getattr(doc, "file_hash", "") or hashlib.sha256(file_bytes).hexdigest(),
                 "file_path": str(p),
-                "timestamp": datetime.fromtimestamp(st_doc.st_mtime, tz=timezone.utc).isoformat(),
+                "timestamp": datetime.fromtimestamp(st_doc.st_mtime, tz=UTC).isoformat(),
             })
 
     return manifest
@@ -592,15 +595,15 @@ def render_application_preparer():
                 jd_hash = selected_jd.snapshot_hash if (selected_jd and selected_jd.snapshot_hash) else getattr(selected_jd, 'content_hash', '')
 
                 valid_match = None
-                if latest_match:
-                    if (
-                        latest_match.user_id == user_id
-                        and latest_match.resume_id == selected_resume_id
-                        and latest_match.job_description_id == selected_jd_id
-                        and (not latest_match.job_snapshot_hash or latest_match.job_snapshot_hash == jd_hash)
-                        and (not latest_match.resume_file_hash or latest_match.resume_file_hash == res_hash)
-                    ):
-                        valid_match = latest_match
+                if (
+                    latest_match
+                    and latest_match.user_id == user_id
+                    and latest_match.resume_id == selected_resume_id
+                    and latest_match.job_description_id == selected_jd_id
+                    and (not latest_match.job_snapshot_hash or latest_match.job_snapshot_hash == jd_hash)
+                    and (not latest_match.resume_file_hash or latest_match.resume_file_hash == res_hash)
+                ):
+                    valid_match = latest_match
 
                 pkt = service.prepare_universal_application_packet(
                     user_id=user_id,
@@ -637,6 +640,17 @@ def render_application_preparer():
 
         # 3. Human Authorization Gate Form
         st.markdown("#### 3. Authorize Application for Submission")
+
+        if app.status == ApplicationStatus.APPROVED.value:
+            st.success("🛡️ **Application Human-Approved:** This application packet has been authorized by candidate review.")
+            st.caption("You may now proceed to the employer portal to submit your materials, then record submission confirmation in the Application Tracker.")
+            if st.button("📋 Open in Application Tracker", key=f"open_tracker_tab7_{app.id}", type="primary"):
+                st.session_state["tracker_selected_app_id"] = app.id
+                try:
+                    st.switch_page("dashboard/views/application_tracker.py")
+                except Exception:  # noqa: BLE001
+                    st.session_state["active_view"] = "application_tracker"
+                    st.rerun()
 
         needs_input_qs = [q for q in qa_packet.questions if q.state == AnswerState.NEEDS_CANDIDATE_INPUT.value]
         over_limit_qs = [q for q in qa_packet.questions if q.exceeds_limit]
@@ -684,7 +698,7 @@ def render_application_preparer():
                                 user_id=user_id,
                                 session_id=auth_session_id,
                             )
-                        except Exception:
+                        except (DatabaseError, KeyError, ValueError, AttributeError):
                             st.error("Your login session is missing or expired. Please sign in again before approving this packet.")
 
                         if sess:
@@ -703,6 +717,7 @@ def render_application_preparer():
                                 candidate_confirmed=confirm_truthfulness,
                             )
                             if succ:
+                                st.session_state["tracker_selected_app_id"] = app.id
                                 st.success(f"✅ {msg}")
                                 st.rerun()
                             else:
@@ -712,8 +727,18 @@ def render_application_preparer():
     # TAB 8: PACKET HISTORY & DOWNLOADS
     # =========================================================================
     with tab_history:
-        st.markdown("### 📜 Application Packet Revisions & Downloads")
-        st.caption("Immutable version history of all prepared packets and official downloadable documents.")
+        c_hist1, c_hist2 = st.columns([4, 1])
+        with c_hist1:
+            st.markdown("### 📜 Application Packet Revisions & Downloads")
+            st.caption("Immutable version history of all prepared packets and official downloadable documents.")
+        with c_hist2:
+            if st.button("📋 View in Tracker", key=f"open_tracker_tab8_{app.id}"):
+                st.session_state["tracker_selected_app_id"] = app.id
+                try:
+                    st.switch_page("dashboard/views/application_tracker.py")
+                except Exception:  # noqa: BLE001
+                    st.session_state["active_view"] = "application_tracker"
+                    st.rerun()
 
         revisions = service.list_application_packets(application_id=app.id, user_id=user_id)
         if not revisions:

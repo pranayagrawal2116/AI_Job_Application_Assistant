@@ -15,7 +15,7 @@ import html
 import io
 import json
 from datetime import UTC, date, datetime
-from typing import Any, Optional
+from typing import Any
 
 import streamlit as st
 
@@ -28,12 +28,16 @@ from src.database.exceptions import (
 )
 from src.database.models import (
     Application,
+    ApplicationEvent,
     ApplicationFollowUp,
     ApplicationStatus,
     FollowUpType,
     SubmissionChannel,
 )
-from src.lifecycle.follow_up_engine import SUPPORTED_TEMPLATE_TYPES
+from src.lifecycle.follow_up_engine import (
+    SUPPORTED_TEMPLATE_TYPES,
+    FollowUpRecommendationEngine,
+)
 from src.lifecycle.state_machine import ApplicationStateMachine
 
 # =============================================================================
@@ -96,6 +100,48 @@ def format_status_badge(status_str: str) -> str:
     except (KeyError, ValueError, AttributeError):
         norm = status_str.upper()
     return f"`{norm}`"
+
+
+def get_application_follow_up_chips(
+    follow_ups: list[ApplicationFollowUp],
+    today_date: date | None = None,
+) -> list[dict[str, Any]]:
+    """Calculates status chips for an application's follow-ups: Overdue, Due Today, Upcoming, Completed."""
+    ref_date = today_date or datetime.now(UTC).date()
+    chips = []
+    for f in follow_ups:
+        f_date = FollowUpRecommendationEngine.parse_date_safe(f.follow_up_date)
+        if f.is_completed:
+            chips.append({
+                "label": f"✅ {f.follow_up_type} Completed",
+                "color": "#10B981",
+                "category": "completed",
+                "id": f.id,
+            })
+        elif f_date and f_date < ref_date:
+            chips.append({
+                "label": f"🔴 Overdue: {f.follow_up_type} ({f.follow_up_date})",
+                "color": "#EF4444",
+                "category": "overdue",
+                "id": f.id,
+            })
+        elif f_date and f_date == ref_date:
+            chips.append({
+                "label": f"🟠 Due Today: {f.follow_up_type}",
+                "color": "#F59E0B",
+                "category": "today",
+                "id": f.id,
+            })
+        else:
+            chips.append({
+                "label": f"🔵 Upcoming: {f.follow_up_type} ({f.follow_up_date})",
+                "color": "#3B82F6",
+                "category": "upcoming",
+                "id": f.id,
+            })
+    order_map = {"overdue": 0, "today": 1, "upcoming": 2, "completed": 3}
+    chips.sort(key=lambda c: order_map.get(c["category"], 9))
+    return chips
 
 
 # =============================================================================
@@ -383,6 +429,77 @@ def render_tracker_filter_toolbar(
 # 4. LIFECYCLE TIMELINE VIEW (Strictly Read-Only)
 # =============================================================================
 
+def render_lifecycle_stepper(app: Application, events: list[ApplicationEvent]) -> None:
+    """Renders a chronological visual lifecycle stepper reflecting authoritative milestones and terminal/reopened state."""
+    st.markdown("###### 🗺️ Application Lifecycle Stepper")
+
+    visited_statuses = set()
+    reopen_events = []
+    for e in events:
+        p = {}
+        if getattr(e, "event_payload_json", None):
+            try:
+                p = json.loads(e.event_payload_json) if isinstance(e.event_payload_json, str) else e.event_payload_json
+            except (json.JSONDecodeError, ValueError, TypeError):
+                p = {}
+        elif getattr(e, "event_payload", None):
+            p = getattr(e, "event_payload", {}) or {}
+
+        if p.get("new_status"):
+            visited_statuses.add(p["new_status"])
+        if getattr(e, "event_type", "") == "APPLICATION_REOPENED" or p.get("reopen_rationale"):
+            reopen_events.append((e, p.get("reopen_rationale")))
+
+    if getattr(app, "status", None):
+        visited_statuses.add(app.status)
+
+    try:
+        current_norm = ApplicationStateMachine.normalize_status(app.status).value
+    except (KeyError, ValueError, AttributeError):
+        current_norm = getattr(app, "status", "DRAFT")
+
+    stages = [
+        ("1. Preparation", ["DRAFT", "PREPARING"]),
+        ("2. Approval", ["READY_FOR_REVIEW", "APPROVED"]),
+        ("3. Submission", ["SUBMITTED", "IN_PROGRESS"]),
+        ("4. Interviews", ["ASSESSMENT", "INTERVIEW"]),
+        ("5. Outcome", ["OFFER", "REJECTED", "WITHDRAWN", "CLOSED"]),
+    ]
+
+    raw_cols = st.columns(5)
+    col_steps = list(raw_cols) if isinstance(raw_cols, (list, tuple)) else []
+    while len(col_steps) < 5:
+        class _DummyCol:
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        col_steps.append(_DummyCol())
+
+    for idx, (stage_name, stage_statuses) in enumerate(stages):
+        is_current_stage = current_norm in stage_statuses
+        has_visited = any(s in visited_statuses for s in stage_statuses)
+
+        with col_steps[idx]:
+            if is_current_stage:
+                st.markdown(f"🔵 **{stage_name}**")
+                st.caption(f"📍 Active (`{current_norm}`)")
+            elif has_visited:
+                st.markdown(f"✅ **{stage_name}**")
+                st.caption("Completed")
+            else:
+                st.markdown(f"⚪ **{stage_name}**")
+                st.caption("Pending")
+
+    if reopen_events:
+        last_reopen = reopen_events[-1]
+        reopen_msg = last_reopen[1] or "Application resumed from concluded state"
+        st.info(f"🔄 **Reopened Opportunity:** {reopen_msg}")
+
+    if current_norm in ("REJECTED", "WITHDRAWN", "CLOSED"):
+        st.caption(f"🛑 Application concluded in terminal state: `{current_norm}`.")
+    elif current_norm == "OFFER":
+        st.success("🎉 **Offer Stage:** Candidate has received an offer for this position!")
+
+
 def render_lifecycle_timeline_view(
     service: DashboardService,
     session_id: str,
@@ -408,6 +525,17 @@ def render_lifecycle_timeline_view(
         st.error(f"🚨 {verification_message}")
 
     events = timeline_info.get("events", [])
+
+    app_obj = None
+    try:
+        app_obj = service.db.get_user_application(app_id, user_id)
+    except (DatabaseError, KeyError, ValueError, AttributeError):
+        app_obj = None
+
+    if app_obj:
+        render_lifecycle_stepper(app_obj, events)
+        st.divider()
+
     if not events:
         st.caption("No lifecycle events recorded for this application.")
         return
@@ -989,6 +1117,8 @@ def render_follow_up_manager(
                 )
                 if assess_date_input is not None:
                     extra_context["assessment_date"] = assess_date_input.isoformat()
+                    extra_context["assessment_date_source"] = "candidate_provided"
+                    st.caption("🔒 *Date is labeled as candidate-provided and unverified; it is not persisted to the application record.*")
 
     try:
         rec_res = service.recommend_application_follow_up(
@@ -1008,7 +1138,7 @@ def render_follow_up_manager(
             rec_desc = rec_res.get("default_description") or ""
 
             # Strict YYYY-MM-DD date parsing (Fail closed)
-            parsed_rec_date: Optional[date] = None
+            parsed_rec_date: date | None = None
             if rec_date_str and isinstance(rec_date_str, str) and len(rec_date_str.strip()) == 10:
                 try:
                     parsed_rec_date = datetime.strptime(rec_date_str.strip(), "%Y-%m-%d").date()
@@ -1016,6 +1146,12 @@ def render_follow_up_manager(
                     parsed_rec_date = None
 
             if parsed_rec_date is not None:
+                # Finding F1: If upstream proposed recommendation date has changed, refresh scheduling widget state
+                prev_rec_date = st.session_state.get(f"last_rec_date_{user_id}_{app.id}")
+                if prev_rec_date != rec_date_str:
+                    st.session_state[f"last_rec_date_{user_id}_{app.id}"] = rec_date_str
+                    st.session_state[f"rec_sched_date_{user_id}_{app.id}"] = parsed_rec_date
+
                 st.info(f"📋 **Recommended Action:** `{rec_type}` • **Proposed Date:** `{rec_date_str}`\n\n**Rationale:** {rec_rationale}")
                 st.caption("💡 *This is an algorithmic recommendation based on application status. It has NOT been scheduled. Review or edit details below before scheduling.*")
 
@@ -1336,6 +1472,7 @@ def render_application_card(
     session_id: str,
     user_id: int,
     include_archived: bool,
+    expanded: bool = False,
 ) -> None:
     """Renders a comprehensive, expandable application card with detail tabs."""
     # Match Evaluation Detail
@@ -1349,11 +1486,24 @@ def render_application_card(
     else:
         score_badge = "Match Evaluation Unavailable"
 
+    # Follow-Up Reminder Chips
+    try:
+        app_fups = service.list_application_follow_ups(
+            session_id=session_id,
+            application_id=app.id,
+            include_archived=include_archived,
+        )
+    except (DatabaseError, KeyError, ValueError, AttributeError):
+        app_fups = []
+    fup_chips = get_application_follow_up_chips(app_fups)
+
     status_tag = format_status_badge(app.status)
     archived_tag = " • [ARCHIVED]" if app.is_archived else ""
-    card_title = f"{status_tag} **{app.job_title}** at **{app.company_name}** ({score_badge}){archived_tag}"
+    urgent_chip = next((c for c in fup_chips if c["category"] in ("overdue", "today")), None)
+    chip_tag = f" • [{urgent_chip['label']}]" if urgent_chip else ""
+    card_title = f"{status_tag} **{app.job_title}** at **{app.company_name}** ({score_badge}){archived_tag}{chip_tag}"
 
-    with st.expander(card_title, expanded=False):
+    with st.expander(card_title, expanded=expanded):
         # Summary Row
         col1, col2, col3, col4 = st.columns(4)
         with col1:
@@ -1364,6 +1514,23 @@ def render_application_card(
             st.caption(f"💰 **Salary:** {app.salary_range or 'Not specified'}")
         with col4:
             st.caption(f"⏳ **Deadline:** {app.application_deadline or 'Not specified'}")
+
+        # Preparation, Submission & Follow-Up Reminders Row
+        has_dates = bool(getattr(app, "date_prepared", None) or getattr(app, "date_submitted", None))
+        if has_dates or fup_chips:
+            col_m1, col_m2 = st.columns(2)
+            with col_m1:
+                date_parts = []
+                if getattr(app, "date_prepared", None):
+                    date_parts.append(f"📝 **Prepared:** `{app.date_prepared}`")
+                if getattr(app, "date_submitted", None):
+                    date_parts.append(f"📬 **Submitted:** `{app.date_submitted}`")
+                if date_parts:
+                    st.caption(" • ".join(date_parts))
+            with col_m2:
+                if fup_chips:
+                    chips_display = " ".join([f"`{c['label']}`" for c in fup_chips[:3]])
+                    st.caption(f"🔔 **Reminders:** {chips_display}")
 
         # Six Detail Tabs
         tab_overview, tab_match, tab_timeline, tab_packets, tab_transitions, tab_follow_ups = st.tabs([
@@ -1376,6 +1543,14 @@ def render_application_card(
         ])
 
         with tab_overview:
+            # Action Readiness Indicators
+            if app.status == ApplicationStatus.APPROVED.value:
+                st.warning("🛡️ **Action Required: Application Human-Approved!** Review materials and submit on the employer website, then confirm manual submission in **⚡ Actions & Transitions**.")
+            elif app.status == ApplicationStatus.READY_FOR_REVIEW.value:
+                st.info("👀 **Review Ready:** Materials are prepared and awaiting your human review in the Application Preparer.")
+            elif app.status == ApplicationStatus.SUBMITTED.value:
+                st.success(f"📬 **Submitted Externally:** Application was submitted on `{app.date_submitted or 'Recorded'}`.")
+
             st.markdown("##### Application Details")
             st.markdown(f"**Company:** {app.company_name} | **Role:** {app.job_title}")
             st.markdown(f"**Current Lifecycle Status:** `{app.status}`")
@@ -1393,6 +1568,9 @@ def render_application_card(
                 st.caption(f"**Linked Job Description ID:** #{app.job_description_id}")
             if app.resume_id:
                 st.caption(f"**Linked Resume ID:** #{app.resume_id}")
+
+            if app.status == ApplicationStatus.APPROVED.value:
+                st.info("👉 Ready to confirm submission? Head to **⚡ Actions & Transitions** to validate external portal navigation and confirm manual submission.")
 
             render_submission_confirmation_details(service, session_id, app, user_id)
 
@@ -1442,10 +1620,18 @@ def render_kanban_board_view(
     session_id: str,
     user_id: int,
     include_archived: bool,
+    follow_ups: list[ApplicationFollowUp] | None = None,
 ) -> None:
     """Renders the exact canonical 5-column Kanban board without drag-and-drop state bypass."""
     st.markdown("### 📊 Application Kanban Board")
     st.caption(f"Showing all {len(applications)} matching applications across five canonical stages. Transitions require authorized workflow actions.")
+
+    # Pre-index follow-ups by application ID
+    fups_by_app: dict[int, list[ApplicationFollowUp]] = {}
+    if follow_ups:
+        for f in follow_ups:
+            if getattr(f, "application_id", None) is not None:
+                fups_by_app.setdefault(f.application_id, []).append(f)
 
     # Group applications into the 5 columns
     col_apps: dict[str, list[Application]] = {col["id"]: [] for col in KANBAN_COLUMNS}
@@ -1491,12 +1677,21 @@ def render_kanban_board_view(
                     safe_company = html.escape(str(app.company_name or "Unknown Company"), quote=True)
                     safe_status = html.escape(str(app.status or "DRAFT"), quote=True)
 
+                    # Follow-Up chips for card
+                    app_fups = fups_by_app.get(app.id, [])
+                    app_chips = get_application_follow_up_chips(app_fups)
+                    urgent_chips = [c for c in app_chips if c["category"] in ("overdue", "today")]
+                    fup_html = ""
+                    if urgent_chips:
+                        fup_c = urgent_chips[0]
+                        fup_html = f'<br><span style="color: {fup_c["color"]}; font-size: 0.85em; font-weight: bold;">{html.escape(fup_c["label"])}</span>'
+
                     st.markdown(
                         f"""
                         <div style="{border_style}">
                             <strong>{safe_title}</strong><br>
                             <span style="color: #4B5563;">{safe_company}</span><br>
-                            <small>Status: <code>{safe_status}</code></small>
+                            <small>Status: <code>{safe_status}</code></small>{fup_html}
                         </div>
                         """,
                         unsafe_allow_html=True,
@@ -1506,6 +1701,12 @@ def render_kanban_board_view(
                         st.caption(f"📍 Location: {app.location or 'N/A'}")
                         if app.application_deadline:
                             st.caption(f"⏳ Deadline: {app.application_deadline}")
+                        if getattr(app, "date_prepared", None):
+                            st.caption(f"📝 Prepared: {app.date_prepared}")
+                        if getattr(app, "date_submitted", None):
+                            st.caption(f"📬 Submitted: {app.date_submitted}")
+                        if app_chips:
+                            st.caption(f"🔔 Reminders: {', '.join([c['label'] for c in app_chips[:2]])}")
 
                         # Manage tabs
                         m_tab_trans, m_tab_pkts, m_tab_time = st.tabs(["⚡ Actions", "📜 Packets", "🛡️ Audit"])

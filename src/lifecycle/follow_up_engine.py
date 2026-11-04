@@ -9,7 +9,7 @@ external employers, recruiters, or third parties.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from src.database.models import Application, ApplicationFollowUp, FollowUpType
@@ -90,7 +90,7 @@ class FollowUpRecommendationEngine:
                 return None
             # Try ISO format
             try:
-                return datetime.fromisoformat(clean.replace("Z", "+00:00")).date()
+                return datetime.fromisoformat(clean).date()
             except ValueError:
                 pass
             # Try YYYY-MM-DD (strict exact format)
@@ -123,7 +123,7 @@ class FollowUpRecommendationEngine:
         extra_context: dict[str, Any] | None = None,
     ) -> FollowUpRecommendation:
         """Calculates a deterministic follow-up recommendation based on current application stage."""
-        ref_date = reference_date or datetime.now(timezone.utc).date()
+        ref_date = reference_date or datetime.now(UTC).date()
         context = extra_context or {}
 
         status = getattr(application, "status", None)
@@ -242,14 +242,24 @@ class FollowUpRecommendationEngine:
         # 3. ASSESSMENT: Status inquiry 5-7 calendar days post-assessment
         # ---------------------------------------------------------------------
         elif status == "ASSESSMENT":
-            assess_raw = context.get("assessment_date") or context.get("assessment_timestamp")
-            assess_date = cls.parse_date_safe(assess_raw)
+            # Finding F2: Candidate-entered assessment dates require explicit candidate_provided provenance
+            raw_assess_source = context.get("assessment_date_source")
+            assess_date = None
+            assess_source = "unavailable"
 
-            if not assess_date:
+            if isinstance(raw_assess_source, str) and raw_assess_source.strip() == "candidate_provided":
+                assess_raw = context.get("assessment_date") or context.get("assessment_timestamp")
+                if assess_raw:
+                    parsed = cls.parse_date_safe(assess_raw)
+                    if parsed:
+                        assess_date = parsed
+                        assess_source = "candidate_provided"
+
+            if not assess_date or assess_source != "candidate_provided":
                 return FollowUpRecommendation(
                     has_recommendation=False,
-                    rationale="Assessment completion date is missing or invalid. Please record an assessment completion date to calculate status inquiry timing.",
-                    application_context=app_ctx,
+                    rationale="Assessment completion date is missing or invalid. Please record a valid assessment completion date with explicit candidate_provided provenance to calculate status inquiry timing.",
+                    application_context=dict(app_ctx, assessment_date_source="unavailable"),
                 )
 
             rec_date = assess_date + timedelta(days=7)
@@ -266,16 +276,16 @@ class FollowUpRecommendationEngine:
                 return FollowUpRecommendation(
                     has_recommendation=False,
                     rationale="A pending status inquiry reminder is already scheduled for this application.",
-                    application_context=app_ctx,
+                    application_context=dict(app_ctx, assessment_date_source="candidate_provided"),
                 )
 
             return FollowUpRecommendation(
                 has_recommendation=True,
                 recommendation_type=FollowUpType.STATUS_INQUIRY.value,
                 recommended_date=rec_date.isoformat(),
-                rationale=f"Recommended status inquiry scheduled for {rec_date.isoformat()} (7 calendar days after assessment completion on {assess_date.isoformat()}).",
+                rationale=f"Recommended status inquiry scheduled for {rec_date.isoformat()} (7 calendar days after candidate-provided assessment completion on {assess_date.isoformat()}).",
                 default_description=f"Check assessment status for {title} with {company}",
-                application_context=app_ctx,
+                application_context=dict(app_ctx, assessment_date_source="candidate_provided"),
             )
 
         # ---------------------------------------------------------------------
@@ -301,8 +311,7 @@ class FollowUpRecommendationEngine:
 
             # Recommend check-in 2 days prior to deadline
             rec_date = deadline_date - timedelta(days=2)
-            if rec_date < ref_date:
-                rec_date = ref_date
+            rec_date = max(rec_date, ref_date)
 
             has_pending = any(
                 r.follow_up_type == FollowUpType.RECRUITER_CHECKIN.value and not r.is_completed
@@ -390,9 +399,8 @@ class FollowUpTemplateGenerator:
             if isinstance(fn, str) and fn.strip():
                 cand_name = fn.strip()
 
-        if not cand_name:
-            if isinstance(trusted_account_name, str) and trusted_account_name.strip():
-                cand_name = trusted_account_name.strip()
+        if not cand_name and isinstance(trusted_account_name, str) and trusted_account_name.strip():
+            cand_name = trusted_account_name.strip()
 
         if not cand_name:
             cand_name = "[CANDIDATE NAME]"

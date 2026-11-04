@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -27,7 +27,12 @@ from src.database.exceptions import (
     SessionExpiredError,
     ValidationError,
 )
-from src.database.models import Application, ApplicationFollowUp, ApplicationStatus, FollowUpType
+from src.database.models import (
+    Application,
+    ApplicationFollowUp,
+    ApplicationStatus,
+    FollowUpType,
+)
 from src.lifecycle.follow_up_engine import (
     FollowUpRecommendationEngine,
     FollowUpTemplateGenerator,
@@ -568,7 +573,10 @@ class TestFollowUpRecommendationEngine(BaseFollowUpTest):
             application=app_assess,
             existing_reminders=[],
             reference_date=ref,
-            extra_context={"assessment_date": "2026-11-05"},
+            extra_context={
+                "assessment_date": "2026-11-05",
+                "assessment_date_source": "candidate_provided",
+            },
         )
         self.assertTrue(rec.has_recommendation)
         self.assertEqual(rec.recommendation_type, FollowUpType.STATUS_INQUIRY.value)
@@ -764,7 +772,7 @@ class TestFollowUpServiceSecurity(BaseFollowUpTest):
 
     def test_service_recommend_expired_session_rejected(self):
         # Expire session_a
-        self.session_a.last_activity = datetime.now(timezone.utc) - timedelta(hours=5)
+        self.session_a.last_activity = datetime.now(UTC) - timedelta(hours=5)
         with self.assertRaises(SessionExpiredError):
             self.service.recommend_application_follow_up(
                 application_id=self.app_a.id,
@@ -1998,7 +2006,7 @@ class TestFollowUpIdentityAndInterviewRemediationPhase7413(BaseFollowUpTest):
             job_title="SWE",
             status=ApplicationStatus.INTERVIEW.value,
         )
-        setattr(app, "interview_date", "2026-11-10")
+        app.interview_date = "2026-11-10"
 
         # Without interview_date_source: "candidate_provided" in context, it is rejected
         rec = FollowUpRecommendationEngine.recommend(

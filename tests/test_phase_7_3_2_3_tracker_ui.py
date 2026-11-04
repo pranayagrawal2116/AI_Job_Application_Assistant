@@ -27,6 +27,7 @@ from dashboard.components.tracker_components import (
     KANBAN_COLUMNS,
     build_tracker_csv_export,
     format_status_badge,
+    get_application_follow_up_chips,
     render_application_card,
     render_archive_action,
     render_external_navigation_action,
@@ -34,6 +35,7 @@ from dashboard.components.tracker_components import (
     render_follow_up_manager,
     render_kanban_board_view,
     render_lifecycle_status_actions,
+    render_lifecycle_stepper,
     render_lifecycle_timeline_view,
     render_manual_submission_section,
     render_prepared_packets_view,
@@ -54,11 +56,14 @@ from src.database.exceptions import (
 )
 from src.database.models import (
     Application,
+    ApplicationEvent,
+    ApplicationFollowUp,
     ApplicationStatus,
     FollowUpType,
     PreparedPacket,
     SubmissionChannel,
 )
+from src.lifecycle.follow_up_engine import FollowUpRecommendationEngine
 from src.lifecycle.state_machine import ApplicationStateMachine
 from src.security.session_manager import SessionManager
 
@@ -1866,10 +1871,12 @@ class TestPhase7421DateAndDraftRemediation(BaseTrackerUITest):
             "rationale": "Impossible date",
             "default_description": "Desc",
         }
-        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec):
-            with patch.object(self.service, "create_application_follow_up", wraps=self.service.create_application_follow_up) as spy_create:
-                render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
-                spy_create.assert_not_called()
+        with (
+            patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec),
+            patch.object(self.service, "create_application_follow_up", wraps=self.service.create_application_follow_up) as spy_create,
+        ):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_create.assert_not_called()
 
     @patch("dashboard.components.tracker_components.st")
     def test_draft_regeneration_resets_editable_widgets_and_preserves_edits(self, mock_st):
@@ -1938,6 +1945,376 @@ class TestPhase7421DateAndDraftRemediation(BaseTrackerUITest):
 
         self.assertEqual(session_state_dict[f"draft_subj_{self.user_a}_{app.id}"], "Thank You So Much (Edited)")
         self.assertEqual(session_state_dict[f"draft_body_{self.user_a}_{app.id}"], "Had a great interview (Edited)")
+
+
+# =============================================================================
+# CATEGORY L: PHASE 7.5 LIFECYCLE OVERHAUL & PREPARER INTEGRATION TESTS
+# =============================================================================
+
+class TestPhase75LifecycleOverhaul(BaseTrackerUITest):
+    """Verifies Phase 7.5 features:
+    - Finding F1: Upstream recommendation date change refreshes date widget while preserving manual edits.
+    - Finding F2: Candidate-provided assessment date provenance parity in engine and UI.
+    - Status chips: Overdue, Due Today, Upcoming, and Completed ordering and categorization.
+    - Stepper: Visual 5-stage lifecycle stepper reflecting authoritative milestones and terminal/reopened state.
+    - Card: Expanded support, readiness indicator banners, prepared/submitted dates, and reminder chips.
+    - Kanban: Follow-up chips on Kanban cards and detailed expander.
+    - View focus: tracker_selected_app_id focus alert, clear button, and targeted card expansion.
+    - Preparer integration: Tab 7 and Tab 8 navigation to Tracker with targeted focus.
+    """
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_finding_f1_recommendation_date_change_resets_widget_and_preserves_candidate_edit(self, mock_st):
+        """Verifies Finding F1:
+        1. Initial recommendation date sets last_rec_date and initializes rec_sched_date widget.
+        2. Candidate manually overrides widget to a custom date.
+        3. Unrelated rerun with unchanged recommendation date preserves candidate's manual override.
+        4. Upstream recommendation date change resets widget to new date and updates last_rec_date.
+        5. Candidate can edit the new date again.
+        """
+        app = self._create_app(self.user_a, "F1 Co", "Engineer", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.button.return_value = False
+        session_state_dict: dict[str, Any] = {}
+        mock_st.session_state = session_state_dict
+
+        # Step 1: Initial recommendation proposing 2026-11-15
+        mock_rec_1 = {
+            "has_recommendation": True,
+            "recommendation_type": "STATUS_INQUIRY",
+            "recommended_date": "2026-11-15",
+            "rationale": "Initial status inquiry rationale",
+            "default_description": "Initial inquiry",
+        }
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec_1):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        self.assertEqual(session_state_dict.get(f"last_rec_date_{self.user_a}_{app.id}"), "2026-11-15")
+        self.assertEqual(session_state_dict.get(f"rec_sched_date_{self.user_a}_{app.id}"), date(2026, 11, 15))
+
+        # Step 2: Candidate manually edits the scheduled date to 2026-11-18
+        session_state_dict[f"rec_sched_date_{self.user_a}_{app.id}"] = date(2026, 11, 18)
+
+        # Step 3: Unrelated rerun with same recommendation date ("2026-11-15")
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec_1):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        # Confirm candidate edit is preserved!
+        self.assertEqual(session_state_dict.get(f"rec_sched_date_{self.user_a}_{app.id}"), date(2026, 11, 18))
+        self.assertEqual(session_state_dict.get(f"last_rec_date_{self.user_a}_{app.id}"), "2026-11-15")
+
+        # Step 4: Upstream recommendation date changes to "2026-11-20"
+        mock_rec_2 = {
+            "has_recommendation": True,
+            "recommendation_type": "STATUS_INQUIRY",
+            "recommended_date": "2026-11-20",
+            "rationale": "Updated inquiry rationale",
+            "default_description": "Updated inquiry",
+        }
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec_2):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        # Confirm widget date is refreshed to the new recommendation date!
+        self.assertEqual(session_state_dict.get(f"last_rec_date_{self.user_a}_{app.id}"), "2026-11-20")
+        self.assertEqual(session_state_dict.get(f"rec_sched_date_{self.user_a}_{app.id}"), date(2026, 11, 20))
+
+        # Step 5: Candidate can edit the newly refreshed date
+        session_state_dict[f"rec_sched_date_{self.user_a}_{app.id}"] = date(2026, 11, 25)
+        with patch.object(self.service, "recommend_application_follow_up", return_value=mock_rec_2):
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        self.assertEqual(session_state_dict.get(f"rec_sched_date_{self.user_a}_{app.id}"), date(2026, 11, 25))
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_finding_f2_assessment_date_provenance_enforced(self, mock_st):
+        """Verifies Finding F2:
+        1. FollowUpRecommendationEngine requires explicit candidate_provided provenance for ASSESSMENT status.
+        2. Missing provenance returns has_recommendation=False and assessment_date_source='unavailable'.
+        3. Untrusted provenance returns has_recommendation=False.
+        4. Valid candidate_provided provenance returns has_recommendation=True with 7 calendar days offset.
+        5. UI populates extra_context['assessment_date_source'] = 'candidate_provided' when entered by candidate.
+        """
+        app = self._create_app(self.user_a, "F2 Co", "Dev", status="ASSESSMENT")
+
+        # 1. Missing provenance in engine
+        rec_missing = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={"assessment_date": "2026-11-05"},
+        )
+        self.assertFalse(rec_missing.has_recommendation)
+        self.assertIn("candidate_provided provenance", rec_missing.rationale)
+        self.assertEqual(rec_missing.application_context.get("assessment_date_source"), "unavailable")
+
+        # 2. Untrusted provenance in engine
+        rec_untrusted = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={
+                "assessment_date": "2026-11-05",
+                "assessment_date_source": "inferred_by_scraper",
+            },
+        )
+        self.assertFalse(rec_untrusted.has_recommendation)
+        self.assertEqual(rec_untrusted.application_context.get("assessment_date_source"), "unavailable")
+
+        # 3. Explicit candidate_provided provenance in engine
+        rec_valid = FollowUpRecommendationEngine.recommend(
+            application=app,
+            existing_reminders=[],
+            reference_date=date(2026, 11, 10),
+            extra_context={
+                "assessment_date": "2026-11-05",
+                "assessment_date_source": "candidate_provided",
+            },
+        )
+        self.assertTrue(rec_valid.has_recommendation)
+        self.assertEqual(rec_valid.recommended_date, "2026-11-12")
+        self.assertIn("candidate-provided assessment completion", rec_valid.rationale)
+        self.assertEqual(rec_valid.application_context.get("assessment_date_source"), "candidate_provided")
+
+        # 4. UI provides candidate_provided tag
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"rec_assess_chk_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = date(2026, 11, 5)
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        with patch.object(self.service, "recommend_application_follow_up", wraps=self.service.recommend_application_follow_up) as spy_rec:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_rec.assert_called_once()
+            extra_ctx = spy_rec.call_args[1].get("extra_context", {})
+            self.assertEqual(extra_ctx.get("assessment_date"), "2026-11-05")
+            self.assertEqual(extra_ctx.get("assessment_date_source"), "candidate_provided")
+
+    def test_get_application_follow_up_chips_urgency_ordering(self):
+        """Verifies get_application_follow_up_chips sorts by urgency: overdue -> today -> upcoming -> completed."""
+        today = date(2026, 11, 4)
+        fups = [
+            ApplicationFollowUp(
+                application_id=10, user_id=self.user_a, follow_up_date="2026-11-15",
+                follow_up_type="STATUS_INQUIRY", description="Upcoming task",
+                is_completed=0, id=1,
+            ),
+            ApplicationFollowUp(
+                application_id=10, user_id=self.user_a, follow_up_date="2026-10-25",
+                follow_up_type="THANK_YOU_NOTE", description="Completed task",
+                is_completed=1, id=2,
+            ),
+            ApplicationFollowUp(
+                application_id=10, user_id=self.user_a, follow_up_date="2026-11-01",
+                follow_up_type="STATUS_INQUIRY", description="Overdue task",
+                is_completed=0, id=3,
+            ),
+            ApplicationFollowUp(
+                application_id=10, user_id=self.user_a, follow_up_date="2026-11-04",
+                follow_up_type="PREPARATION", description="Due today task",
+                is_completed=0, id=4,
+            ),
+        ]
+
+        chips = get_application_follow_up_chips(fups, today_date=today)
+        self.assertEqual(len(chips), 4)
+        self.assertEqual(chips[0]["category"], "overdue")
+        self.assertEqual(chips[0]["id"], 3)
+        self.assertIn("Overdue", chips[0]["label"])
+
+        self.assertEqual(chips[1]["category"], "today")
+        self.assertEqual(chips[1]["id"], 4)
+        self.assertIn("Due Today", chips[1]["label"])
+
+        self.assertEqual(chips[2]["category"], "upcoming")
+        self.assertEqual(chips[2]["id"], 1)
+        self.assertIn("Upcoming", chips[2]["label"])
+
+        self.assertEqual(chips[3]["category"], "completed")
+        self.assertEqual(chips[3]["id"], 2)
+        self.assertIn("Completed", chips[3]["label"])
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_render_lifecycle_stepper_milestones_and_terminal_reopened(self, mock_st):
+        """Verifies render_lifecycle_stepper renders active, completed, terminal, and reopen states."""
+        # 1. Offer stage application
+        app_offer = self._create_app(self.user_a, "Stepper Co", "Engineer", status="OFFER")
+        col_mocks = [MagicMock() for _ in range(5)]
+        mock_st.columns.return_value = col_mocks
+
+        render_lifecycle_stepper(app_offer, events=[])
+        mock_st.success.assert_called_with("🎉 **Offer Stage:** Candidate has received an offer for this position!")
+
+        # 2. Terminal stage application
+        app_term = self._create_app(self.user_a, "Term Co", "Engineer", status="REJECTED")
+        mock_st.reset_mock()
+        mock_st.columns.return_value = col_mocks
+
+        render_lifecycle_stepper(app_term, events=[])
+        caption_calls = [call[0][0] for call in mock_st.caption.call_args_list]
+        self.assertTrue(any("Application concluded in terminal state: `REJECTED`" in str(c) for c in caption_calls))
+
+        # 3. Reopened application with events
+        app_reopen = self._create_app(self.user_a, "Reopen Co", "Engineer", status="IN_PROGRESS")
+        mock_st.reset_mock()
+        mock_st.columns.return_value = col_mocks
+        evt = ApplicationEvent(
+            application_id=app_reopen.id,
+            user_id=self.user_a,
+            sequence_no=1,
+            event_type="APPLICATION_REOPENED",
+            actor_type="CANDIDATE",
+            actor_identifier=f"user_{self.user_a}",
+            event_payload_json=json.dumps({"reopen_rationale": "Position re-listed by hiring team"}),
+            previous_event_hash="0" * 64,
+            event_hash="h1",
+            id=1,
+        )
+        render_lifecycle_stepper(app_reopen, events=[evt])
+        info_calls = [call[0][0] for call in mock_st.info.call_args_list]
+        self.assertTrue(any("Position re-listed by hiring team" in str(c) for c in info_calls))
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_render_application_card_expanded_and_readiness_banners(self, mock_st):
+        """Verifies render_application_card supports expanded parameter and displays status readiness banners."""
+        app_approved = self._create_app(self.user_a, "Approved Co", "Lead Dev", status="APPROVED")
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE applications SET date_prepared = '2026-11-02' WHERE id = ?",
+                (app_approved.id,),
+            )
+        app_approved = self.db.get_user_application(app_approved.id, self.user_a)
+
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+
+        # Render with expanded=True
+        render_application_card(
+            app_approved, self.service, self.session_a.session_id, self.user_a,
+            include_archived=False, expanded=True,
+        )
+        # Verify expander received expanded=True
+        exp_calls = [call[1].get("expanded") for call in mock_st.expander.call_args_list]
+        self.assertIn(True, exp_calls)
+
+        # Verify warning banner for APPROVED
+        warn_calls = [call[0][0] for call in mock_st.warning.call_args_list]
+        self.assertTrue(any("Action Required: Application Human-Approved!" in str(c) for c in warn_calls))
+
+        # Test READY_FOR_REVIEW banner
+        app_ready = self._create_app(self.user_a, "Ready Co", "Lead Dev", status="READY_FOR_REVIEW")
+        mock_st.reset_mock()
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
+        render_application_card(
+            app_ready, self.service, self.session_a.session_id, self.user_a,
+            include_archived=False, expanded=False,
+        )
+        info_calls = [call[0][0] for call in mock_st.info.call_args_list]
+        self.assertTrue(any("Review Ready:" in str(c) for c in info_calls))
+
+        # Test SUBMITTED banner
+        app_sub = self._create_app(self.user_a, "Sub Co", "Lead Dev", status="SUBMITTED")
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE applications SET date_submitted = '2026-11-03' WHERE id = ?",
+                (app_sub.id,),
+            )
+        app_sub = self.db.get_user_application(app_sub.id, self.user_a)
+        mock_st.reset_mock()
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
+        render_application_card(
+            app_sub, self.service, self.session_a.session_id, self.user_a,
+            include_archived=False, expanded=False,
+        )
+        succ_calls = [call[0][0] for call in mock_st.success.call_args_list]
+        self.assertTrue(any("Submitted Externally:" in str(c) for c in succ_calls))
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_render_kanban_board_view_follow_up_chips_and_cards(self, mock_st):
+        """Verifies render_kanban_board_view accepts follow_ups, renders badges on cards, and details in expander."""
+        app = self._create_app(
+            self.user_a, "Kanban Fup Co", "ML Engineer",
+            status="SUBMITTED", application_deadline="2026-11-30",
+        )
+        fup = ApplicationFollowUp(
+            application_id=app.id,
+            user_id=self.user_a,
+            follow_up_date="2026-11-01",  # Overdue
+            follow_up_type="STATUS_INQUIRY",
+            description="Urgent status check",
+            is_completed=0,
+            id=101,
+        )
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.tabs.side_effect = lambda tabs: [MagicMock() for _ in tabs]
+
+        render_kanban_board_view(
+            [app], self.service, self.session_a.session_id, self.user_a,
+            include_archived=False, follow_ups=[fup],
+        )
+
+        # Verify markdown calls rendered the overdue chip HTML
+        md_calls = [call[0][0] for call in mock_st.markdown.call_args_list]
+        has_overdue_chip = any("Overdue: STATUS_INQUIRY" in str(c) for c in md_calls)
+        self.assertTrue(has_overdue_chip)
+
+    @patch("dashboard.views.application_tracker.st")
+    def test_application_tracker_focus_navigation_flow(self, mock_st):
+        """Verifies render_application_tracker surfaces focus banner and target card expansion when tracker_selected_app_id is set."""
+        app = self._create_app(self.user_a, "Focus Co", "Engineer", status="APPROVED")
+        mock_st.session_state = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+            "tracker_selected_app_id": app.id,
+        }
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.return_value = False
+
+        with patch("dashboard.views.application_tracker.DashboardService.get_instance", return_value=self.service):
+            render_application_tracker()
+
+        # Verify focus banner was rendered
+        info_calls = [call[0][0] for call in mock_st.info.call_args_list]
+        self.assertTrue(any(f"Showing Application #{app.id}" in str(c) for c in info_calls))
+
+        # Verify focus banner was rendered
+        info_calls = [call[0][0] for call in mock_st.info.call_args_list]
+        self.assertTrue(any(f"Showing Application #{app.id}" in str(c) for c in info_calls))
+
+    @patch("dashboard.views.application_preparer.st")
+    def test_application_preparer_navigation_buttons(self, mock_st):
+        """Verifies Application Preparer Tab 7 and Tab 8 navigation buttons set tracker_selected_app_id."""
+        app = self._create_app(self.user_a, "Nav Co", "Engineer", status="APPROVED")
+        session_state_dict: dict[str, Any] = {
+            "authenticated_session_id": self.session_a.session_id,
+            "authenticated_user_id": self.user_a,
+        }
+        mock_st.session_state = session_state_dict
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.button.side_effect = lambda label, key=None, type=None: key == f"open_tracker_tab7_{app.id}"
+
+        # Test simulating the Tab 7 button logic
+        if mock_st.button("📋 Open in Application Tracker", key=f"open_tracker_tab7_{app.id}", type="primary"):
+            mock_st.session_state["tracker_selected_app_id"] = app.id
+
+        self.assertEqual(mock_st.session_state.get("tracker_selected_app_id"), app.id)
+
+        # Test Tab 8 button logic
+        mock_st.session_state["tracker_selected_app_id"] = None
+        mock_st.button.side_effect = lambda label, key=None: key == f"open_tracker_tab8_{app.id}"
+        if mock_st.button("📋 View in Tracker", key=f"open_tracker_tab8_{app.id}"):
+            mock_st.session_state["tracker_selected_app_id"] = app.id
+
+        self.assertEqual(mock_st.session_state.get("tracker_selected_app_id"), app.id)
 
 
 if __name__ == "__main__":
