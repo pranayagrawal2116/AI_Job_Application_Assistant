@@ -1246,6 +1246,33 @@ class DashboardService:
 
         return result
 
+    @staticmethod
+    def _sanitize_manifest_for_candidate(manifest_entries: Any) -> List[Dict[str, Any]]:
+        """Sanitizes server-side attachments manifest for safe candidate inspection.
+
+        Strips internal server filesystem paths, storage roots, and locators.
+        Retains only display metadata: artifact_type, display filename, format, size,
+        and availability.
+        """
+        if not manifest_entries or not isinstance(manifest_entries, list):
+            return []
+
+        sanitized = []
+        for entry in manifest_entries:
+            if not isinstance(entry, dict):
+                continue
+            sanitized.append({
+                "artifact_type": entry.get("artifact_type"),
+                "filename": entry.get("filename") or entry.get("stored_filename") or "document",
+                "format": str(entry.get("format", "")).upper() if entry.get("format") else None,
+                "size_bytes": entry.get("size_bytes"),
+                "size_kb": entry.get("size_kb"),
+                "file_hash": entry.get("file_hash") or entry.get("sha256_hash"),
+                "timestamp": entry.get("timestamp"),
+                "document_available": bool(entry.get("file_hash") or entry.get("sha256_hash")),
+            })
+        return sanitized
+
     def get_candidate_prepared_packet(
         self,
         application_id: int,
@@ -1262,6 +1289,8 @@ class DashboardService:
         - Cross-application protection (packet.application_id == application_id).
         - Read-only historical integrity check against canonical snapshot hash.
         - Exact approval provenance matching packet_id, hash, and application.
+        - Strict isolation: tampered snapshots never trusted or fallen back to DB columns.
+        - Server path redaction: attachments manifest sanitized of filesystem paths.
         - Strictly non-mutating (does not alter packet active status, approvals, or application state).
         """
         user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
@@ -1291,12 +1320,18 @@ class DashboardService:
         else:
             recomputed_hash = hashlib.sha256(packet.canonical_snapshot_json.encode("utf-8")).hexdigest()
             if recomputed_hash == packet.packet_version_hash:
-                integrity_valid = True
-                verification_message = "Packet integrity verified."
                 try:
-                    snapshot_payload = json.loads(packet.canonical_snapshot_json)
-                except Exception:
-                    snapshot_payload = None
+                    parsed = json.loads(packet.canonical_snapshot_json)
+                    if isinstance(parsed, dict):
+                        integrity_valid = True
+                        verification_message = "Packet integrity verified."
+                        snapshot_payload = parsed
+                    else:
+                        integrity_valid = False
+                        verification_message = "Integrity check failed: Canonical snapshot structure is invalid."
+                except Exception as exc:
+                    integrity_valid = False
+                    verification_message = f"Integrity check failed: Canonical snapshot JSON is malformed: {exc}"
             else:
                 integrity_valid = False
                 verification_message = (
@@ -1331,34 +1366,11 @@ class DashboardService:
             }
 
         # Extract materials from snapshot or attributes
-        tailored_resume_data = {}
-        cover_letter_data = {}
+        tailored_resume_data: Dict[str, Any] = {}
+        cover_letter_data: Dict[str, Any] = {}
         screening_questions_data: List[Dict[str, Any]] = []
         attachments_manifest_list: List[Dict[str, Any]] = []
 
-        if snapshot_payload:
-            tailored_resume_data = snapshot_payload.get("tailored_resume") or {}
-            cover_letter_data = snapshot_payload.get("cover_letter") or {}
-            screening_questions_data = snapshot_payload.get("screening_questions") or []
-            attachments_manifest_list = snapshot_payload.get("attachments_manifest") or []
-        else:
-            # Fallback for legacy records or tampered snapshots
-            if packet.screening_answers_json:
-                try:
-                    parsed_qa = json.loads(packet.screening_answers_json)
-                    if isinstance(parsed_qa, list):
-                        screening_questions_data = parsed_qa
-                except Exception:
-                    pass
-            if packet.attachments_manifest_json:
-                try:
-                    parsed_att = json.loads(packet.attachments_manifest_json)
-                    if isinstance(parsed_att, list):
-                        attachments_manifest_list = parsed_att
-                except Exception:
-                    pass
-
-        # Determine document availability
         documents_available: Dict[str, bool] = {
             "tailored_resume_pdf": False,
             "tailored_resume_docx": False,
@@ -1370,21 +1382,55 @@ class DashboardService:
             "consolidated_packet_docx": False,
             "original_resume": False,
         }
-        for att in attachments_manifest_list:
-            art_type = att.get("artifact_type")
-            if art_type in documents_available:
-                documents_available[art_type] = True
 
-        if packet.tailored_resume_path:
-            if packet.tailored_resume_path.lower().endswith(".pdf"):
-                documents_available["tailored_resume_pdf"] = True
-            elif packet.tailored_resume_path.lower().endswith(".docx"):
-                documents_available["tailored_resume_docx"] = True
-        if packet.cover_letter_path:
-            if packet.cover_letter_path.lower().endswith(".pdf"):
-                documents_available["cover_letter_pdf"] = True
-            elif packet.cover_letter_path.lower().endswith(".docx"):
-                documents_available["cover_letter_docx"] = True
+        if integrity_valid and snapshot_payload:
+            # Valid non-legacy snapshot: authoritative materials from snapshot only
+            tailored_resume_data = snapshot_payload.get("tailored_resume") or {}
+            cover_letter_data = snapshot_payload.get("cover_letter") or {}
+            screening_questions_data = snapshot_payload.get("screening_questions") or []
+            raw_manifest = snapshot_payload.get("attachments_manifest") or []
+            attachments_manifest_list = self._sanitize_manifest_for_candidate(raw_manifest)
+            for att in attachments_manifest_list:
+                art_type = att.get("artifact_type")
+                if art_type in documents_available:
+                    documents_available[art_type] = True
+        elif packet.is_legacy:
+            # Safe historical inspection of legitimate legacy packets
+            if packet.screening_answers_json:
+                try:
+                    parsed_qa = json.loads(packet.screening_answers_json)
+                    if isinstance(parsed_qa, list):
+                        screening_questions_data = parsed_qa
+                except Exception:
+                    pass
+            if packet.attachments_manifest_json:
+                try:
+                    parsed_att = json.loads(packet.attachments_manifest_json)
+                    if isinstance(parsed_att, list):
+                        attachments_manifest_list = self._sanitize_manifest_for_candidate(parsed_att)
+                except Exception:
+                    pass
+            for att in attachments_manifest_list:
+                art_type = att.get("artifact_type")
+                if art_type in documents_available:
+                    documents_available[art_type] = True
+            if packet.tailored_resume_path:
+                if packet.tailored_resume_path.lower().endswith(".pdf"):
+                    documents_available["tailored_resume_pdf"] = True
+                elif packet.tailored_resume_path.lower().endswith(".docx"):
+                    documents_available["tailored_resume_docx"] = True
+            if packet.cover_letter_path:
+                if packet.cover_letter_path.lower().endswith(".pdf"):
+                    documents_available["cover_letter_pdf"] = True
+                elif packet.cover_letter_path.lower().endswith(".docx"):
+                    documents_available["cover_letter_docx"] = True
+        else:
+            # Non-legacy packet with FAILED integrity: do NOT trust tampered snapshot and do NOT fall back to DB columns!
+            tailored_resume_data = {}
+            cover_letter_data = {}
+            screening_questions_data = []
+            attachments_manifest_list = []
+            # documents_available remains all False
 
         return {
             "packet_id": packet.id,
@@ -1436,15 +1482,16 @@ class DashboardService:
         3. Retrieve application with candidate ownership enforcement.
         4. Retrieve packet with candidate ownership enforcement.
         5. Verify packet belongs to application.
-        6. Verify requested document type is supported.
-        7. Resolve document locator exclusively from server-side metadata.
-        8. Resolve filesystem location safely.
-        9. Verify final path remains within candidate's approved private storage boundary.
-        10. Reject traversal (..), absolute path substitution, and symlink escapes.
-        11. Verify file exists and is a regular file.
-        12. Verify expected SHA-256 hash against authoritative packet metadata.
-        13. Verify actual file format matches expected PDF/DOCX magic bytes.
-        14. Return (file_bytes, safe_filename, mime_type).
+        6. PRE-RETRIEVAL INTEGRITY GATE: Verify packet canonical snapshot hash and structure.
+           Fail closed on legacy, missing, tampered, or malformed snapshots.
+        7. Verify requested document type and resolve expected format.
+        8. Resolve document locator strictly from snapshot manifest (no detached DB fallback).
+        9. Enforce strict format, extension, and artifact type consistency.
+        10. Resolve filesystem location safely and reject traversal (..) or null bytes.
+        11. Verify containment within candidate's approved private storage boundary.
+        12. Verify file exists and is a regular file.
+        13. Verify SHA-256 against authoritative expected hash in packet manifest.
+        14. Verify magic bytes (%PDF- or PK\x03\x04) and return (file_bytes, safe_filename, mime_type).
         """
         from src.security.file_security import FileSecurityValidator
 
@@ -1468,176 +1515,193 @@ class DashboardService:
                 f"not requested Application #{application_id}."
             )
 
-        # 6. Verify requested document type is supported
+        # 6. PRE-RETRIEVAL INTEGRITY GATE
+        # Must verify canonical snapshot BEFORE reading any document path, filename, or hash
+        if packet.is_legacy or not packet.canonical_snapshot_json:
+            raise SecurityAuthorizationError(
+                "Legacy packet record lacks a verifiable canonical snapshot. "
+                "Document download is prohibited under strict security policy."
+            )
+
+        recomputed_hash = hashlib.sha256(packet.canonical_snapshot_json.encode("utf-8")).hexdigest()
+        if recomputed_hash != packet.packet_version_hash:
+            raise SecurityAuthorizationError(
+                "Prepared packet integrity verification failed. "
+                "Document download is prohibited."
+            )
+
+        try:
+            snapshot = json.loads(packet.canonical_snapshot_json)
+        except Exception as exc:
+            raise SecurityAuthorizationError(
+                f"Canonical snapshot is malformed. Document download is prohibited: {exc}"
+            )
+
+        if not isinstance(snapshot, dict):
+            raise SecurityAuthorizationError(
+                "Canonical snapshot structure is invalid. Document download is prohibited."
+            )
+
+        if snapshot.get("user_id") != user_id:
+            raise SecurityAuthorizationError(
+                "Snapshot user identity mismatch. Document download is prohibited."
+            )
+        if snapshot.get("application_id") != application_id:
+            raise SecurityAuthorizationError(
+                "Snapshot application identity mismatch. Document download is prohibited."
+            )
+        expected_version = getattr(packet, "packet_version", packet.version_num)
+        if snapshot.get("packet_version") != expected_version:
+            raise SecurityAuthorizationError(
+                "Snapshot packet version mismatch. Document download is prohibited."
+            )
+
+        manifest_entries = snapshot.get("attachments_manifest")
+        if manifest_entries is None or not isinstance(manifest_entries, list):
+            raise SecurityAuthorizationError(
+                "Snapshot attachments manifest is invalid. Document download is prohibited."
+            )
+
+        # 7. Verify requested document type and resolve expected format
         if not document_type or not isinstance(document_type, str):
             raise ValidationError("Document type must be a non-empty string.")
 
         norm_type = document_type.strip().lower()
-        supported_types = {
-            "tailored_resume_pdf",
-            "tailored_resume_docx",
-            "cover_letter_pdf",
-            "cover_letter_docx",
-            "screening_qa_pdf",
-            "screening_qa_docx",
-            "consolidated_packet_pdf",
-            "consolidated_packet_docx",
-            "original_resume",
-            # Common short aliases
-            "resume_pdf",
-            "resume_docx",
-            "cover_pdf",
-            "cover_docx",
-            "qa_pdf",
-            "qa_docx",
-            "packet_pdf",
-            "packet_docx",
-            "tailored_resume",
-            "cover_letter",
-            "screening_qa",
-            "packet",
+
+        format_expectations = {
+            "tailored_resume_pdf": ("tailored_resume_pdf", "PDF"),
+            "tailored_resume_docx": ("tailored_resume_docx", "DOCX"),
+            "cover_letter_pdf": ("cover_letter_pdf", "PDF"),
+            "cover_letter_docx": ("cover_letter_docx", "DOCX"),
+            "screening_qa_pdf": ("screening_qa_pdf", "PDF"),
+            "screening_qa_docx": ("screening_qa_docx", "DOCX"),
+            "consolidated_packet_pdf": ("consolidated_packet_pdf", "PDF"),
+            "consolidated_packet_docx": ("consolidated_packet_docx", "DOCX"),
+            "original_resume": ("original_resume", None),
+            # Aliases
+            "resume_pdf": ("tailored_resume_pdf", "PDF"),
+            "resume_docx": ("tailored_resume_docx", "DOCX"),
+            "cover_pdf": ("cover_letter_pdf", "PDF"),
+            "cover_docx": ("cover_letter_docx", "DOCX"),
+            "qa_pdf": ("screening_qa_pdf", "PDF"),
+            "qa_docx": ("screening_qa_docx", "DOCX"),
+            "packet_pdf": ("consolidated_packet_pdf", "PDF"),
+            "packet_docx": ("consolidated_packet_docx", "DOCX"),
+            "tailored_resume": ("tailored_resume_pdf", "PDF"),
+            "cover_letter": ("cover_letter_pdf", "PDF"),
+            "screening_qa": ("screening_qa_pdf", "PDF"),
+            "packet": ("consolidated_packet_pdf", "PDF"),
         }
-        if norm_type not in supported_types:
+
+        if norm_type not in format_expectations:
             raise ValidationError(
                 f"Unsupported document type: '{document_type}'. "
                 "Only compiled PDF and DOCX packet materials are supported."
             )
 
-        # Normalize aliases to canonical artifact types
-        canonical_map = {
-            "resume_pdf": "tailored_resume_pdf",
-            "resume_docx": "tailored_resume_docx",
-            "tailored_resume": "tailored_resume_pdf",
-            "cover_pdf": "cover_letter_pdf",
-            "cover_docx": "cover_letter_docx",
-            "cover_letter": "cover_letter_pdf",
-            "qa_pdf": "screening_qa_pdf",
-            "qa_docx": "screening_qa_docx",
-            "screening_qa": "screening_qa_pdf",
-            "packet_pdf": "consolidated_packet_pdf",
-            "packet_docx": "consolidated_packet_docx",
-            "packet": "consolidated_packet_pdf",
-        }
-        target_art_type = canonical_map.get(norm_type, norm_type)
+        target_art_type, expected_format = format_expectations[norm_type]
 
-        # 7. Resolve document locator exclusively from server-side metadata
-        raw_path_str: Optional[str] = None
-        expected_hash: Optional[str] = None
-        display_filename: Optional[str] = None
-        expected_format: Optional[str] = None
-
-        manifest_entries: List[Dict[str, Any]] = []
-        if packet.canonical_snapshot_json:
-            try:
-                snap = json.loads(packet.canonical_snapshot_json)
-                manifest_entries = snap.get("attachments_manifest") or []
-            except Exception:
-                pass
-        if not manifest_entries and packet.attachments_manifest_json:
-            try:
-                parsed_m = json.loads(packet.attachments_manifest_json)
-                if isinstance(parsed_m, list):
-                    manifest_entries = parsed_m
-            except Exception:
-                pass
-
+        # 8. Resolve document locator strictly from snapshot manifest (no detached DB fallback)
+        target_entry = None
         for entry in manifest_entries:
-            art = entry.get("artifact_type")
-            if art == target_art_type:
-                raw_path_str = entry.get("file_path")
-                expected_hash = entry.get("file_hash") or entry.get("sha256_hash")
-                display_filename = entry.get("filename") or entry.get("stored_filename")
-                expected_format = entry.get("format")
+            if isinstance(entry, dict) and entry.get("artifact_type") == target_art_type:
+                target_entry = entry
                 break
 
-        # Fallback to direct packet columns if not in manifest
-        if not raw_path_str:
-            if target_art_type in ("tailored_resume_pdf", "tailored_resume_docx"):
-                raw_path_str = packet.tailored_resume_path
-                expected_hash = packet.tailored_resume_hash
-                if raw_path_str:
-                    display_filename = Path(raw_path_str).name
-                    expected_format = "PDF" if raw_path_str.lower().endswith(".pdf") else "DOCX"
-            elif target_art_type in ("cover_letter_pdf", "cover_letter_docx"):
-                raw_path_str = packet.cover_letter_path
-                expected_hash = packet.cover_letter_hash
-                if raw_path_str:
-                    display_filename = Path(raw_path_str).name
-                    expected_format = "PDF" if raw_path_str.lower().endswith(".pdf") else "DOCX"
-
-        if not raw_path_str:
+        if not target_entry:
             raise FileNotFoundError(
                 f"Requested document '{document_type}' is unavailable for Packet #{packet_id}."
             )
 
+        raw_path_str = target_entry.get("file_path")
+        expected_hash = target_entry.get("file_hash") or target_entry.get("sha256_hash")
+        display_filename = target_entry.get("filename") or target_entry.get("stored_filename")
+        manifest_format = str(target_entry.get("format", "")).upper()
+
+        # 9. Enforce document format & extension consistency
+        if not manifest_format or manifest_format not in ("PDF", "DOCX"):
+            raise ValidationError(
+                f"Unsupported manifest document format: '{manifest_format}'."
+            )
+
+        if expected_format is not None and manifest_format != expected_format:
+            raise ValidationError(
+                f"Document format mismatch: requested '{document_type}' ({expected_format}) "
+                f"conflicts with manifest format '{manifest_format}'."
+            )
+
+        if not raw_path_str:
+            raise FileNotFoundError(
+                f"Requested document '{document_type}' has no file path in packet manifest."
+            )
+
+        ext = Path(raw_path_str).suffix.lower()
+        if manifest_format == "PDF" and ext != ".pdf":
+            raise ValidationError(
+                f"Format mismatch: manifest format 'PDF' conflicts with file extension '{ext}'."
+            )
+        if manifest_format == "DOCX" and ext != ".docx":
+            raise ValidationError(
+                f"Format mismatch: manifest format 'DOCX' conflicts with file extension '{ext}'."
+            )
+
         if not expected_hash:
             raise SecurityAuthorizationError(
-                f"Document '{document_type}' lacks an authoritative integrity hash in packet metadata. "
+                f"Document '{document_type}' lacks an authoritative integrity hash in packet manifest. "
                 "Download rejected under strict security policy."
             )
 
-        # 8. Resolve filesystem location safely and reject traversal
+        # 10. Resolve filesystem location safely and reject traversal
         if ".." in raw_path_str:
-            raise SecurityAuthorizationError(
-                f"Path traversal detected in document locator: '{raw_path_str}'"
-            )
+            raise SecurityAuthorizationError("Path traversal detected in document locator.")
         if "\x00" in raw_path_str:
             raise SecurityAuthorizationError("Invalid character in document path locator.")
 
         raw_path = Path(raw_path_str)
         target_path = raw_path.resolve()
 
-        # 9 & 10. Verify containment within candidate's approved private storage boundary
+        # 11. Verify containment within candidate's approved private storage boundary
         candidate_sandbox = (self.storage_base_dir / str(user_id)).resolve()
         try:
             target_path.relative_to(candidate_sandbox)
         except ValueError:
             raise SecurityAuthorizationError(
-                f"Security violation: Resolved document path '{target_path}' escapes candidate #{user_id} "
-                f"private storage boundary '{candidate_sandbox}'."
+                f"Security violation: Requested document escapes candidate #{user_id} private storage boundary."
             )
 
-        # 11. Verify file exists and is regular file
+        # 12. Verify file exists and is regular file
+        safe_filename = FileSecurityValidator.sanitize_filename(display_filename or target_path.name)
         if not target_path.exists() or not target_path.is_file():
             raise FileNotFoundError(
-                f"Stored document file not found on disk: '{target_path.name}'"
+                f"Stored document file not found on disk: '{safe_filename}'"
             )
 
-        # 12. Verify SHA-256 against authoritative expected hash
+        # 13. Verify SHA-256 against authoritative expected hash
         file_bytes = target_path.read_bytes()
         actual_hash = hashlib.sha256(file_bytes).hexdigest()
         if actual_hash.lower() != expected_hash.lower():
             raise SecurityAuthorizationError(
-                f"Document integrity verification failed: expected hash '{expected_hash}', "
-                f"got '{actual_hash}'. File on disk does not match immutable packet manifest."
+                "Document integrity verification failed. File on disk does not match immutable packet manifest."
             )
 
-        # 13. Verify file format and magic bytes
-        file_ext = target_path.suffix.lower()
-        if expected_format:
-            fmt_upper = expected_format.upper()
-        else:
-            fmt_upper = "PDF" if file_ext == ".pdf" else "DOCX"
-
-        if fmt_upper == "PDF" or file_ext == ".pdf":
+        # 14. Verify file format and magic bytes
+        if manifest_format == "PDF":
             if not file_bytes.startswith(b"%PDF-"):
                 raise InvalidFileFormatError(
-                    f"File format validation failed for '{target_path.name}': missing valid PDF magic bytes."
+                    f"File format validation failed for '{safe_filename}': missing valid PDF magic bytes."
                 )
             mime_type = "application/pdf"
-        elif fmt_upper == "DOCX" or file_ext == ".docx":
+        elif manifest_format == "DOCX":
             if not file_bytes.startswith(b"PK\x03\x04"):
                 raise InvalidFileFormatError(
-                    f"File format validation failed for '{target_path.name}': missing valid DOCX magic bytes."
+                    f"File format validation failed for '{safe_filename}': missing valid DOCX magic bytes."
                 )
             mime_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
         else:
             raise InvalidFileFormatError(
-                f"Unsupported document format '{fmt_upper}' for '{target_path.name}'. Only PDF and DOCX are allowed."
+                f"Unsupported document format '{manifest_format}'. Only PDF and DOCX are allowed."
             )
 
-        # 14. Return (file_bytes, safe_filename, mime_type)
-        safe_filename = FileSecurityValidator.sanitize_filename(display_filename or target_path.name)
         return file_bytes, safe_filename, mime_type
 
     def issue_manual_submission_ticket(

@@ -697,6 +697,85 @@ class TestCandidatePacketDetailAndApproval(BaseTimelinePacketReviewTest):
         appr = self.db.get_packet_approval(p.id, self.user_a)
         self.assertFalse(appr.is_consumed)
 
+    def test_no_internal_path_exposure_in_packet_detail(self):
+        """Packet detail sanitizes attachments manifest and exposes no internal server paths."""
+        app_id = self._create_app(self.user_a, "Sanitize Co", "Security Engineer")
+        internal_path = str(self.user_a_storage / "super_secret_internal_dir" / "resume.pdf")
+        manifest = [
+            {
+                "artifact_type": "tailored_resume_pdf",
+                "filename": "candidate_resume.pdf",
+                "stored_filename": "secret_internal_resume.pdf",
+                "format": "PDF",
+                "size_bytes": 1024,
+                "file_hash": "a" * 64,
+                "file_path": internal_path,
+                "storage_root": "/var/data/private",
+            }
+        ]
+        pkt = self._create_packet(app_id, self.user_a, version_num=1, attachments_manifest=manifest)
+
+        detail = self.service.get_candidate_prepared_packet(app_id, pkt.id, self.session_a.session_id)
+        self.assertTrue(detail["integrity_valid"])
+        self.assertEqual(len(detail["attachments_manifest"]), 1)
+        entry = detail["attachments_manifest"][0]
+
+        # Verify disallowed keys are not present
+        self.assertNotIn("file_path", entry)
+        self.assertNotIn("storage_root", entry)
+        self.assertNotIn("stored_filename", entry)
+
+        # Verify allowed keys are present
+        self.assertEqual(entry["artifact_type"], "tailored_resume_pdf")
+        self.assertEqual(entry["filename"], "candidate_resume.pdf")
+        self.assertEqual(entry["format"], "PDF")
+        self.assertEqual(entry["size_bytes"], 1024)
+        self.assertEqual(entry["file_hash"], "a" * 64)
+        self.assertTrue(entry["document_available"])
+
+        # Verify serialized packet dictionary contains no internal filesystem paths
+        serialized = json.dumps(detail)
+        self.assertNotIn(internal_path, serialized)
+        self.assertNotIn("super_secret_internal_dir", serialized)
+        self.assertNotIn("/var/data/private", serialized)
+
+    def test_tampered_non_legacy_packet_does_not_fallback_to_db_columns(self):
+        """Tampered non-legacy packet does NOT fall back to trusting detached/mutable DB columns."""
+        app_id = self._create_app(self.user_a, "Tamper Target", "Engineer")
+        pkt = self._create_packet(
+            app_id,
+            self.user_a,
+            version_num=1,
+            tailored_resume_path="/some/fake/path.pdf",
+            tailored_resume_hash="resume_hash_fallback",
+            cover_letter_path="/some/fake/cl.pdf",
+            cover_letter_hash="cl_hash_fallback",
+            attachments_manifest=[{
+                "artifact_type": "tailored_resume_pdf",
+                "filename": "fake.pdf",
+                "format": "PDF",
+                "file_hash": "hash1",
+                "file_path": "/some/path",
+            }],
+        )
+
+        # Tamper the canonical snapshot JSON
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE prepared_packets SET canonical_snapshot_json = ? WHERE id = ?",
+                (json.dumps({"tampered": True, "malicious": "content"}), pkt.id),
+            )
+
+        detail = self.service.get_candidate_prepared_packet(app_id, pkt.id, self.session_a.session_id)
+        self.assertFalse(detail["integrity_valid"])
+        self.assertIn("Integrity check failed", detail["verification_message"])
+        # Assert materials are NOT loaded from detached DB columns
+        self.assertEqual(detail["tailored_resume"], {})
+        self.assertEqual(detail["cover_letter"], {})
+        self.assertEqual(detail["screening_questions"], [])
+        self.assertEqual(detail["attachments_manifest"], [])
+        self.assertFalse(any(detail["documents_available"].values()))
+
 
 # =============================================================================
 # 4. SECURE PDF/DOCX DOWNLOAD TESTS
@@ -1034,6 +1113,235 @@ class TestCandidatePacketDocumentDownload(BaseTimelinePacketReviewTest):
         self.assertEqual(app_db.status, "DRAFT")
         appr_db = self.db.get_packet_approval(pkt.id, self.user_a)
         self.assertFalse(appr_db.is_consumed)
+
+    def test_legacy_packet_download_rejected(self):
+        """Legacy packet lacking canonical snapshot is rejected with SecurityAuthorizationError."""
+        app_id = self._create_app(self.user_a, "Legacy Co", "Dev")
+        p_legacy = self._create_packet(app_id, self.user_a, version_num=1, is_legacy=True)
+
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=p_legacy.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("legacy packet record lacks a verifiable canonical snapshot", str(ctx.exception).lower())
+
+    def test_snapshot_tampering_during_download_rejected(self):
+        """Tampering canonical snapshot after creation fails closed with SecurityAuthorizationError before reading disk."""
+        app_id = self._create_app(self.user_a, "Tamper Co", "Dev")
+        pkt = self._create_packet(app_id, self.user_a, version_num=1, attachments_manifest=self.manifest)
+
+        # Tamper snapshot in database
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE prepared_packets SET canonical_snapshot_json = ? WHERE id = ?",
+                (json.dumps({"tampered": True}), pkt.id),
+            )
+
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=pkt.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("integrity verification failed", str(ctx.exception).lower())
+
+    def test_detached_manifest_fallback_rejected(self):
+        """Detached attachments_manifest_json in DB is rejected if snapshot manifest is empty or omitted."""
+        app_id = self._create_app(self.user_a, "Detached Co", "Dev")
+        # Create packet with empty attachments_manifest in snapshot, but detached DB column populated
+        payload = {
+            "application_id": app_id,
+            "user_id": self.user_a,
+            "packet_version": 1,
+            "tailored_resume": {"name": "Alice Candidate"},
+            "cover_letter": {"letter_text": "Sample text"},
+            "screening_questions": [],
+            "attachments_manifest": [],  # Empty in snapshot
+        }
+        pkt = self._create_packet(
+            app_id,
+            self.user_a,
+            version_num=1,
+            snapshot_payload=payload,
+            attachments_manifest=self.manifest,  # Populates packet.attachments_manifest_json column
+            tailored_resume_path=str(self.pdf_path),
+            tailored_resume_hash=self.pdf_hash,
+        )
+
+        # Download must raise FileNotFoundError because canonical snapshot manifest is authoritative
+        with self.assertRaises(FileNotFoundError):
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=pkt.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+
+    def test_tampered_manifest_rejected(self):
+        """Modifying manifest entry inside snapshot causes version hash mismatch and download failure."""
+        app_id = self._create_app(self.user_a, "Manifest Tamper Co", "Dev")
+        pkt = self._create_packet(app_id, self.user_a, version_num=1, attachments_manifest=self.manifest)
+
+        # Read snapshot payload, alter the manifest file_path, and write back without updating version hash
+        snapshot = json.loads(pkt.canonical_snapshot_json)
+        snapshot["attachments_manifest"][0]["file_path"] = str(self.docx_path)
+        tampered_json = json.dumps(snapshot, sort_keys=True)
+
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE prepared_packets SET canonical_snapshot_json = ? WHERE id = ?",
+                (tampered_json, pkt.id),
+            )
+
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=pkt.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("integrity verification failed", str(ctx.exception).lower())
+
+    def test_invalid_snapshot_json_rejected(self):
+        """Malformed or non-dict JSON in canonical_snapshot_json fails both detail and download."""
+        app_id = self._create_app(self.user_a, "Malformed JSON Co", "Dev")
+        pkt = self._create_packet(app_id, self.user_a, version_num=1, attachments_manifest=self.manifest)
+
+        # Case A: Malformed syntax
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE prepared_packets SET canonical_snapshot_json = '{malformed: true' WHERE id = ?",
+                (pkt.id,),
+            )
+
+        detail = self.service.get_candidate_prepared_packet(app_id, pkt.id, self.session_a.session_id)
+        self.assertFalse(detail["integrity_valid"])
+        self.assertIn("Integrity check failed", detail["verification_message"])
+
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=pkt.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("integrity verification failed", str(ctx.exception).lower())
+
+        # Case B: Valid JSON but not a dictionary (e.g. list)
+        list_json = json.dumps(["not", "a", "dict"])
+        list_hash = hashlib.sha256(list_json.encode("utf-8")).hexdigest()
+        with self.db.transaction() as conn:
+            conn.cursor().execute(
+                "UPDATE prepared_packets SET canonical_snapshot_json = ?, packet_version_hash = ? WHERE id = ?",
+                (list_json, list_hash, pkt.id),
+            )
+
+        detail_list = self.service.get_candidate_prepared_packet(app_id, pkt.id, self.session_a.session_id)
+        self.assertFalse(detail_list["integrity_valid"])
+        self.assertIn("Canonical snapshot structure is invalid", detail_list["verification_message"])
+
+        with self.assertRaises(SecurityAuthorizationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=pkt.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("Canonical snapshot structure is invalid", str(ctx.exception))
+
+    def test_document_format_mismatch_rejected(self):
+        """Cross-checks requested document_type, manifest format, extension, and magic bytes."""
+        app_id = self._create_app(self.user_a, "Mismatch Co", "Dev")
+
+        # 1. DOCX requested with PDF manifest format
+        mismatch_manifest_1 = [
+            {
+                "artifact_type": "cover_letter_docx",
+                "filename": "cover.pdf",
+                "format": "PDF",  # Conflicts with cover_letter_docx requirement of DOCX
+                "file_hash": self.pdf_hash,
+                "file_path": str(self.pdf_path),
+            }
+        ]
+        p1 = self._create_packet(app_id, self.user_a, version_num=1, attachments_manifest=mismatch_manifest_1)
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=p1.id,
+                document_type="cover_letter_docx",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("format mismatch", str(ctx.exception).lower())
+
+        # 2. PDF requested with DOCX manifest format
+        mismatch_manifest_2 = [
+            {
+                "artifact_type": "tailored_resume_pdf",
+                "filename": "resume.docx",
+                "format": "DOCX",  # Conflicts with tailored_resume_pdf requirement of PDF
+                "file_hash": self.docx_hash,
+                "file_path": str(self.docx_path),
+            }
+        ]
+        p2 = self._create_packet(app_id, self.user_a, version_num=2, attachments_manifest=mismatch_manifest_2)
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=p2.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("format mismatch", str(ctx.exception).lower())
+
+        # 3. DOCX manifest format with .pdf file path extension
+        fake_ext_pdf = self.app_a_dir / "fake_ext.pdf"
+        fake_ext_pdf.write_bytes(self.docx_bytes)
+        fake_ext_pdf_hash = hashlib.sha256(self.docx_bytes).hexdigest()
+        mismatch_manifest_3 = [
+            {
+                "artifact_type": "cover_letter_docx",
+                "filename": "cover.docx",
+                "format": "DOCX",
+                "file_hash": fake_ext_pdf_hash,
+                "file_path": str(fake_ext_pdf),  # .pdf extension conflicts with DOCX format
+            }
+        ]
+        p3 = self._create_packet(app_id, self.user_a, version_num=3, attachments_manifest=mismatch_manifest_3)
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=p3.id,
+                document_type="cover_letter_docx",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("conflicts with file extension", str(ctx.exception).lower())
+
+        # 4. PDF manifest format with .docx file path extension
+        fake_ext_docx = self.app_a_dir / "fake_ext.docx"
+        fake_ext_docx.write_bytes(self.pdf_bytes)
+        fake_ext_docx_hash = hashlib.sha256(self.pdf_bytes).hexdigest()
+        mismatch_manifest_4 = [
+            {
+                "artifact_type": "tailored_resume_pdf",
+                "filename": "resume.pdf",
+                "format": "PDF",
+                "file_hash": fake_ext_docx_hash,
+                "file_path": str(fake_ext_docx),  # .docx extension conflicts with PDF format
+            }
+        ]
+        p4 = self._create_packet(app_id, self.user_a, version_num=4, attachments_manifest=mismatch_manifest_4)
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.get_candidate_packet_document(
+                application_id=app_id,
+                packet_id=p4.id,
+                document_type="tailored_resume_pdf",
+                session_id=self.session_a.session_id,
+            )
+        self.assertIn("conflicts with file extension", str(ctx.exception).lower())
 
 
 if __name__ == "__main__":

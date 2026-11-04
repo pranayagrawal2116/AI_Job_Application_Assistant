@@ -58,6 +58,8 @@ All capabilities enforce session-derived identity, candidate application and pac
 - **Historical Read-Only Integrity:** Verifies `SHA256(canonical_snapshot_json.encode('utf-8')) == packet_version_hash` without requiring `is_active_revision == 1`.
 - **Legacy Records:** Identifies packets without canonical snapshots (`is_legacy=True`, `integrity_valid=False`) with informative limitation messages without raising exceptions or fabricating snapshots.
 - **Approval Provenance:** Checked against `application_approvals` matching exact `packet_id`, `packet_version_hash`, `application_id`, and `user_id`. Accurately reports consumed and unconsumed approval states.
+- **Server Path Redaction:** Sanitizes candidate-facing `attachments_manifest` with `_sanitize_manifest_for_candidate`, completely stripping internal server paths (`file_path`), storage roots, and locators.
+- **Strict Column Isolation:** Non-legacy packets failing snapshot integrity do not trust tampered payloads and never fall back to detached DB columns; materials and documents available are returned empty/false.
 
 ### Workstream D: Secure PDF/DOCX Packet Document Download
 - **Service Contract:** `DashboardService.get_candidate_packet_document(application_id, packet_id, document_type, session_id, client_user_id=None)`
@@ -67,15 +69,15 @@ All capabilities enforce session-derived identity, candidate application and pac
   3. Retrieve application with candidate ownership enforcement.
   4. Retrieve packet with candidate ownership enforcement.
   5. Verify packet belongs to application (`packet.application_id == application_id`).
-  6. Verify requested document type is supported (`PDF`, `DOCX`, and canonical aliases).
-  7. Resolve document locator exclusively from server-side packet metadata (`attachments_manifest` or `PreparedPacket`).
-  8. Resolve filesystem location safely, rejecting `..` traversal and null bytes.
-  9. Verify path containment within candidate private storage boundary (`data/users/<user_id>/`).
-  10. Reject traversal, absolute path substitution, and symlink escapes.
-  11. Verify file exists and is a regular file.
-  12. Verify SHA-256 against authoritative expected hash in packet manifest.
-  13. Verify file format and magic bytes (`%PDF-` for PDF, `PK\x03\x04` for DOCX).
-  14. Return `(file_bytes, safe_filename, mime_type)` with sanitized filename.
+  6. PRE-RETRIEVAL INTEGRITY GATE: Verify packet canonical snapshot hash and structure before reading file locators. Fail closed on legacy, missing, tampered, or malformed snapshots. Enforce identity field agreement (`user_id`, `application_id`, `packet_version`).
+  7. Verify requested document type and resolve expected format (`PDF`, `DOCX`, and canonical aliases).
+  8. Resolve document locator strictly from authoritative snapshot manifest with zero fallback to detached DB columns or mutable packet paths.
+  9. Enforce strict format, artifact type, and extension consistency (`PDF` requires `.pdf`, `DOCX` requires `.docx`).
+  10. Resolve filesystem location safely, rejecting `..` traversal and null bytes without leaking server paths in error messages.
+  11. Verify path containment within candidate private storage boundary (`data/users/<user_id>/`).
+  12. Verify file exists and is a regular file.
+  13. Verify SHA-256 against authoritative expected hash in packet manifest.
+  14. Verify magic bytes (`%PDF-` for PDF, `PK\x03\x04` for DOCX) and return `(file_bytes, safe_filename, mime_type)`.
 - **Non-Mutating Guarantee:** Read-only operation with zero database or file mutations.
 
 ---
@@ -115,8 +117,10 @@ A dedicated regression test suite was added in `tests/test_phase_7_3_2_2_timelin
    - Consumed and unconsumed approval state accuracy.
    - Legacy packet detail handling.
    - Non-mutating detail inspection guarantee.
+   - Sanitization of attachments manifest and zero exposure of internal filesystem paths.
+   - Strict column isolation: non-legacy tampered snapshot does not fall back to DB columns.
 
-4. **Secure Document Download Tests (13 tests):**
+4. **Secure Document Download Tests (20 tests):**
    - Valid PDF retrieval with MIME type and safe filename.
    - Valid DOCX retrieval with MIME type and safe filename.
    - Unauthenticated and cross-user download rejection.
@@ -130,15 +134,21 @@ A dedicated regression test suite was added in `tests/test_phase_7_3_2_2_timelin
    - Path traversal (`..`) rejection.
    - Symlink escape rejection.
    - Non-mutating download guarantee.
+   - Legacy packet download rejection (`SecurityAuthorizationError`).
+   - Pre-retrieval snapshot tampering rejection before disk access (`SecurityAuthorizationError`).
+   - Rejection of detached `attachments_manifest_json` fallback when snapshot manifest is empty (`FileNotFoundError`).
+   - Tampered manifest inside snapshot rejection (`SecurityAuthorizationError`).
+   - Malformed JSON and non-dict snapshot structure rejection (`SecurityAuthorizationError`).
+   - Document format mismatch matrix: DOCX with PDF manifest, PDF with DOCX manifest, DOCX with `.pdf` extension, PDF with `.docx` extension (`ValidationError`).
 
 ---
 
 ## 5. Test Execution Results
 
-- **New Test Suite:** `tests/test_phase_7_3_2_2_timeline_packet_review.py`: 44 passed in 1.97s (100%).
+- **Phase 7.3.2.2 Test Suite:** `tests/test_phase_7_3_2_2_timeline_packet_review.py`: 52 passed in 3.44s (100%).
 - **Phase 7.3.2.1 Test Suite:** `tests/test_phase_7_3_2_1_tracker_read_apis.py`: 33 passed in 1.48s (100%).
 - **Phase 7.2.2 Test Suites:** 98 passed in 7.39s (100%).
-- **Full Project Test Suite:** 767 passed in 41.51s (100%, 0 failures, 0 errors).
+- **Full Project Test Suite:** 775 passed in 42.42s (100%, 0 failures, 0 errors).
 - **Static Analysis:**
   - `pyflakes dashboard/services/dashboard_service.py tests/test_phase_7_3_2_2_timeline_packet_review.py`: 0 errors.
   - `ruff check --select F`: Clean, 0 errors.
@@ -153,3 +163,24 @@ A dedicated regression test suite was added in `tests/test_phase_7_3_2_2_timelin
 - **Index Changes:** 0.
 - **Foreign Key Changes:** 0.
 - **Historical Audit Records:** Preserved completely intact and immutable.
+
+---
+
+## 7. Independent Audit Remediation Summary
+
+1. **Pre-Retrieval Integrity Gate:**
+   - In `DashboardService.get_candidate_packet_document()`, snapshot verification occurs strictly BEFORE accessing any document path, filename, artifact type, or expected file hash.
+   - Verifies `canonical_snapshot_json` exists, recomputes SHA-256 against `packet_version_hash`, validates JSON parsing and dictionary structure, and enforces identity consistency (`user_id`, `application_id`, `packet_version`).
+   - Legacy packets fail closed with `SecurityAuthorizationError`.
+2. **Authoritative Canonical Manifest Only:**
+   - Document locators and hashes are resolved strictly from the verified snapshot's `attachments_manifest`.
+   - Eliminated all fallbacks to detached database columns (`attachments_manifest_json`, `tailored_resume_path`, `cover_letter_path`).
+   - Missing or empty snapshot manifest raises `FileNotFoundError`.
+3. **Format, Artifact Type, and Extension Consistency:**
+   - Cross-checks requested `document_type`, manifest `artifact_type`, manifest `format` (`PDF`/`DOCX`), file extension, and magic bytes (`%PDF-`, `PK\x03\x04`).
+   - Mismatches fail closed with `ValidationError` or `InvalidFileFormatError`.
+4. **Internal Path Exposure Redaction:**
+   - In `get_candidate_prepared_packet()`, `_sanitize_manifest_for_candidate()` strips all server filesystem paths (`file_path`), storage roots, and locators.
+   - In `get_candidate_packet_document()`, exception messages never leak internal server storage roots or full filesystem paths.
+5. **Tampered Packet Detail Behavior:**
+   - Tampered non-legacy packets report `integrity_valid = False` with a clear explanation and return empty candidate materials and all-false document availability without falling back to DB columns.
