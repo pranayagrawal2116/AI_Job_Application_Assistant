@@ -33,6 +33,7 @@ from src.database.models import (
     FollowUpType,
     SubmissionChannel,
 )
+from src.lifecycle.follow_up_engine import SUPPORTED_TEMPLATE_TYPES
 from src.lifecycle.state_machine import ApplicationStateMachine
 
 # =============================================================================
@@ -881,7 +882,9 @@ def render_follow_up_manager(
     user_id: int,
     include_archived: bool,
 ) -> None:
-    """Renders scheduled reminders list, completion, deletion, and addition."""
+    """Renders scheduled reminders list, completion, deletion, algorithmic recommendations,
+    and draft template generation.
+    """
     st.markdown("##### 📅 Follow-Up Reminders")
 
     try:
@@ -918,28 +921,231 @@ def render_follow_up_manager(
                                     )
                                     st.success("Reminder completed.")
                                     st.rerun()
-                                except (DatabaseError, ValueError) as exc:
+                                except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
                                     st.error(f"Error: {exc}")
 
                     with st.popover("Delete", key=f"fup_del_pop_{user_id}_{f.id}"):
                         st.warning("Confirm deleting this reminder?")
                         if st.button("Confirm Delete", key=f"fup_del_btn_{user_id}_{f.id}"):
                             try:
-                                service.delete_application_follow_up(
+                                deleted = service.delete_application_follow_up(
                                     session_id=session_id,
                                     follow_up_id=f.id,
-                                    outcome_notes=outcome.strip() if outcome else None,
                                 )
-                                st.success("Reminder deleted.")
-                                st.rerun()
-                            except (DatabaseError, ValueError) as exc:
+                                if deleted:
+                                    st.success("Reminder deleted.")
+                                    st.rerun()
+                                else:
+                                    st.error("Reminder could not be found or has already been deleted.")
+                            except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
                                 st.error(f"Error deleting: {exc}")
                 st.divider()
     else:
         st.caption("No follow-up reminders scheduled for this application.")
 
-    # Form to schedule new reminder
-    with st.expander("➕ Schedule New Follow-Up Reminder", expanded=False):
+    # Guard: Archived applications show historical reminders above, but disable active intelligence and scheduling
+    if bool(getattr(app, "is_archived", 0)):
+        st.info("📦 This application is archived. Follow-up recommendations, scheduling, and draft generation are disabled.")
+        return
+
+    # -------------------------------------------------------------------------
+    # Follow-Up Intelligence & Algorithmic Recommendation
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("###### 💡 Follow-Up Intelligence")
+
+    extra_context: dict[str, Any] = {}
+
+    # Candidate context inputs for status-specific recommendations
+    if app.status == ApplicationStatus.INTERVIEW.value:
+        with st.container():
+            st.caption("ℹ️ *To receive a 24-hour thank-you note recommendation, provide the date your interview took place.*")
+            provide_int_date = st.checkbox(
+                "Provide interview date for recommendation",
+                key=f"rec_int_chk_{user_id}_{app.id}",
+            )
+            if provide_int_date:
+                int_date_input = st.date_input(
+                    "Interview Date",
+                    key=f"rec_int_date_{user_id}_{app.id}",
+                )
+                extra_context["interview_date"] = int_date_input.isoformat()
+                extra_context["interview_date_source"] = "candidate_provided"
+                st.caption("🔒 *Date is labeled as candidate-provided and unverified; it is not persisted to the application record.*")
+    elif app.status == ApplicationStatus.ASSESSMENT.value:
+        with st.container():
+            st.caption("ℹ️ *To receive an assessment status inquiry recommendation, provide your assessment completion date.*")
+            provide_assess_date = st.checkbox(
+                "Provide assessment completion date",
+                key=f"rec_assess_chk_{user_id}_{app.id}",
+            )
+            if provide_assess_date:
+                assess_date_input = st.date_input(
+                    "Assessment Date",
+                    key=f"rec_assess_date_{user_id}_{app.id}",
+                )
+                extra_context["assessment_date"] = assess_date_input.isoformat()
+
+    try:
+        rec_res = service.recommend_application_follow_up(
+            application_id=app.id,
+            session_id=session_id,
+            extra_context=extra_context if extra_context else None,
+        )
+    except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
+        st.caption(f"Recommendation unavailable: {exc}")
+        rec_res = None
+
+    if rec_res:
+        if rec_res.get("has_recommendation"):
+            rec_type = rec_res.get("recommendation_type") or "STATUS_INQUIRY"
+            rec_date_str = rec_res.get("recommended_date") or ""
+            rec_rationale = rec_res.get("rationale") or ""
+            rec_desc = rec_res.get("default_description") or ""
+
+            st.info(f"📋 **Recommended Action:** `{rec_type}` • **Proposed Date:** `{rec_date_str}`\n\n**Rationale:** {rec_rationale}")
+            st.caption("💡 *This is an algorithmic recommendation based on application status. It has NOT been scheduled. Review or edit details below before scheduling.*")
+
+            with st.expander("🗓️ Review & Schedule Proposed Reminder", expanded=False):
+                try:
+                    default_d = datetime.strptime(rec_date_str, "%Y-%m-%d").date() if rec_date_str else datetime.now(UTC).date()
+                except Exception:
+                    default_d = datetime.now(UTC).date()
+
+                col_rec_d, col_rec_t = st.columns(2)
+                with col_rec_d:
+                    sched_date = st.date_input(
+                        "Reminder Date",
+                        value=default_d,
+                        key=f"rec_sched_date_{user_id}_{app.id}",
+                    )
+                with col_rec_t:
+                    type_opts = FollowUpType.list()
+                    type_idx = type_opts.index(rec_type) if rec_type in type_opts else 0
+                    sched_type = st.selectbox(
+                        "Reminder Type",
+                        options=type_opts,
+                        index=type_idx,
+                        key=f"rec_sched_type_{user_id}_{app.id}",
+                    )
+                sched_desc = st.text_input(
+                    "Task Description",
+                    value=rec_desc,
+                    key=f"rec_sched_desc_{user_id}_{app.id}",
+                )
+
+                if st.button("Schedule This Reminder", key=f"rec_sched_btn_{user_id}_{app.id}"):
+                    if not sched_desc or not sched_desc.strip():
+                        st.error("Please enter a description for the reminder.")
+                    else:
+                        try:
+                            service.create_application_follow_up(
+                                session_id=session_id,
+                                application_id=app.id,
+                                follow_up_date=sched_date.isoformat(),
+                                follow_up_type=sched_type,
+                                description=sched_desc.strip(),
+                            )
+                            st.success("Follow-up reminder scheduled successfully.")
+                            st.rerun()
+                        except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
+                            st.error(f"Cannot schedule reminder: {exc}")
+        else:
+            rec_rationale = rec_res.get("rationale") or "No automatic follow-up recommendation configured for this status."
+            st.caption(f"ℹ️ {rec_rationale}")
+
+    # -------------------------------------------------------------------------
+    # Message Draft Template Generator
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    with st.expander("✉️ Generate Follow-Up Message Draft", expanded=False):
+        st.caption("Draft a professional, zero-hallucination message for manual candidate review and dispatch.")
+        st.warning(
+            "⚠️ **Candidate-Controlled Drafting:** Generating a draft does NOT send an email or contact recruiters. "
+            "All messages require manual review and sending by you."
+        )
+
+        sel_template_type = st.selectbox(
+            "Template Type",
+            options=list(SUPPORTED_TEMPLATE_TYPES),
+            key=f"tpl_type_{user_id}_{app.id}",
+        )
+
+        col_rec, col_int = st.columns(2)
+        with col_rec:
+            rec_name_input = st.text_input(
+                "Recruiter Name (Optional)",
+                placeholder="e.g. Jane Doe",
+                key=f"tpl_rec_name_{user_id}_{app.id}",
+            )
+        with col_int:
+            int_name_input = st.text_input(
+                "Interviewer Name (Optional)",
+                placeholder="e.g. Dr. Alex Smith",
+                key=f"tpl_int_name_{user_id}_{app.id}",
+            )
+
+        tpl_ctx: dict[str, Any] = {}
+        if rec_name_input and rec_name_input.strip():
+            tpl_ctx["recruiter_name"] = rec_name_input.strip()
+        if int_name_input and int_name_input.strip():
+            tpl_ctx["interviewer_name"] = int_name_input.strip()
+
+        if sel_template_type == "THANK_YOU_NOTE":
+            include_int_date = st.checkbox(
+                "Include specific interview date in thank-you note",
+                key=f"tpl_include_date_{user_id}_{app.id}",
+            )
+            if include_int_date:
+                int_date_val = st.date_input(
+                    "Interview Date",
+                    key=f"tpl_int_date_{user_id}_{app.id}",
+                )
+                tpl_ctx["interview_date"] = int_date_val.isoformat()
+                tpl_ctx["interview_date_source"] = "candidate_provided"
+
+        if st.button("Generate Draft", key=f"gen_tpl_btn_{user_id}_{app.id}"):
+            try:
+                draft_res = service.generate_follow_up_template(
+                    application_id=app.id,
+                    session_id=session_id,
+                    follow_up_type=sel_template_type,
+                    extra_context=tpl_ctx if tpl_ctx else None,
+                )
+                st.session_state[f"generated_draft_{user_id}_{app.id}"] = draft_res
+                st.success("Draft generated successfully. Review and edit below before manual sending.")
+            except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
+                st.error(f"Cannot generate template: {exc}")
+
+        draft_data = st.session_state.get(f"generated_draft_{user_id}_{app.id}")
+        if draft_data:
+            st.markdown("###### 📝 Generated Draft (Editable)")
+            st.text_input(
+                "Subject",
+                value=draft_data.get("subject", ""),
+                key=f"draft_subj_{user_id}_{app.id}",
+            )
+            st.text_area(
+                "Body",
+                value=draft_data.get("body", ""),
+                height=220,
+                key=f"draft_body_{user_id}_{app.id}",
+            )
+
+            meta = draft_data.get("context_metadata", {})
+            cand_name_meta = meta.get("candidate_name", "[CANDIDATE NAME]")
+            rec_src_meta = meta.get("recruiter_name_source", "placeholder")
+            int_src_meta = meta.get("interview_date_source", "unavailable")
+            st.caption(
+                f"**Candidate:** `{cand_name_meta}` • **Recruiter source:** `{rec_src_meta}` • **Interview date source:** `{int_src_meta}`"
+            )
+            st.info("📋 Copy the subject and body above to send manually through your preferred email client or portal.")
+
+    # -------------------------------------------------------------------------
+    # Manual Custom Reminder Scheduling
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    with st.expander("➕ Schedule Custom Follow-Up Reminder", expanded=False):
         col_d, col_t = st.columns(2)
         with col_d:
             f_date = st.date_input("Reminder Date", key=f"new_fup_date_{user_id}_{app.id}")
@@ -968,7 +1174,7 @@ def render_follow_up_manager(
                     )
                     st.success("Follow-up reminder scheduled successfully.")
                     st.rerun()
-                except (DatabaseError, ValueError) as exc:
+                except (DatabaseError, ValidationError, SecurityAuthorizationError) as exc:
                     st.error(f"Cannot schedule reminder: {exc}")
 
 

@@ -18,7 +18,7 @@ import json
 import os
 import tempfile
 import unittest
-from datetime import UTC
+from datetime import UTC, date
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock, patch
@@ -1404,6 +1404,198 @@ class TestComponentRendering(BaseTrackerUITest):
         self.assertEqual(len(SubmissionChannel.list()), 7)
         self.assertIn(ApplicationStatus.DRAFT, ApplicationStateMachine.UNIVERSAL_STATUSES)
         self.assertIn(ApplicationStatus.OFFER, ApplicationStateMachine.UNIVERSAL_STATUSES)
+
+
+# =============================================================================
+# CATEGORY J: PHASE 7.4.2 CANDIDATE FOLLOW-UP INTELLIGENCE & REMINDER UI TESTS
+# =============================================================================
+
+class TestPhase742FollowUpUIIntegration(BaseTrackerUITest):
+    """Verifies Phase 7.4.2 UI integrations in tracker_components.render_follow_up_manager:
+    - Archived application guard disables scheduling, recommendations, and drafts
+    - Deletion of pending reminders does not pass outcome_notes or mutate outcome
+    - Deletion of completed reminders does not raise UnboundLocalError
+    - Recommendation UI renders status-specific recommendations and creates reminder on candidate action
+    - Interview status checkbox accurately passes candidate_provided tag
+    - Template draft generator UI renders supported types and populates editable subject/body
+    """
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_archived_application_disables_scheduling_and_recommendations(self, mock_st):
+        """When an application is archived, historical reminders are shown, but active recommendations, scheduling, and drafts are disabled."""
+        app = self._create_app(self.user_a, "Archived Corp", "Developer", is_archived=1)
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, include_archived=True)
+
+        # Confirm st.info was called with the archived guard notice
+        info_calls = [call[0][0] for call in mock_st.info.call_args_list]
+        self.assertTrue(any("archived" in c.lower() for c in info_calls))
+
+        # Confirm recommendation or draft buttons were not invoked
+        button_labels = [call[0][0] for call in mock_st.button.call_args_list]
+        self.assertNotIn("Schedule This Reminder", button_labels)
+        self.assertNotIn("Generate Draft", button_labels)
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_deletion_pending_reminder_does_not_pass_outcome_notes(self, mock_st):
+        """Deleting a pending reminder calls delete_application_follow_up without outcome_notes."""
+        app = self._create_app(self.user_a, "Delete Co", "Developer")
+        f = self.service.create_application_follow_up(
+            session_id=self.session_a.session_id,
+            application_id=app.id,
+            follow_up_date="2026-11-20",
+            follow_up_type="STATUS_INQUIRY",
+            description="Pending reminder to delete",
+        )
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+
+        def button_mock(label, key=None):
+            return key == f"fup_del_btn_{self.user_a}_{f.id}"
+        mock_st.button.side_effect = button_mock
+
+        with patch.object(self.service, "delete_application_follow_up", wraps=self.service.delete_application_follow_up) as spy_del:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_del.assert_called_once_with(
+                session_id=self.session_a.session_id,
+                follow_up_id=f.id,
+            )
+        mock_st.success.assert_called_with("Reminder deleted.")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_deletion_completed_reminder_does_not_raise_unbound_outcome(self, mock_st):
+        """Deleting a completed reminder succeeds and does not raise UnboundLocalError."""
+        app = self._create_app(self.user_a, "Delete Done Co", "Developer")
+        f = self.service.create_application_follow_up(
+            session_id=self.session_a.session_id,
+            application_id=app.id,
+            follow_up_date="2026-11-20",
+            follow_up_type="STATUS_INQUIRY",
+            description="Completed reminder to delete",
+        )
+        self.service.complete_application_follow_up(
+            session_id=self.session_a.session_id,
+            follow_up_id=f.id,
+            outcome_notes="Recruiter replied.",
+        )
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+
+        def button_mock(label, key=None):
+            return key == f"fup_del_btn_{self.user_a}_{f.id}"
+        mock_st.button.side_effect = button_mock
+
+        # Must execute without UnboundLocalError
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+        mock_st.success.assert_called_with("Reminder deleted.")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_recommendation_ui_submitted_status_displays_and_schedules(self, mock_st):
+        """SUBMITTED status displays recommendation and clicking schedule creates reminder."""
+        app = self._create_app(
+            self.user_a, "Rec Co", "Engineer", status="SUBMITTED",
+        )
+        # Set date_submitted in DB
+        with self.db.transaction() as conn:
+            conn.cursor().execute("UPDATE applications SET date_submitted = '2026-11-01' WHERE id = ?", (app.id,))
+        app = self.db.get_user_application(app.id, self.user_a)
+
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.session_state = {}
+
+        # Default button returns False
+        mock_st.button.return_value = False
+
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        # Check that recommendation info was displayed
+        info_calls = [call[0][0] for call in mock_st.info.call_args_list]
+        self.assertTrue(any("STATUS_INQUIRY" in str(c) for c in info_calls))
+
+        # Now test clicking "Schedule This Reminder"
+        def button_mock(label, key=None):
+            return key == f"rec_sched_btn_{self.user_a}_{app.id}"
+        mock_st.button.side_effect = button_mock
+        mock_st.date_input.return_value = date(2026, 11, 13)
+        mock_st.selectbox.return_value = "STATUS_INQUIRY"
+        mock_st.text_input.return_value = "Follow up with recruiter regarding application status"
+
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        fups = self.service.list_application_follow_ups(self.session_a.session_id, app.id)
+        self.assertEqual(len(fups), 1)
+        self.assertEqual(fups[0].follow_up_type, "STATUS_INQUIRY")
+        self.assertEqual(fups[0].follow_up_date, "2026-11-13")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_recommendation_ui_interview_with_candidate_provided_date(self, mock_st):
+        """INTERVIEW status with candidate provided date passes candidate_provided tag to engine."""
+        app = self._create_app(self.user_a, "Interview Co", "Engineer", status="INTERVIEW")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        mock_st.checkbox.side_effect = lambda label, key=None: key == f"rec_int_chk_{self.user_a}_{app.id}"
+        mock_st.date_input.return_value = date(2026, 11, 4)
+        mock_st.button.return_value = False
+        mock_st.session_state = {}
+
+        with patch.object(self.service, "recommend_application_follow_up", wraps=self.service.recommend_application_follow_up) as spy_rec:
+            render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+            spy_rec.assert_called_once()
+            call_kwargs = spy_rec.call_args[1]
+            extra_ctx = call_kwargs.get("extra_context", {})
+            self.assertEqual(extra_ctx.get("interview_date"), "2026-11-04")
+            self.assertEqual(extra_ctx.get("interview_date_source"), "candidate_provided")
+
+    @patch("dashboard.components.tracker_components.st")
+    def test_template_draft_generator_ui_flow(self, mock_st):
+        """Candidate can generate a draft template and review editable fields."""
+        app = self._create_app(self.user_a, "Draft Co", "Engineer", status="SUBMITTED")
+        mock_st.columns.side_effect = lambda n: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
+        mock_st.container.return_value.__enter__.return_value = MagicMock()
+        mock_st.popover.return_value.__enter__.return_value = MagicMock()
+        mock_st.expander.return_value.__enter__.return_value = MagicMock()
+        session_state_dict: dict[str, Any] = {}
+        mock_st.session_state = session_state_dict
+
+        def selectbox_mock(label, options=None, index=0, key=None):
+            if key == f"tpl_type_{self.user_a}_{app.id}":
+                return "STATUS_INQUIRY"
+            return (options or ["STATUS_INQUIRY"])[0]
+        mock_st.selectbox.side_effect = selectbox_mock
+
+        def text_input_mock(label, value="", placeholder="", key=None):
+            if key == f"tpl_rec_name_{self.user_a}_{app.id}":
+                return "Sarah Recruiter"
+            return value or ""
+        mock_st.text_input.side_effect = text_input_mock
+
+        def button_mock(label, key=None):
+            return key == f"gen_tpl_btn_{self.user_a}_{app.id}"
+        mock_st.button.side_effect = button_mock
+
+        render_follow_up_manager(self.service, self.session_a.session_id, app, self.user_a, False)
+
+        # Stored in session state
+        stored_draft = session_state_dict.get(f"generated_draft_{self.user_a}_{app.id}")
+        self.assertIsNotNone(stored_draft)
+        self.assertIn("subject", stored_draft)
+        self.assertIn("body", stored_draft)
+        self.assertIn("Engineer", stored_draft["subject"])
+        self.assertIn("Draft Co", stored_draft["body"])
+        self.assertIn("Sarah Recruiter", stored_draft["body"])
+        mock_st.success.assert_called_with("Draft generated successfully. Review and edit below before manual sending.")
 
 
 if __name__ == "__main__":

@@ -2059,5 +2059,188 @@ class TestFollowUpIdentityAndInterviewRemediationPhase7413(BaseFollowUpTest):
         self.assertEqual(tpl.context_metadata.get("interview_date_source"), "unavailable")
 
 
+# =============================================================================
+# 14. PHASE 7.4.2: CANDIDATE FOLLOW-UP INTELLIGENCE & REMINDER INTEGRATION
+# =============================================================================
+
+class TestPhase742FollowUpIntegrations(BaseFollowUpTest):
+    """Verifies Phase 7.4.2 backend integrations:
+    - Archived application creation guard in DatabaseManager & DashboardService
+    - Follow-up reminder deletion signature & behavior without outcome_notes
+    - Completed reminder deletion behavior & audit event emission
+    - Preservation of historical reminder listing on archived applications
+    - Multi-user isolation for creation and deletion
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Create an archived application for Alice
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO applications (
+                    id, user_id, company_name, job_title, status,
+                    date_submitted, is_archived, notes
+                ) VALUES (7421, 1, 'Archived Corp', 'Senior Engineer',
+                          'SUBMITTED', '2026-11-01', 1, 'Archived position for Phase 7.4.2 test')
+                """
+            )
+        self.archived_app = self.db.get_user_application(7421, self.user_a)
+
+    def test_db_create_follow_up_on_archived_application_raises_validation_error(self):
+        """DatabaseManager.create_application_follow_up raises ValidationError for archived applications."""
+        with self.assertRaises(ValidationError) as ctx:
+            self.db.create_application_follow_up(
+                application_id=self.archived_app.id,
+                user_id=self.user_a,
+                follow_up_date="2026-11-15",
+                follow_up_type="STATUS_INQUIRY",
+                description="Status check on archived application",
+            )
+        self.assertIn("archived", str(ctx.exception).lower())
+
+        # Verify no rows created and no audit events recorded
+        fups = self.db.list_application_follow_ups(user_id=self.user_a, application_id=self.archived_app.id, include_archived=True)
+        self.assertEqual(len(fups), 0)
+        events = self.db.get_application_events(self.archived_app.id, self.user_a)
+        sched_events = [e for e in events if e.event_type == "FOLLOW_UP_SCHEDULED"]
+        self.assertEqual(len(sched_events), 0)
+
+    def test_service_create_follow_up_on_archived_application_raises_validation_error(self):
+        """DashboardService.create_application_follow_up raises ValidationError for archived applications."""
+        with self.assertRaises(ValidationError) as ctx:
+            self.service.create_application_follow_up(
+                session_id=self.session_a.session_id,
+                application_id=self.archived_app.id,
+                follow_up_date="2026-11-15",
+                follow_up_type="STATUS_INQUIRY",
+                description="Status check on archived application",
+            )
+        self.assertIn("archived", str(ctx.exception).lower())
+
+    def test_delete_pending_follow_up_succeeds_without_outcome_notes(self):
+        """Deleting a pending reminder succeeds and does not accept or require outcome_notes."""
+        import inspect
+
+        # Verify method signature does NOT have outcome_notes
+        sig = inspect.signature(self.service.delete_application_follow_up)
+        self.assertNotIn("outcome_notes", sig.parameters)
+
+        f = self.service.create_application_follow_up(
+            session_id=self.session_a.session_id,
+            application_id=self.app_a.id,
+            follow_up_date="2026-11-15",
+            follow_up_type="STATUS_INQUIRY",
+            description="Pending follow-up to delete",
+        )
+        self.assertIsNotNone(f.id)
+
+        # Deletion succeeds
+        deleted = self.service.delete_application_follow_up(
+            session_id=self.session_a.session_id,
+            follow_up_id=f.id,
+        )
+        self.assertTrue(deleted)
+
+        # Subsequent deletion raises ValidationError (not found)
+        with self.assertRaises(ValidationError):
+            self.service.delete_application_follow_up(
+                session_id=self.session_a.session_id,
+                follow_up_id=f.id,
+            )
+
+        # Audit event FOLLOW_UP_DELETED is recorded
+        events = self.db.get_application_events(self.app_a.id, self.user_a)
+        del_events = [e for e in events if e.event_type == "FOLLOW_UP_DELETED"]
+        self.assertEqual(len(del_events), 1)
+
+    def test_delete_completed_follow_up_succeeds(self):
+        """Deleting a completed reminder succeeds and does not cause UnboundLocalError."""
+        f = self.service.create_application_follow_up(
+            session_id=self.session_a.session_id,
+            application_id=self.app_a.id,
+            follow_up_date="2026-11-15",
+            follow_up_type="STATUS_INQUIRY",
+            description="Completed reminder to delete",
+        )
+        self.service.complete_application_follow_up(
+            session_id=self.session_a.session_id,
+            follow_up_id=f.id,
+            outcome_notes="Recruiter responded positively.",
+        )
+
+        deleted = self.service.delete_application_follow_up(
+            session_id=self.session_a.session_id,
+            follow_up_id=f.id,
+        )
+        self.assertTrue(deleted)
+
+        # Verify reminder is gone
+        fups = self.service.list_application_follow_ups(self.session_a.session_id, self.app_a.id)
+        self.assertEqual(len(fups), 0)
+
+    def test_list_follow_ups_includes_archived_application_reminders_when_requested(self):
+        """Listing reminders for an archived application returns historical reminders when include_archived=True."""
+        # Create reminder on active application
+        f = self.service.create_application_follow_up(
+            session_id=self.session_a.session_id,
+            application_id=self.app_a.id,
+            follow_up_date="2026-11-18",
+            follow_up_type="PORTFOLIO_UPDATE",
+            description="Send updated portfolio",
+        )
+
+        # Archive the application
+        self.service.archive_candidate_application(
+            application_id=self.app_a.id,
+            session_id=self.session_a.session_id,
+            archive_reason="Position closed",
+        )
+
+        # When include_archived=True, historical reminders are returned
+        archived_fups = self.service.list_application_follow_ups(
+            session_id=self.session_a.session_id,
+            application_id=self.app_a.id,
+            include_archived=True,
+        )
+        self.assertEqual(len(archived_fups), 1)
+        self.assertEqual(archived_fups[0].id, f.id)
+
+        # When include_archived=False, returns empty list
+        active_fups = self.service.list_application_follow_ups(
+            session_id=self.session_a.session_id,
+            application_id=self.app_a.id,
+            include_archived=False,
+        )
+        self.assertEqual(len(active_fups), 0)
+
+    def test_cross_user_follow_up_creation_blocked(self):
+        """Candidate B cannot create a follow-up reminder on Candidate A's application."""
+        with self.assertRaises(CrossUserAccessError):
+            self.service.create_application_follow_up(
+                session_id=self.session_b.session_id,
+                application_id=self.app_a.id,
+                follow_up_date="2026-11-20",
+                follow_up_type="STATUS_INQUIRY",
+                description="Cross user reminder",
+            )
+
+    def test_cross_user_follow_up_deletion_blocked(self):
+        """Candidate B cannot delete Candidate A's follow-up reminder."""
+        f = self.service.create_application_follow_up(
+            session_id=self.session_a.session_id,
+            application_id=self.app_a.id,
+            follow_up_date="2026-11-20",
+            follow_up_type="STATUS_INQUIRY",
+            description="Alice reminder",
+        )
+        with self.assertRaises(CrossUserAccessError):
+            self.service.delete_application_follow_up(
+                session_id=self.session_b.session_id,
+                follow_up_id=f.id,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

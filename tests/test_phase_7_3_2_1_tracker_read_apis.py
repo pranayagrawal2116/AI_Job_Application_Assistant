@@ -421,7 +421,7 @@ class TestCandidateTrackerMetrics(BaseTrackerReadAPITest):
         tomorrow = (today + timedelta(days=1)).isoformat()
 
         app_active = self._create_app(self.user_a, "Active Co", "Role", is_archived=0)
-        app_archived = self._create_app(self.user_a, "Archived Co", "Role", is_archived=1)
+        app_archived = self._create_app(self.user_a, "Archived Co", "Role", is_archived=0)
 
         # 1. Past due on active app (DUE)
         self.db.create_application_follow_up(
@@ -465,6 +465,7 @@ class TestCandidateTrackerMetrics(BaseTrackerReadAPITest):
             follow_up_type="RECRUITER_CHECKIN",
             description="Archived overdue checkin",
         )
+        self.db.archive_user_application(app_archived, self.user_a, "Position archived")
 
         metrics_default = self.service.get_candidate_tracker_metrics(self.session_a.session_id)
         self.assertEqual(metrics_default["follow_ups_due"], 2)
@@ -724,7 +725,7 @@ class TestCandidateFollowUpService(BaseTrackerReadAPITest):
     def test_list_follow_ups_filtering_and_archival(self):
         """list_application_follow_ups supports filtering by app, completion, and archival."""
         app_active = self._create_app(self.user_a, "Active Co", "Role", is_archived=0)
-        app_archived = self._create_app(self.user_a, "Archived Co", "Role", is_archived=1)
+        app_archived = self._create_app(self.user_a, "Archived Co", "Role", is_archived=0)
 
         fu1 = self.service.create_application_follow_up(
             session_id=self.session_a.session_id,
@@ -751,6 +752,11 @@ class TestCandidateFollowUpService(BaseTrackerReadAPITest):
             follow_up_date="2026-11-07",
             follow_up_type="RECRUITER_CHECKIN",
             description="Archived incomplete",
+        )
+        self.service.archive_candidate_application(
+            application_id=app_archived,
+            session_id=self.session_a.session_id,
+            archive_reason="Position closed",
         )
 
         # Default excludes archived

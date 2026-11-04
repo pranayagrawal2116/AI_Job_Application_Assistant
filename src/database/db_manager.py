@@ -5165,7 +5165,7 @@ class DatabaseManager:
             cursor = conn.cursor()
 
             # Verify application exists and belongs to user
-            cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+            cursor.execute("SELECT id, user_id, is_archived FROM applications WHERE id = ?", (application_id,))
             app_row = cursor.fetchone()
             if not app_row:
                 raise ApplicationNotFoundError(application_id)
@@ -5174,6 +5174,10 @@ class DatabaseManager:
                     user_id=user_id,
                     target_user_id=app_row["user_id"],
                     resource=f"Application #{application_id}",
+                )
+            if bool(app_row["is_archived"]):
+                raise ValidationError(
+                    f"Cannot create follow-up reminder for archived Application #{application_id}."
                 )
 
             cursor.execute(

@@ -2277,12 +2277,16 @@ class DashboardService:
         client_user_id: Optional[int] = None,
     ) -> ApplicationFollowUp:
         """Creates a follow-up reminder enforcing candidate application ownership."""
-        from src.database.exceptions import ApplicationNotFoundError
+        from src.database.exceptions import ApplicationNotFoundError, ValidationError
 
         user_id, _ = self.resolve_authenticated_candidate(session_id, client_user_id)
         app = self.db.get_user_application(application_id=application_id, user_id=user_id)
         if not app:
             raise ApplicationNotFoundError(application_id)
+        if bool(getattr(app, "is_archived", 0)):
+            raise ValidationError(
+                f"Cannot create follow-up reminder for archived Application #{application_id}."
+            )
         return self.db.create_application_follow_up(
             application_id=application_id,
             user_id=user_id,
