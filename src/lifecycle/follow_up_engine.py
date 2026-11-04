@@ -187,20 +187,25 @@ class FollowUpRecommendationEngine:
         # 2. INTERVIEW: Thank-you note within 24 hours of interview
         # ---------------------------------------------------------------------
         elif status == "INTERVIEW":
-            # Finding C: Inspect authoritative stored interview date first, then candidate context
-            int_raw = getattr(application, "interview_date", None)
-            int_source = "application_record" if int_raw else None
-            if not int_raw:
+            # Findings B & C (Option B): No authoritative persisted interview date exists in the database schema.
+            # Candidate-entered dates are accepted ONLY when explicit provenance is provided (interview_date_source == "candidate_provided").
+            raw_source = context.get("interview_date_source")
+            int_date = None
+            int_source = "unavailable"
+
+            if isinstance(raw_source, str) and raw_source.strip() == "candidate_provided":
                 int_raw = context.get("interview_date") or context.get("interview_timestamp")
                 if int_raw:
-                    int_source = "candidate_provided"
+                    parsed = cls.parse_date_safe(int_raw)
+                    if parsed:
+                        int_date = parsed
+                        int_source = "candidate_provided"
 
-            int_date = cls.parse_date_safe(int_raw)
-            if not int_date:
+            if not int_date or int_source != "candidate_provided":
                 return FollowUpRecommendation(
                     has_recommendation=False,
-                    rationale="Interview date is missing or invalid. Please record a valid interview date to schedule a thank-you note.",
-                    application_context=app_ctx,
+                    rationale="Interview date is missing or invalid. Please record a valid interview date with explicit candidate_provided provenance to schedule a thank-you note.",
+                    application_context=dict(app_ctx, interview_date_source="unavailable"),
                 )
 
             # Within 24 hours: same day or next calendar day
@@ -210,7 +215,7 @@ class FollowUpRecommendationEngine:
                 return FollowUpRecommendation(
                     has_recommendation=False,
                     rationale=f"Interview date ({int_date.isoformat()}) was more than 24 hours ago; thank-you note window has expired.",
-                    application_context=app_ctx,
+                    application_context=dict(app_ctx, interview_date_source="candidate_provided"),
                 )
 
             has_pending = any(
@@ -221,17 +226,16 @@ class FollowUpRecommendationEngine:
                 return FollowUpRecommendation(
                     has_recommendation=False,
                     rationale="A pending thank-you note reminder is already scheduled for this application.",
-                    application_context=app_ctx,
+                    application_context=dict(app_ctx, interview_date_source="candidate_provided"),
                 )
 
-            source_label = "recorded" if int_source == "application_record" else "candidate-provided"
             return FollowUpRecommendation(
                 has_recommendation=True,
                 recommendation_type=FollowUpType.THANK_YOU_NOTE.value,
                 recommended_date=rec_date.isoformat(),
-                rationale=f"Recommended thank-you note scheduled for {rec_date.isoformat()} (within 24 hours of {source_label} interview on {int_date.isoformat()}).",
+                rationale=f"Recommended thank-you note scheduled for {rec_date.isoformat()} (within 24 hours of candidate-provided interview on {int_date.isoformat()}).",
                 default_description=f"Send thank-you note following {title} interview with {company}",
-                application_context=dict(app_ctx, interview_date_source=int_source or "candidate_provided"),
+                application_context=dict(app_ctx, interview_date_source="candidate_provided"),
             )
 
         # ---------------------------------------------------------------------
@@ -357,17 +361,22 @@ class FollowUpTemplateGenerator:
             )
 
         profile = candidate_profile or {}
-        context = extra_context or {}
+        # Finding A: Remove reserved identity keys from caller context before constructing internal context
+        RESERVED_IDENTITY_KEYS = {"_trusted_account_name", "trusted_account_name", "candidate_name"}
+        context = {
+            k: v for k, v in (extra_context or {}).items()
+            if k not in RESERVED_IDENTITY_KEYS
+        }
 
         # Support unwrapped profile dict or DB row dict with 'profile_data'
         p_data = profile.get("profile_data") if isinstance(profile.get("profile_data"), dict) else profile
 
-        # Strict candidate name resolution order (Finding B):
+        # Strict candidate name resolution order (Finding A):
         # 1. candidate_profile["personal_information"]["full_name"]
         # 2. candidate_profile["full_name"]
-        # 3. trusted_account_name (from param or context["_trusted_account_name"])
+        # 3. trusted_account_name (from dedicated authenticated parameter)
         # 4. "[CANDIDATE NAME]"
-        # Note: arbitrary caller-supplied extra_context["candidate_name"] CANNOT override profile or account identity.
+        # Note: arbitrary caller-supplied extra_context cannot override profile or account identity.
         cand_name: str | None = None
         if isinstance(p_data, dict):
             cand_pinfo = p_data.get("personal_information")
@@ -382,9 +391,8 @@ class FollowUpTemplateGenerator:
                 cand_name = fn.strip()
 
         if not cand_name:
-            acct_fn = trusted_account_name or context.get("_trusted_account_name")
-            if isinstance(acct_fn, str) and acct_fn.strip():
-                cand_name = acct_fn.strip()
+            if isinstance(trusted_account_name, str) and trusted_account_name.strip():
+                cand_name = trusted_account_name.strip()
 
         if not cand_name:
             cand_name = "[CANDIDATE NAME]"
@@ -402,24 +410,27 @@ class FollowUpTemplateGenerator:
         raw_interviewer = context.get("interviewer_name")
         interviewer_name = raw_interviewer.strip() if isinstance(raw_interviewer, str) and raw_interviewer.strip() else "[INTERVIEWER NAME]"
 
-        # 4. Resolve dates strictly with validation (Findings A & C)
+        # 4. Resolve dates strictly with validation (Findings A, B & C)
         # Submission date: authoritative application record only
         sub_raw = getattr(application, "date_submitted", None)
         sub_date = FollowUpRecommendationEngine.parse_date_safe(sub_raw)
         sub_str = sub_date.isoformat() if sub_date else None
 
-        # Interview date: check authoritative stored record first, then candidate-provided
-        int_raw = getattr(application, "interview_date", None)
-        int_source = "application_record" if int_raw else None
-        if not int_raw:
-            int_raw = context.get("interview_date") or context.get("interview_timestamp")
-            if int_raw:
-                int_source = "candidate_provided"
+        # Interview date: require explicit candidate_provided provenance (Option B: no persisted date exists)
+        raw_int_source = context.get("interview_date_source")
+        int_date = None
+        int_source = "unavailable"
 
-        int_date = FollowUpRecommendationEngine.parse_date_safe(int_raw)
+        if isinstance(raw_int_source, str) and raw_int_source.strip() == "candidate_provided":
+            raw_int = context.get("interview_date") or context.get("interview_timestamp")
+            if raw_int:
+                parsed_int = FollowUpRecommendationEngine.parse_date_safe(raw_int)
+                if parsed_int:
+                    int_date = parsed_int
+                    int_source = "candidate_provided"
+
         if int_date:
             int_str = int_date.isoformat()
-            int_source = int_source or "candidate_provided"
         else:
             int_str = None
             int_source = "unavailable"
@@ -439,7 +450,7 @@ class FollowUpTemplateGenerator:
             "interview_date_source": int_source,
             "has_verified_recruiter": False,  # Candidate-provided context is unverified
             "has_verified_interviewer": False,  # Candidate-provided context is unverified
-            "date_referenced": sub_str or int_str,
+            "date_referenced": sub_str if follow_up_type == FollowUpType.STATUS_INQUIRY.value else int_str,
         }
 
         # ---------------------------------------------------------------------

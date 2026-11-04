@@ -2440,10 +2440,12 @@ class DashboardService:
         if user_row and user_row.get("full_name") and str(user_row.get("full_name")).strip():
             trusted_account_name = str(user_row["full_name"]).strip()
 
-        merged_context = dict(extra_context or {})
-        # Preserve trusted account name in internal context
-        if trusted_account_name:
-            merged_context["_trusted_account_name"] = trusted_account_name
+        # Finding A: Strip reserved identity keys from caller context before constructing internal context
+        RESERVED_IDENTITY_KEYS = {"_trusted_account_name", "trusted_account_name", "candidate_name"}
+        merged_context = {
+            k: v for k, v in (extra_context or {}).items()
+            if k not in RESERVED_IDENTITY_KEYS
+        }
 
         if follow_up_id is not None:
             fup = self.db.get_application_follow_up(follow_up_id=follow_up_id, user_id=user_id)
