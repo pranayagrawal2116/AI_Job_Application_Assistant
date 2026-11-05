@@ -57,35 +57,85 @@ class FileSecurityValidator:
 
     def get_candidate_storage_root(self, user_id: int) -> Path:
         """Returns the isolated private root directory for a candidate (data/users/<user_id>/)."""
-        if not user_id or int(user_id) <= 0:
+        if not user_id:
+            raise ValidationError("user_id is mandatory.")
+        try:
+            uid = int(user_id)
+            if uid <= 0:
+                raise ValidationError(f"Invalid user_id: {user_id}")
+        except (ValueError, TypeError):
             raise ValidationError(f"Invalid user_id: {user_id}")
-        root_dir = (self.base_storage_dir / str(user_id)).resolve()
-        root_dir.mkdir(parents=True, exist_ok=True)
-        return root_dir
+
+        base_dir = Path(self.base_storage_dir)
+        raw_root = base_dir / str(uid)
+
+        # Inspect candidate directory before following symlinks
+        if os.path.lexists(raw_root) and (os.path.islink(raw_root) or raw_root.is_symlink()):
+            raise FileSecurityError(
+                f"Candidate root directory cannot be a symbolic link: '{raw_root}'"
+            )
+
+        raw_root.mkdir(parents=True, exist_ok=True)
+        if os.path.islink(raw_root) or raw_root.is_symlink():
+            raise FileSecurityError(
+                f"Candidate root directory cannot be a symbolic link: '{raw_root}'"
+            )
+
+        resolved_base = base_dir.resolve()
+        resolved_root = raw_root.resolve()
+
+        try:
+            rel = resolved_root.relative_to(resolved_base)
+        except ValueError:
+            raise FileSecurityError(
+                f"Candidate root '{raw_root}' resolved outside base storage '{base_dir}'."
+            )
+
+        if rel.parts != (str(uid),):
+            raise FileSecurityError(
+                f"Candidate root '{raw_root}' resolved to unexpected path '{resolved_root}' (expected relative path '{uid}')."
+            )
+
+        return resolved_root
 
     def get_user_resumes_dir(self, user_id: int) -> Path:
         """Returns the isolated private directory for a user's resumes."""
-        if not user_id or int(user_id) <= 0:
-            raise ValidationError(f"Invalid user_id: {user_id}")
-        user_dir = (self.base_storage_dir / str(user_id) / "resumes").resolve()
-        user_dir.mkdir(parents=True, exist_ok=True)
-        return user_dir
+        cand_root = self.get_candidate_storage_root(user_id)
+        raw_dir = cand_root / "resumes"
+        if os.path.lexists(raw_dir) and (os.path.islink(raw_dir) or raw_dir.is_symlink()):
+            raise FileSecurityError(f"User resumes directory cannot be a symbolic link: '{raw_dir}'")
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.islink(raw_dir) or raw_dir.is_symlink():
+            raise FileSecurityError(f"User resumes directory cannot be a symbolic link: '{raw_dir}'")
+        resolved = raw_dir.resolve()
+        resolved.relative_to(cand_root)
+        return resolved
 
     def get_user_job_descriptions_dir(self, user_id: int) -> Path:
         """Returns the isolated private directory for a user's uploaded job descriptions."""
-        if not user_id or int(user_id) <= 0:
-            raise ValidationError(f"Invalid user_id: {user_id}")
-        user_dir = (self.base_storage_dir / str(user_id) / "job_descriptions").resolve()
-        user_dir.mkdir(parents=True, exist_ok=True)
-        return user_dir
+        cand_root = self.get_candidate_storage_root(user_id)
+        raw_dir = cand_root / "job_descriptions"
+        if os.path.lexists(raw_dir) and (os.path.islink(raw_dir) or raw_dir.is_symlink()):
+            raise FileSecurityError(f"User job descriptions directory cannot be a symbolic link: '{raw_dir}'")
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.islink(raw_dir) or raw_dir.is_symlink():
+            raise FileSecurityError(f"User job descriptions directory cannot be a symbolic link: '{raw_dir}'")
+        resolved = raw_dir.resolve()
+        resolved.relative_to(cand_root)
+        return resolved
 
     def get_user_confirmations_dir(self, user_id: int) -> Path:
         """Returns the isolated private directory for a user's submission confirmations."""
-        if not user_id or int(user_id) <= 0:
-            raise ValidationError(f"Invalid user_id: {user_id}")
-        user_dir = (self.base_storage_dir / str(user_id) / "confirmations").resolve()
-        user_dir.mkdir(parents=True, exist_ok=True)
-        return user_dir
+        cand_root = self.get_candidate_storage_root(user_id)
+        raw_dir = cand_root / "confirmations"
+        if os.path.lexists(raw_dir) and (os.path.islink(raw_dir) or raw_dir.is_symlink()):
+            raise FileSecurityError(f"User confirmations directory cannot be a symbolic link: '{raw_dir}'")
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        if os.path.islink(raw_dir) or raw_dir.is_symlink():
+            raise FileSecurityError(f"User confirmations directory cannot be a symbolic link: '{raw_dir}'")
+        resolved = raw_dir.resolve()
+        resolved.relative_to(cand_root)
+        return resolved
 
     @staticmethod
     def sanitize_filename(filename: str) -> str:
@@ -581,7 +631,13 @@ class FileSecurityValidator:
         Returns:
             Tuple[resolved_path: Path, file_bytes: bytes, file_hash: str, file_size: int]
         """
-        if not user_id or int(user_id) <= 0:
+        if not user_id:
+            raise ValidationError("user_id is mandatory.")
+        try:
+            uid = int(user_id)
+            if uid <= 0:
+                raise ValidationError(f"Invalid user_id: {user_id}")
+        except (ValueError, TypeError):
             raise ValidationError(f"Invalid user_id: {user_id}")
 
         if not file_path or not str(file_path).strip():
@@ -595,51 +651,87 @@ class FileSecurityValidator:
         if ".." in path_str or ".." in Path(path_str).parts:
             raise FileSecurityError(f"Path traversal detected in {resource_desc} path: '{file_path}'")
 
-        candidate_root = self.get_candidate_storage_root(user_id).resolve()
+        candidate_root = self.get_candidate_storage_root(uid)
         raw_path = Path(path_str)
 
-        # Symlink defense: check if target path itself or any of its components are symlinks
-        if raw_path.is_symlink():
-            raise FileSecurityError(
-                f"Symbolic link detected: {resource_desc} path '{file_path}' cannot be a symbolic link."
-            )
+        # 1. Inspect original supplied path before resolution
+        # Check absolute vs relative containment
+        base_dir = Path(self.base_storage_dir)
+        resolved_base = base_dir.resolve()
 
-        # Containment resolution
         if raw_path.is_absolute():
-            resolved_target = raw_path.resolve()
-        else:
-            # Check if relative to working directory or relative to candidate_root
-            cwd_resolved = raw_path.resolve()
+            # Check if relative to base_dir, resolved_base, or candidate_root
+            rel_from_base = None
             try:
-                cwd_resolved.relative_to(candidate_root)
-                resolved_target = cwd_resolved
+                rel_from_base = raw_path.relative_to(base_dir)
             except ValueError:
-                resolved_target = (candidate_root / raw_path).resolve()
+                try:
+                    rel_from_base = raw_path.relative_to(resolved_base)
+                except ValueError:
+                    pass
 
+            if rel_from_base is not None:
+                if not rel_from_base.parts or rel_from_base.parts[0] != str(uid):
+                    raise FileSecurityError(
+                        f"Path containment violation: {resource_desc} '{file_path}' is outside candidate storage root '{candidate_root}'."
+                    )
+                rel = Path(*rel_from_base.parts[1:])
+            else:
+                try:
+                    rel = raw_path.relative_to(candidate_root)
+                except ValueError:
+                    try:
+                        rel = raw_path.relative_to(candidate_root.resolve())
+                    except ValueError:
+                        raise FileSecurityError(
+                            f"Path containment violation: {resource_desc} '{file_path}' is outside candidate storage root '{candidate_root}'."
+                        )
+            effective_path = candidate_root.joinpath(*rel.parts)
+        else:
+            # Relative path
+            parts = raw_path.parts
+            if parts and parts[0] == str(uid):
+                rel = Path(*parts[1:])
+            else:
+                rel = raw_path
+            effective_path = candidate_root.joinpath(*rel.parts)
+
+        # 2. Inspect every component from candidate_root down to target BEFORE resolving
+        if ".." in rel.parts:
+            raise FileSecurityError(f"Path traversal detected in {resource_desc} path: '{file_path}'")
+
+        curr = candidate_root
+        for part in rel.parts:
+            curr = curr / part
+            if os.path.lexists(curr) and (os.path.islink(curr) or curr.is_symlink()):
+                raise FileSecurityError(
+                    f"Symbolic link detected: {resource_desc} path component '{curr}' cannot be a symbolic link."
+                )
+
+        # 3. Resolve path only after original path components have been checked
+        resolved_target = effective_path.resolve()
         try:
-            rel = resolved_target.relative_to(candidate_root)
+            resolved_target.relative_to(candidate_root)
         except ValueError:
             raise FileSecurityError(
                 f"Path containment violation: {resource_desc} '{file_path}' resolves outside candidate storage root '{candidate_root}'."
             )
 
-        curr = candidate_root
-        for part in rel.parts:
-            curr = curr / part
-            if curr.is_symlink():
-                raise FileSecurityError(
-                    f"Symbolic link detected: {resource_desc} path '{curr}' cannot be a symbolic link."
-                )
-
         if not resolved_target.exists():
             raise FileNotFoundError(f"{resource_desc} not found on disk at '{resolved_target}'.")
 
-        if not resolved_target.is_file():
+        if os.path.islink(resolved_target) or resolved_target.is_symlink() or not resolved_target.is_file():
             raise ValidationError(f"{resource_desc} path '{resolved_target}' is not a regular file.")
 
+        # 4. Open and read actual bytes using O_NOFOLLOW
         try:
-            file_bytes = resolved_target.read_bytes()
-        except Exception as read_err:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            fd = os.open(resolved_target, flags)
+            with os.fdopen(fd, "rb") as f:
+                file_bytes = f.read()
+        except OSError as read_err:
             raise CorruptedFileError(f"Failed to read {resource_desc} file on disk: {read_err}")
 
         actual_size = len(file_bytes)

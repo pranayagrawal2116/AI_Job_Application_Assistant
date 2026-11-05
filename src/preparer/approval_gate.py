@@ -1043,7 +1043,7 @@ class HumanApprovalGate:
         if not valid_ticket:
             return False, f"Submission rejected: {ticket_msg}"
 
-        if not self.db.has_valid_human_approval(job_id=job_id, expected_packet_hash=packet_version_hash):
+        if not self.db.has_valid_human_approval(job_id=job_id, user_id=getattr(session, "user_id", None), expected_packet_hash=packet_version_hash):
             return False, (
                 f"Submission rejected: Job #{job_id} does not have an active, unconsumed human approval record "
                 f"matching packet version hash '{packet_version_hash[:12]}...' in the audit trail."

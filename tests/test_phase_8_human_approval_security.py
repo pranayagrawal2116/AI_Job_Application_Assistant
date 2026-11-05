@@ -823,7 +823,7 @@ class TestPhase8PostApprovalInvalidation(Phase8TestBase):
             candidate_confirmed=True,
         )
         self.assertTrue(succ)
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
         # 2. Modify tailored resume content -> creates revision 2
         tailored_res2, cover_letter, qa_packet = self._generate_test_materials(self.user_a.id)
@@ -848,7 +848,7 @@ class TestPhase8PostApprovalInvalidation(Phase8TestBase):
 
         # 4. Old approval record CANNOT authorize the active application / revision
         self.assertFalse(
-            self.db.has_valid_human_approval(app.id),
+            self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id),
             "Application has an edited packet revision; old approval must not be valid for active revision.",
         )
 
@@ -880,7 +880,7 @@ class TestPhase8PostApprovalInvalidation(Phase8TestBase):
             candidate_confirmed=True,
         )
         self.assertTrue(succ2, f"Failed authorizing revision 2: {msg2}")
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
     def test_cover_letter_edit_invalidates_approval(self):
         """Editing cover letter creates revision 2 and invalidates old approval."""
@@ -901,7 +901,7 @@ class TestPhase8PostApprovalInvalidation(Phase8TestBase):
             action_ticket=ticket1,
             candidate_confirmed=True,
         )
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
         # Edit cover letter text
         tailored_res, cover_letter2, qa_packet = self._generate_test_materials(self.user_a.id)
@@ -916,7 +916,7 @@ class TestPhase8PostApprovalInvalidation(Phase8TestBase):
             qa_packet=qa_packet,
             job_description_snapshot_hash=self.jd_a.content_hash,
         )
-        self.assertFalse(self.db.has_valid_human_approval(app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
 
 class TestPhase8AutonomousSubmissionPrevention(Phase8TestBase):
@@ -1046,7 +1046,7 @@ class TestPhase8AutonomousSubmissionPrevention(Phase8TestBase):
         self.assertEqual(updated_app.status, "SUBMITTED")
 
         # Approval is consumed, cannot be reused for second submission
-        self.assertFalse(self.db.has_valid_human_approval(app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
 
 class TestPhase8TransactionAtomicityAndFailureInjection(Phase8TestBase):

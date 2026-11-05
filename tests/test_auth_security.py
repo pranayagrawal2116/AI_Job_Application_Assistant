@@ -198,7 +198,7 @@ class TestPasswordReset(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test_auth.db"
         self.db = DatabaseManager(db_path=self.db_path)
-        self.session_mgr = SessionManager()
+        self.session_mgr = SessionManager(db_manager=self.db)
         self.auth = AuthManager(db_manager=self.db)
         self.user = self.auth.register(
             email="reset.user@example.com",
@@ -338,7 +338,7 @@ class TestActionTicketsAndKeyRotation(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = Path(self.temp_dir.name) / "test_auth.db"
         self.db = DatabaseManager(db_path=self.db_path)
-        self.session_mgr = SessionManager()
+        self.session_mgr = SessionManager(db_manager=self.db)
 
     def tearDown(self):
         self.temp_dir.cleanup()

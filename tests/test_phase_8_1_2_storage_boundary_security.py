@@ -531,7 +531,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
         # Verify application transitioned to Awaiting Approval
         app_after_auth = self.db.get_user_application(app.id, self.user_1)
         self.assertEqual(app_after_auth.status, "Awaiting Approval")
-        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
         # Save updated candidate profile
         new_profile_data = {
@@ -545,7 +545,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
         )
 
         # 1. Approval must now be invalid
-        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
         # 2. Application status must transition from APPROVED to READY_FOR_REVIEW
         app_after_prof_update = self.db.get_user_application(app.id, self.user_1)
@@ -597,7 +597,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
         # Invariant: application status remains Awaiting Approval and approval remains intact
         app_check = self.db.get_user_application(app.id, self.user_1)
         self.assertEqual(app_check.status, "Awaiting Approval")
-        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
     # =========================================================================
     # FINDING E: Failure-Safe Emergency Signing Key Rotation
@@ -633,7 +633,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
 
         # Simulate SQLite failure on revoke_signing_key_approvals
         with patch.object(self.db, "revoke_signing_key_approvals", side_effect=RuntimeError("Simulated SQLite write error")):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises((RuntimeError, SecurityAuthorizationError)):
                 km.rotate_keys(
                     new_key_id="v2_emergency",
                     new_secret=b"replacement_secret_32_bytes_long!",
@@ -664,7 +664,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
             action_ticket=ticket,
             candidate_confirmed=True,
         )
-        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
         # Perform emergency rotation
         new_key = b"emergency_key_32_bytes_long_12345"
@@ -675,7 +675,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
         )
 
         # 1. Stored approval signed by old key is revoked
-        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
         # 2. Previously issued ticket cannot be consumed or verified
         with self.assertRaises((KeyRevokedError, SecurityAuthorizationError)):
@@ -747,7 +747,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
             action_ticket=ticket,
             candidate_confirmed=True,
         )
-        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
         # 1. Consumed approval
         with self.db.transaction() as conn:
@@ -755,7 +755,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
                 "UPDATE application_approvals SET consumed_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (approval.id,),
             )
-        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
         # 2. Revoked approval
         with self.db.transaction() as conn:
@@ -763,7 +763,7 @@ class TestPhase812StorageBoundarySecurity(unittest.TestCase):
                 "UPDATE application_approvals SET consumed_at = NULL, revoked_at = CURRENT_TIMESTAMP WHERE id = ?",
                 (approval.id,),
             )
-        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_1))
 
     def test_legacy_log_fallback_blocked_when_prepared_packets_exist(self):
         """Legacy audit log approval fallback is blocked if application has prepared packets."""

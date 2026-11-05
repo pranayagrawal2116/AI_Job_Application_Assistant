@@ -122,10 +122,21 @@ class KeyRotationManager:
         if clean_new_key_id in self._revoked_keys:
             raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_new_key_id}'.")
 
+        db = db_manager or self._db_manager
+        if db and hasattr(db, "is_key_revoked") and callable(getattr(db, "is_key_revoked")):
+            if db.is_key_revoked(clean_new_key_id):
+                self._revoked_keys.add(clean_new_key_id)
+                raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_new_key_id}'.")
+
+        if mode == self.MODE_EMERGENCY:
+            if not db or not hasattr(db, "revoke_signing_key_approvals") or not callable(getattr(db, "revoke_signing_key_approvals")):
+                raise SecurityAuthorizationError(
+                    "Durable emergency key rotation requires an active persistent DatabaseManager with revoke_signing_key_approvals support."
+                )
+
         with self._lock:
             old_key_id = self.active_key_id
             old_secret = self._keys.get(old_key_id)
-            db = db_manager or self._db_manager
 
             if mode == self.MODE_GRACEFUL:
                 if old_secret:
@@ -139,8 +150,12 @@ class KeyRotationManager:
                 )
             elif mode == self.MODE_EMERGENCY:
                 # 1. Durable persistence in SQLite must succeed BEFORE modifying in-memory key state
-                if db and hasattr(db, "revoke_signing_key_approvals"):
+                try:
                     db.revoke_signing_key_approvals(old_key_id, reason="EMERGENCY_KEY_REVOCATION")
+                except Exception as exc:
+                    raise SecurityAuthorizationError(
+                        f"Durable emergency key revocation failed: {exc}"
+                    ) from exc
 
                 # 2. Only after SQLite commit succeeds, update in-memory key state
                 self._revoked_keys.add(old_key_id)

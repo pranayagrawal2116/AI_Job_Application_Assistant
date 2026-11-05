@@ -463,6 +463,32 @@ When interacting with the browser via Playwright MCP:
     - `DatabaseManager.has_valid_human_approval()`: disambiguated `application_id` from legacy `job_id`, strictly rejected malformed or non-numeric user IDs, enforced candidate application ownership, rejected consumed (`is_consumed = 1` or `consumed_at IS NOT NULL`) and revoked (`is_revoked = 1` or `revoked_at IS NOT NULL`) approvals, and restricted legacy `application_logs` fallback exclusively to applications with 0 prepared packets.
   - Verification & Regressions: Added 25 comprehensive tests in `tests/test_phase_8_1_2_storage_boundary_security.py`. All 1,201 tests across the entire repository test suite passing (100% pass rate). 0 ruff errors, 0 compileall errors, 0 git diff errors.
 
+- [x] **Architecture v2.1.1 Phase 8.1.3: Final Trust-Boundary & Approval Lookup Remediation** (Complete)
+  - Finding A — Trusted Candidate Storage Root & Symlink Defenses:
+    - `FileSecurityValidator.get_candidate_storage_root(user_id)`: validates positive integer user IDs, verifies raw directory path with `os.path.islink()` before creating or traversing, enforces strict subpath containment relative to resolved storage base with `rel.parts == (str(uid),)`, rejecting candidate directories that are symlinks to other candidates or external targets.
+    - `FileSecurityValidator.get_user_resumes_dir()`, `get_user_job_descriptions_dir()`, and `get_user_confirmations_dir()` verify candidate subdirectories are not symlinks.
+    - `FileSecurityValidator.resolve_and_verify_candidate_file()`: checks for `\x00` and path traversal; checks candidate containment against base storage and resolved storage roots; inspects each individual path component in `rel.parts` before resolution to reject intermediate directory symlinks (even when target is within candidate root); rejects final-file symlinks; re-verifies containment post-resolution; opens file descriptors with `os.O_NOFOLLOW` for byte reads to prevent TOCTOU symlink race substitutions.
+  - Finding B — Failure-Safe Emergency Signing Key Rotation:
+    - `KeyRotationManager.rotate_keys()` and `SessionManager.rotate_keys()`: require an active persistent `DatabaseManager` with `revoke_signing_key_approvals` support when `mode == MODE_EMERGENCY`, raising `SecurityAuthorizationError` if missing or invalid.
+    - Rejects key-ID reuse if replacement key was previously revoked in memory or SQLite.
+    - Executes durable SQLite key revocation and approval revocation first; wraps database operations to raise `SecurityAuthorizationError` on failure; updates in-memory key state and purges grants only after the SQLite transaction commits successfully.
+    - In-memory active key remains unchanged and old key remains functional if rotation fails.
+  - Finding C — Disambiguated Approval Lookups & Exact Audit Scoping:
+    - `DatabaseManager.has_valid_human_approval()`: positional identifier calls (`application_id is None and job_id is None`) fail closed immediately, eliminating ambiguity where application IDs and catalog job IDs share numeric values.
+    - Explicit `application_id` lookup validates candidate ownership (`user_id`), rejects missing or malformed candidate user IDs, requires active packet revision (`is_active_revision = 1`), and verifies approval status in `application_approvals`.
+    - Explicit `job_id` lookup verifies candidate ownership, enforces zero prepared packet history (`COUNT(prepared_packets) == 0`), and queries `application_logs` strictly scoped to `(application_id, job_id, user_id)`.
+    - Modern applications with prepared packet history are blocked from falling back to legacy audit logs.
+    - Shared catalog jobs across multiple candidates maintain strict approval isolation.
+  - Finding D — State-Machine Validation During Candidate Profile Invalidation:
+    - `DatabaseManager.save_user_candidate_profile()`: groups unconsumed approvals by `application_id` to prevent duplicate invalidation events.
+    - Only applications currently in `APPROVED` (or alias `Awaiting Approval`) transition back to `READY_FOR_REVIEW`.
+    - Validates transition using `ApplicationStateMachine.validate_transition(norm_status, ApplicationStatus.READY_FOR_REVIEW)`.
+    - Applications in post-submission statuses (e.g., `Applied`, `INTERVIEW`) revoke unconsumed approvals without illegally mutating application status.
+    - Performs atomic conditional SQL updates (`WHERE id = ? AND user_id = ? AND status = ?`) with concurrency detection.
+    - Appends an immutable `PACKET_APPROVAL_REVOKED` timeline event per affected application with canonical JSON payload and cryptographic event hash chaining.
+    - Rolls back profile updates, approval revocation, status changes, and timeline events atomically on any write failure.
+  - Verification & Regressions: Added 27 comprehensive tests in `tests/test_phase_8_1_3_final_trust_boundary_security.py`. All 1,228 tests across the entire repository test suite passing (100% pass rate). 0 ruff errors, 0 compileall errors, 0 git diff errors.
+
 ---
 
 ## 7. Approval Requirement

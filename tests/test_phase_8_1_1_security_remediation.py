@@ -178,7 +178,7 @@ class TestFindingAEmergencyKeyRevocation(Phase811TestBase):
         old_key_id = approval.key_id
 
         # Verify initial approval is active and unrevoked
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
         appr_db = self.db.get_packet_approval(packet.id, self.user_a.id)
         self.assertIsNotNone(appr_db)
         self.assertFalse(appr_db.is_revoked)
@@ -205,7 +205,7 @@ class TestFindingAEmergencyKeyRevocation(Phase811TestBase):
         self.assertIsNone(self.db.get_packet_approval(packet.id, self.user_a.id, include_revoked=False))
 
         # 4. has_valid_human_approval returns False
-        self.assertFalse(self.db.has_valid_human_approval(app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
     def test_manual_submission_rejected_even_with_fresh_ticket_under_replacement_key(self):
         """Submission is rejected if the underlying approval was revoked, even with a fresh ticket under the new key."""
@@ -280,7 +280,7 @@ class TestFindingAEmergencyKeyRevocation(Phase811TestBase):
         self.assertFalse(new_approval.is_revoked)
 
         # Verify has_valid_human_approval is restored
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
         # Issue submission ticket and confirm manual submission
         sub_ticket = self.session_mgr.issue_action_ticket(
@@ -328,7 +328,7 @@ class TestFindingBCandidateProfileChangeInvalidation(Phase811TestBase):
         self.assertIsNotNone(appr_after.revoked_at)
 
         # has_valid_human_approval returns False
-        self.assertFalse(self.db.has_valid_human_approval(app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
     def test_packet_integrity_detects_candidate_profile_hash_and_version_mismatch(self):
         """verify_prepared_packet_integrity compares active DB profile against packet metadata and rejects stale packets."""
@@ -596,20 +596,24 @@ class TestFindingDDisambiguatedApprovalLookup(Phase811TestBase):
         """has_valid_human_approval correctly resolves application_id and job_id explicitly."""
         app, packet, approval = self._create_and_approve_packet(self.user_a.id)
 
-        # 1. Positional lookup
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        # 1. Positional lookup fails closed
+        self.assertFalse(self.db.has_valid_human_approval(app.id))
 
         # 2. Explicit keyword application_id lookup
-        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
         # 3. Explicit expected_packet_hash match
         self.assertTrue(
-            self.db.has_valid_human_approval(application_id=app.id, expected_packet_hash=packet.packet_version_hash)
+            self.db.has_valid_human_approval(
+                application_id=app.id, user_id=self.user_a.id, expected_packet_hash=packet.packet_version_hash
+            )
         )
 
         # 4. Mismatched packet hash returns False
         self.assertFalse(
-            self.db.has_valid_human_approval(application_id=app.id, expected_packet_hash="wrong_hash_12345")
+            self.db.has_valid_human_approval(
+                application_id=app.id, user_id=self.user_a.id, expected_packet_hash="wrong_hash_12345"
+            )
         )
 
     def test_has_valid_human_approval_enforces_user_isolation(self):
@@ -625,7 +629,7 @@ class TestFindingDDisambiguatedApprovalLookup(Phase811TestBase):
     def test_has_valid_human_approval_rejects_outdated_revision(self):
         """When a new packet revision is created, approval for revision 1 returns False."""
         app, packet_v1, _ = self._create_and_approve_packet(self.user_a.id)
-        self.assertTrue(self.db.has_valid_human_approval(app.id))
+        self.assertTrue(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
         # Create revision 2
         res_gen = UniversalTailoredResumeGenerator()
@@ -652,9 +656,11 @@ class TestFindingDDisambiguatedApprovalLookup(Phase811TestBase):
         self.assertEqual(packet_v2.version_num, 2)
 
         # has_valid_human_approval must now return False because active revision has changed
-        self.assertFalse(self.db.has_valid_human_approval(app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
         self.assertFalse(
-            self.db.has_valid_human_approval(app.id, expected_packet_hash=packet_v1.packet_version_hash)
+            self.db.has_valid_human_approval(
+                application_id=app.id, user_id=self.user_a.id, expected_packet_hash=packet_v1.packet_version_hash
+            )
         )
 
     def test_modern_application_does_not_fall_back_to_legacy_logs(self):
@@ -673,7 +679,7 @@ class TestFindingDDisambiguatedApprovalLookup(Phase811TestBase):
             )
 
         # Must return False because modern application has prepared_packets and requires table approval
-        self.assertFalse(self.db.has_valid_human_approval(app.id))
+        self.assertFalse(self.db.has_valid_human_approval(application_id=app.id, user_id=self.user_a.id))
 
 
 if __name__ == "__main__":

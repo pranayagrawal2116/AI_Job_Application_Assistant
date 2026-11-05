@@ -287,7 +287,7 @@ class TestDatabaseManager(unittest.TestCase):
             approval_notes="Manually reviewed form inputs and authorized submission.",
         )
         self.assertEqual(approval_log.action, "HUMAN_APPROVAL_GRANTED")
-        self.assertTrue(self.db.has_valid_human_approval(job_id))
+        self.assertTrue(self.db.has_valid_human_approval(job_id=job_id))
 
         # 5. Transition to Awaiting Approval
         self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL)
