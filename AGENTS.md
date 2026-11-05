@@ -426,6 +426,25 @@ When interacting with the browser via Playwright MCP:
   - Atomicity & Failure Injection: Verified complete rollback under injected database failures with zero partial records, burned ticket nonces preventing replay, and intact event hash chains.
   - Verification & Regressions: Added 34 dedicated unit, security, concurrency, rotation, and failure-injection tests in `tests/test_phase_8_human_approval_security.py`. All 1,159 tests in the full repository test suite passing (100% pass rate). 0 pyflakes errors, 0 ruff errors, and clean git diff check.
 
+- [x] **Architecture v2.1.1 Phase 8.1.1: Persisted Approval Revocation & Packet Integrity Remediation** (Complete)
+  - Finding A — Durable Emergency Approval Revocation:
+    - Extended SQLite schema with `revoked_signing_keys` table (`key_id TEXT PRIMARY KEY, revoked_at DATETIME, reason TEXT`) and `application_approvals` audit columns (`is_revoked INTEGER DEFAULT 0`, `revoked_at DATETIME`, `revocation_reason TEXT`).
+    - Wired `DatabaseManager` with `SessionManager.register_db_manager()`. Emergency key rotation (`rotate_keys(mode=MODE_EMERGENCY)`) persists revoked keys in SQLite and atomically updates all unconsumed approvals in SQLite (`is_revoked = 1, revocation_reason = 'EMERGENCY_KEY_REVOCATION'`).
+    - Rejected revoked approvals in `DatabaseManager.get_packet_approval()`, `has_valid_human_approval()`, `has_matching_human_approval()`, and `DashboardService.record_candidate_manual_submission()` even if a fresh `MANUAL_SUBMISSION` ticket under a replacement active key is presented. Candidate re-authorization under the replacement key required.
+  - Finding B — Candidate Profile Change Invalidation:
+    - Atomically updated `DatabaseManager.save_user_candidate_profile()` to mark all unconsumed approvals for that user as `is_revoked = 1, revocation_reason = 'CANDIDATE_PROFILE_UPDATED'`.
+    - Strengthened `HumanApprovalGate.verify_prepared_packet_integrity()` to compare active database profile version and profile hash against packet metadata, rejecting stale packet approvals and manual submissions.
+  - Finding C — Fail-Closed Source and Artifact Verification:
+    - Strengthened `HumanApprovalGate.verify_prepared_packet_integrity()` across all constituent resources:
+      - *Source Resume:* Verified existence in SQLite, user ownership, active status (`is_active = 1`), active version matching, candidate storage physical file existence, symlink escape rejection, path traversal rejection, and cryptographic byte SHA-256 match.
+      - *Job Description:* Verified existence in SQLite, user ownership, active status (`is_active = 1`), and content/snapshot hash matching.
+      - *Generated Documents & Attachments:* Physical file verification, symlink escape checks, byte SHA-256 validation, and PDF/DOCX magic byte validation.
+      - *Screening QA:* Rejected malformed structures, `NEEDS_CANDIDATE_INPUT`, and character limit overflows; preserved valid empty lists `[]` and answers.
+  - Finding D — Ambiguous Approval Lookup Disambiguation:
+    - Hardened `DatabaseManager.has_valid_human_approval()` to disambiguate `application_id` from legacy `job_id`, enforce `user_id` ownership, verify packet version hash and active revision status (`is_active_revision = 1`), and reject consumed or revoked (`is_revoked = 1` or key in `revoked_signing_keys`) approvals.
+    - Guaranteed modern applications with prepared packets never fall back to legacy `application_logs`.
+  - Verification & Regressions: Added 17 dedicated comprehensive tests in `tests/test_phase_8_1_1_security_remediation.py`. All 1,176 tests in the full repository test suite passing (100% pass rate). 0 pyflakes errors, 0 ruff errors.
+
 ---
 
 ## 7. Approval Requirement

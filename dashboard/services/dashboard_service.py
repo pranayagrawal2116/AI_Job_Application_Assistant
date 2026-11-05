@@ -1843,11 +1843,26 @@ class DashboardService:
             if not is_intact:
                 raise SecurityAuthorizationError(f"Prepared packet integrity compromised: {int_msg}")
 
-        # 8. Retrieve corresponding human approval record
-        approval = self.db.get_packet_approval(packet_id, user_id)
+        # 8. Retrieve corresponding human approval record (including revoked to enforce explicit security rejection)
+        approval = self.db.get_packet_approval(packet_id, user_id, include_revoked=True)
         if not approval:
             raise SecurityAuthorizationError(
                 f"No human approval record found for PreparedPacket #{packet_id}."
+            )
+
+        # Confirm approval is not revoked
+        if getattr(approval, "is_revoked", False) or approval.is_revoked == 1:
+            reason = getattr(approval, "revocation_reason", None) or "REVOKED"
+            raise SecurityAuthorizationError(
+                f"Human approval for PreparedPacket #{packet_id} has been revoked ({reason}). "
+                "Candidate re-authorization under an active signing key is required."
+            )
+
+        # Confirm signing key used for approval has not been revoked
+        if hasattr(self.db, "is_key_revoked") and self.db.is_key_revoked(approval.key_id):
+            raise SecurityAuthorizationError(
+                f"Human approval for PreparedPacket #{packet_id} was signed with revoked key '{approval.key_id}'. "
+                "Candidate re-authorization under an active signing key is required."
             )
 
         # 9. Confirm approval corresponds to exact packet hash

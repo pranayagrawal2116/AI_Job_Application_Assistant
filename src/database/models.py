@@ -413,6 +413,9 @@ class ApplicationApproval:
     approved_at: Optional[str] = None
     consumed_at: Optional[str] = None
     is_consumed: bool = False
+    is_revoked: bool = False
+    revoked_at: Optional[str] = None
+    revocation_reason: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

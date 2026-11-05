@@ -378,8 +378,17 @@ CREATE TABLE IF NOT EXISTS application_approvals (
     approved_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     consumed_at DATETIME,
     is_consumed INTEGER DEFAULT 0 CHECK(is_consumed IN (0, 1)),
+    is_revoked INTEGER DEFAULT 0 CHECK(is_revoked IN (0, 1)),
+    revoked_at DATETIME,
+    revocation_reason TEXT,
     FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE,
     FOREIGN KEY (packet_id, user_id) REFERENCES prepared_packets(id, user_id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS revoked_signing_keys (
+    key_id TEXT PRIMARY KEY,
+    revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reason TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS consumed_action_nonces (

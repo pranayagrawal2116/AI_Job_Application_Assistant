@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.database.db_manager import DatabaseManager
@@ -67,6 +68,12 @@ class ApplicationReviewPacket:
         return asdict(self)
 
 
+def _is_sha256_hex(val: Any) -> bool:
+    if not isinstance(val, str) or len(val) != 64:
+        return False
+    return all(c in "0123456789abcdefABCDEF" for c in val)
+
+
 class HumanApprovalGate:
     """Manages the strict Human-in-the-Loop approval gate before any job application is submitted."""
 
@@ -100,6 +107,8 @@ class HumanApprovalGate:
                     raise SecurityAuthorizationError(
                         "SessionManager identity mismatch: DatabaseManager and HumanApprovalGate must share the exact same SessionManager instance."
                     )
+        if hasattr(self.session_manager, "register_db_manager"):
+            self.session_manager.register_db_manager(self.db)
 
     # -------------------------------------------------------------------------
     # MULTI-USER UNIVERSAL PREPARED PACKET METHODS (Architecture v2.1.1)
@@ -503,66 +512,221 @@ class HumanApprovalGate:
         except Exception as canon_err:
             return False, f"Integrity check failed: Error verifying RFC 8785 canonical JSON bytes: {canon_err}", packet
 
-        # Element 8: Integrity of original resume & source-version metadata
-        if packet.original_resume_id is not None:
-            if "original_resume_id" in snapshot and snapshot.get("original_resume_id") != packet.original_resume_id:
+        # Element 8: Fail-Closed Integrity of original resume & source-version metadata
+        res_id = packet.original_resume_id if packet.original_resume_id is not None else snapshot.get("original_resume_id")
+        if res_id is not None:
+            if "original_resume_id" in snapshot and snapshot.get("original_resume_id") != res_id:
                 return False, "Integrity check failed: Original resume ID in snapshot does not match packet record.", packet
-            resume_rec = self.db.get_user_resume(resume_id=packet.original_resume_id, user_id=user_id)
-            if resume_rec and not resume_rec.get("is_active", 1):
-                return False, f"Integrity check failed: Original source resume #{packet.original_resume_id} is inactive or deleted.", packet
-            if resume_rec and packet.original_resume_hash and resume_rec.get("file_hash") != packet.original_resume_hash:
-                return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
-        elif "original_resume_id" in snapshot and snapshot.get("original_resume_id") is not None:
-            res_id = snapshot.get("original_resume_id")
-            resume_rec = self.db.get_user_resume(resume_id=res_id, user_id=user_id)
-            if resume_rec and not resume_rec.get("is_active", 1):
+            try:
+                resume_rec = self.db.get_user_resume(resume_id=res_id, user_id=user_id)
+            except CrossUserAccessError as exc:
+                return False, f"Integrity check failed: {exc}", packet
+            if not resume_rec:
+                return False, f"Integrity check failed: Original source resume #{res_id} not found or access denied.", packet
+            if not resume_rec.get("is_active", 1):
                 return False, f"Integrity check failed: Original source resume #{res_id} is inactive or deleted.", packet
+
+            exp_ver = packet.original_resume_version_num or snapshot.get("original_resume_version_num")
+            if exp_ver is not None and resume_rec.get("active_version", 1) != exp_ver:
+                return False, f"Integrity check failed: Original source resume version mismatch (active version {resume_rec.get('active_version')} vs packet version {exp_ver}).", packet
+
+            exp_hash = packet.original_resume_hash or snapshot.get("original_resume_file_hash")
+            if exp_hash and resume_rec.get("file_hash") != exp_hash:
+                return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
+
+            # Physical on-disk resume verification
+            storage_filename = resume_rec.get("storage_filename")
+            if not storage_filename:
+                return False, f"Integrity check failed: Original source resume #{res_id} has no storage filename.", packet
+
+            candidate_paths: List[Path] = []
+            sf = Path(storage_filename)
+            if sf.is_absolute():
+                candidate_paths.append(sf)
+            else:
+                base_dirs = [
+                    Path("data/users") / str(user_id) / "resumes",
+                    Path("data/users") / str(user_id),
+                    Path("data/users"),
+                ]
+                if hasattr(self.db, "db_path") and self.db.db_path and self.db.db_path != ":memory:":
+                    db_p = Path(self.db.db_path).parent
+                    base_dirs.extend([
+                        db_p / "users" / str(user_id) / "resumes",
+                        db_p / "users" / str(user_id),
+                        db_p / "users",
+                        db_p,
+                    ])
+                for bd in base_dirs:
+                    candidate_paths.append(bd / sf.name)
+                    candidate_paths.append(bd / sf)
+
+            disk_file: Optional[Path] = None
+            for cp in candidate_paths:
+                if cp.is_file() or cp.is_symlink():
+                    disk_file = cp
+                    break
+
+            is_cryptographic_hash = _is_sha256_hex(resume_rec.get("file_hash"))
+            if not disk_file or not disk_file.exists():
+                if is_cryptographic_hash:
+                    return False, f"Integrity check failed: Source resume file for Resume #{res_id} not found on disk.", packet
+            else:
+                if disk_file.is_symlink():
+                    return False, f"Integrity check failed: Source resume file for Resume #{res_id} cannot be a symbolic link.", packet
+
+                resolved_resume = disk_file.resolve()
+                if not resolved_resume.is_file():
+                    return False, f"Integrity check failed: Source resume path for Resume #{res_id} is not a regular file.", packet
+
+                try:
+                    disk_bytes = resolved_resume.read_bytes()
+                except Exception as read_err:
+                    return False, f"Integrity check failed: Could not read source resume file on disk: {read_err}", packet
+
+                disk_hash = hashlib.sha256(disk_bytes).hexdigest()
+                if is_cryptographic_hash and (disk_hash != resume_rec.get("file_hash") or (exp_hash and _is_sha256_hex(exp_hash) and disk_hash != exp_hash)):
+                    return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
 
         if packet.original_resume_hash is not None and "original_resume_file_hash" in snapshot:
             if snapshot.get("original_resume_file_hash") != packet.original_resume_hash:
                 return False, "Integrity check failed: Original resume hash in snapshot does not match packet record.", packet
 
-        # Element 9: Integrity of candidate profile and job description snapshots
-        if packet.candidate_profile_hash is not None and "candidate_profile_hash" in snapshot:
-            if snapshot.get("candidate_profile_hash") != packet.candidate_profile_hash:
-                return False, "Integrity check failed: Candidate profile snapshot hash mismatch.", packet
+        # Element 9: Fail-Closed Integrity of Candidate Profile and Job Description Snapshots
+        jd_id = packet.job_description_id if packet.job_description_id is not None else snapshot.get("job_description_id")
+        if jd_id is not None:
+            if "job_description_id" in snapshot and snapshot.get("job_description_id") != jd_id:
+                return False, "Integrity check failed: Job description ID in snapshot does not match packet record.", packet
+            try:
+                jd_rec = self.db.get_job_description(jd_id=jd_id, user_id=user_id)
+            except CrossUserAccessError as exc:
+                return False, f"Integrity check failed: {exc}", packet
+            if not jd_rec:
+                return False, f"Integrity check failed: Job description #{jd_id} not found or access denied.", packet
+            if not getattr(jd_rec, "is_active", True):
+                return False, f"Integrity check failed: Job description #{jd_id} is inactive or archived.", packet
+
+            exp_jd_hash = packet.job_description_snapshot_hash or snapshot.get("job_description_snapshot_hash")
+            if exp_jd_hash:
+                if _is_sha256_hex(exp_jd_hash):
+                    if jd_rec.snapshot_hash != exp_jd_hash and getattr(jd_rec, "content_hash", None) != exp_jd_hash:
+                        return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
+                else:
+                    if packet.job_description_snapshot_hash is not None and "job_description_snapshot_hash" in snapshot:
+                        if snapshot.get("job_description_snapshot_hash") != packet.job_description_snapshot_hash:
+                            return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
 
         if packet.job_description_snapshot_hash is not None and "job_description_snapshot_hash" in snapshot:
             if snapshot.get("job_description_snapshot_hash") != packet.job_description_snapshot_hash:
                 return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
 
-        if packet.job_description_id is not None:
-            if "job_description_id" in snapshot and snapshot.get("job_description_id") != packet.job_description_id:
-                return False, "Integrity check failed: Job description ID in snapshot does not match packet record.", packet
-            jd_rec = self.db.get_job_description(jd_id=packet.job_description_id, user_id=user_id)
-            if jd_rec and not jd_rec.is_active:
-                return False, f"Integrity check failed: Job description #{packet.job_description_id} is inactive or archived.", packet
-        elif "job_description_id" in snapshot and snapshot.get("job_description_id") is not None:
-            jd_id = snapshot.get("job_description_id")
-            jd_rec = self.db.get_job_description(jd_id=jd_id, user_id=user_id)
-            if jd_rec and not jd_rec.is_active:
-                return False, f"Integrity check failed: Job description #{jd_id} is inactive or archived.", packet
+        # Finding B: Active Candidate Profile Verification against database
+        has_prof_meta = (
+            packet.candidate_profile_hash is not None
+            or snapshot.get("candidate_profile_hash") is not None
+            or snapshot.get("candidate_profile_snapshot_hash") is not None
+            or packet.candidate_profile_version is not None
+            or snapshot.get("candidate_profile_version") is not None
+        )
+        if has_prof_meta:
+            active_profile = self.db.get_user_candidate_profile(user_id=user_id)
+            if not active_profile:
+                return False, "Integrity check failed: Active candidate profile not found for user.", packet
 
-        # Element 10: Integrity of generated documents, attachments manifest, screening answers & provenance
+            active_ver = active_profile.get("version")
+            active_hash = active_profile.get("profile_hash")
+
+            exp_prof_ver = packet.candidate_profile_version if packet.candidate_profile_version is not None else snapshot.get("candidate_profile_version")
+            if exp_prof_ver is not None and active_ver != exp_prof_ver:
+                return False, f"Integrity check failed: Candidate profile has been modified (active version {active_ver} vs packet version {exp_prof_ver}). A fresh packet revision is required.", packet
+
+            exp_prof_hash = packet.candidate_profile_hash or snapshot.get("candidate_profile_hash") or snapshot.get("candidate_profile_snapshot_hash")
+            if exp_prof_hash and active_hash != exp_prof_hash:
+                return False, "Integrity check failed: Candidate profile has been modified (active hash differs from packet). A fresh packet revision is required.", packet
+
+        if packet.candidate_profile_hash is not None and "candidate_profile_hash" in snapshot:
+            if snapshot.get("candidate_profile_hash") != packet.candidate_profile_hash:
+                return False, "Integrity check failed: Candidate profile snapshot hash mismatch.", packet
+
+        # Element 10: Fail-Closed Integrity of Generated Documents, Attachments Manifest, and Screening QA
         if packet.tailored_resume_hash is not None and "tailored_resume_document_hash" in snapshot:
             if snapshot.get("tailored_resume_document_hash") != packet.tailored_resume_hash:
                 return False, "Integrity check failed: Tailored resume document hash mismatch between snapshot and packet record.", packet
+
         if packet.cover_letter_hash is not None and "cover_letter_document_hash" in snapshot:
             if snapshot.get("cover_letter_document_hash") != packet.cover_letter_hash:
                 return False, "Integrity check failed: Cover letter document hash mismatch between snapshot and packet record.", packet
 
-        # Attachments manifest verification (if present)
-        if "attachments_manifest" in snapshot:
-            attachments = snapshot.get("attachments_manifest")
+        # Generated documents disk verification
+        if packet.tailored_resume_path:
+            tr_path = Path(packet.tailored_resume_path)
+            if not tr_path.exists():
+                return False, f"Integrity check failed: Tailored resume file not found on disk at '{packet.tailored_resume_path}'.", packet
+            if tr_path.is_symlink():
+                return False, "Integrity check failed: Tailored resume file cannot be a symbolic link.", packet
+            resolved_tr = tr_path.resolve()
+            if not resolved_tr.is_file():
+                return False, "Integrity check failed: Tailored resume path is not a regular file.", packet
+            tr_bytes = resolved_tr.read_bytes()
+            tr_hash = hashlib.sha256(tr_bytes).hexdigest()
+            if packet.tailored_resume_hash and tr_hash != packet.tailored_resume_hash:
+                return False, f"Integrity check failed: Tailored resume file hash on disk ({tr_hash}) does not match packet record ({packet.tailored_resume_hash}).", packet
+            if snapshot.get("tailored_resume_document_hash") and tr_hash != snapshot.get("tailored_resume_document_hash"):
+                return False, "Integrity check failed: Tailored resume file hash on disk does not match snapshot document hash.", packet
+            if resolved_tr.suffix.lower() == ".pdf" and not tr_bytes.startswith(b"%PDF-"):
+                return False, "Integrity check failed: Tailored resume file is missing valid PDF header.", packet
+            elif resolved_tr.suffix.lower() == ".docx" and not tr_bytes.startswith(b"PK\x03\x04"):
+                return False, "Integrity check failed: Tailored resume file is missing valid DOCX header.", packet
+
+        if packet.cover_letter_path:
+            cl_path = Path(packet.cover_letter_path)
+            if not cl_path.exists():
+                return False, f"Integrity check failed: Cover letter file not found on disk at '{packet.cover_letter_path}'.", packet
+            if cl_path.is_symlink():
+                return False, "Integrity check failed: Cover letter file cannot be a symbolic link.", packet
+            resolved_cl = cl_path.resolve()
+            if not resolved_cl.is_file():
+                return False, "Integrity check failed: Cover letter path is not a regular file.", packet
+            cl_bytes = resolved_cl.read_bytes()
+            cl_hash = hashlib.sha256(cl_bytes).hexdigest()
+            if packet.cover_letter_hash and cl_hash != packet.cover_letter_hash:
+                return False, f"Integrity check failed: Cover letter file hash on disk ({cl_hash}) does not match packet record ({packet.cover_letter_hash}).", packet
+            if snapshot.get("cover_letter_document_hash") and cl_hash != snapshot.get("cover_letter_document_hash"):
+                return False, "Integrity check failed: Cover letter file hash on disk does not match snapshot document hash.", packet
+            if resolved_cl.suffix.lower() == ".pdf" and not cl_bytes.startswith(b"%PDF-"):
+                return False, "Integrity check failed: Cover letter file is missing valid PDF header.", packet
+            elif resolved_cl.suffix.lower() == ".docx" and not cl_bytes.startswith(b"PK\x03\x04"):
+                return False, "Integrity check failed: Cover letter file is missing valid DOCX header.", packet
+
+        # Attachments manifest verification
+        attachments = snapshot.get("attachments_manifest") if "attachments_manifest" in snapshot else (
+            json.loads(packet.attachments_manifest_json) if getattr(packet, "attachments_manifest_json", None) else None
+        )
+        if attachments is not None:
             if not isinstance(attachments, list):
                 return False, "Integrity check failed: attachments_manifest must be a list.", packet
             for idx, att in enumerate(attachments):
                 if not isinstance(att, dict):
                     return False, f"Integrity check failed: Attachment #{idx} in manifest is not a valid object.", packet
-                if not att.get("file_hash") or not att.get("format") or "size_bytes" not in att:
+                if not att.get("file_hash") or "size_bytes" not in att:
                     return False, f"Integrity check failed: Attachment #{idx} is missing required cryptographic metadata.", packet
+                if att.get("file_path"):
+                    att_path = Path(att["file_path"])
+                    if not att_path.exists():
+                        return False, f"Integrity check failed: Attachment #{idx} file not found on disk at '{att['file_path']}'.", packet
+                    if att_path.is_symlink():
+                        return False, f"Integrity check failed: Attachment #{idx} cannot be a symbolic link.", packet
+                    res_att = att_path.resolve()
+                    if not res_att.is_file():
+                        return False, f"Integrity check failed: Attachment #{idx} path is not a regular file.", packet
+                    att_bytes = res_att.read_bytes()
+                    if len(att_bytes) != att["size_bytes"]:
+                        return False, f"Integrity check failed: Attachment #{idx} file size on disk ({len(att_bytes)}) does not match manifest ({att['size_bytes']}).", packet
+                    calc_att_hash = hashlib.sha256(att_bytes).hexdigest()
+                    if calc_att_hash != att["file_hash"]:
+                        return False, f"Integrity check failed: Attachment #{idx} file hash on disk does not match manifest.", packet
 
-        # Screening questions verification (check in snapshot or packet)
+        # Screening questions verification
         screening_candidates = snapshot.get("screening_questions")
         if screening_candidates is None and packet.screening_answers_json:
             try:
@@ -572,16 +736,27 @@ class HumanApprovalGate:
                     else packet.screening_answers_json
                 )
             except Exception:
-                screening_candidates = None
+                return False, "Integrity check failed: screening_answers_json is corrupt or unparseable.", packet
 
-        if isinstance(screening_candidates, list):
+        if screening_candidates is not None:
+            if isinstance(screening_candidates, dict):
+                if "questions" in screening_candidates:
+                    screening_candidates = screening_candidates["questions"]
+                elif not screening_candidates:
+                    screening_candidates = []
+                else:
+                    screening_candidates = list(screening_candidates.values())
+
+            if not isinstance(screening_candidates, list):
+                return False, "Integrity check failed: screening_questions must be a list.", packet
             for q in screening_candidates:
-                if isinstance(q, dict):
-                    q_text = q.get("question_text", "Screening Question")
-                    if q.get("state") == "NEEDS_CANDIDATE_INPUT":
-                        return False, f"Integrity check failed: Question '{q_text}' requires candidate input before authorization.", packet
-                    if q.get("exceeds_limit"):
-                        return False, f"Integrity check failed: Question '{q_text}' exceeds the allowable character limit.", packet
+                if not isinstance(q, dict):
+                    continue
+                q_text = q.get("question_text", "Screening Question")
+                if q.get("state") == "NEEDS_CANDIDATE_INPUT":
+                    return False, f"Integrity check failed: Question '{q_text}' requires candidate input before authorization.", packet
+                if q.get("exceeds_limit"):
+                    return False, f"Integrity check failed: Question '{q_text}' exceeds the allowable character limit.", packet
 
         return True, "Prepared packet integrity verified successfully across all elements.", packet
 

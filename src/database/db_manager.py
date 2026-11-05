@@ -134,6 +134,8 @@ class DatabaseManager:
                 raise SecurityAuthorizationError(
                     f"Invalid verifier configuration: session_manager must be an exact SessionManager instance, got {type(session_manager)}."
                 )
+            if hasattr(session_manager, "register_db_manager"):
+                session_manager.register_db_manager(self)
         self._session_manager = session_manager
 
         # Ensure parent directory exists for file-based DB
@@ -150,6 +152,8 @@ class DatabaseManager:
             raise SecurityAuthorizationError(
                 f"Invalid verifier configuration: session_manager must be an exact SessionManager instance, got {type(sm)}."
             )
+        if hasattr(sm, "register_db_manager"):
+            sm.register_db_manager(self)
         return sm
 
     def get_connection(self, timeout: Optional[float] = None) -> sqlite3.Connection:
@@ -306,6 +310,20 @@ class DatabaseManager:
         add_col_if_missing("applications", "salary_range", "TEXT")
         add_col_if_missing("applications", "application_deadline", "DATETIME")
         add_col_if_missing("applications", "is_archived", "INTEGER DEFAULT 0")
+        add_col_if_missing("application_approvals", "is_revoked", "INTEGER DEFAULT 0")
+        add_col_if_missing("application_approvals", "revoked_at", "DATETIME")
+        add_col_if_missing("application_approvals", "revocation_reason", "TEXT")
+
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS revoked_signing_keys (
+                    key_id TEXT PRIMARY KEY,
+                    revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    reason TEXT NOT NULL
+                )
+            """)
+        except sqlite3.OperationalError:
+            pass
 
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
@@ -1760,64 +1778,132 @@ class DatabaseManager:
 
     def has_valid_human_approval(
         self,
-        job_id: int,
+        identifier: Optional[int] = None,
         expected_packet_hash: Optional[str] = None,
         user_id: Optional[Union[int, str]] = None,
+        *,
+        application_id: Optional[int] = None,
+        job_id: Optional[int] = None,
     ) -> bool:
-        """Checks whether an active, unrevoked, and unconsumed human approval record exists."""
-        # 1. Check application_approvals table if application exists
+        """Checks whether an active, unrevoked, and unconsumed human approval record exists.
+
+        Disambiguates application_id from legacy job_id, strictly enforces user ownership,
+        verifies packet version hash and active revision status, and rejects consumed or revoked approvals.
+        """
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, user_id FROM applications WHERE id = ? OR job_id = ?", (job_id, job_id))
-            app_row = cursor.fetchone()
+
+            # Disambiguate target application
+            app_row = None
+            if application_id is not None:
+                cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+                app_row = cursor.fetchone()
+            elif job_id is not None:
+                cursor.execute("SELECT id, user_id FROM applications WHERE job_id = ?", (job_id,))
+                app_row = cursor.fetchone()
+            elif identifier is not None:
+                cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (identifier,))
+                app_row = cursor.fetchone()
+                if not app_row:
+                    cursor.execute("SELECT id, user_id FROM applications WHERE job_id = ?", (identifier,))
+                    app_row = cursor.fetchone()
+
             if app_row:
                 app_id = app_row["id"]
-                if expected_packet_hash:
+                # Enforce user_id ownership if provided
+                if user_id is not None and app_row["user_id"] is not None:
+                    try:
+                        if int(app_row["user_id"]) != int(user_id):
+                            return False
+                    except (ValueError, TypeError):
+                        pass
+
+                # Check active prepared packet revision
+                cursor.execute(
+                    "SELECT id, version_num, packet_version_hash, is_active_revision FROM prepared_packets WHERE application_id = ? AND is_active_revision = 1 ORDER BY version_num DESC LIMIT 1",
+                    (app_id,),
+                )
+                active_packet_row = cursor.fetchone()
+
+                target_hash = expected_packet_hash
+                if target_hash is None and active_packet_row:
+                    target_hash = active_packet_row["packet_version_hash"]
+
+                if target_hash:
+                    if expected_packet_hash:
+                        cursor.execute(
+                            "SELECT is_active_revision FROM prepared_packets WHERE application_id = ? AND packet_version_hash = ?",
+                            (app_id, expected_packet_hash),
+                        )
+                        pkt_chk = cursor.fetchone()
+                        if pkt_chk and not pkt_chk["is_active_revision"]:
+                            return False
+
                     cursor.execute(
                         """
-                        SELECT id, is_consumed, packet_version_hash
+                        SELECT id, user_id, key_id, is_consumed, is_revoked, packet_version_hash
                         FROM application_approvals
                         WHERE application_id = ? AND packet_version_hash = ?
-                        ORDER BY approved_at DESC LIMIT 1
+                          AND (is_revoked IS NULL OR is_revoked = 0)
+                          AND (is_consumed IS NULL OR is_consumed = 0)
+                        ORDER BY approved_at DESC, id DESC
                         """,
-                        (app_id, expected_packet_hash),
+                        (app_id, target_hash),
                     )
                 else:
-                    # If expected_packet_hash not specified, check if active prepared packet exists
                     cursor.execute(
-                        "SELECT packet_version_hash FROM prepared_packets WHERE application_id = ? AND is_active_revision = 1",
+                        """
+                        SELECT id, user_id, key_id, is_consumed, is_revoked, packet_version_hash
+                        FROM application_approvals
+                        WHERE application_id = ?
+                          AND (is_revoked IS NULL OR is_revoked = 0)
+                          AND (is_consumed IS NULL OR is_consumed = 0)
+                        ORDER BY approved_at DESC, id DESC
+                        """,
                         (app_id,),
                     )
-                    act_pkt = cursor.fetchone()
-                    if act_pkt and act_pkt["packet_version_hash"]:
-                        target_hash = act_pkt["packet_version_hash"]
-                        cursor.execute(
-                            """
-                            SELECT id, is_consumed, packet_version_hash
-                            FROM application_approvals
-                            WHERE application_id = ? AND packet_version_hash = ?
-                            ORDER BY approved_at DESC LIMIT 1
-                            """,
-                            (app_id, target_hash),
-                        )
-                    else:
-                        cursor.execute(
-                            """
-                            SELECT id, is_consumed, packet_version_hash
-                            FROM application_approvals
-                            WHERE application_id = ?
-                            ORDER BY approved_at DESC LIMIT 1
-                            """,
-                            (app_id,),
-                        )
-                appr_row = cursor.fetchone()
-                if appr_row:
+
+                appr_rows = cursor.fetchall()
+                for appr_row in appr_rows:
+                    # Enforce user_id matching if provided
+                    if user_id is not None and appr_row["user_id"] is not None:
+                        try:
+                            if int(appr_row["user_id"]) != int(user_id):
+                                continue
+                        except (ValueError, TypeError):
+                            continue
+
+                    # Reject consumed approvals
                     if appr_row["is_consumed"]:
-                        return False
+                        continue
+
+                    # Reject revoked approvals
+                    if appr_row["is_revoked"]:
+                        continue
+
+                    # Reject approvals signed with revoked keys
+                    if self.is_key_revoked(appr_row["key_id"]):
+                        continue
+
+                    # Verify approval matches active prepared packet revision if present
+                    if active_packet_row:
+                        if active_packet_row["packet_version_hash"] != appr_row["packet_version_hash"]:
+                            continue
+
                     return True
 
+                # If application has prepared packets, fail closed (no fallback to legacy logs)
+                cursor.execute("SELECT COUNT(*) as pkt_count FROM prepared_packets WHERE application_id = ?", (app_id,))
+                pkt_count = cursor.fetchone()["pkt_count"]
+                if pkt_count > 0:
+                    return False
+
         # 2. Check legacy application_logs audit trail for backward compatibility
-        logs = self.get_application_logs(job_id)
+        lookup_job_id = job_id if job_id is not None else identifier
+        if lookup_job_id is None:
+            return False
+
+        logs = self.get_application_logs(lookup_job_id)
         has_approval = False
         latest_approval_hash = None
         for log in logs:
@@ -2133,6 +2219,49 @@ class DatabaseManager:
             row = cursor.fetchone()
             return bool(row and row["is_consumed"])
 
+    def revoke_signing_key_approvals(
+        self,
+        key_id: str,
+        reason: str = "EMERGENCY_KEY_REVOCATION",
+    ) -> int:
+        """Persists emergency key revocation and invalidates all unconsumed approvals issued under the key."""
+        if not key_id:
+            return 0
+        clean_key = key_id.strip()
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO revoked_signing_keys (key_id, revoked_at, reason)
+                VALUES (?, CURRENT_TIMESTAMP, ?)
+                """,
+                (clean_key, reason),
+            )
+            cursor.execute(
+                """
+                UPDATE application_approvals
+                SET is_revoked = 1, revoked_at = CURRENT_TIMESTAMP, revocation_reason = ?
+                WHERE key_id = ? AND is_consumed = 0 AND (is_revoked IS NULL OR is_revoked = 0)
+                """,
+                (reason, clean_key),
+            )
+            revoked_count = cursor.rowcount
+            logger.warning(
+                "Revoked signing key '%s' and invalidated %d unconsumed approvals in SQLite (reason: %s)",
+                clean_key, revoked_count, reason
+            )
+            return revoked_count
+
+    def is_key_revoked(self, key_id: str) -> bool:
+        """Checks if a signing key has been revoked in SQLite."""
+        if not key_id:
+            return False
+        clean_key = key_id.strip()
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM revoked_signing_keys WHERE key_id = ?", (clean_key,))
+            return cursor.fetchone() is not None
+
     def _record_packet_approval_internal(
         self,
         cursor: sqlite3.Cursor,
@@ -2377,18 +2506,43 @@ class DatabaseManager:
 
             current_status = app_row["status"]
             norm_status = ApplicationStateMachine.normalize_status(current_status)
-            if norm_status != ApplicationStatus.READY_FOR_REVIEW:
+            if norm_status not in (ApplicationStatus.READY_FOR_REVIEW, ApplicationStatus.APPROVED):
                 raise InvalidStatusTransitionError(
                     old_status=current_status,
                     new_status=ApplicationStatus.APPROVED.value,
-                    allowed=[ApplicationStatus.READY_FOR_REVIEW.value, ApplicationStatus.APPLICATION_PREPARED.value],
+                    allowed=[
+                        ApplicationStatus.READY_FOR_REVIEW.value,
+                        ApplicationStatus.APPLICATION_PREPARED.value,
+                    ],
                 )
+
+            # Re-authorizing an already APPROVED application is only allowed if a prior approval was revoked
+            if norm_status == ApplicationStatus.APPROVED:
+                cursor.execute(
+                    """
+                    SELECT id FROM application_approvals
+                    WHERE application_id = ? AND is_revoked = 1
+                    """,
+                    (application_id,),
+                )
+                has_revoked = cursor.fetchone()
+                if not has_revoked:
+                    raise InvalidStatusTransitionError(
+                        old_status=current_status,
+                        new_status=ApplicationStatus.APPROVED.value,
+                        allowed=[
+                            ApplicationStatus.READY_FOR_REVIEW.value,
+                            ApplicationStatus.APPLICATION_PREPARED.value,
+                        ],
+                    )
 
             # Derive new status exclusively from existing application status representation (never caller-selectable)
             if current_status == ApplicationStatus.READY_FOR_REVIEW.value:
                 new_status = ApplicationStatus.APPROVED.value
-            elif current_status == ApplicationStatus.APPLICATION_PREPARED.value:
+            elif current_status in (ApplicationStatus.APPLICATION_PREPARED.value, ApplicationStatus.AWAITING_APPROVAL.value):
                 new_status = ApplicationStatus.AWAITING_APPROVAL.value
+            elif current_status == ApplicationStatus.APPROVED.value:
+                new_status = ApplicationStatus.APPROVED.value
             else:
                 new_status = ApplicationStatus.APPROVED.value
 
@@ -2458,28 +2612,57 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                SELECT id FROM application_approvals
-                WHERE application_id = ? AND user_id = ? AND packet_version_hash = ? AND is_consumed = 0
-                ORDER BY approved_at DESC LIMIT 1
+                SELECT id, key_id FROM application_approvals
+                WHERE application_id = ? AND user_id = ? AND packet_version_hash = ?
+                  AND is_consumed = 0 AND (is_revoked IS NULL OR is_revoked = 0)
+                ORDER BY approved_at DESC, id DESC LIMIT 1
                 """,
                 (application_id, user_id, expected_packet_hash),
             )
-            return cursor.fetchone() is not None
+            row = cursor.fetchone()
+            if not row:
+                return False
+            if self.is_key_revoked(row["key_id"]):
+                return False
+            return True
 
-    def get_packet_approval(self, packet_id: int, user_id: int) -> Optional[ApplicationApproval]:
+    def get_packet_approval(
+        self,
+        packet_id: int,
+        user_id: int,
+        include_revoked: bool = False,
+    ) -> Optional[ApplicationApproval]:
         """Retrieves the latest human approval record for a prepared packet, enforcing user ownership."""
         with self.connection() as conn:
             cursor = conn.cursor()
+            # First check for an active, unrevoked approval
             cursor.execute(
                 """
                 SELECT * FROM application_approvals
-                WHERE packet_id = ? AND user_id = ?
-                ORDER BY approved_at DESC LIMIT 1
+                WHERE packet_id = ? AND user_id = ? AND (is_revoked IS NULL OR is_revoked = 0)
+                ORDER BY approved_at DESC, id DESC LIMIT 1
                 """,
                 (packet_id, user_id),
             )
             row = cursor.fetchone()
-            return ApplicationApproval(**dict(row)) if row else None
+            if not row and include_revoked:
+                # If no unrevoked approval exists and caller requested include_revoked, return latest revoked approval
+                cursor.execute(
+                    """
+                    SELECT * FROM application_approvals
+                    WHERE packet_id = ? AND user_id = ?
+                    ORDER BY approved_at DESC, id DESC LIMIT 1
+                    """,
+                    (packet_id, user_id),
+                )
+                row = cursor.fetchone()
+
+            if not row:
+                return None
+            row_dict = dict(row)
+            row_dict["is_consumed"] = bool(row_dict.get("is_consumed", 0))
+            row_dict["is_revoked"] = bool(row_dict.get("is_revoked", 0))
+            return ApplicationApproval(**row_dict)
 
     # -------------------------------------------------------------------------
     # PHASE 2 & 4: USER-SCOPED JOB DESCRIPTIONS & SNAPSHOT MANAGEMENT
@@ -3982,6 +4165,22 @@ class DatabaseManager:
                 (user_id, profile_json, profile_hash, next_version),
             )
             profile_id = cursor.lastrowid
+
+            # Finding B: Invalidate any unconsumed approvals for this candidate
+            cursor.execute(
+                """
+                UPDATE application_approvals
+                SET is_revoked = 1, revoked_at = CURRENT_TIMESTAMP, revocation_reason = 'CANDIDATE_PROFILE_UPDATED'
+                WHERE user_id = ? AND is_consumed = 0 AND (is_revoked IS NULL OR is_revoked = 0)
+                """,
+                (user_id,),
+            )
+            revoked_count = cursor.rowcount
+            if revoked_count > 0:
+                logger.info(
+                    "Invalidated %d unconsumed approvals for user #%d due to candidate profile update",
+                    revoked_count, user_id
+                )
             cursor.execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,))
             res = dict(cursor.fetchone())
             res["profile_data"] = json.loads(res["profile_data"])
@@ -4870,9 +5069,10 @@ class DatabaseManager:
                 # Verify valid active unconsumed human approval exists
                 cursor.execute(
                     """
-                    SELECT id, is_consumed FROM application_approvals
+                    SELECT id, is_consumed, is_revoked, key_id FROM application_approvals
                     WHERE application_id = ? AND user_id = ? AND packet_id = ? AND packet_version_hash = ?
-                    ORDER BY approved_at DESC LIMIT 1
+                      AND (is_revoked IS NULL OR is_revoked = 0)
+                    ORDER BY approved_at DESC, id DESC LIMIT 1
                     """,
                     (application_id, user_id, packet_id, packet_hash),
                 )
@@ -4884,6 +5084,10 @@ class DatabaseManager:
                 if appr_row["is_consumed"]:
                     raise SecurityAuthorizationError(
                         f"Human approval for PreparedPacket #{packet_id} has already been consumed."
+                    )
+                if self.is_key_revoked(appr_row["key_id"]):
+                    raise SecurityAuthorizationError(
+                        f"Human approval for PreparedPacket #{packet_id} was signed with revoked key '{appr_row['key_id']}'."
                     )
 
                 # Consume the approval record with current server timestamp

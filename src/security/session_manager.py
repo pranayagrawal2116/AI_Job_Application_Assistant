@@ -36,11 +36,13 @@ class KeyRotationManager:
         self,
         initial_key_id: str = "v1",
         initial_secret: Optional[Union[str, bytes]] = None,
+        db_manager: Optional[Any] = None,
     ):
         self.active_key_id = initial_key_id
         self._keys: Dict[str, bytes] = {}
         self._retired_keys: Dict[str, Tuple[bytes, float]] = {}  # key_id -> (secret, expires_at)
         self._revoked_keys: Set[str] = set()
+        self._db_manager = db_manager
 
         if initial_secret:
             secret_bytes = self._coerce_bytes(initial_secret)
@@ -71,10 +73,19 @@ class KeyRotationManager:
         """Returns the active (key_id, secret_bytes) for signing new action tickets."""
         return self.active_key_id, self._keys[self.active_key_id]
 
+    def register_db_manager(self, db_manager: Any) -> None:
+        """Registers a DatabaseManager for persistent revocation tracking."""
+        self._db_manager = db_manager
+
     def get_verification_key(self, key_id: str) -> bytes:
         """Retrieves key for verifying a ticket. Raises KeyRevokedError if revoked or unknown."""
         if key_id in self._revoked_keys:
             raise KeyRevokedError(key_id)
+
+        if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
+            if self._db_manager.is_key_revoked(key_id):
+                self._revoked_keys.add(key_id)
+                raise KeyRevokedError(key_id)
 
         if key_id in self._keys:
             return self._keys[key_id]
@@ -93,6 +104,7 @@ class KeyRotationManager:
         new_secret: Union[str, bytes],
         mode: str = MODE_GRACEFUL,
         overlap_window_seconds: int = 900,
+        db_manager: Optional[Any] = None,
     ) -> None:
         """Rotates active signing key.
         - Mode A (Graceful): Previous key moved to retired status with overlap window.
@@ -104,6 +116,7 @@ class KeyRotationManager:
 
         old_key_id = self.active_key_id
         old_secret = self._keys.get(old_key_id)
+        db = db_manager or self._db_manager
 
         if mode == self.MODE_GRACEFUL:
             if old_secret:
@@ -117,6 +130,8 @@ class KeyRotationManager:
                 del self._keys[old_key_id]
             if old_key_id in self._retired_keys:
                 del self._retired_keys[old_key_id]
+            if db and hasattr(db, "revoke_signing_key_approvals"):
+                db.revoke_signing_key_approvals(old_key_id, reason="EMERGENCY_KEY_REVOCATION")
             logger.warning("EMERGENCY key rotation: revoked %s immediately, active is now %s", old_key_id, new_key_id)
         else:
             raise ValueError(f"Unknown rotation mode: {mode}")
@@ -170,7 +185,9 @@ class SessionManager:
         server_secret: Optional[bytes] = None,
         active_key_id: Optional[str] = None,
         rotation_keys: Optional[Dict[str, bytes]] = None,
+        db_manager: Optional[Any] = None,
     ):
+        self._db_manager = db_manager
         self._sessions: Dict[str, CandidateSession] = {}
         self._active_grants: Dict[str, Dict[str, Any]] = {}
         self._consumed_grants: Set[str] = set()
@@ -231,6 +248,7 @@ class SessionManager:
         self.key_rotation_mgr = KeyRotationManager(
             initial_key_id=self._active_key_id,
             initial_secret=self._server_secret,
+            db_manager=self._db_manager,
         )
         for k_id, k_val in self._rotation_keys.items():
             if k_id != self._active_key_id:
@@ -238,6 +256,12 @@ class SessionManager:
 
         if SessionManager._instance is None:
             SessionManager._instance = self
+
+    def register_db_manager(self, db_manager: Any) -> None:
+        """Registers a DatabaseManager for persistent revocation tracking."""
+        self._db_manager = db_manager
+        if hasattr(self, "key_rotation_mgr") and self.key_rotation_mgr is not None:
+            self.key_rotation_mgr.register_db_manager(db_manager)
 
     @property
     def active_key_id(self) -> str:
@@ -1050,19 +1074,24 @@ class SessionManager:
         new_secret: Union[str, bytes],
         mode: str = KeyRotationManager.MODE_GRACEFUL,
         overlap_window_seconds: int = 900,
+        db_manager: Optional[Any] = None,
     ) -> None:
         """Rotates HMAC signing keys on KeyRotationManager with immediate grant/ticket revocation on emergency."""
         with self._session_lock:
             old_key_id = self.key_rotation_mgr.active_key_id
+            db = db_manager or self._db_manager
             self.key_rotation_mgr.rotate_keys(
                 new_key_id=new_key_id,
                 new_secret=new_secret,
                 mode=mode,
                 overlap_window_seconds=overlap_window_seconds,
+                db_manager=db,
             )
             self._active_key_id = new_key_id
             self._server_secret = self.key_rotation_mgr._keys[new_key_id]
             if mode == KeyRotationManager.MODE_EMERGENCY:
+                if db and hasattr(db, "revoke_signing_key_approvals"):
+                    db.revoke_signing_key_approvals(old_key_id, reason="EMERGENCY_KEY_REVOCATION")
                 with self._grant_lock:
                     grants_to_purge = [
                         gid for gid, ginfo in self._active_grants.items()
