@@ -48,6 +48,12 @@ PDF_MAGIC = b"%PDF-"
 DOCX_MAGIC = b"PK\x03\x04"
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
+
+# System-level file operation builtins for descriptor-relative capability checks
+_BUILTIN_OS_OPEN = os.open
+_BUILTIN_OS_STAT = os.stat
+_BUILTIN_OS_LSTAT = getattr(os, "lstat", None)
+
 ALLOWED_CONFIRMATION_EXTENSIONS = (".pdf", ".png", ".jpg", ".jpeg")
 
 
@@ -608,6 +614,57 @@ class FileSecurityValidator:
             logger.warning("Job description file %s for User #%d was already missing from disk.", storage_filename, user_id)
             return False
 
+    @classmethod
+    def supports_descriptor_relative_validation(cls) -> bool:
+        """Determines if the platform supports secure descriptor-relative traversal with O_NOFOLLOW.
+
+        Required capabilities:
+        1. os.open supports dir_fd (os.open in os.supports_dir_fd).
+        2. Symlink-safe metadata inspection relative to dir_fd:
+           Either (os.stat in os.supports_dir_fd and os.stat in os.supports_follow_symlinks)
+           OR (os.lstat in os.supports_dir_fd).
+        3. Platform provides os.O_NOFOLLOW flag.
+        """
+        supports_dfd = getattr(os, "supports_dir_fd", set())
+        supports_fsl = getattr(os, "supports_follow_symlinks", set())
+
+        has_open_dir_fd = (os.open in supports_dfd) or (_BUILTIN_OS_OPEN in supports_dfd)
+        has_stat_nofollow_dir_fd = (
+            (os.stat in supports_dfd or _BUILTIN_OS_STAT in supports_dfd)
+            and (os.stat in supports_fsl or _BUILTIN_OS_STAT in supports_fsl)
+        )
+        has_lstat_dir_fd = (os.lstat in supports_dfd) or (_BUILTIN_OS_LSTAT is not None and _BUILTIN_OS_LSTAT in supports_dfd)
+        has_nofollow = hasattr(os, "O_NOFOLLOW")
+
+        return bool(has_open_dir_fd and (has_stat_nofollow_dir_fd or has_lstat_dir_fd) and has_nofollow)
+
+    @classmethod
+    def _descriptor_relative_stat_nofollow(cls, name: str, dir_fd: int) -> os.stat_result:
+        """Inspects metadata of a path entry relative to a directory descriptor without following symlinks.
+
+        Compatible with both Linux/Python 3.11 (where os.stat supports dir_fd and follow_symlinks=False)
+        and macOS/Python 3.13 (where os.lstat or os.stat may be used).
+
+        Raises:
+            FileNotFoundError: If the entry does not exist relative to dir_fd.
+            FileSecurityError: If platform lacks descriptor-relative nofollow capability or OS error occurs.
+        """
+        supports_dfd = getattr(os, "supports_dir_fd", set())
+        supports_fsl = getattr(os, "supports_follow_symlinks", set())
+
+        is_stat_supported = (
+            (os.stat in supports_dfd or _BUILTIN_OS_STAT in supports_dfd)
+            and (os.stat in supports_fsl or _BUILTIN_OS_STAT in supports_fsl)
+        )
+        is_lstat_supported = (os.lstat in supports_dfd) or (_BUILTIN_OS_LSTAT is not None and _BUILTIN_OS_LSTAT in supports_dfd)
+
+        if is_stat_supported:
+            return os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+        elif is_lstat_supported:
+            return os.lstat(name, dir_fd=dir_fd)
+        else:
+            raise FileSecurityError("Platform lacks descriptor-relative metadata inspection without symlink following.")
+
     def resolve_and_verify_candidate_file(
         self,
         user_id: int,
@@ -706,8 +763,23 @@ class FileSecurityValidator:
             raise FileSecurityError(f"Empty relative path in {resource_desc}: '{file_path}'")
 
         # Check platform descriptor-relative support
-        if os.open not in os.supports_dir_fd or os.lstat not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
-            raise FileSecurityError("Descriptor-relative path validation with O_NOFOLLOW is not supported on this platform.")
+        if not self.supports_descriptor_relative_validation():
+            supports_dfd = getattr(os, "supports_dir_fd", set())
+            supports_fsl = getattr(os, "supports_follow_symlinks", set())
+            missing = []
+            if os.open not in supports_dfd and _BUILTIN_OS_OPEN not in supports_dfd:
+                missing.append("os.open(dir_fd)")
+            has_stat = (
+                (os.stat in supports_dfd or _BUILTIN_OS_STAT in supports_dfd)
+                and (os.stat in supports_fsl or _BUILTIN_OS_STAT in supports_fsl)
+            )
+            has_lstat = (os.lstat in supports_dfd) or (_BUILTIN_OS_LSTAT is not None and _BUILTIN_OS_LSTAT in supports_dfd)
+            if not (has_stat or has_lstat):
+                missing.append("descriptor-relative nofollow stat")
+            if not hasattr(os, "O_NOFOLLOW"):
+                missing.append("os.O_NOFOLLOW")
+            missing_info = f" (missing: {', '.join(missing)})" if missing else ""
+            raise FileSecurityError(f"Descriptor-relative path validation with O_NOFOLLOW is not supported on this platform{missing_info}.")
 
         parent_parts = rel.parts[:-1]
         filename = rel.parts[-1]
@@ -743,7 +815,7 @@ class FileSecurityValidator:
 
                 # Check for symlink in intermediate directory component
                 try:
-                    st_link = os.lstat(part, dir_fd=current_dir_fd)
+                    st_link = self._descriptor_relative_stat_nofollow(part, current_dir_fd)
                     if stat.S_ISLNK(st_link.st_mode):
                         raise FileSecurityError(
                             f"Symbolic link detected: {resource_desc} path component '{part}' cannot be a symbolic link."
@@ -778,7 +850,7 @@ class FileSecurityValidator:
 
             # 3. Open the final file relative to the verified parent descriptor with O_NOFOLLOW
             try:
-                st_file_lstat = os.lstat(filename, dir_fd=current_dir_fd)
+                st_file_lstat = self._descriptor_relative_stat_nofollow(filename, current_dir_fd)
                 if stat.S_ISLNK(st_file_lstat.st_mode):
                     raise FileSecurityError(
                         f"Symbolic link detected: {resource_desc} '{filename}' cannot be a symbolic link."

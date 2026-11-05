@@ -512,6 +512,24 @@ When interacting with the browser via Playwright MCP:
     - `DashboardService.update_application_status()` and `confirm_manual_submission()`: delegate exact `application_id` and `user_id` to `DatabaseManager`, ensuring dashboard transitions are strictly candidate-scoped.
     - Added 20 comprehensive unit and integration tests in `tests/test_phase_8_1_4_application_scoped_transitions.py`. All 1,248 tests across the entire repository test suite passing (100% pass rate). 0 ruff errors, 0 compileall errors, 0 git diff errors.
 
+- [x] **Architecture v2.1.1 Phase 8.1.5: Secure Descriptor-Relative File Validation Compatibility** (Complete)
+  - Finding A — Accurate Platform Capability Detection Across Python 3.11 & 3.13:
+    - `FileSecurityValidator.supports_descriptor_relative_validation()`: reliably detects descriptor-relative capabilities across Python runtime environments without false negatives.
+    - Accurately accounts for Linux/Python 3.11 where `os.supports_dir_fd` contains `os.stat` (implementing POSIX `fstatat(..., AT_SYMLINK_NOFOLLOW)` with `follow_symlinks=False`) while `os.lstat` is not in `os.supports_dir_fd`.
+    - Accepts both `(os.stat in os.supports_dir_fd and os.stat in os.supports_follow_symlinks)` and `os.lstat in os.supports_dir_fd`, combined with `os.open in os.supports_dir_fd` and `hasattr(os, "O_NOFOLLOW")`.
+    - Captures module-level builtin references (`_BUILTIN_OS_OPEN`, `_BUILTIN_OS_STAT`, `_BUILTIN_OS_LSTAT`) ensuring capability checks remain robust when functions are wrapped or mocked.
+  - Finding B — Symlink-Safe Descriptor-Relative Metadata Inspection & Fail-Closed Defense:
+    - `FileSecurityValidator._descriptor_relative_stat_nofollow(name, dir_fd)`: inspects directory and file metadata relative to `dir_fd` without following symlinks, delegating to `os.stat(name, dir_fd=dir_fd, follow_symlinks=False)` or `os.lstat(name, dir_fd=dir_fd)`.
+    - Preserves all Phase 8.1.4 security guarantees: strict candidate storage root containment, intermediate directory inspection with `O_DIRECTORY | O_NOFOLLOW`, final file open with `O_NOFOLLOW`, regular file verification via `os.fstat()`, byte verification from descriptor, and reliable closure of all file and directory descriptors in `finally` blocks.
+    - Zero unsafe fallback: missing platform capabilities fail closed immediately with an informative `FileSecurityError` enumerating the missing OS primitives.
+  - Finding C — Full End-to-End Packet Approval, Storage Boundary & Multi-Tenant Isolation Preservation:
+    - Full end-to-end packet preparation, canonical hash verification, and human authorization pass seamlessly under both live POSIX environments and simulated Python 3.11 Linux capability sets.
+    - Preserves multi-tenant isolation, cross-user file access rejections, and tamper detection.
+  - Verification & Regressions:
+    - Authored 19 comprehensive unit and integration tests in `tests/test_phase_8_1_5_descriptor_relative_compatibility.py`.
+    - All 1,267 tests across the entire repository test suite passing (100% pass rate).
+    - 0 ruff errors, 0 compileall errors, 0 git diff errors.
+
 ---
 
 ## 7. Approval Requirement
