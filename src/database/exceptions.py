@@ -221,6 +221,11 @@ class FileSecurityError(SecurityAuthorizationError):
     pass
 
 
+class ResumeIntegrityError(FileSecurityError, ValidationError):
+    """Raised when a candidate resume fails cryptographic integrity, binary verification, or just-in-time validation."""
+    pass
+
+
 class InvalidFileFormatError(FileSecurityError, ValueError):
     """Raised when an uploaded document format or magic-bytes signature is unsupported."""
     pass

@@ -261,6 +261,11 @@ class DatabaseManager:
         add_col_if_missing("resumes", "active_version", "INTEGER DEFAULT 1")
         add_col_if_missing("resumes", "is_active", "INTEGER DEFAULT 1")
         add_col_if_missing("resumes", "is_primary", "INTEGER DEFAULT 0")
+        add_col_if_missing("resumes", "file_size_bytes", "INTEGER")
+        add_col_if_missing("resumes", "file_hash", "TEXT")
+        add_col_if_missing("resume_versions", "file_size_bytes", "INTEGER")
+        add_col_if_missing("resume_versions", "file_hash", "TEXT")
+        add_col_if_missing("resume_versions", "storage_filename", "TEXT")
         add_col_if_missing("jobs", "company_id", "INTEGER")
         add_col_if_missing("candidate_profiles", "profile_hash", "TEXT")
         add_col_if_missing("job_descriptions", "source_url", "TEXT")
@@ -4383,6 +4388,25 @@ class DatabaseManager:
             raise FileNotFoundError(f"Resume file on disk not found: {target_path}")
 
         return target_path
+
+    def verify_and_load_resume(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: Optional[int] = None,
+        user_base_dir: Optional[Path] = None,
+        fresh_parse: bool = True,
+    ):
+        """Just-in-time verifies and loads candidate resume binary via ResumeIntegrityVerifier."""
+        from src.security.resume_verifier import ResumeIntegrityVerifier
+        verifier = ResumeIntegrityVerifier(db_manager=self)
+        return verifier.verify_and_load_resume(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=version_num,
+            user_base_dir=user_base_dir,
+            fresh_parse=fresh_parse,
+        )
 
     def delete_user_resume(
         self,

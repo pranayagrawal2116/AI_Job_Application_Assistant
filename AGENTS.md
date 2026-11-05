@@ -530,6 +530,39 @@ When interacting with the browser via Playwright MCP:
     - All 1,267 tests across the entire repository test suite passing (100% pass rate).
     - 0 ruff errors, 0 compileall errors, 0 git diff errors.
 
+- [x] **Architecture v2.1.1 Phase 9.1.1: Job Description Binary Integrity & Snapshot Hardening** (Complete)
+  - Finding A — Cryptographic File Integrity & Schema Evolution:
+    - Added `file_hash`, `file_size_bytes`, and `file_format` columns to `job_descriptions` with idempotent SQLite migration in `DatabaseManager._ensure_backward_compatible_columns()`.
+    - Document upload workflow (`upload_user_job_description`) persists the actual binary attributes directly from `FileSecurityValidator`.
+  - Finding B — Independent Caller Hash Verification:
+    - `JobParser.parse_file()` independently verifies content SHA-256 against `expected_file_hash` and rejects mismatches before parsing.
+    - `DatabaseManager.save_job_description_snapshot()` recomputes canonical snapshot SHA-256 and rejects discrepancies.
+  - Finding C — Transactional Snapshot Write-Locking & Linear Revision Lineage:
+    - `save_job_description_snapshot()` executes under immediate transaction write lock (`BEGIN IMMEDIATE`), deactivates superseded parent snapshots, and links child revisions.
+    - Added SQLite partial unique constraint `idx_job_descriptions_unique_active_child` enforcing strict single active child revision lineage.
+  - Verification & Regressions:
+    - Added 15 comprehensive unit and regression tests in `tests/test_phase_9_1_1_snapshot_hardening.py`.
+    - All 1,282 tests in repository test suite passing (100% pass rate). 0 ruff errors.
+
+- [x] **Architecture v2.1.1 Phase 9.1.1.1: Resume Binary Integrity & Just-In-Time Verification** (Complete)
+  - Finding A — Authoritative Identification & Ownership Isolation:
+    - Strict candidate ownership enforcement and exact version resolution (`resume_versions` query before parent fallback), rejecting cross-user access (`CrossUserAccessError`) and arbitrary latest version assumptions.
+  - Finding B — Secure File Access & TOCTOU Protection:
+    - Direct reuse of `FileSecurityValidator.resolve_and_verify_candidate_file()` using descriptor-relative `O_NOFOLLOW` inspection, symlink rejection, path traversal prevention, magic bytes checking, size comparison, and SHA-256 verification.
+    - Immutable in-memory verified container (`VerifiedResume`) with log-safe `__repr__` masking raw binary bytes and text. Text extraction and parsing operate directly on verified in-memory bytes, eliminating file replacement races.
+  - Finding C — Fresh In-Memory Extraction & Universal Parsing:
+    - Added `bytes` input support to `extract_text_from_pdf` and `extract_text_from_docx`; implemented `parse_bytes` in `ResumeParser`.
+    - Fresh AST parsing for every security-sensitive operation; fail-closed behavior on corrupted files with zero reliance on stale `parsed_data` JSON.
+    - Zero hallucination policy: security metadata (hashes, file sizes) is kept internal and never fabricated as candidate facts.
+  - Finding D — Centralized Workflow Integration:
+    - Unified `ResumeIntegrityVerifier` across `DashboardService.verify_and_load_resume`, `CandidateProfile` view, `ProfileUpdater.sync_user_profile`, `UniversalTailoredResumeGenerator.generate`, cover letter drafting, screening QA, and `HumanApprovalGate.prepare_universal_packet` (Element 0 JIT verification) / `verify_prepared_packet_integrity` (Element 8 disk verification).
+  - Finding E — Historical Record Policy & Controlled Recovery:
+    - Historical records missing cryptographic metadata fail closed for sensitive operations, with audited recovery via `reverify_and_backfill_historical_resume`.
+  - Verification & Regressions:
+    - Authored 30 comprehensive regression tests in `tests/test_phase_9_1_1_1_resume_integrity.py`.
+    - All 1,312 tests across 58 test suites passing (100% pass rate).
+    - 0 ruff errors, 0 lint warnings.
+
 ---
 
 ## 7. Approval Requirement

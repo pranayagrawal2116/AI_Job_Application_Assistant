@@ -20,6 +20,7 @@ from src.database.exceptions import (
     CorruptedFileError,
     EncryptedFileError,
     InvalidFileFormatError,
+    ValidationError,
 )
 from src.matcher.terminology import split_date_range
 from src.utils.logger import setup_logger
@@ -304,15 +305,20 @@ class ResumeParser:
                 sha.update(chunk)
         return sha.hexdigest()
 
-    def extract_text_from_pdf(self, path: Union[str, Path]) -> Tuple[str, List[Tuple[int, str]], int]:
-        """Extracts text per page from PDF using pypdf.
-        
+    def extract_text_from_pdf(self, path_or_bytes: Union[str, Path, bytes]) -> Tuple[str, List[Tuple[int, str]], int]:
+        """Extracts plain text and per-page text from PDF using pypdf.
+
+        Supports both file paths and raw verified in-memory bytes without disk re-reading.
+
         Returns:
             Tuple[full_raw_text, list_of_tuples(page_num, page_text), total_pages]
         """
-        path_obj = Path(path)
-        with open(path_obj, "rb") as f:
-            pdf_bytes = f.read()
+        if isinstance(path_or_bytes, bytes):
+            pdf_bytes = path_or_bytes
+        else:
+            path_obj = Path(path_or_bytes)
+            with open(path_obj, "rb") as f:
+                pdf_bytes = f.read()
 
         if not pdf_bytes.startswith(b"%PDF-"):
             raise InvalidFileFormatError("File does not start with valid PDF magic bytes.")
@@ -342,15 +348,20 @@ class ResumeParser:
         except Exception as e:
             raise CorruptedFileError(f"Failed to read PDF document: {e}")
 
-    def extract_text_from_docx(self, path: Union[str, Path]) -> Tuple[str, List[Tuple[int, str]], int]:
+    def extract_text_from_docx(self, path_or_bytes: Union[str, Path, bytes]) -> Tuple[str, List[Tuple[int, str]], int]:
         """Extracts text from DOCX paragraphs and tables using python-docx.
-        
+
+        Supports both file paths and raw verified in-memory bytes without disk re-reading.
+
         Returns:
             Tuple[full_raw_text, list_of_tuples(section_idx, section_text), total_sections]
         """
-        path_obj = Path(path)
-        with open(path_obj, "rb") as f:
-            docx_bytes = f.read()
+        if isinstance(path_or_bytes, bytes):
+            docx_bytes = path_or_bytes
+        else:
+            path_obj = Path(path_or_bytes)
+            with open(path_obj, "rb") as f:
+                docx_bytes = f.read()
 
         if not docx_bytes.startswith(b"PK\x03\x04"):
             raise InvalidFileFormatError("File does not start with valid DOCX zip magic bytes.")
@@ -381,36 +392,58 @@ class ResumeParser:
         except Exception as e:
             raise CorruptedFileError(f"Failed to read DOCX document: {e}")
 
-    def parse_file(self, file_path: Union[str, Path]) -> ParsedResume:
-        """Parses a resume file (PDF or DOCX) into a ParsedResume object."""
-        path = Path(file_path).resolve()
-        if not path.is_file():
-            raise FileNotFoundError(f"Resume file not found at: {path}")
+    def parse_bytes(
+        self,
+        file_bytes: bytes,
+        file_format: str,
+        file_path: str = "",
+    ) -> ParsedResume:
+        """Parses verified resume bytes directly into a ParsedResume object without disk re-reading.
 
-        ext = path.suffix.lower()
-        if ext == ".pdf":
-            raw_text, pages_data, page_count = self.extract_text_from_pdf(path)
-            file_format = "PDF"
-        elif ext in (".docx", ".doc"):
-            raw_text, pages_data, page_count = self.extract_text_from_docx(path)
-            file_format = "DOCX"
+        Guarantees TOCTOU defense by processing bytes obtained directly from the verified file descriptor.
+        """
+        if not file_bytes:
+            raise ValidationError("Resume file content is empty (0 bytes).")
+
+        fmt = file_format.strip().lower().lstrip(".")
+        if fmt == "pdf":
+            raw_text, pages_data, page_count = self.extract_text_from_pdf(file_bytes)
+            norm_format = "PDF"
+        elif fmt in ("docx", "doc"):
+            raw_text, pages_data, page_count = self.extract_text_from_docx(file_bytes)
+            norm_format = "DOCX"
         else:
-            raise InvalidFileFormatError(f"Unsupported file extension '{ext}'. Only .pdf and .docx are supported.")
+            raise InvalidFileFormatError(f"Unsupported file format '{file_format}'. Only .pdf and .docx are supported.")
 
-        file_hash = self.compute_file_hash(path)
+        file_hash = hashlib.sha256(file_bytes).hexdigest()
         timestamp = datetime.now(timezone.utc).isoformat()
 
-        logger.info("Universal parsing of %s (%s, %d bytes)", path.name, file_format, path.stat().st_size)
+        logger.info("Universal parsing from verified bytes (%s, %d bytes)", norm_format, len(file_bytes))
 
-        parsed = self._extract_universal_data(raw_text, pages_data, file_format)
-        parsed.file_path = str(path)
-        parsed.file_format = file_format
+        parsed = self._extract_universal_data(raw_text, pages_data, norm_format)
+        parsed.file_path = file_path
+        parsed.file_format = norm_format
         parsed.file_hash = file_hash
         parsed.parsed_timestamp = timestamp
         parsed.raw_text = raw_text
         parsed.page_count = page_count
 
         return parsed
+
+    def parse_file(self, file_path: Union[str, Path]) -> ParsedResume:
+        """Parses a resume file (PDF or DOCX) into a ParsedResume object."""
+        path = Path(file_path).resolve()
+        if not path.is_file():
+            raise FileNotFoundError(f"Resume file not found at: {path}")
+
+        ext = path.suffix.lower().lstrip(".")
+        if ext not in ("pdf", "docx", "doc"):
+            raise InvalidFileFormatError(f"Unsupported file extension '.{ext}'. Only .pdf and .docx are supported.")
+
+        with open(path, "rb") as f:
+            file_bytes = f.read()
+
+        return self.parse_bytes(file_bytes=file_bytes, file_format=ext, file_path=str(path))
 
     # -------------------------------------------------------------------------
     # CORE EXTRACTION PIPELINE

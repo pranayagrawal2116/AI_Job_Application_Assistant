@@ -170,6 +170,24 @@ class HumanApprovalGate:
         generation_timestamp: Optional[str] = None,
     ) -> PreparedPacket:
         """Assembles and stores an immutable PreparedPacket revision in SQLite."""
+        # 0. JIT Resume Integrity Verification before packet preparation
+        if original_resume_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
+            verified_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=original_resume_id,
+                version_num=original_resume_version_num,
+                fresh_parse=False,
+            )
+            if original_resume_hash and verified_res.file_hash.lower() != original_resume_hash.lower():
+                raise ValidationError(
+                    f"Original resume hash mismatch: supplied '{original_resume_hash}' does not match "
+                    f"verified on-disk file hash '{verified_res.file_hash}'."
+                )
+            original_resume_hash = verified_res.file_hash
+            original_resume_version_num = verified_res.version_num
+
         # 0. Resolve source version metadata and packet revision number
         with self.db.connection() as conn:
             cursor = conn.cursor()
@@ -558,34 +576,23 @@ class HumanApprovalGate:
             if exp_hash and resume_rec.get("file_hash") != exp_hash:
                 return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
 
-            # Physical on-disk resume verification via FileSecurityValidator
+            # Physical on-disk resume verification via ResumeIntegrityVerifier
             exp_file_hash = exp_hash or resume_rec.get("file_hash")
             is_cryptographic_hash = _is_sha256_hex(exp_file_hash)
             if is_cryptographic_hash:
-                storage_filename = resume_rec.get("storage_filename")
-                if not storage_filename:
-                    return False, f"Integrity check failed: Original source resume #{res_id} has no storage filename.", packet
-
                 try:
-                    sf = Path(storage_filename)
-                    cand_resumes = self.file_validator.get_user_resumes_dir(user_id)
-                    cand_root = self.file_validator.get_candidate_storage_root(user_id)
-                    if (cand_resumes / sf.name).exists():
-                        resume_target: Path | str = cand_resumes / sf.name
-                    elif (cand_root / sf.name).exists():
-                        resume_target = cand_root / sf.name
-                    elif sf.is_absolute():
-                        resume_target = sf
-                    else:
-                        resume_target = cand_resumes / sf.name
-
-                    self.file_validator.resolve_and_verify_candidate_file(
+                    from src.security.resume_verifier import ResumeIntegrityVerifier
+                    verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
+                    verified_res = verifier.verify_and_load_resume(
                         user_id=user_id,
-                        file_path=resume_target,
-                        expected_hash=exp_file_hash,
-                        expected_format=resume_rec.get("file_format") or "pdf",
+                        resume_id=res_id,
+                        version_num=exp_ver,
+                        fresh_parse=False,
+                        enforce_size=False,
                         resource_desc=f"Source resume file for Resume #{res_id}",
                     )
+                    if exp_file_hash and verified_res.file_hash.lower() != exp_file_hash.lower():
+                        return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
                 except (FileSecurityError, ValidationError, FileNotFoundError, InvalidFileFormatError, FileTooLargeError, CorruptedFileError) as file_err:
                     return False, f"Integrity check failed: {file_err}", packet
 

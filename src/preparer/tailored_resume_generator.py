@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import difflib
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional
 import uuid
@@ -410,9 +411,27 @@ class UniversalTailoredResumeGenerator:
         job_description: Optional[Dict[str, Any]] = None,
         match_result: Optional[Dict[str, Any]] = None,
         custom_instructions: Optional[str] = None,
+        resume_id: Optional[int] = None,
+        resume_version_num: Optional[int] = None,
+        db_manager: Optional[Any] = None,
+        user_base_dir: Optional[Path] = None,
     ) -> TailoredResume:
         """Generates a tailored resume rooted strictly in verified evidence."""
-        resume_dict = resume_data or {}
+        if resume_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            from src.security.file_security import FileSecurityValidator
+            f_val = FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else None
+            verifier = ResumeIntegrityVerifier(db_manager=db_manager, file_validator=f_val)
+            verified_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=resume_id,
+                version_num=resume_version_num,
+                user_base_dir=user_base_dir,
+                fresh_parse=True,
+            )
+            resume_dict = verified_res.parsed_resume.to_dict()
+        else:
+            resume_dict = resume_data or {}
         jd_dict = job_description or {}
         prof_dict = candidate_profile or {}
 

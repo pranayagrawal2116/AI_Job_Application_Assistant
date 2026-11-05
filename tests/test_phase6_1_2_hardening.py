@@ -466,6 +466,23 @@ class TestPhase612Hardening(unittest.TestCase):
     # -------------------------------------------------------------------------
     def test_12_canonical_payload_includes_resume_version(self):
         """12. Canonical payload includes resume version."""
+        with self.db.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO resume_versions (
+                    resume_id, user_id, version_num, storage_filename,
+                    file_hash, file_size_bytes, change_notes, snapshot_json, created_at
+                ) VALUES (?, ?, 2, ?, ?, ?, 'Version 2 notes', ?, CURRENT_TIMESTAMP)
+                """,
+                (
+                    self.resume_a["id"],
+                    self.user_a.id,
+                    self.resume_a["storage_filename"],
+                    self.resume_a["file_hash"],
+                    self.resume_a["file_size_bytes"],
+                    self.resume_a["parsed_data"],
+                ),
+            )
         app = self.db.get_or_create_application_workspace(user_id=self.user_a.id, job_description_id=self.jd_a.id)
         tailored, cl, qa_packet = self._create_sample_materials(self.user_a.id)
         pkt = self.gate.prepare_universal_packet(

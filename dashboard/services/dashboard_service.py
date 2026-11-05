@@ -2712,21 +2712,36 @@ class DashboardService:
         job_description_id: int,
     ) -> Tuple[str, str]:
         """Inspects resume and job description to recommend best matching scoring profile."""
-        resume = self.db.get_user_resume(resume_id, user_id=user_id)
         jd = self.db.get_job_description(jd_id=job_description_id, user_id=user_id)
-        if not resume or not jd:
+        if not jd:
             return "general_baseline", "Standard evaluation profile."
 
-        cand_level = resume.get("label") or "entry"
+        cand_level = "entry"
         years_exp = None
-        parsed_resume = resume.get("parsed_data")
-        if isinstance(parsed_resume, str):
-            try:
-                parsed_resume = json.loads(parsed_resume)
-            except Exception:
-                parsed_resume = {}
-        if isinstance(parsed_resume, dict):
-            cand_level = parsed_resume.get("career_level") or cand_level
+        try:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            from src.security.file_security import FileSecurityValidator
+            verifier = ResumeIntegrityVerifier(
+                db_manager=self.db,
+                file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
+            )
+            verified_res = verifier.verify_and_load_resume(user_id=user_id, resume_id=resume_id, fresh_parse=True)
+            cand_level = verified_res.parsed_resume.career_level or "entry"
+            parsed_resume = verified_res.parsed_resume.to_dict()
+            if isinstance(parsed_resume, dict):
+                cand_level = parsed_resume.get("career_level") or cand_level
+        except Exception:
+            resume = self.db.get_user_resume(resume_id, user_id=user_id)
+            if resume:
+                cand_level = resume.get("label") or "entry"
+                parsed_resume = resume.get("parsed_data")
+                if isinstance(parsed_resume, str):
+                    try:
+                        parsed_resume = json.loads(parsed_resume)
+                    except Exception:
+                        parsed_resume = {}
+                if isinstance(parsed_resume, dict):
+                    cand_level = parsed_resume.get("career_level") or cand_level
 
         parsed_jd = jd.to_dict().get("parsed_data") or {}
         if isinstance(parsed_jd, str):
@@ -2814,6 +2829,47 @@ class DashboardService:
             resume_id=resume_id,
         )
 
+    def verify_and_load_resume(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: Optional[int] = None,
+        fresh_parse: bool = True,
+    ):
+        """Just-in-time verifies and loads candidate resume binary via ResumeIntegrityVerifier."""
+        from src.security.resume_verifier import ResumeIntegrityVerifier
+        from src.security.file_security import FileSecurityValidator
+        verifier = ResumeIntegrityVerifier(
+            db_manager=self.db,
+            file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
+        )
+        return verifier.verify_and_load_resume(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=version_num,
+            fresh_parse=fresh_parse,
+        )
+
+    def sync_user_profile_from_resume_id(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: Optional[int] = None,
+        approved_fields: Optional[List[str]] = None,
+        override_protected: bool = False,
+    ) -> Dict[str, Any]:
+        """Verifies candidate resume JIT and synchronizes user candidate profile."""
+        from src.preparer.profile_updater import ProfileUpdater
+        updater = ProfileUpdater(db_manager=self.db)
+        return updater.sync_user_profile(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=version_num,
+            approved_fields=approved_fields,
+            override_protected=override_protected,
+            user_base_dir=self.storage_base_dir,
+        )
+
     def generate_tailored_resume(
         self,
         user_id: int,
@@ -2822,9 +2878,15 @@ class DashboardService:
         job_description: Optional[Dict[str, Any]] = None,
         match_result: Optional[Dict[str, Any]] = None,
         custom_instructions: Optional[str] = None,
+        resume_id: Optional[int] = None,
+        resume_version_num: Optional[int] = None,
     ):
-        """Generates role-specific tailored resume using UniversalTailoredResumeGenerator."""
+        """Generates role-specific tailored resume using UniversalTailoredResumeGenerator with JIT verification."""
         from src.preparer.tailored_resume_generator import UniversalTailoredResumeGenerator
+        target_res_id = resume_id
+        if target_res_id is None and isinstance(resume_data, dict) and "id" in resume_data and "file_hash" in resume_data:
+            target_res_id = resume_data["id"]
+
         generator = UniversalTailoredResumeGenerator()
         return generator.generate(
             user_id=user_id,
@@ -2833,6 +2895,10 @@ class DashboardService:
             job_description=job_description,
             match_result=match_result,
             custom_instructions=custom_instructions,
+            resume_id=target_res_id,
+            resume_version_num=resume_version_num,
+            db_manager=self.db,
+            user_base_dir=self.storage_base_dir,
         )
 
     def generate_universal_cover_letter(
@@ -2845,12 +2911,32 @@ class DashboardService:
         tone: Any = None,
         career_level: Any = None,
         custom_instructions: Optional[str] = None,
+        resume_id: Optional[int] = None,
+        resume_version_num: Optional[int] = None,
     ):
-        """Generates evidence-backed tailored cover letter across any profession."""
+        """Generates evidence-backed tailored cover letter across any profession with JIT verification."""
         from src.preparer.cover_letter_generator import (
             CoverLetterGenerator,
             LetterTone,
         )
+        target_res_id = resume_id
+        if target_res_id is None and isinstance(resume_data, dict) and "id" in resume_data and "file_hash" in resume_data:
+            target_res_id = resume_data["id"]
+        if target_res_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            from src.security.file_security import FileSecurityValidator
+            verifier = ResumeIntegrityVerifier(
+                db_manager=self.db,
+                file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
+            )
+            verified_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=target_res_id,
+                version_num=resume_version_num,
+                fresh_parse=True,
+            )
+            resume_data = verified_res.parsed_resume.to_dict()
+
         generator = CoverLetterGenerator(candidate_profile=candidate_profile)
         user_app_dir = Path(f"data/users/{user_id}/applications")
         selected_tone = tone or LetterTone.PROFESSIONAL_DIRECT
@@ -2874,9 +2960,29 @@ class DashboardService:
         resume_data: Optional[Dict[str, Any]] = None,
         job_description: Optional[Dict[str, Any]] = None,
         character_limit: Optional[int] = None,
+        resume_id: Optional[int] = None,
+        resume_version_num: Optional[int] = None,
     ):
-        """Answers screening questions across 19 categories rooted strictly in verified evidence."""
+        """Answers screening questions across 19 categories rooted strictly in verified evidence with JIT verification."""
         from src.preparer.question_answerer import QuestionAnswerer
+        target_res_id = resume_id
+        if target_res_id is None and isinstance(resume_data, dict) and "id" in resume_data and "file_hash" in resume_data:
+            target_res_id = resume_data["id"]
+        if target_res_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            from src.security.file_security import FileSecurityValidator
+            verifier = ResumeIntegrityVerifier(
+                db_manager=self.db,
+                file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
+            )
+            verified_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=target_res_id,
+                version_num=resume_version_num,
+                fresh_parse=True,
+            )
+            resume_data = verified_res.parsed_resume.to_dict()
+
         answerer = QuestionAnswerer(candidate_profile=candidate_profile)
         return answerer.batch_answer_questions(
             questions=questions,

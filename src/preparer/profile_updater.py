@@ -460,13 +460,34 @@ class ProfileUpdater:
     def sync_user_profile(
         self,
         user_id: int,
-        resume_path: str | Path,
+        resume_path: Optional[str | Path] = None,
         approved_fields: Optional[List[str]] = None,
         override_protected: bool = False,
+        resume_id: Optional[int] = None,
+        version_num: Optional[int] = None,
+        user_base_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
-        """Synchronizes a user's candidate profile from a resume file and stores a database snapshot."""
-        parser = ResumeParser()
-        parsed = parser.parse_file(resume_path)
+        """Synchronizes a user's candidate profile from a resume file or verified resume ID and stores a database snapshot."""
+        from src.database.exceptions import ValidationError
+
+        if resume_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            from src.security.file_security import FileSecurityValidator
+            f_val = FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else None
+            verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=f_val)
+            verified_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=resume_id,
+                version_num=version_num,
+                user_base_dir=user_base_dir,
+                fresh_parse=True,
+            )
+            parsed = verified_res.parsed_resume
+        elif resume_path is not None:
+            parser = ResumeParser()
+            parsed = parser.parse_file(resume_path)
+        else:
+            raise ValidationError("Either resume_path or resume_id must be provided to sync user profile.")
 
         curr_rec = self.db.get_user_candidate_profile(user_id)
         if not curr_rec:

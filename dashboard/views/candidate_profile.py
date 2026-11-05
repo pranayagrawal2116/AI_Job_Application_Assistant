@@ -416,9 +416,8 @@ def render_candidate_profile():
 
             if selected_id:
                 try:
-                    resume_path = service.db.get_resume_file_path(user_id, selected_id)
-                    parser = ResumeParser()
-                    parsed = parser.parse_file(resume_path)
+                    verified_res = service.verify_and_load_resume(user_id=user_id, resume_id=selected_id, fresh_parse=True)
+                    parsed = verified_res.parsed_resume
                     updater = ProfileUpdater(db_manager=service.db)
                     diff = updater.diff_profile_with_resume(prof, parsed)
 
