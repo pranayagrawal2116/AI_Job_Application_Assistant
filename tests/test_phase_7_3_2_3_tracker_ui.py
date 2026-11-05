@@ -185,7 +185,7 @@ class BaseTrackerUITest(unittest.TestCase):
             "packet_version": version_num,
             "tailored_resume": {"name": "Alice Candidate", "summary": "AI Systems Expert"},
             "cover_letter": {"letter_text": "Tailored cover letter text for opportunity."},
-            "screening_questions": [{"question": "Years of experience?", "answer": "4 years"}],
+            "screening_questions": [{"question_id": "q1", "question_text": "Years of experience?", "answer_text": "4 years", "question": "Years of experience?", "answer": "4 years"}],
             "attachments_manifest": attachments_manifest or [],
         }
         canonical_snapshot_json = canonical_json_bytes(payload).decode("utf-8")

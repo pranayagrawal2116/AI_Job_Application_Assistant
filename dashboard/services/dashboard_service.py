@@ -1812,6 +1812,15 @@ class DashboardService:
         # 3. Verify application is in allowed pre-submission status
         norm_status = ApplicationStateMachine.normalize_status(app.status)
         if norm_status not in (ApplicationStatus.APPROVED, ApplicationStatus.AWAITING_APPROVAL):
+            active_pkt = self.db.get_active_prepared_packet(application_id=application_id, user_id=user_id)
+            if active_pkt and active_pkt.id:
+                appr_chk = self.db.get_packet_approval(active_pkt.id, user_id, include_revoked=True)
+                if appr_chk and (getattr(appr_chk, "is_revoked", False) or appr_chk.is_revoked == 1):
+                    reason = getattr(appr_chk, "revocation_reason", None) or "REVOKED"
+                    raise SecurityAuthorizationError(
+                        f"Human approval for PreparedPacket #{active_pkt.id} has been revoked ({reason}). "
+                        f"Application is in status '{app.status}'. Candidate re-authorization is required."
+                    )
             raise SecurityAuthorizationError(
                 f"Application #{application_id} is in status '{app.status}'. "
                 "Only APPROVED applications can be submitted."

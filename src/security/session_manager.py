@@ -43,6 +43,7 @@ class KeyRotationManager:
         self._retired_keys: Dict[str, Tuple[bytes, float]] = {}  # key_id -> (secret, expires_at)
         self._revoked_keys: Set[str] = set()
         self._db_manager = db_manager
+        self._lock = threading.RLock()
 
         if initial_secret:
             secret_bytes = self._coerce_bytes(initial_secret)
@@ -108,36 +109,51 @@ class KeyRotationManager:
     ) -> None:
         """Rotates active signing key.
         - Mode A (Graceful): Previous key moved to retired status with overlap window.
-        - Mode B (Emergency): Previous key immediately revoked.
+        - Mode B (Emergency): Previous key immediately revoked in SQLite and memory.
         """
+        if not new_key_id or not str(new_key_id).strip():
+            raise SecurityAuthorizationError("New key ID cannot be empty.")
+        clean_new_key_id = str(new_key_id).strip()
+
         new_bytes = self._coerce_bytes(new_secret)
         if len(new_bytes) < 32:
             raise SecurityAuthorizationError("New signing secret must have at least 32 bytes.")
 
-        old_key_id = self.active_key_id
-        old_secret = self._keys.get(old_key_id)
-        db = db_manager or self._db_manager
+        if clean_new_key_id in self._revoked_keys:
+            raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_new_key_id}'.")
 
-        if mode == self.MODE_GRACEFUL:
-            if old_secret:
-                self._retired_keys[old_key_id] = (old_secret, time.time() + overlap_window_seconds)
-            if old_key_id in self._keys:
-                del self._keys[old_key_id]
-            logger.info("Graceful key rotation: active %s -> %s (retired %s for %ds)", old_key_id, new_key_id, old_key_id, overlap_window_seconds)
-        elif mode == self.MODE_EMERGENCY:
-            self._revoked_keys.add(old_key_id)
-            if old_key_id in self._keys:
-                del self._keys[old_key_id]
-            if old_key_id in self._retired_keys:
-                del self._retired_keys[old_key_id]
-            if db and hasattr(db, "revoke_signing_key_approvals"):
-                db.revoke_signing_key_approvals(old_key_id, reason="EMERGENCY_KEY_REVOCATION")
-            logger.warning("EMERGENCY key rotation: revoked %s immediately, active is now %s", old_key_id, new_key_id)
-        else:
-            raise ValueError(f"Unknown rotation mode: {mode}")
+        with self._lock:
+            old_key_id = self.active_key_id
+            old_secret = self._keys.get(old_key_id)
+            db = db_manager or self._db_manager
 
-        self._keys[new_key_id] = new_bytes
-        self.active_key_id = new_key_id
+            if mode == self.MODE_GRACEFUL:
+                if old_secret:
+                    self._retired_keys[old_key_id] = (old_secret, time.time() + overlap_window_seconds)
+                self._keys.pop(old_key_id, None)
+                self._keys[clean_new_key_id] = new_bytes
+                self.active_key_id = clean_new_key_id
+                logger.info(
+                    "Graceful key rotation: active %s -> %s (retired %s for %ds)",
+                    old_key_id, clean_new_key_id, old_key_id, overlap_window_seconds
+                )
+            elif mode == self.MODE_EMERGENCY:
+                # 1. Durable persistence in SQLite must succeed BEFORE modifying in-memory key state
+                if db and hasattr(db, "revoke_signing_key_approvals"):
+                    db.revoke_signing_key_approvals(old_key_id, reason="EMERGENCY_KEY_REVOCATION")
+
+                # 2. Only after SQLite commit succeeds, update in-memory key state
+                self._revoked_keys.add(old_key_id)
+                self._keys.pop(old_key_id, None)
+                self._retired_keys.pop(old_key_id, None)
+                self._keys[clean_new_key_id] = new_bytes
+                self.active_key_id = clean_new_key_id
+                logger.warning(
+                    "EMERGENCY key rotation: revoked %s immediately, active is now %s",
+                    old_key_id, clean_new_key_id
+                )
+            else:
+                raise ValueError(f"Unknown rotation mode: {mode}")
 
 
 @dataclass
@@ -1090,8 +1106,6 @@ class SessionManager:
             self._active_key_id = new_key_id
             self._server_secret = self.key_rotation_mgr._keys[new_key_id]
             if mode == KeyRotationManager.MODE_EMERGENCY:
-                if db and hasattr(db, "revoke_signing_key_approvals"):
-                    db.revoke_signing_key_approvals(old_key_id, reason="EMERGENCY_KEY_REVOCATION")
                 with self._grant_lock:
                     grants_to_purge = [
                         gid for gid, ginfo in self._active_grants.items()

@@ -445,6 +445,24 @@ When interacting with the browser via Playwright MCP:
     - Guaranteed modern applications with prepared packets never fall back to legacy `application_logs`.
   - Verification & Regressions: Added 17 dedicated comprehensive tests in `tests/test_phase_8_1_1_security_remediation.py`. All 1,176 tests in the full repository test suite passing (100% pass rate). 0 pyflakes errors, 0 ruff errors.
 
+- [x] **Architecture v2.1.1 Phase 8.1.2: Storage Boundary Enforcement & Fail-Closed Security Completion** (Complete)
+  - Finding A — Candidate Private-Storage Boundaries:
+    - Authoritative storage resolver in `FileSecurityValidator.resolve_and_verify_candidate_file()`: enforces private storage root `data/users/<authenticated_user_id>/`, canonical path resolution, path traversal (`..` and NUL byte) rejection, directory and final-path symlink escape rejection, regular file verification, readable status, 10 MB limit enforcement, actual byte SHA-256 computation, and magic-byte checks for PDF, DOCX, PNG, and JPEG.
+    - `HumanApprovalGate.verify_prepared_packet_integrity()` verifies physical disk files across all packet resources: source resume, tailored resume, cover letter, and attachments manifest. Dynamic test storage directory resolution supports isolated test sandboxes while strictly locking candidate containment.
+  - Finding B — Job Description Content Integrity:
+    - Required active candidate-owned job description (`is_active = 1, user_id == authenticated_user_id`).
+    - Recomputed raw content SHA-256 against `job_descriptions.content_hash` and canonical JSON manifest SHA-256 against `job_descriptions.snapshot_hash`. Verified packet expected hash matches authoritative hash, preventing stale or tampered requirements survival.
+  - Finding C — Malformed Screening QA Payloads Fail Closed:
+    - Strict validation in `verify_prepared_packet_integrity()`: verified valid JSON syntax, top-level `list` type, non-null dict items, mandatory fields (`question_id`, `question_text`, `answer_text`), absence of unverified inputs (`NEEDS_CANDIDATE_INPUT`), and absence of character limit overflows (`exceeds_limit`). Valid empty lists `[]` pass.
+  - Finding D — Profile Invalidation & Application Lifecycle Transition:
+    - `DatabaseManager.save_user_candidate_profile()` atomically revokes unconsumed approvals for the updated user, transitions affected applications in `APPROVED` or `Awaiting Approval` back to `READY_FOR_REVIEW`, and appends an immutable `PACKET_APPROVAL_REVOKED` timeline event with canonical hash chaining, rolling back cleanly on any failure.
+  - Finding E — Failure-Safe Emergency Key Rotation:
+    - Pre-validated replacement key format, key length (>= 32 bytes), and key ID before modifying state.
+    - Executed durable SQLite key revocation and approval revocation FIRST under `SessionManager._lock`. In-memory active keys and active grant/ticket caches are purged and updated only after the SQLite transaction commits successfully.
+  - Finding F — Fully Unambiguous, Fail-Closed Approval Lookup:
+    - `DatabaseManager.has_valid_human_approval()`: disambiguated `application_id` from legacy `job_id`, strictly rejected malformed or non-numeric user IDs, enforced candidate application ownership, rejected consumed (`is_consumed = 1` or `consumed_at IS NOT NULL`) and revoked (`is_revoked = 1` or `revoked_at IS NOT NULL`) approvals, and restricted legacy `application_logs` fallback exclusively to applications with 0 prepared packets.
+  - Verification & Regressions: Added 25 comprehensive tests in `tests/test_phase_8_1_2_storage_boundary_security.py`. All 1,201 tests across the entire repository test suite passing (100% pass rate). 0 ruff errors, 0 compileall errors, 0 git diff errors.
+
 ---
 
 ## 7. Approval Requirement

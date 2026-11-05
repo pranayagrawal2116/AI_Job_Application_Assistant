@@ -28,6 +28,7 @@ from pypdf.errors import PdfReadError
 from src.database.exceptions import (
     CorruptedFileError,
     EncryptedFileError,
+    FileSecurityError,
     FileTooLargeError,
     InvalidFileFormatError,
     ValidationError,
@@ -53,6 +54,14 @@ class FileSecurityValidator:
 
     def __init__(self, base_storage_dir: Path | None = None):
         self.base_storage_dir = Path(base_storage_dir) if base_storage_dir else DEFAULT_USER_STORAGE_BASE
+
+    def get_candidate_storage_root(self, user_id: int) -> Path:
+        """Returns the isolated private root directory for a candidate (data/users/<user_id>/)."""
+        if not user_id or int(user_id) <= 0:
+            raise ValidationError(f"Invalid user_id: {user_id}")
+        root_dir = (self.base_storage_dir / str(user_id)).resolve()
+        root_dir.mkdir(parents=True, exist_ok=True)
+        return root_dir
 
     def get_user_resumes_dir(self, user_id: int) -> Path:
         """Returns the isolated private directory for a user's resumes."""
@@ -546,3 +555,132 @@ class FileSecurityValidator:
         except FileNotFoundError:
             logger.warning("Job description file %s for User #%d was already missing from disk.", storage_filename, user_id)
             return False
+
+    def resolve_and_verify_candidate_file(
+        self,
+        user_id: int,
+        file_path: str | Path | None,
+        expected_hash: str | None = None,
+        expected_size: int | None = None,
+        expected_format: str | None = None,
+        is_mandatory: bool = True,
+        resource_desc: str = "Candidate file",
+    ) -> tuple[Path, bytes, str, int]:
+        """Resolves, checks containment, and verifies cryptographic integrity of a candidate file.
+
+        Enforces:
+        1. Non-empty path requirement if is_mandatory is True.
+        2. Immediate rejection of null bytes and '..' path traversal sequences.
+        3. Strict containment within candidate's private storage root (data/users/<user_id>/).
+        4. Rejection of symbolic links on all parent directory components and the final file.
+        5. Regular readable file validation.
+        6. Maximum file size check (10 MB) and exact byte-size match against expected_size.
+        7. Recomputed SHA-256 digest validation against expected_hash (fail closed on mismatch or invalid hash).
+        8. Magic-byte verification for expected document format (PDF, DOCX, PNG, JPEG).
+
+        Returns:
+            Tuple[resolved_path: Path, file_bytes: bytes, file_hash: str, file_size: int]
+        """
+        if not user_id or int(user_id) <= 0:
+            raise ValidationError(f"Invalid user_id: {user_id}")
+
+        if not file_path or not str(file_path).strip():
+            if is_mandatory:
+                raise ValidationError(f"{resource_desc} path is missing or empty.")
+            return Path(""), b"", "", 0
+
+        path_str = str(file_path).strip()
+        if "\x00" in path_str:
+            raise FileSecurityError(f"Null byte detected in {resource_desc} path: '{file_path}'")
+        if ".." in path_str or ".." in Path(path_str).parts:
+            raise FileSecurityError(f"Path traversal detected in {resource_desc} path: '{file_path}'")
+
+        candidate_root = self.get_candidate_storage_root(user_id).resolve()
+        raw_path = Path(path_str)
+
+        # Symlink defense: check if target path itself or any of its components are symlinks
+        if raw_path.is_symlink():
+            raise FileSecurityError(
+                f"Symbolic link detected: {resource_desc} path '{file_path}' cannot be a symbolic link."
+            )
+
+        # Containment resolution
+        if raw_path.is_absolute():
+            resolved_target = raw_path.resolve()
+        else:
+            # Check if relative to working directory or relative to candidate_root
+            cwd_resolved = raw_path.resolve()
+            try:
+                cwd_resolved.relative_to(candidate_root)
+                resolved_target = cwd_resolved
+            except ValueError:
+                resolved_target = (candidate_root / raw_path).resolve()
+
+        try:
+            rel = resolved_target.relative_to(candidate_root)
+        except ValueError:
+            raise FileSecurityError(
+                f"Path containment violation: {resource_desc} '{file_path}' resolves outside candidate storage root '{candidate_root}'."
+            )
+
+        curr = candidate_root
+        for part in rel.parts:
+            curr = curr / part
+            if curr.is_symlink():
+                raise FileSecurityError(
+                    f"Symbolic link detected: {resource_desc} path '{curr}' cannot be a symbolic link."
+                )
+
+        if not resolved_target.exists():
+            raise FileNotFoundError(f"{resource_desc} not found on disk at '{resolved_target}'.")
+
+        if not resolved_target.is_file():
+            raise ValidationError(f"{resource_desc} path '{resolved_target}' is not a regular file.")
+
+        try:
+            file_bytes = resolved_target.read_bytes()
+        except Exception as read_err:
+            raise CorruptedFileError(f"Failed to read {resource_desc} file on disk: {read_err}")
+
+        actual_size = len(file_bytes)
+        if actual_size > MAX_FILE_SIZE_BYTES:
+            raise FileTooLargeError(
+                f"{resource_desc} size ({actual_size / (1024*1024):.2f} MB) exceeds maximum allowed limit of 10 MB."
+            )
+
+        if expected_size is not None:
+            if not isinstance(expected_size, int) or expected_size < 0:
+                raise ValidationError(f"Invalid expected size metadata for {resource_desc}: {expected_size}")
+            if actual_size != expected_size:
+                raise ValidationError(
+                    f"{resource_desc} file size on disk ({actual_size} bytes) does not match manifest ({expected_size} bytes)."
+                )
+
+        actual_hash = hashlib.sha256(file_bytes).hexdigest()
+        if expected_hash is not None:
+            if not isinstance(expected_hash, str) or len(expected_hash) != 64 or not all(c in "0123456789abcdefABCDEF" for c in expected_hash):
+                raise ValidationError(f"Invalid expected SHA-256 metadata for {resource_desc}: '{expected_hash}'.")
+            if actual_hash.lower() != expected_hash.lower():
+                if "source resume" in resource_desc.lower():
+                    raise ValidationError("Original source resume file hash has changed since packet creation.")
+                raise ValidationError(
+                    f"{resource_desc} SHA-256 hash on disk ({actual_hash}) does not match expected hash ({expected_hash})."
+                )
+
+        # Magic byte validation
+        clean_ext = resolved_target.suffix.lstrip(".").lower()
+        fmt = (expected_format or clean_ext).lower()
+        if fmt == "pdf":
+            if not file_bytes.startswith(PDF_MAGIC):
+                raise InvalidFileFormatError(f"{resource_desc} is missing valid PDF header magic bytes.")
+        elif fmt == "docx":
+            if not file_bytes.startswith(DOCX_MAGIC):
+                raise InvalidFileFormatError(f"{resource_desc} is missing valid DOCX header magic bytes.")
+        elif fmt == "png":
+            if not file_bytes.startswith(PNG_MAGIC):
+                raise InvalidFileFormatError(f"{resource_desc} is missing valid PNG header magic bytes.")
+        elif fmt in ("jpg", "jpeg"):
+            if not file_bytes.startswith(JPEG_MAGIC):
+                raise InvalidFileFormatError(f"{resource_desc} is missing valid JPEG header magic bytes.")
+
+        return resolved_target, file_bytes, actual_hash, actual_size

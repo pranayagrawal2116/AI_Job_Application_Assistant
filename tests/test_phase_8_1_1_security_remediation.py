@@ -473,7 +473,7 @@ class TestFindingCFailClosedVerification(Phase811TestBase):
         qa_packet = ScreeningQAPacket(self.user_a.id, self.jd_a.id, qs)
 
         # Create dummy PDF file for tailored resume
-        fake_tr_path = Path(self.temp_dir.name) / "tailored_res.pdf"
+        fake_tr_path = self.user_base_dir / str(self.user_a.id) / "tailored_res.pdf"
         fake_tr_path.write_bytes(b"%PDF-1.4 dummy tailored resume")
         fake_hash = hashlib.sha256(b"%PDF-1.4 dummy tailored resume").hexdigest()
 
@@ -519,7 +519,7 @@ class TestFindingCFailClosedVerification(Phase811TestBase):
         app = self.db.get_or_create_application_workspace(
             user_id=self.user_a.id, job_description_id=self.jd_a.id, resume_id=self.resume_a["id"]
         )
-        att_file = Path(self.temp_dir.name) / "cert.pdf"
+        att_file = self.user_base_dir / str(self.user_a.id) / "cert.pdf"
         att_bytes = b"%PDF-1.4 certification bytes"
         att_file.write_bytes(att_bytes)
         att_hash = hashlib.sha256(att_bytes).hexdigest()

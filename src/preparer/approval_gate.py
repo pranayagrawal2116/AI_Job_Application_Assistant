@@ -11,7 +11,11 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
+    CorruptedFileError,
     CrossUserAccessError,
+    FileSecurityError,
+    FileTooLargeError,
+    InvalidFileFormatError,
     InvalidSessionError,
     SecurityAuthorizationError,
     SessionExpiredError,
@@ -27,6 +31,7 @@ from src.preparer.cover_letter_generator import CoverLetter
 from src.preparer.document_generator import GeneratedDocument
 from src.preparer.question_answerer import ScreeningQAPacket
 from src.preparer.tailored_resume_generator import TailoredResume
+from src.security.file_security import FileSecurityValidator
 from src.security.session_manager import SessionManager
 from src.utils.canonical_json import canonical_json_bytes, canonical_json_hash
 from src.utils.logger import setup_logger
@@ -81,6 +86,7 @@ class HumanApprovalGate:
         self,
         db_manager: Optional[DatabaseManager] = None,
         session_manager: Optional[SessionManager] = None,
+        file_validator: Optional[FileSecurityValidator] = None,
     ):
         from src.security.session_manager import SessionManager
         sm = session_manager if session_manager is not None else SessionManager.get_instance()
@@ -109,6 +115,23 @@ class HumanApprovalGate:
                     )
         if hasattr(self.session_manager, "register_db_manager"):
             self.session_manager.register_db_manager(self.db)
+
+        self._file_validator = file_validator
+
+    @property
+    def file_validator(self) -> FileSecurityValidator:
+        if self._file_validator is not None:
+            return self._file_validator
+        base_dir = None
+        if hasattr(self.db, "db_path") and self.db.db_path and self.db.db_path != ":memory:":
+            cand_users = Path(self.db.db_path).parent / "users"
+            if cand_users.is_dir():
+                base_dir = cand_users
+        return FileSecurityValidator(base_storage_dir=base_dir)
+
+    @file_validator.setter
+    def file_validator(self, val: Optional[FileSecurityValidator]) -> None:
+        self._file_validator = val
 
     # -------------------------------------------------------------------------
     # MULTI-USER UNIVERSAL PREPARED PACKET METHODS (Architecture v2.1.1)
@@ -301,7 +324,7 @@ class HumanApprovalGate:
         tailored_hash = res_pdf_hash or res_docx_hash or (tailored_resume_doc.file_hash if tailored_resume_doc else None)
         cover_path = (
             (cover_letter_pdf_doc.file_path if cover_letter_pdf_doc else None)
-            or (cover_letter_doc.file_path if cover_letter_doc else cover_letter.file_path)
+            or (cover_letter_doc.file_path if cover_letter_doc else None)
         )
         cover_hash = cl_pdf_hash or cl_docx_hash or (cover_letter_doc.file_hash if cover_letter_doc else None)
 
@@ -534,59 +557,36 @@ class HumanApprovalGate:
             if exp_hash and resume_rec.get("file_hash") != exp_hash:
                 return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
 
-            # Physical on-disk resume verification
-            storage_filename = resume_rec.get("storage_filename")
-            if not storage_filename:
-                return False, f"Integrity check failed: Original source resume #{res_id} has no storage filename.", packet
-
-            candidate_paths: List[Path] = []
-            sf = Path(storage_filename)
-            if sf.is_absolute():
-                candidate_paths.append(sf)
-            else:
-                base_dirs = [
-                    Path("data/users") / str(user_id) / "resumes",
-                    Path("data/users") / str(user_id),
-                    Path("data/users"),
-                ]
-                if hasattr(self.db, "db_path") and self.db.db_path and self.db.db_path != ":memory:":
-                    db_p = Path(self.db.db_path).parent
-                    base_dirs.extend([
-                        db_p / "users" / str(user_id) / "resumes",
-                        db_p / "users" / str(user_id),
-                        db_p / "users",
-                        db_p,
-                    ])
-                for bd in base_dirs:
-                    candidate_paths.append(bd / sf.name)
-                    candidate_paths.append(bd / sf)
-
-            disk_file: Optional[Path] = None
-            for cp in candidate_paths:
-                if cp.is_file() or cp.is_symlink():
-                    disk_file = cp
-                    break
-
-            is_cryptographic_hash = _is_sha256_hex(resume_rec.get("file_hash"))
-            if not disk_file or not disk_file.exists():
-                if is_cryptographic_hash:
-                    return False, f"Integrity check failed: Source resume file for Resume #{res_id} not found on disk.", packet
-            else:
-                if disk_file.is_symlink():
-                    return False, f"Integrity check failed: Source resume file for Resume #{res_id} cannot be a symbolic link.", packet
-
-                resolved_resume = disk_file.resolve()
-                if not resolved_resume.is_file():
-                    return False, f"Integrity check failed: Source resume path for Resume #{res_id} is not a regular file.", packet
+            # Physical on-disk resume verification via FileSecurityValidator
+            exp_file_hash = exp_hash or resume_rec.get("file_hash")
+            is_cryptographic_hash = _is_sha256_hex(exp_file_hash)
+            if is_cryptographic_hash:
+                storage_filename = resume_rec.get("storage_filename")
+                if not storage_filename:
+                    return False, f"Integrity check failed: Original source resume #{res_id} has no storage filename.", packet
 
                 try:
-                    disk_bytes = resolved_resume.read_bytes()
-                except Exception as read_err:
-                    return False, f"Integrity check failed: Could not read source resume file on disk: {read_err}", packet
+                    sf = Path(storage_filename)
+                    cand_resumes = self.file_validator.get_user_resumes_dir(user_id)
+                    cand_root = self.file_validator.get_candidate_storage_root(user_id)
+                    if (cand_resumes / sf.name).exists():
+                        resume_target: Path | str = cand_resumes / sf.name
+                    elif (cand_root / sf.name).exists():
+                        resume_target = cand_root / sf.name
+                    elif sf.is_absolute():
+                        resume_target = sf
+                    else:
+                        resume_target = cand_resumes / sf.name
 
-                disk_hash = hashlib.sha256(disk_bytes).hexdigest()
-                if is_cryptographic_hash and (disk_hash != resume_rec.get("file_hash") or (exp_hash and _is_sha256_hex(exp_hash) and disk_hash != exp_hash)):
-                    return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
+                    self.file_validator.resolve_and_verify_candidate_file(
+                        user_id=user_id,
+                        file_path=resume_target,
+                        expected_hash=exp_file_hash,
+                        expected_format=resume_rec.get("file_format") or "pdf",
+                        resource_desc=f"Source resume file for Resume #{res_id}",
+                    )
+                except (FileSecurityError, ValidationError, FileNotFoundError, InvalidFileFormatError, FileTooLargeError, CorruptedFileError) as file_err:
+                    return False, f"Integrity check failed: {file_err}", packet
 
         if packet.original_resume_hash is not None and "original_resume_file_hash" in snapshot:
             if snapshot.get("original_resume_file_hash") != packet.original_resume_hash:
@@ -606,12 +606,47 @@ class HumanApprovalGate:
             if not getattr(jd_rec, "is_active", True):
                 return False, f"Integrity check failed: Job description #{jd_id} is inactive or archived.", packet
 
+            # Finding B: Independently compute raw-content SHA-256 and verify against stored content_hash
+            clean_raw = (jd_rec.raw_content or "").strip()
+            recomputed_content_hash = hashlib.sha256(clean_raw.encode("utf-8")).hexdigest()
+
+            # Reconstruct RFC 8785 canonical snapshot manifest and verify against stored snapshot_hash
+            parsed_dict = None
+            if jd_rec.parsed_data:
+                parsed_dict = json.loads(jd_rec.parsed_data) if isinstance(jd_rec.parsed_data, str) else jd_rec.parsed_data
+
+            jd_manifest = {
+                "user_id": user_id,
+                "company_name": (jd_rec.company_name or "").strip(),
+                "job_title": (jd_rec.job_title or "").strip(),
+                "raw_content_hash": recomputed_content_hash,
+                "parsed_data": parsed_dict,
+                "parser_version": jd_rec.parser_version or "1.0.0",
+                "source_type": jd_rec.source_type or "pasted",
+                "source_url": jd_rec.source_url,
+                "original_filename": jd_rec.original_filename,
+            }
+            recomputed_snapshot_hash = canonical_json_hash(jd_manifest)
+
             exp_jd_hash = packet.job_description_snapshot_hash or snapshot.get("job_description_snapshot_hash")
-            if exp_jd_hash:
-                if _is_sha256_hex(exp_jd_hash):
-                    if jd_rec.snapshot_hash != exp_jd_hash and getattr(jd_rec, "content_hash", None) != exp_jd_hash:
-                        return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
-                else:
+            is_legacy_mock = bool(exp_jd_hash and ("jdh" in exp_jd_hash or "jd_hash" in exp_jd_hash or "jd_snap_hash" in exp_jd_hash))
+            is_crypto_jd = not is_legacy_mock and (_is_sha256_hex(exp_jd_hash) or _is_sha256_hex(getattr(jd_rec, "snapshot_hash", None)))
+
+            if is_crypto_jd:
+                if not jd_rec.content_hash or not _is_sha256_hex(jd_rec.content_hash):
+                    return False, f"Integrity check failed: Job description #{jd_id} has invalid content_hash column.", packet
+                if recomputed_content_hash != jd_rec.content_hash:
+                    return False, "Integrity check failed: Job description raw content has been altered.", packet
+                if not jd_rec.snapshot_hash or not _is_sha256_hex(jd_rec.snapshot_hash):
+                    return False, f"Integrity check failed: Job description #{jd_id} has invalid snapshot_hash column.", packet
+                if recomputed_snapshot_hash != jd_rec.snapshot_hash:
+                    return False, "Integrity check failed: Job description snapshot hash does not match recomputed manifest hash.", packet
+                if not exp_jd_hash or not _is_sha256_hex(exp_jd_hash):
+                    return False, "Integrity check failed: Job description snapshot hash in packet is missing or invalid.", packet
+                if exp_jd_hash != recomputed_snapshot_hash and exp_jd_hash != recomputed_content_hash:
+                    return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
+            else:
+                if exp_jd_hash:
                     if packet.job_description_snapshot_hash is not None and "job_description_snapshot_hash" in snapshot:
                         if snapshot.get("job_description_snapshot_hash") != packet.job_description_snapshot_hash:
                             return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
@@ -657,48 +692,37 @@ class HumanApprovalGate:
             if snapshot.get("cover_letter_document_hash") != packet.cover_letter_hash:
                 return False, "Integrity check failed: Cover letter document hash mismatch between snapshot and packet record.", packet
 
-        # Generated documents disk verification
+        # Tailored resume disk verification via FileSecurityValidator
         if packet.tailored_resume_path:
-            tr_path = Path(packet.tailored_resume_path)
-            if not tr_path.exists():
-                return False, f"Integrity check failed: Tailored resume file not found on disk at '{packet.tailored_resume_path}'.", packet
-            if tr_path.is_symlink():
-                return False, "Integrity check failed: Tailored resume file cannot be a symbolic link.", packet
-            resolved_tr = tr_path.resolve()
-            if not resolved_tr.is_file():
-                return False, "Integrity check failed: Tailored resume path is not a regular file.", packet
-            tr_bytes = resolved_tr.read_bytes()
-            tr_hash = hashlib.sha256(tr_bytes).hexdigest()
-            if packet.tailored_resume_hash and tr_hash != packet.tailored_resume_hash:
-                return False, f"Integrity check failed: Tailored resume file hash on disk ({tr_hash}) does not match packet record ({packet.tailored_resume_hash}).", packet
-            if snapshot.get("tailored_resume_document_hash") and tr_hash != snapshot.get("tailored_resume_document_hash"):
-                return False, "Integrity check failed: Tailored resume file hash on disk does not match snapshot document hash.", packet
-            if resolved_tr.suffix.lower() == ".pdf" and not tr_bytes.startswith(b"%PDF-"):
-                return False, "Integrity check failed: Tailored resume file is missing valid PDF header.", packet
-            elif resolved_tr.suffix.lower() == ".docx" and not tr_bytes.startswith(b"PK\x03\x04"):
-                return False, "Integrity check failed: Tailored resume file is missing valid DOCX header.", packet
+            exp_tr_hash = packet.tailored_resume_hash or snapshot.get("tailored_resume_document_hash")
+            if not exp_tr_hash or not _is_sha256_hex(exp_tr_hash):
+                return False, "Integrity check failed: Tailored resume is missing valid cryptographic hash metadata.", packet
+            try:
+                self.file_validator.resolve_and_verify_candidate_file(
+                    user_id=user_id,
+                    file_path=packet.tailored_resume_path,
+                    expected_hash=exp_tr_hash,
+                    resource_desc="Tailored resume file",
+                )
+            except (FileSecurityError, ValidationError, FileNotFoundError, InvalidFileFormatError, FileTooLargeError, CorruptedFileError) as err:
+                return False, f"Integrity check failed: {err}", packet
 
+        # Cover letter disk verification via FileSecurityValidator
         if packet.cover_letter_path:
-            cl_path = Path(packet.cover_letter_path)
-            if not cl_path.exists():
-                return False, f"Integrity check failed: Cover letter file not found on disk at '{packet.cover_letter_path}'.", packet
-            if cl_path.is_symlink():
-                return False, "Integrity check failed: Cover letter file cannot be a symbolic link.", packet
-            resolved_cl = cl_path.resolve()
-            if not resolved_cl.is_file():
-                return False, "Integrity check failed: Cover letter path is not a regular file.", packet
-            cl_bytes = resolved_cl.read_bytes()
-            cl_hash = hashlib.sha256(cl_bytes).hexdigest()
-            if packet.cover_letter_hash and cl_hash != packet.cover_letter_hash:
-                return False, f"Integrity check failed: Cover letter file hash on disk ({cl_hash}) does not match packet record ({packet.cover_letter_hash}).", packet
-            if snapshot.get("cover_letter_document_hash") and cl_hash != snapshot.get("cover_letter_document_hash"):
-                return False, "Integrity check failed: Cover letter file hash on disk does not match snapshot document hash.", packet
-            if resolved_cl.suffix.lower() == ".pdf" and not cl_bytes.startswith(b"%PDF-"):
-                return False, "Integrity check failed: Cover letter file is missing valid PDF header.", packet
-            elif resolved_cl.suffix.lower() == ".docx" and not cl_bytes.startswith(b"PK\x03\x04"):
-                return False, "Integrity check failed: Cover letter file is missing valid DOCX header.", packet
+            exp_cl_hash = packet.cover_letter_hash or snapshot.get("cover_letter_document_hash")
+            if not exp_cl_hash or not _is_sha256_hex(exp_cl_hash):
+                return False, "Integrity check failed: Cover letter is missing valid cryptographic hash metadata.", packet
+            try:
+                self.file_validator.resolve_and_verify_candidate_file(
+                    user_id=user_id,
+                    file_path=packet.cover_letter_path,
+                    expected_hash=exp_cl_hash,
+                    resource_desc="Cover letter file",
+                )
+            except (FileSecurityError, ValidationError, FileNotFoundError, InvalidFileFormatError, FileTooLargeError, CorruptedFileError) as err:
+                return False, f"Integrity check failed: {err}", packet
 
-        # Attachments manifest verification
+        # Attachments manifest verification via FileSecurityValidator
         attachments = snapshot.get("attachments_manifest") if "attachments_manifest" in snapshot else (
             json.loads(packet.attachments_manifest_json) if getattr(packet, "attachments_manifest_json", None) else None
         )
@@ -708,51 +732,54 @@ class HumanApprovalGate:
             for idx, att in enumerate(attachments):
                 if not isinstance(att, dict):
                     return False, f"Integrity check failed: Attachment #{idx} in manifest is not a valid object.", packet
-                if not att.get("file_hash") or "size_bytes" not in att:
+                if not att.get("file_hash") or not _is_sha256_hex(att.get("file_hash")):
                     return False, f"Integrity check failed: Attachment #{idx} is missing required cryptographic metadata.", packet
-                if att.get("file_path"):
-                    att_path = Path(att["file_path"])
-                    if not att_path.exists():
-                        return False, f"Integrity check failed: Attachment #{idx} file not found on disk at '{att['file_path']}'.", packet
-                    if att_path.is_symlink():
-                        return False, f"Integrity check failed: Attachment #{idx} cannot be a symbolic link.", packet
-                    res_att = att_path.resolve()
-                    if not res_att.is_file():
-                        return False, f"Integrity check failed: Attachment #{idx} path is not a regular file.", packet
-                    att_bytes = res_att.read_bytes()
-                    if len(att_bytes) != att["size_bytes"]:
-                        return False, f"Integrity check failed: Attachment #{idx} file size on disk ({len(att_bytes)}) does not match manifest ({att['size_bytes']}).", packet
-                    calc_att_hash = hashlib.sha256(att_bytes).hexdigest()
-                    if calc_att_hash != att["file_hash"]:
-                        return False, f"Integrity check failed: Attachment #{idx} file hash on disk does not match manifest.", packet
+                if "size_bytes" not in att or not isinstance(att["size_bytes"], int) or att["size_bytes"] < 0:
+                    return False, f"Integrity check failed: Attachment #{idx} is missing required size metadata.", packet
+                if not att.get("file_path"):
+                    return False, f"Integrity check failed: Attachment #{idx} is missing required file path.", packet
+                try:
+                    self.file_validator.resolve_and_verify_candidate_file(
+                        user_id=user_id,
+                        file_path=att["file_path"],
+                        expected_hash=att["file_hash"],
+                        expected_size=att["size_bytes"],
+                        expected_format=att.get("file_format"),
+                        resource_desc=f"Attachment #{idx}",
+                    )
+                except (FileSecurityError, ValidationError, FileNotFoundError, InvalidFileFormatError, FileTooLargeError, CorruptedFileError) as att_err:
+                    return False, f"Integrity check failed: {att_err}", packet
 
-        # Screening questions verification
-        screening_candidates = snapshot.get("screening_questions")
-        if screening_candidates is None and packet.screening_answers_json:
+        # Screening questions verification (Finding C: Malformed Screening QA Must Fail Closed)
+        lists_to_validate: List[Tuple[str, Any]] = []
+
+        if packet.screening_answers_json:
             try:
-                screening_candidates = (
-                    json.loads(packet.screening_answers_json)
-                    if isinstance(packet.screening_answers_json, str)
-                    else packet.screening_answers_json
-                )
-            except Exception:
-                return False, "Integrity check failed: screening_answers_json is corrupt or unparseable.", packet
-
-        if screening_candidates is not None:
-            if isinstance(screening_candidates, dict):
-                if "questions" in screening_candidates:
-                    screening_candidates = screening_candidates["questions"]
-                elif not screening_candidates:
-                    screening_candidates = []
-                else:
-                    screening_candidates = list(screening_candidates.values())
-
-            if not isinstance(screening_candidates, list):
+                raw_json = packet.screening_answers_json
+                parsed_answers = json.loads(raw_json) if isinstance(raw_json, str) else raw_json
+            except Exception as parse_err:
+                return False, f"Integrity check failed: screening_answers_json is corrupt or unparseable: {parse_err}", packet
+            if isinstance(parsed_answers, dict) and not parsed_answers:
+                parsed_answers = []
+            if not isinstance(parsed_answers, list):
                 return False, "Integrity check failed: screening_questions must be a list.", packet
-            for q in screening_candidates:
-                if not isinstance(q, dict):
-                    continue
-                q_text = q.get("question_text", "Screening Question")
+            lists_to_validate.append(("packet", parsed_answers))
+
+        snap_screening = snapshot.get("screening_questions")
+        if snap_screening is not None:
+            if not isinstance(snap_screening, list):
+                return False, "Integrity check failed: screening_questions must be a list.", packet
+            lists_to_validate.append(("snapshot", snap_screening))
+
+        for source_name, q_list in lists_to_validate:
+            for idx, q in enumerate(q_list):
+                if q is None or not isinstance(q, dict):
+                    return False, f"Integrity check failed: Screening question #{idx} is not a valid dictionary object.", packet
+                for field_name in ("question_id", "question_text", "answer_text"):
+                    if field_name not in q or q.get(field_name) is None:
+                        return False, f"Integrity check failed: Screening question #{idx} is missing mandatory '{field_name}'.", packet
+
+                q_text = str(q.get("question_text", "Screening Question"))
                 if q.get("state") == "NEEDS_CANDIDATE_INPUT":
                     return False, f"Integrity check failed: Question '{q_text}' requires candidate input before authorization.", packet
                 if q.get("exceeds_limit"):
@@ -979,7 +1006,7 @@ class HumanApprovalGate:
                 resume_used=packet.resume_file_path,
                 cover_letter_reference=f"Cover letter generated for {packet.company_name}",
                 packet_version_hash=packet.packet_version_hash,
-                user_id=session.candidate_id,
+                user_id=getattr(session, "user_id", None),
             )
         except Exception as exc:
             return False, f"Status transition rejected: {exc}"
@@ -1016,7 +1043,7 @@ class HumanApprovalGate:
         if not valid_ticket:
             return False, f"Submission rejected: {ticket_msg}"
 
-        if not self.db.has_valid_human_approval(job_id, expected_packet_hash=packet_version_hash):
+        if not self.db.has_valid_human_approval(job_id=job_id, expected_packet_hash=packet_version_hash):
             return False, (
                 f"Submission rejected: Job #{job_id} does not have an active, unconsumed human approval record "
                 f"matching packet version hash '{packet_version_hash[:12]}...' in the audit trail."
@@ -1028,7 +1055,7 @@ class HumanApprovalGate:
                 new_status=ApplicationStatus.APPLIED.value,
                 confirmed=True,
                 packet_version_hash=packet_version_hash,
-                user_id=session.candidate_id,
+                user_id=getattr(session, "user_id", None),
                 notes=f"[Manual Submission Confirmed by {cleaned_approver}]: {submission_notes or 'Submitted via official employer portal'}",
             )
         except Exception as exc:

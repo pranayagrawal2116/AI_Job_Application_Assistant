@@ -1545,7 +1545,7 @@ class DatabaseManager:
 
         # 2. Strict Human Authorization Validation for Awaiting Approval
         if matched_status == ApplicationStatus.AWAITING_APPROVAL.value:
-            if not self.has_valid_human_approval(job_id, expected_packet_hash=packet_version_hash, user_id=user_id):
+            if not self.has_valid_human_approval(job_id=job_id, expected_packet_hash=packet_version_hash, user_id=user_id):
                 raise SecurityAuthorizationError(
                     f"Transition to 'Awaiting Approval' rejected: Job #{job_id} requires valid, authenticated "
                     f"human approval of the reviewed application packet."
@@ -1563,7 +1563,7 @@ class DatabaseManager:
                     new_status=matched_status,
                     allowed=[ApplicationStatus.AWAITING_APPROVAL.value],
                 )
-            if not self.has_valid_human_approval(job_id, expected_packet_hash=packet_version_hash, user_id=user_id):
+            if not self.has_valid_human_approval(job_id=job_id, expected_packet_hash=packet_version_hash, user_id=user_id):
                 raise UnconfirmedSubmissionError(
                     "STRICT SAFEGUARD: Cannot mark application as 'Applied' without an active, unconsumed human approval record "
                     "matching the reviewed application packet hash in the audit trail."
@@ -1790,6 +1790,15 @@ class DatabaseManager:
         Disambiguates application_id from legacy job_id, strictly enforces user ownership,
         verifies packet version hash and active revision status, and rejects consumed or revoked approvals.
         """
+        clean_user_id: Optional[int] = None
+        if user_id is not None:
+            try:
+                clean_user_id = int(user_id)
+                if clean_user_id <= 0:
+                    return False
+            except (ValueError, TypeError):
+                return False
+
         with self.connection() as conn:
             cursor = conn.cursor()
 
@@ -1811,12 +1820,9 @@ class DatabaseManager:
             if app_row:
                 app_id = app_row["id"]
                 # Enforce user_id ownership if provided
-                if user_id is not None and app_row["user_id"] is not None:
-                    try:
-                        if int(app_row["user_id"]) != int(user_id):
-                            return False
-                    except (ValueError, TypeError):
-                        pass
+                if clean_user_id is not None and app_row["user_id"] is not None:
+                    if int(app_row["user_id"]) != clean_user_id:
+                        return False
 
                 # Check active prepared packet revision
                 cursor.execute(
@@ -1841,11 +1847,11 @@ class DatabaseManager:
 
                     cursor.execute(
                         """
-                        SELECT id, user_id, key_id, is_consumed, is_revoked, packet_version_hash
+                        SELECT id, user_id, key_id, is_consumed, consumed_at, is_revoked, revoked_at, packet_version_hash
                         FROM application_approvals
                         WHERE application_id = ? AND packet_version_hash = ?
-                          AND (is_revoked IS NULL OR is_revoked = 0)
-                          AND (is_consumed IS NULL OR is_consumed = 0)
+                          AND (is_revoked IS NULL OR is_revoked = 0) AND revoked_at IS NULL
+                          AND (is_consumed IS NULL OR is_consumed = 0) AND consumed_at IS NULL
                         ORDER BY approved_at DESC, id DESC
                         """,
                         (app_id, target_hash),
@@ -1853,11 +1859,11 @@ class DatabaseManager:
                 else:
                     cursor.execute(
                         """
-                        SELECT id, user_id, key_id, is_consumed, is_revoked, packet_version_hash
+                        SELECT id, user_id, key_id, is_consumed, consumed_at, is_revoked, revoked_at, packet_version_hash
                         FROM application_approvals
                         WHERE application_id = ?
-                          AND (is_revoked IS NULL OR is_revoked = 0)
-                          AND (is_consumed IS NULL OR is_consumed = 0)
+                          AND (is_revoked IS NULL OR is_revoked = 0) AND revoked_at IS NULL
+                          AND (is_consumed IS NULL OR is_consumed = 0) AND consumed_at IS NULL
                         ORDER BY approved_at DESC, id DESC
                         """,
                         (app_id,),
@@ -1866,19 +1872,16 @@ class DatabaseManager:
                 appr_rows = cursor.fetchall()
                 for appr_row in appr_rows:
                     # Enforce user_id matching if provided
-                    if user_id is not None and appr_row["user_id"] is not None:
-                        try:
-                            if int(appr_row["user_id"]) != int(user_id):
-                                continue
-                        except (ValueError, TypeError):
+                    if clean_user_id is not None and appr_row["user_id"] is not None:
+                        if int(appr_row["user_id"]) != clean_user_id:
                             continue
 
                     # Reject consumed approvals
-                    if appr_row["is_consumed"]:
+                    if appr_row["is_consumed"] or appr_row["consumed_at"] is not None:
                         continue
 
                     # Reject revoked approvals
-                    if appr_row["is_revoked"]:
+                    if appr_row["is_revoked"] or appr_row["revoked_at"] is not None:
                         continue
 
                     # Reject approvals signed with revoked keys
@@ -1898,10 +1901,31 @@ class DatabaseManager:
                 if pkt_count > 0:
                     return False
 
-        # 2. Check legacy application_logs audit trail for backward compatibility
-        lookup_job_id = job_id if job_id is not None else identifier
-        if lookup_job_id is None:
-            return False
+            # 2. Check legacy application_logs audit trail for backward compatibility
+            lookup_job_id = job_id if job_id is not None else identifier
+            if lookup_job_id is None:
+                return False
+
+            # Legacy fallback: must enforce user ownership and only execute when application has 0 prepared packets
+            cursor.execute(
+                """
+                SELECT a.id, a.user_id, COUNT(p.id) as pkt_cnt
+                FROM applications a
+                LEFT JOIN prepared_packets p ON a.id = p.application_id
+                WHERE a.job_id = ?
+                GROUP BY a.id, a.user_id
+                """,
+                (lookup_job_id,),
+            )
+            leg_app_row = cursor.fetchone()
+            if leg_app_row:
+                if leg_app_row["pkt_cnt"] > 0:
+                    return False
+                if clean_user_id is not None and leg_app_row["user_id"] is not None:
+                    if int(leg_app_row["user_id"]) != clean_user_id:
+                        return False
+            elif clean_user_id is not None:
+                return False
 
         logs = self.get_application_logs(lookup_job_id)
         has_approval = False
@@ -3784,7 +3808,15 @@ class DatabaseManager:
 
         # 4. Generate isolated user storage path
         storage_filename = validator.generate_storage_filename(original_filename)
-        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        if user_base_dir:
+            if user_base_dir.name == "resumes":
+                base_dir = user_base_dir
+            elif user_base_dir.name == str(user_id):
+                base_dir = user_base_dir / "resumes"
+            else:
+                base_dir = user_base_dir / str(user_id) / "resumes"
+        else:
+            base_dir = Path("data/users") / str(user_id) / "resumes"
         dest_path = base_dir / storage_filename
         validator.save_file(file_bytes, dest_path, user_id=user_id)
 
@@ -4166,7 +4198,17 @@ class DatabaseManager:
             )
             profile_id = cursor.lastrowid
 
-            # Finding B: Invalidate any unconsumed approvals for this candidate
+            # Finding D: Invalidate any unconsumed approvals for this candidate and transition affected applications
+            cursor.execute(
+                """
+                SELECT id, application_id, packet_id, packet_version_hash, ticket_nonce, key_id
+                FROM application_approvals
+                WHERE user_id = ? AND is_consumed = 0 AND (is_revoked IS NULL OR is_revoked = 0)
+                """,
+                (user_id,),
+            )
+            unconsumed_approvals = [dict(r) for r in cursor.fetchall()]
+
             cursor.execute(
                 """
                 UPDATE application_approvals
@@ -4181,6 +4223,46 @@ class DatabaseManager:
                     "Invalidated %d unconsumed approvals for user #%d due to candidate profile update",
                     revoked_count, user_id
                 )
+
+            # Reflect approval revocation in application lifecycle state machine & timeline
+            from src.lifecycle.state_machine import ApplicationStateMachine
+            for appr in unconsumed_approvals:
+                app_id = appr.get("application_id")
+                if not app_id:
+                    continue
+                cursor.execute("SELECT id, status FROM applications WHERE id = ? AND user_id = ?", (app_id, user_id))
+                app_row = cursor.fetchone()
+                if not app_row:
+                    continue
+
+                cur_status = app_row["status"]
+                norm_status = ApplicationStateMachine.normalize_status(cur_status)
+                if norm_status == ApplicationStatus.APPROVED:
+                    new_status = ApplicationStatus.READY_FOR_REVIEW.value
+                    cursor.execute(
+                        "UPDATE applications SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+                        (new_status, app_id, user_id),
+                    )
+                    event_payload = {
+                        "approval_id": appr["id"],
+                        "packet_id": appr.get("packet_id"),
+                        "packet_version_hash": appr.get("packet_version_hash"),
+                        "revocation_reason": "CANDIDATE_PROFILE_UPDATED",
+                        "ticket_nonce": appr.get("ticket_nonce"),
+                        "key_id": appr.get("key_id"),
+                    }
+                    self._insert_application_event_internal(
+                        cursor=cursor,
+                        application_id=app_id,
+                        user_id=user_id,
+                        event_type="PACKET_APPROVAL_REVOKED",
+                        previous_status=cur_status,
+                        new_status=new_status,
+                        actor_type="SYSTEM",
+                        actor_identifier=f"user_{user_id}",
+                        session_reference=None,
+                        event_payload=event_payload,
+                    )
             cursor.execute("SELECT * FROM candidate_profiles WHERE id = ?", (profile_id,))
             res = dict(cursor.fetchone())
             res["profile_data"] = json.loads(res["profile_data"])
