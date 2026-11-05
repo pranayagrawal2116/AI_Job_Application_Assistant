@@ -7,6 +7,7 @@ Verifies dashboard service operations:
 - Streamlit render_resume_match_analysis component execution.
 """
 
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -15,6 +16,7 @@ from unittest.mock import MagicMock, patch
 from dashboard.services.dashboard_service import DashboardService
 from dashboard.views.resume_match_analysis import render_resume_match_analysis
 from src.database.db_manager import DatabaseManager
+from tests.fixtures.synthetic_personas import generate_persona_pdf
 
 
 class TestMatchDashboard(unittest.TestCase):
@@ -24,6 +26,7 @@ class TestMatchDashboard(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db = DatabaseManager(db_path=Path(self.temp_dir.name) / "test_dash.db")
         self.service = DashboardService(db_manager=self.db)
+        self.service.storage_base_dir = Path(self.temp_dir.name) / "users"
 
         # Setup standard user, resume, and job description
         with self.db.transaction() as conn:
@@ -31,14 +34,30 @@ class TestMatchDashboard(unittest.TestCase):
             cursor.execute("INSERT INTO users (email, password_hash, password_salt, full_name) VALUES ('dash@test.com', 'h', 'salt', 'Dashboard User')")
             self.user_id = cursor.lastrowid
 
+            # Create physical valid PDF file on disk
+            user_resumes = self.service.storage_base_dir / str(self.user_id) / "resumes"
+            user_resumes.mkdir(parents=True, exist_ok=True)
+            pdf_bytes = generate_persona_pdf("freshman_cs_student")
+            (user_resumes / "r.pdf").write_bytes(pdf_bytes)
+            real_hash = hashlib.sha256(pdf_bytes).hexdigest()
+            real_size = len(pdf_bytes)
+
             cursor.execute(
                 """
                 INSERT INTO resumes (user_id, storage_filename, original_filename, file_format, file_hash, file_size_bytes, parsed_data)
-                VALUES (?, 'r.pdf', 'Resume.pdf', 'pdf', 'hash_r', 100, '{"career_level": "student", "technical_skills": ["Python", "SQL"], "education": [{"degree": "B.Tech in CS", "major": "Computer Science"}], "projects": [{"title": "AI Bot", "description": "Chatbot"}]}')
+                VALUES (?, 'r.pdf', 'Resume.pdf', 'pdf', ?, ?, '{"career_level": "student", "technical_skills": ["Python", "SQL"], "education": [{"degree": "B.Tech in CS", "major": "Computer Science"}], "projects": [{"title": "AI Bot", "description": "Chatbot"}]}')
                 """,
-                (self.user_id,),
+                (self.user_id, real_hash, real_size),
             )
             self.resume_id = cursor.lastrowid
+
+            cursor.execute(
+                """
+                INSERT INTO resume_versions (resume_id, user_id, version_num, storage_filename, file_hash, file_size_bytes, change_notes, snapshot_json)
+                VALUES (?, ?, 1, 'r.pdf', ?, ?, 'Initial upload', '{}')
+                """,
+                (self.resume_id, self.user_id, real_hash, real_size),
+            )
 
             cursor.execute(
                 """

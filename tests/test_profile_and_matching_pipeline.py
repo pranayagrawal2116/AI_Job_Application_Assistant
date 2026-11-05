@@ -14,6 +14,7 @@ Exhaustively verifies:
 5. End-to-end database persistence and audit hash tracking.
 """
 
+import hashlib
 from pathlib import Path
 import tempfile
 import unittest
@@ -31,6 +32,7 @@ from src.preparer.resume_parser import (
     EducationEntry,
     ParsedResume,
 )
+from tests.fixtures.synthetic_personas import generate_persona_pdf
 
 
 class TestProfileAndMatchingPipeline(unittest.TestCase):
@@ -38,9 +40,10 @@ class TestProfileAndMatchingPipeline(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.storage_base = Path(self.temp_dir.name) / "users"
         self.db_path = Path(self.temp_dir.name) / "test_pipeline.db"
         self.db = DatabaseManager(db_path=self.db_path)
-        self.service = DashboardService(db_manager=self.db)
+        self.service = DashboardService(db_manager=self.db, storage_base_dir=self.storage_base)
         self.matcher = UniversalMatcher(db_manager=self.db)
 
         # Setup test user
@@ -552,16 +555,31 @@ class TestProfileAndMatchingPipeline(unittest.TestCase):
         self.db.save_user_candidate_profile(user_id=self.user_id, profile_data=editor_profile)
 
         # 2. Add resume and job description
+        user_res_dir = self.service.storage_base_dir / str(self.user_id) / "resumes"
+        user_res_dir.mkdir(parents=True, exist_ok=True)
+        pdf_bytes = generate_persona_pdf("backend_engineer")
+        (user_res_dir / "r.pdf").write_bytes(pdf_bytes)
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        file_size = len(pdf_bytes)
+
         with self.db.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
                 INSERT INTO resumes (user_id, storage_filename, original_filename, file_format, file_hash, file_size_bytes, parsed_data, active_version, is_active)
-                VALUES (?, 'r.pdf', 'r.pdf', 'pdf', 'hash_r', 1024, '{"skills":["Python"]}', 1, 1)
+                VALUES (?, 'r.pdf', 'r.pdf', 'pdf', ?, ?, '{"skills":["Python"]}', 1, 1)
                 """,
-                (self.user_id,),
+                (self.user_id, file_hash, file_size),
             )
             res_id = cursor.lastrowid
+
+            cursor.execute(
+                """
+                INSERT INTO resume_versions (resume_id, user_id, version_num, storage_filename, file_hash, file_size_bytes, change_notes, snapshot_json)
+                VALUES (?, ?, 1, 'r.pdf', ?, ?, 'Initial upload', '{}')
+                """,
+                (res_id, self.user_id, file_hash, file_size),
+            )
 
             cursor.execute(
                 """

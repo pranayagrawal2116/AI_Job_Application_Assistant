@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
+    CrossUserAccessError,
     JobDescriptionNotFoundError,
     JobNotFoundError,
     ResumeNotFoundError,
@@ -1856,15 +1857,41 @@ class UniversalMatcher:
         candidate_profile_hash: Optional[str] = None,
         job_description_id: Optional[int] = None,
         job_id: Optional[int] = None,
+        verified_resume: Optional[Any] = None,
+        enforce_resume_verification: bool = False,
     ) -> UniversalMatchResult:
         """Runs universal match evaluation between a candidate profile/resume and a job opportunity.
         
         Enforces composite user-ownership checks, calculates transparent dimension breakdowns,
         three-state eligibility, zero-hallucination guarantees, and optional immutable persistence.
         """
-        # 1. Composite Ownership Validation if IDs supplied
+        # 1. Composite Ownership Validation and Verified Resume Resolution
         resume_file_hash = None
-        if resume_id is not None:
+        if verified_resume is not None:
+            if verified_resume.user_id != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=verified_resume.user_id,
+                    resource=f"VerifiedResume #{verified_resume.resume_id}",
+                )
+            resume_id = verified_resume.resume_id
+            resume_version_num = verified_resume.version_num
+            resume_file_hash = verified_resume.file_hash
+            resume_data = verified_resume.parsed_resume
+        elif enforce_resume_verification and resume_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            verifier = ResumeIntegrityVerifier(db_manager=self.db)
+            verified_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=resume_id,
+                version_num=resume_version_num,
+                fresh_parse=True,
+            )
+            resume_id = verified_res.resume_id
+            resume_version_num = verified_res.version_num
+            resume_file_hash = verified_res.file_hash
+            resume_data = verified_res.parsed_resume
+        elif resume_id is not None:
             res_rec = self.db.get_user_resume(resume_id, user_id=user_id)
             if not res_rec:
                 raise ResumeNotFoundError(f"Resume #{resume_id} not found.")

@@ -417,14 +417,18 @@ class UniversalTailoredResumeGenerator:
         user_base_dir: Optional[Path] = None,
     ) -> TailoredResume:
         """Generates a tailored resume rooted strictly in verified evidence."""
-        if resume_id is not None:
+        target_res_id = resume_id
+        if target_res_id is None and isinstance(resume_data, dict):
+            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
+
+        if target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
             f_val = FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else None
             verifier = ResumeIntegrityVerifier(db_manager=db_manager, file_validator=f_val)
             verified_res = verifier.verify_and_load_resume(
                 user_id=user_id,
-                resume_id=resume_id,
+                resume_id=target_res_id,
                 version_num=resume_version_num,
                 user_base_dir=user_base_dir,
                 fresh_parse=True,

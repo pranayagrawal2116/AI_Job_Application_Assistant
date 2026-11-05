@@ -42,6 +42,7 @@ from src.matcher.universal_matcher import (
     UniversalMatcher,
     UniversalScoringEngine,
 )
+from tests.fixtures.synthetic_personas import generate_persona_pdf
 
 
 class TestPhase51Hardening(unittest.TestCase):
@@ -49,9 +50,10 @@ class TestPhase51Hardening(unittest.TestCase):
 
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
+        self.storage_base = Path(self.temp_dir.name) / "users"
         self.db_path = Path(self.temp_dir.name) / "test_phase51.db"
         self.db = DatabaseManager(db_path=self.db_path)
-        self.service = DashboardService(db_manager=self.db)
+        self.service = DashboardService(db_manager=self.db, storage_base_dir=self.storage_base)
         self.matcher = UniversalMatcher(db_manager=self.db)
 
         # Create two distinct test users in database
@@ -75,10 +77,17 @@ class TestPhase51Hardening(unittest.TestCase):
         parsed_data: Optional[Dict[str, Any]] = None,
         active_version: int = 1,
     ) -> Dict[str, Any]:
-        """Creates a resume record directly in the test database."""
+        """Creates a resume record directly in the test database with a valid physical file."""
+        user_res_dir = self.service.storage_base_dir / str(user_id) / "resumes"
+        user_res_dir.mkdir(parents=True, exist_ok=True)
+        pdf_bytes = generate_persona_pdf("backend_engineer")
+        storage_filename = f"test_resume_v{active_version}.pdf"
+        (user_res_dir / storage_filename).write_bytes(pdf_bytes)
+        file_hash = hashlib.sha256(pdf_bytes).hexdigest()
+        file_size = len(pdf_bytes)
+
         data = parsed_data or {"skills": ["Python"]}
         json_data = json.dumps(data)
-        file_hash = hashlib.sha256(json_data.encode("utf-8")).hexdigest()
         with self.db.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -86,11 +95,22 @@ class TestPhase51Hardening(unittest.TestCase):
                 INSERT INTO resumes (
                     user_id, storage_filename, original_filename, file_format,
                     file_hash, file_size_bytes, parsed_data, active_version, is_active
-                ) VALUES (?, 'test_resume.pdf', 'test_resume.pdf', 'pdf', ?, 1024, ?, ?, 1)
+                ) VALUES (?, ?, ?, 'pdf', ?, ?, ?, ?, 1)
                 """,
-                (user_id, file_hash, json_data, active_version),
+                (user_id, storage_filename, storage_filename, file_hash, file_size, json_data, active_version),
             )
             res_id = cursor.lastrowid
+            for v in range(1, active_version + 1):
+                v_filename = f"test_resume_v{v}.pdf"
+                (user_res_dir / v_filename).write_bytes(pdf_bytes)
+                cursor.execute(
+                    """
+                    INSERT INTO resume_versions (
+                        resume_id, user_id, version_num, storage_filename, file_hash, file_size_bytes, change_notes, snapshot_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'Version created', '{}')
+                    """,
+                    (res_id, user_id, v, v_filename, file_hash, file_size),
+                )
             cursor.execute("SELECT * FROM resumes WHERE id = ?", (res_id,))
             return dict(cursor.fetchone())
 

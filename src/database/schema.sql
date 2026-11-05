@@ -436,6 +436,22 @@ CREATE TABLE IF NOT EXISTS auth_audit_logs (
 );
 
 -- ---------------------------------------------------------------------
+-- 13. RESUME RECOVERY AUDIT LOG (Finding C - Durable Recovery Evidence)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS resume_recovery_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resume_id INTEGER NOT NULL,
+    version_num INTEGER NOT NULL,
+    previous_state_json TEXT NOT NULL,
+    recovered_file_hash TEXT,
+    recovered_file_size_bytes INTEGER,
+    recovery_outcome TEXT NOT NULL,
+    details TEXT,
+    recovered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- ---------------------------------------------------------------------
 -- INDEXES FOR PERFORMANCE, FAST SEARCH, AND ISOLATION
 -- ---------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);

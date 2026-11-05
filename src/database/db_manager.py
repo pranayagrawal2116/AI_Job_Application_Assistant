@@ -334,6 +334,24 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS resume_recovery_audit (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    resume_id INTEGER NOT NULL,
+                    version_num INTEGER NOT NULL,
+                    previous_state_json TEXT NOT NULL,
+                    recovered_file_hash TEXT,
+                    recovered_file_size_bytes INTEGER,
+                    recovery_outcome TEXT NOT NULL,
+                    details TEXT,
+                    recovered_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+        except sqlite3.OperationalError:
+            pass
+
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
@@ -4407,6 +4425,61 @@ class DatabaseManager:
             user_base_dir=user_base_dir,
             fresh_parse=fresh_parse,
         )
+
+    def record_resume_recovery_audit(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: int,
+        previous_state: Dict[str, Any],
+        recovery_outcome: str,
+        recovered_file_hash: Optional[str] = None,
+        recovered_file_size_bytes: Optional[int] = None,
+        details: Optional[str] = None,
+    ) -> int:
+        """Persists durable audit record for resume integrity recovery."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO resume_recovery_audit (
+                    user_id, resume_id, version_num, previous_state_json,
+                    recovered_file_hash, recovered_file_size_bytes, recovery_outcome, details
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    resume_id,
+                    version_num,
+                    json.dumps(previous_state),
+                    recovered_file_hash,
+                    recovered_file_size_bytes,
+                    recovery_outcome,
+                    details,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_resume_recovery_audit(
+        self,
+        user_id: int,
+        resume_id: Optional[int] = None,
+        version_num: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves durable audit records for resume recovery."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM resume_recovery_audit WHERE user_id = ?"
+            params: List[Any] = [user_id]
+            if resume_id is not None:
+                query += " AND resume_id = ?"
+                params.append(resume_id)
+            if version_num is not None:
+                query += " AND version_num = ?"
+                params.append(version_num)
+            query += " ORDER BY id DESC"
+            cursor.execute(query, params)
+            return [dict(row) for row in cursor.fetchall()]
 
     def delete_user_resume(
         self,

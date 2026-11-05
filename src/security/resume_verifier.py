@@ -15,16 +15,12 @@ Enforces:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
-from datetime import datetime, timezone
-import hashlib
-import os
+import json
 from pathlib import Path
 import re
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple, Union
-
-if TYPE_CHECKING:
-    from src.preparer.resume_parser import ParsedResume, ResumeParser
+from typing import Any, Dict, Optional, Tuple
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
@@ -45,7 +41,7 @@ logger = setup_logger("ResumeIntegrityVerifier")
 _SHA256_HEX_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
 
 
-@dataclass
+@dataclass(frozen=True)
 class VerifiedResume:
     """Immutable verified resume artifact holding verified bytes, metadata, and fresh parsed representation."""
 
@@ -58,21 +54,33 @@ class VerifiedResume:
     file_size_bytes: int
     file_format: str
     raw_text: str
-    parsed_resume: ParsedResume
+    _parsed_resume: Any
     original_filename: str = ""
     resolved_path: Optional[Path] = None
+
+    def __post_init__(self):
+        # Enforce defensive deep-copy of parsed representation upon construction
+        if hasattr(self, "_parsed_resume") and self._parsed_resume is not None:
+            object.__setattr__(self, "_parsed_resume", copy.deepcopy(self._parsed_resume))
+
+    @property
+    def parsed_resume(self) -> Any:
+        """Returns a defensive deep copy of the parsed resume to guarantee immutability."""
+        return copy.deepcopy(self._parsed_resume)
 
     def __repr__(self) -> str:
         # Mask raw bytes and truncate text to prevent leaking candidate data into ordinary logs
         return (
             f"VerifiedResume(resume_id={self.resume_id}, user_id={self.user_id}, "
             f"version_num={self.version_num}, format='{self.file_format}', "
+            f"storage_filename='{self.storage_filename}', "
             f"size={self.file_size_bytes}, hash='{self.file_hash[:12]}...', "
             f"bytes=<bytes: {len(self.file_bytes)}>, text_len={len(self.raw_text)})"
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Returns safe serializable metadata dictionary excluding sensitive raw bytes."""
+        """Returns safe serializable metadata dictionary excluding sensitive raw bytes and server filesystem paths."""
+        parsed_dict = self._parsed_resume.to_dict() if hasattr(self._parsed_resume, "to_dict") else {}
         return {
             "resume_id": self.resume_id,
             "user_id": self.user_id,
@@ -82,8 +90,8 @@ class VerifiedResume:
             "file_size_bytes": self.file_size_bytes,
             "file_format": self.file_format,
             "original_filename": self.original_filename,
-            "resolved_path": str(self.resolved_path) if self.resolved_path else "",
-            "parsed_data": self.parsed_resume.to_dict(),
+            "resolved_path": self.storage_filename,
+            "parsed_data": copy.deepcopy(parsed_dict),
         }
 
 
@@ -329,27 +337,68 @@ class ResumeIntegrityVerifier:
             resume_id=resume_id,
             user_id=int(user_id),
             version_num=target_ver,
-            storage_filename=Path(str(res_row.get("storage_filename", ""))).name,
+            storage_filename=resolved_path.name,
             file_bytes=file_bytes,
             file_hash=actual_hash,
             file_size_bytes=actual_size,
             file_format=expected_fmt,
             raw_text=parsed_resume.raw_text,
-            parsed_resume=parsed_resume,
+            _parsed_resume=parsed_resume,
             original_filename=res_row.get("original_filename", ""),
             resolved_path=resolved_path,
         )
+
+    def _record_audit_safe(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: int,
+        previous_state: Dict[str, Any],
+        recovery_outcome: str,
+        recovered_hash: Optional[str] = None,
+        recovered_size: Optional[int] = None,
+        details: Optional[str] = None,
+    ) -> None:
+        """Safely persists durable audit evidence for recovery operations without leaking candidate data."""
+        try:
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO resume_recovery_audit (
+                        user_id, resume_id, version_num, previous_state_json,
+                        recovered_file_hash, recovered_file_size_bytes, recovery_outcome, details
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id,
+                        resume_id,
+                        version_num,
+                        json.dumps(previous_state),
+                        recovered_hash,
+                        recovered_size,
+                        recovery_outcome,
+                        details,
+                    ),
+                )
+        except Exception as audit_err:
+            logger.warning("Could not persist recovery audit record: %s", audit_err)
 
     def reverify_and_backfill_historical_resume(
         self,
         user_id: int,
         resume_id: int,
+        version_num: Optional[int] = None,
         user_base_dir: Optional[Path] = None,
     ) -> Dict[str, Any]:
         """Controlled recovery path for historical resumes missing cryptographic integrity metadata.
 
-        Verifies that the physical file exists in the candidate's isolated sandbox,
-        validates magic bytes, computes SHA-256 and size, and persists metadata to DB.
+        Enforces Finding C:
+        1. Exact-version recovery targeting version_num (defaults to active_version).
+        2. Differentiates missing/invalid metadata from valid existing metadata that mismatches (rejects tampering).
+        3. Updates ONLY the specific version in resume_versions (and parent resumes only if active_version).
+        4. Atomic transaction with row-count checks preventing concurrency races.
+        5. Records durable audit evidence in resume_recovery_audit.
         """
         uid = self._validate_user_id(user_id)
 
@@ -368,12 +417,56 @@ class ResumeIntegrityVerifier:
                     resource=f"Resume #{resume_id}",
                 )
 
-        storage_filename = res_row.get("storage_filename")
-        if not storage_filename or not str(storage_filename).strip():
-            raise ResumeIntegrityError(f"Historical resume #{resume_id} has no storage filename recorded.")
+            active_ver = res_row.get("active_version", 1) or 1
+            target_ver = version_num if version_num is not None else active_ver
 
-        clean_name = Path(storage_filename).name
+            cursor.execute(
+                "SELECT * FROM resume_versions WHERE resume_id = ? AND user_id = ? AND version_num = ?",
+                (resume_id, uid, target_ver),
+            )
+            v_row = cursor.fetchone()
+            if v_row:
+                v_dict = dict(v_row)
+                storage_filename = v_dict.get("storage_filename") or (
+                    res_row.get("storage_filename") if target_ver == active_ver else None
+                )
+                existing_hash = v_dict.get("file_hash")
+                existing_size = v_dict.get("file_size_bytes")
+            elif target_ver == active_ver:
+                storage_filename = res_row.get("storage_filename")
+                existing_hash = res_row.get("file_hash")
+                existing_size = res_row.get("file_size_bytes")
+            else:
+                raise ResumeNotFoundError(f"Version {target_ver} for Resume #{resume_id} not found.")
+
+        previous_state = {
+            "version_num": target_ver,
+            "storage_filename": storage_filename,
+            "file_hash": existing_hash,
+            "file_size_bytes": existing_size,
+        }
+
+        if not storage_filename or not str(storage_filename).strip():
+            self._record_audit_safe(
+                uid,
+                resume_id,
+                target_ver,
+                previous_state,
+                "REJECTED_MISSING_FILENAME",
+                details="No storage filename recorded.",
+            )
+            raise ResumeIntegrityError(f"Historical resume #{resume_id} (v{target_ver}) has no storage filename recorded.")
+
+        clean_name = Path(str(storage_filename)).name
         if ".." in clean_name or "/" in clean_name or "\\" in clean_name or "\x00" in clean_name:
+            self._record_audit_safe(
+                uid,
+                resume_id,
+                target_ver,
+                previous_state,
+                "REJECTED_PATH_TRAVERSAL",
+                details=f"Path traversal in storage filename: '{storage_filename}'",
+            )
             raise FileSecurityError(f"Path traversal in storage filename: '{storage_filename}'")
 
         if user_base_dir is not None:
@@ -390,50 +483,149 @@ class ResumeIntegrityVerifier:
         target_path = user_resumes_dir / clean_name
         expected_fmt = (res_row.get("file_format") or target_path.suffix.lstrip(".")).lower()
 
-        # Verify on-disk file existence, symlink rejection, and magic bytes (without expected hash/size)
-        resolved_path, file_bytes, actual_hash, actual_size = self.file_validator.resolve_and_verify_candidate_file(
-            user_id=uid,
-            file_path=target_path,
-            expected_hash=None,
-            expected_size=None,
-            expected_format=expected_fmt,
-            is_mandatory=True,
-            resource_desc=f"Historical resume #{resume_id}",
+        # Finding C 5.1: If record ALREADY contains valid cryptographic metadata and file does not match,
+        # treat as potential tampering incident. Never re-sign or overwrite valid cryptographic metadata!
+        has_valid_crypto_metadata = (
+            isinstance(existing_hash, str)
+            and bool(_SHA256_HEX_REGEX.match(existing_hash))
+            and isinstance(existing_size, int)
+            and existing_size > 0
         )
 
-        # Parse freshly to ensure document is readable
-        parsed = self.parser.parse_bytes(file_bytes=file_bytes, file_format=expected_fmt, file_path=str(resolved_path))
+        try:
+            resolved_path, file_bytes, actual_hash, actual_size = self.file_validator.resolve_and_verify_candidate_file(
+                user_id=uid,
+                file_path=target_path,
+                expected_hash=None,
+                expected_size=None,
+                expected_format=expected_fmt,
+                is_mandatory=True,
+                resource_desc=f"Historical resume #{resume_id} (v{target_ver})",
+            )
+        except (FileSecurityError, ValidationError, FileNotFoundError, InvalidFileFormatError, FileTooLargeError, CorruptedFileError) as exc:
+            self._record_audit_safe(
+                uid,
+                resume_id,
+                target_ver,
+                previous_state,
+                "REJECTED_FILE_VALIDATION_FAILED",
+                details=str(exc),
+            )
+            raise
 
-        # Idempotently update database record with verified integrity metadata
+        if has_valid_crypto_metadata:
+            if actual_hash.lower() != existing_hash.lower() or actual_size != existing_size:
+                self._record_audit_safe(
+                    uid,
+                    resume_id,
+                    target_ver,
+                    previous_state,
+                    "REJECTED_TAMPERING_SUSPECTED",
+                    details=(
+                        f"Record already contains valid cryptographic hash ({existing_hash[:12]}...) "
+                        f"which does not match file on disk ({actual_hash[:12]}...)."
+                    ),
+                )
+                raise ResumeIntegrityError(
+                    f"Cannot recover Resume #{resume_id} (v{target_ver}): Record already contains valid "
+                    f"cryptographic metadata that does not match the file on disk. Potential tampering detected."
+                )
+
+        # Parse freshly to ensure document is readable and not corrupted
+        try:
+            parsed = self.parser.parse_bytes(file_bytes=file_bytes, file_format=expected_fmt, file_path=str(resolved_path))
+        except Exception as parse_err:
+            self._record_audit_safe(
+                uid,
+                resume_id,
+                target_ver,
+                previous_state,
+                "REJECTED_PARSING_FAILED",
+                details=str(parse_err),
+            )
+            raise CorruptedFileError(f"Failed to parse historical resume file on disk: {parse_err}") from parse_err
+
+        # Atomic transaction with row-count checks (Finding C 5.2)
         with self.db.transaction() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                UPDATE resumes SET
-                    file_hash = ?,
-                    file_size_bytes = ?,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND user_id = ?
-                """,
-                (actual_hash, actual_size, resume_id, uid),
-            )
+
+            # 1. Update or insert exact resume_versions row
             cursor.execute(
                 """
                 UPDATE resume_versions SET
                     file_hash = ?,
-                    file_size_bytes = ?
-                WHERE resume_id = ? AND user_id = ? AND (file_hash IS NULL OR file_size_bytes IS NULL)
+                    file_size_bytes = ?,
+                    storage_filename = COALESCE(storage_filename, ?)
+                WHERE resume_id = ? AND user_id = ? AND version_num = ?
                 """,
-                (actual_hash, actual_size, resume_id, uid),
+                (actual_hash, actual_size, clean_name, resume_id, uid, target_ver),
             )
+            if cursor.rowcount == 0 and target_ver == active_ver:
+                parsed_json = json.dumps(parsed.to_dict()) if hasattr(parsed, "to_dict") else "{}"
+                cursor.execute(
+                    """
+                    INSERT INTO resume_versions (
+                        resume_id, user_id, version_num, storage_filename,
+                        file_hash, file_size_bytes, change_notes, snapshot_json, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'Historical recovery', ?, CURRENT_TIMESTAMP)
+                    """,
+                    (resume_id, uid, target_ver, clean_name, actual_hash, actual_size, parsed_json),
+                )
+
+            # 2. Update parent resumes record ONLY if recovering active_version
+            if target_ver == active_ver:
+                cursor.execute(
+                    """
+                    UPDATE resumes SET
+                        file_hash = ?,
+                        file_size_bytes = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ? AND user_id = ?
+                    """,
+                    (actual_hash, actual_size, resume_id, uid),
+                )
+
+            # 3. Persist durable audit record
+            cursor.execute(
+                """
+                INSERT INTO resume_recovery_audit (
+                    user_id, resume_id, version_num, previous_state_json,
+                    recovered_file_hash, recovered_file_size_bytes, recovery_outcome, details
+                ) VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', ?)
+                """,
+                (
+                    uid,
+                    resume_id,
+                    target_ver,
+                    json.dumps(previous_state),
+                    actual_hash,
+                    actual_size,
+                    f"Recovered {expected_fmt.upper()} binary ({actual_size} bytes)",
+                ),
+            )
+
+            # Retrieve updated version / parent info
             cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
-            updated_row = dict(cursor.fetchone())
+            updated_parent = dict(cursor.fetchone())
+            cursor.execute(
+                "SELECT * FROM resume_versions WHERE resume_id = ? AND version_num = ?",
+                (resume_id, target_ver),
+            )
+            v_row = cursor.fetchone()
+            updated_version = dict(v_row) if v_row else {}
 
         logger.info(
-            "Successfully re-verified historical resume #%d for user %d (size: %d, SHA-256: %s...)",
+            "Successfully recovered historical resume #%d (v%d) for user %d (size: %d, SHA-256: %s...)",
             resume_id,
+            target_ver,
             uid,
             actual_size,
             actual_hash[:12],
         )
-        return updated_row
+        return {
+            "resume": updated_parent,
+            "version": updated_version,
+            "version_num": target_ver,
+            "file_hash": actual_hash,
+            "file_size_bytes": actual_size,
+        }

@@ -563,6 +563,33 @@ When interacting with the browser via Playwright MCP:
     - All 1,312 tests across 58 test suites passing (100% pass rate).
     - 0 ruff errors, 0 lint warnings.
 
+- [x] **Architecture v2.1.1 Phase 9.1.1.2: Resume Integrity Gap Remediation & Matching Path Closure** (Complete)
+  - Finding A — Matching Pipeline Bypass Closure:
+    - Integrated JIT binary verification via `ResumeIntegrityVerifier.verify_and_load_resume()` into `DashboardService.run_match_evaluation()`.
+    - Evaluates freshly extracted candidate facts directly from verified binary bytes; `UniversalMatcher.evaluate()` requires verification when evaluated via persistent service requests (`enforce_resume_verification=True`).
+    - Fails closed immediately on missing, tampered, or unverified resumes, guaranteeing zero `match_results` rows are persisted on failure.
+  - Finding B — Unverified Scoring Recommendation Fallback Removal:
+    - Removed broad exception fallback to stale database `parsed_data` in `DashboardService.recommend_scoring_profile()`.
+    - Fails closed on file tampering or missing files; generic baseline fallback is strictly limited to when `resume_id is None`.
+  - Finding C — Exact-Version Historical Recovery & Durable Audit Logging:
+    - Rewrote `reverify_and_backfill_historical_resume()` to require exact target versioning (`version_num`), preventing cross-version clobbering.
+    - Implemented strict tamper detection refusing to re-sign or overwrite records that already possess valid cryptographic metadata when disk files differ.
+    - Updates parent `resumes` table only when recovering `active_version`.
+    - Added SQLite table `resume_recovery_audit` with query helpers (`record_resume_recovery_audit`, `get_resume_recovery_audit`) capturing previous state, outcome, recovered hash/size, and details.
+  - Finding D — Genuine Immutability of `VerifiedResume`:
+    - Converted `VerifiedResume` to `@dataclass(frozen=True)` with deepcopy defense on `@property def parsed_resume`.
+    - Sanitized `to_dict()` (excludes raw bytes/text, sanitizes `resolved_path` to basename) and log-masked `__repr__`.
+  - Finding E — Closure of Alternate Resume-Data Bypasses:
+    - Plugged resume dictionary bypasses across `generate_tailored_resume`, `generate_universal_cover_letter`, `batch_answer_screening_questions`, and `UniversalTailoredResumeGenerator.generate` by resolving resume IDs regardless of `file_hash` presence and JIT-verifying before generation.
+    - Added path traversal detection (`\x00` and `..`) to `ProfileUpdater.sync_user_profile`.
+  - Finding F — Exact-Version Identity Consistency:
+    - Fixed `VerifiedResume.storage_filename = resolved_path.name`, ensuring exact identity consistency for historical version loads.
+  - Verification & Regressions:
+    - Authored 33 comprehensive regression tests in `tests/test_phase_9_1_1_2_integrity_remediation.py`.
+    - Aligned existing test suites (`test_match_dashboard.py`, `test_phase5_1_hardening.py`, `test_profile_and_matching_pipeline.py`).
+    - All 1,345 tests across 59 test suites passing (100% pass rate).
+    - 0 ruff errors, 0 pyflakes errors, 0 lint warnings.
+
 ---
 
 ## 7. Approval Requirement

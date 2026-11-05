@@ -2708,7 +2708,7 @@ class DashboardService:
     def recommend_scoring_profile(
         self,
         user_id: int,
-        resume_id: int,
+        resume_id: Optional[int],
         job_description_id: int,
     ) -> Tuple[str, str]:
         """Inspects resume and job description to recommend best matching scoring profile."""
@@ -2718,30 +2718,16 @@ class DashboardService:
 
         cand_level = "entry"
         years_exp = None
-        try:
+        if resume_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
+            f_val = FileSecurityValidator(base_storage_dir=self.storage_base_dir) if self.storage_base_dir else None
             verifier = ResumeIntegrityVerifier(
                 db_manager=self.db,
-                file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
+                file_validator=f_val,
             )
             verified_res = verifier.verify_and_load_resume(user_id=user_id, resume_id=resume_id, fresh_parse=True)
             cand_level = verified_res.parsed_resume.career_level or "entry"
-            parsed_resume = verified_res.parsed_resume.to_dict()
-            if isinstance(parsed_resume, dict):
-                cand_level = parsed_resume.get("career_level") or cand_level
-        except Exception:
-            resume = self.db.get_user_resume(resume_id, user_id=user_id)
-            if resume:
-                cand_level = resume.get("label") or "entry"
-                parsed_resume = resume.get("parsed_data")
-                if isinstance(parsed_resume, str):
-                    try:
-                        parsed_resume = json.loads(parsed_resume)
-                    except Exception:
-                        parsed_resume = {}
-                if isinstance(parsed_resume, dict):
-                    cand_level = parsed_resume.get("career_level") or cand_level
 
         parsed_jd = jd.to_dict().get("parsed_data") or {}
         if isinstance(parsed_jd, str):
@@ -2776,19 +2762,37 @@ class DashboardService:
 
         # 2. Fetch active resume version
         res_rec = self.db.get_user_resume(resume_id, user_id)
-        active_version = res_rec.get("active_version", 1) if res_rec else 1
+        if not res_rec:
+            raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+        active_version = res_rec.get("active_version", 1) or 1
+
+        # 3. JIT Verify Resume Binary before matching (Finding A)
+        from src.security.resume_verifier import ResumeIntegrityVerifier
+        from src.security.file_security import FileSecurityValidator
+
+        f_val = FileSecurityValidator(base_storage_dir=self.storage_base_dir) if self.storage_base_dir else None
+        verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=f_val)
+        verified_res = verifier.verify_and_load_resume(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=active_version,
+            fresh_parse=True,
+        )
 
         matcher = UniversalMatcher(db_manager=self.db)
         return matcher.evaluate(
             user_id=user_id,
             resume_id=resume_id,
-            resume_version_num=active_version,
+            resume_version_num=verified_res.version_num,
+            resume_data=verified_res.parsed_resume,
+            verified_resume=verified_res,
             profile_data=profile_data,
             candidate_profile_version=candidate_profile_version,
             candidate_profile_hash=candidate_profile_hash,
             job_description_id=job_description_id,
             scoring_profile_id=scoring_profile_id,
             persist=True,
+            enforce_resume_verification=True,
         )
 
     def get_user_match_history(
@@ -2884,8 +2888,8 @@ class DashboardService:
         """Generates role-specific tailored resume using UniversalTailoredResumeGenerator with JIT verification."""
         from src.preparer.tailored_resume_generator import UniversalTailoredResumeGenerator
         target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict) and "id" in resume_data and "file_hash" in resume_data:
-            target_res_id = resume_data["id"]
+        if target_res_id is None and isinstance(resume_data, dict):
+            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
 
         generator = UniversalTailoredResumeGenerator()
         return generator.generate(
@@ -2920,8 +2924,8 @@ class DashboardService:
             LetterTone,
         )
         target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict) and "id" in resume_data and "file_hash" in resume_data:
-            target_res_id = resume_data["id"]
+        if target_res_id is None and isinstance(resume_data, dict):
+            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
         if target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
@@ -2966,8 +2970,8 @@ class DashboardService:
         """Answers screening questions across 19 categories rooted strictly in verified evidence with JIT verification."""
         from src.preparer.question_answerer import QuestionAnswerer
         target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict) and "id" in resume_data and "file_hash" in resume_data:
-            target_res_id = resume_data["id"]
+        if target_res_id is None and isinstance(resume_data, dict):
+            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
         if target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator

@@ -484,6 +484,10 @@ class ProfileUpdater:
             )
             parsed = verified_res.parsed_resume
         elif resume_path is not None:
+            rp_str = str(resume_path).strip()
+            if "\x00" in rp_str or ".." in rp_str:
+                from src.database.exceptions import FileSecurityError
+                raise FileSecurityError(f"Path traversal detected in resume_path: '{resume_path}'")
             parser = ResumeParser()
             parsed = parser.parse_file(resume_path)
         else:
