@@ -80,6 +80,11 @@ class ValidationError(DatabaseError):
     pass
 
 
+class ConcurrencyConflictError(ValidationError):
+    """Raised when a concurrent modification or race condition is detected during transactional operations."""
+    pass
+
+
 class InvalidStatusTransitionError(DatabaseError):
     """Raised when an illegal application status transition is attempted."""
 

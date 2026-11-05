@@ -434,6 +434,9 @@ class JobDescription:
     source_url: Optional[str] = None
     original_filename: Optional[str] = None
     storage_filename: Optional[str] = None
+    file_hash: Optional[str] = None
+    file_size_bytes: Optional[int] = None
+    file_format: Optional[str] = None
     snapshot_hash: Optional[str] = None
     parsed_data: Optional[str] = None
     parser_version: Optional[str] = "1.0.0"

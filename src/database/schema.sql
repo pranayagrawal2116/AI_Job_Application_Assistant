@@ -110,6 +110,9 @@ CREATE TABLE IF NOT EXISTS job_descriptions (
     source_url TEXT,
     original_filename TEXT,
     storage_filename TEXT,
+    file_hash TEXT,
+    file_size_bytes INTEGER,
+    file_format TEXT,
     company_name TEXT NOT NULL,
     job_title TEXT NOT NULL,
     raw_content TEXT NOT NULL,
@@ -444,6 +447,9 @@ CREATE INDEX IF NOT EXISTS idx_job_descriptions_user ON job_descriptions(user_id
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_user_content ON job_descriptions(user_id, content_hash);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_snapshot_hash ON job_descriptions(user_id, snapshot_hash);
 CREATE INDEX IF NOT EXISTS idx_job_descriptions_supersedes ON job_descriptions(supersedes_job_description_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_job_descriptions_unique_active_child
+ON job_descriptions(user_id, supersedes_job_description_id)
+WHERE supersedes_job_description_id IS NOT NULL AND is_active = 1;
 CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_resume ON match_results(user_id, resume_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_jd ON match_results(user_id, job_description_id);

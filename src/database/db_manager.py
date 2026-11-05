@@ -12,6 +12,7 @@ import pandas as pd
 
 from src.database.exceptions import (
     ApplicationNotFoundError,
+    ConcurrencyConflictError,
     CrossUserAccessError,
     DatabaseError,
     DatabaseMigrationError,
@@ -271,6 +272,9 @@ class DatabaseManager:
         add_col_if_missing("job_descriptions", "supersedes_job_description_id", "INTEGER")
         add_col_if_missing("job_descriptions", "snapshot_hash", "TEXT")
         add_col_if_missing("job_descriptions", "is_active", "INTEGER DEFAULT 1")
+        add_col_if_missing("job_descriptions", "file_hash", "TEXT")
+        add_col_if_missing("job_descriptions", "file_size_bytes", "INTEGER")
+        add_col_if_missing("job_descriptions", "file_format", "TEXT")
         add_col_if_missing("match_results", "resume_version_num", "INTEGER DEFAULT 1")
         add_col_if_missing("match_results", "resume_file_hash", "TEXT")
         add_col_if_missing("match_results", "candidate_profile_version", "INTEGER DEFAULT 1")
@@ -330,6 +334,11 @@ class DatabaseManager:
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_prepared_packets_id_user ON prepared_packets(id, user_id)")
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_user_jd ON applications(user_id, job_description_id) WHERE job_description_id IS NOT NULL")
+            cursor.execute("""
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_job_descriptions_unique_active_child
+                ON job_descriptions(user_id, supersedes_job_description_id)
+                WHERE supersedes_job_description_id IS NOT NULL AND is_active = 1
+            """)
         except sqlite3.OperationalError:
             pass
 
@@ -2949,6 +2958,9 @@ class DatabaseManager:
         source_url: Optional[str] = None,
         original_filename: Optional[str] = None,
         storage_filename: Optional[str] = None,
+        file_hash: Optional[str] = None,
+        file_size_bytes: Optional[int] = None,
+        file_format: Optional[str] = None,
         parser_version: str = "1.0.0",
         extraction_confidence: float = 1.0,
         supersedes_job_description_id: Optional[int] = None,
@@ -2967,29 +2979,42 @@ class DatabaseManager:
             raise UserNotFoundError(f"User #{user_id}")
 
         raw_content_clean = raw_content.strip()
-        raw_content_hash = hashlib.sha256(raw_content_clean.encode("utf-8")).hexdigest()
-        if not content_hash:
-            content_hash = raw_content_hash
+        computed_raw_hash = hashlib.sha256(raw_content_clean.encode("utf-8")).hexdigest()
 
-        # Compute RFC 8785 canonical snapshot_hash if not explicitly provided
-        if not snapshot_hash:
-            manifest = {
-                "user_id": user_id,
-                "company_name": company_name.strip(),
-                "job_title": job_title.strip(),
-                "raw_content_hash": raw_content_hash,
-                "parsed_data": parsed_data,
-                "parser_version": parser_version,
-                "source_type": source_type,
-                "source_url": source_url,
-                "original_filename": original_filename,
-            }
-            snapshot_hash = canonical_json_hash(manifest)
+        # Independently calculate and validate caller-supplied content_hash
+        if content_hash is not None and content_hash != computed_raw_hash:
+            raise ValidationError(
+                f"Supplied content_hash '{content_hash}' does not match computed hash '{computed_raw_hash}'."
+            )
+        content_hash = computed_raw_hash
 
-        # Check deduplication per-user
-        if supersedes_job_description_id is None:
-            with self.connection() as conn:
-                cursor = conn.cursor()
+        # Independently calculate and validate caller-supplied RFC 8785 canonical snapshot_hash
+        manifest = {
+            "user_id": user_id,
+            "company_name": company_name.strip(),
+            "job_title": job_title.strip(),
+            "raw_content_hash": computed_raw_hash,
+            "parsed_data": parsed_data,
+            "parser_version": parser_version,
+            "source_type": source_type,
+            "source_url": source_url,
+            "original_filename": original_filename,
+        }
+        computed_snapshot_hash = canonical_json_hash(manifest)
+
+        if snapshot_hash is not None and snapshot_hash != computed_snapshot_hash:
+            raise ValidationError(
+                f"Supplied snapshot_hash '{snapshot_hash}' does not match computed canonical manifest hash '{computed_snapshot_hash}'."
+            )
+        snapshot_hash = computed_snapshot_hash
+
+        parsed_json = json.dumps(parsed_data) if parsed_data else None
+
+        with self.immediate_transaction() as conn:
+            cursor = conn.cursor()
+
+            # Check deduplication per-user for root snapshots
+            if supersedes_job_description_id is None:
                 cursor.execute(
                     "SELECT id FROM job_descriptions WHERE user_id = ? AND content_hash = ? AND is_active = 1",
                     (user_id, content_hash),
@@ -3001,31 +3026,54 @@ class DatabaseManager:
                         existing_id=existing["id"],
                     )
 
-        # If superseding, verify parent ownership
-        if supersedes_job_description_id is not None:
-            parent = self.get_job_description(supersedes_job_description_id, user_id=user_id)
-            if not parent:
-                raise JobDescriptionNotFoundError(f"Job Description #{supersedes_job_description_id} not found.")
-
-        parsed_json = json.dumps(parsed_data) if parsed_data else None
-
-        with self.transaction() as conn:
-            cursor = conn.cursor()
-
-            # If superseding, deactivate the superseded record
+            # If superseding, verify parent ownership, active status, and linear lineage
             if supersedes_job_description_id is not None:
                 cursor.execute(
-                    "UPDATE job_descriptions SET is_active = 0 WHERE id = ? AND user_id = ?",
+                    "SELECT id, user_id, is_active FROM job_descriptions WHERE id = ?",
+                    (supersedes_job_description_id,),
+                )
+                parent = cursor.fetchone()
+                if not parent:
+                    raise JobDescriptionNotFoundError(
+                        f"Job Description #{supersedes_job_description_id} not found."
+                    )
+                if parent["user_id"] != user_id:
+                    raise CrossUserAccessError(
+                        user_id=user_id,
+                        target_user_id=parent["user_id"],
+                        resource=f"JobDescription #{supersedes_job_description_id}",
+                    )
+                if not parent["is_active"]:
+                    raise ValidationError(
+                        f"Cannot supersede Job Description #{supersedes_job_description_id}: record is already inactive."
+                    )
+
+                cursor.execute(
+                    "SELECT id FROM job_descriptions WHERE supersedes_job_description_id = ? AND user_id = ? AND is_active = 1",
                     (supersedes_job_description_id, user_id),
                 )
+                active_child = cursor.fetchone()
+                if active_child:
+                    raise ValidationError(
+                        f"Cannot supersede Job Description #{supersedes_job_description_id}: an active child revision already exists as ID #{active_child['id']}."
+                    )
+
+                cursor.execute(
+                    "UPDATE job_descriptions SET is_active = 0 WHERE id = ? AND user_id = ? AND is_active = 1",
+                    (supersedes_job_description_id, user_id),
+                )
+                if cursor.rowcount != 1:
+                    raise ConcurrencyConflictError(
+                        f"Failed to deactivate parent Job Description #{supersedes_job_description_id} (concurrent modification)."
+                    )
 
             cursor.execute(
                 """
                 INSERT INTO job_descriptions (
                     user_id, source_type, company_name, job_title, raw_content, content_hash, snapshot_hash, parsed_data,
-                    source_url, original_filename, storage_filename, parser_version, extraction_confidence,
-                    supersedes_job_description_id, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source_url, original_filename, storage_filename, file_hash, file_size_bytes, file_format,
+                    parser_version, extraction_confidence, supersedes_job_description_id, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -3039,6 +3087,9 @@ class DatabaseManager:
                     source_url,
                     original_filename,
                     storage_filename,
+                    file_hash,
+                    file_size_bytes,
+                    file_format,
                     parser_version,
                     extraction_confidence,
                     supersedes_job_description_id,
@@ -3062,6 +3113,9 @@ class DatabaseManager:
         source_url: Optional[str] = None,
         original_filename: Optional[str] = None,
         storage_filename: Optional[str] = None,
+        file_hash: Optional[str] = None,
+        file_size_bytes: Optional[int] = None,
+        file_format: Optional[str] = None,
         parser_version: str = "1.0.0",
         extraction_confidence: float = 1.0,
         supersedes_job_description_id: Optional[int] = None,
@@ -3080,6 +3134,9 @@ class DatabaseManager:
             source_url=source_url,
             original_filename=original_filename,
             storage_filename=storage_filename,
+            file_hash=file_hash,
+            file_size_bytes=file_size_bytes,
+            file_format=file_format,
             parser_version=parser_version,
             extraction_confidence=extraction_confidence,
             supersedes_job_description_id=supersedes_job_description_id,
@@ -3116,6 +3173,9 @@ class DatabaseManager:
             source_url=existing.source_url,
             original_filename=existing.original_filename,
             storage_filename=existing.storage_filename,
+            file_hash=existing.file_hash,
+            file_size_bytes=existing.file_size_bytes,
+            file_format=existing.file_format,
             parser_version=version,
             extraction_confidence=confidence,
             parsed_data=updated_parsed_data,
@@ -3291,7 +3351,7 @@ class DatabaseManager:
         if ext not in ("pdf", "docx"):
             raise InvalidFileFormatError(f"Unsupported file format '.{ext}'. Only PDF and DOCX documents are accepted.")
 
-        storage_filename, detected_format, _, _ = validator.save_user_job_description_file(
+        storage_filename, detected_format, file_size, file_hash = validator.save_user_job_description_file(
             user_id=user_id,
             file_bytes=file_bytes,
             original_filename=original_filename,
@@ -3325,6 +3385,9 @@ class DatabaseManager:
             source_type="upload",
             original_filename=original_filename,
             storage_filename=storage_filename,
+            file_hash=file_hash,
+            file_size_bytes=file_size,
+            file_format=detected_format,
             parser_version=structured.parser_version,
             extraction_confidence=structured.extraction_confidence,
             parsed_data=structured.to_dict(),
