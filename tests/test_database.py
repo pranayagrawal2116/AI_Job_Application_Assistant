@@ -237,8 +237,9 @@ class TestDatabaseManager(unittest.TestCase):
             job_id,
             approver_name="Candidate Pranay",
             approval_notes="Manually reviewed form inputs and authorized review packet.",
+            user_id=self.user_id,
         )
-        app4 = self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL)
+        app4 = self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL, user_id=self.user_id)
         self.assertEqual(app4.status, ApplicationStatus.AWAITING_APPROVAL.value)
 
         # Check logs recorded
@@ -269,12 +270,12 @@ class TestDatabaseManager(unittest.TestCase):
 
         # 1. Direct illegal transition from Discovered to Applied MUST fail
         with self.assertRaises(InvalidStatusTransitionError):
-            self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True)
+            self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True, user_id=self.user_id)
 
         # 2. Transition through valid sequence to Application Prepared
-        self.db.update_application_status(job_id, ApplicationStatus.UNDER_REVIEW)
-        self.db.update_application_status(job_id, ApplicationStatus.SHORTLISTED)
-        self.db.update_application_status(job_id, ApplicationStatus.APPLICATION_PREPARED)
+        self.db.update_application_status(job_id, ApplicationStatus.UNDER_REVIEW, user_id=self.user_id)
+        self.db.update_application_status(job_id, ApplicationStatus.SHORTLISTED, user_id=self.user_id)
+        self.db.update_application_status(job_id, ApplicationStatus.APPLICATION_PREPARED, user_id=self.user_id)
 
         # 3. Automated bots/agents cannot grant approval
         with self.assertRaises(ValidationError):
@@ -285,19 +286,20 @@ class TestDatabaseManager(unittest.TestCase):
             job_id,
             approver_name="Candidate Pranay",
             approval_notes="Manually reviewed form inputs and authorized submission.",
+            user_id=self.user_id,
         )
         self.assertEqual(approval_log.action, "HUMAN_APPROVAL_GRANTED")
-        self.assertTrue(self.db.has_valid_human_approval(job_id=job_id))
+        self.assertTrue(self.db.has_valid_human_approval(job_id=job_id, user_id=self.user_id))
 
         # 5. Transition to Awaiting Approval
-        self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL)
+        self.db.update_application_status(job_id, ApplicationStatus.AWAITING_APPROVAL, user_id=self.user_id)
 
         # 6. Attempt to set Applied without confirmed=True -> MUST fail
         with self.assertRaises(UnconfirmedSubmissionError):
-            self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=False)
+            self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=False, user_id=self.user_id)
 
         # 7. Now transition to Applied with confirmed=True succeeds
-        app = self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True)
+        app = self.db.update_application_status(job_id, ApplicationStatus.APPLIED, confirmed=True, user_id=self.user_id)
         self.assertEqual(app.status, ApplicationStatus.APPLIED.value)
         self.assertIsNotNone(app.date_submitted)
 

@@ -1471,13 +1471,56 @@ class DatabaseManager:
     # APPLICATION OPERATIONS & STATUS TRACKING
     # -------------------------------------------------------------------------
 
-    def get_application_by_job_id(self, job_id: int) -> Optional[Application]:
-        """Fetches the application record linked to a given job ID."""
+    def get_application_by_id(self, application_id: int) -> Optional[Application]:
+        """Fetches the application record linked to a given primary key application ID."""
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT * FROM applications WHERE job_id = ?", (job_id,))
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (int(application_id),))
             row = cursor.fetchone()
             return Application(**dict(row)) if row else None
+
+    def get_application_by_job_id(
+        self,
+        job_id: int,
+        user_id: Optional[Union[int, str]] = None,
+    ) -> Optional[Application]:
+        """Fetches the application record linked to a given job ID.
+
+        When user_id is provided, scopes the lookup to that candidate's application.
+        When user_id is omitted:
+        - If no applications exist for job_id, returns None.
+        - If multiple applications exist for job_id across candidates, fails closed by raising SecurityAuthorizationError.
+        - If exactly 1 application exists, returns that application.
+        """
+        clean_user_id: Optional[int] = None
+        if user_id is not None:
+            try:
+                clean_user_id = int(user_id)
+                if clean_user_id <= 0:
+                    return None
+            except (ValueError, TypeError):
+                return None
+
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if clean_user_id is not None:
+                cursor.execute(
+                    "SELECT * FROM applications WHERE job_id = ? AND user_id = ?",
+                    (int(job_id), clean_user_id),
+                )
+                row = cursor.fetchone()
+                return Application(**dict(row)) if row else None
+            else:
+                cursor.execute("SELECT * FROM applications WHERE job_id = ?", (int(job_id),))
+                rows = cursor.fetchall()
+                if not rows:
+                    return None
+                if len(rows) > 1:
+                    raise SecurityAuthorizationError(
+                        f"Ambiguous application lookup for job {job_id}: multiple applications exist across candidates. "
+                        f"Explicit user_id or application_id is required."
+                    )
+                return Application(**dict(rows[0]))
 
     def list_applications(self, status: Optional[str] = None) -> List[Application]:
         """Lists all applications, optionally filtered by status."""
@@ -1495,26 +1538,31 @@ class DatabaseManager:
 
     def update_application_status(
         self,
-        job_id: int,
-        new_status: Union[str, ApplicationStatus],
+        job_id: Optional[int] = None,
+        new_status: Optional[Union[str, ApplicationStatus]] = None,
         confirmed: bool = False,
         notes: Optional[str] = None,
         resume_used: Optional[str] = None,
         cover_letter_reference: Optional[str] = None,
         packet_version_hash: Optional[str] = None,
-        user_id: Optional[str] = None,
+        user_id: Optional[Union[str, int]] = None,
+        *,
+        application_id: Optional[int] = None,
     ) -> Application:
-        """Updates the application status for a job, with strict transition state machines,
-        human-in-the-loop authorization, and immutable audit logging.
+        """Updates the application status for an exact application or job, with strict transition state machines,
+        application-scoped human authorization, and immutable audit logging.
 
         Raises:
             JobNotFoundError: If job does not exist.
             ApplicationNotFoundError: If application record does not exist.
             InvalidStatusError: If new_status is not a recognized status.
             InvalidStatusTransitionError: If the transition skips intermediate state machines.
-            SecurityAuthorizationError: If human approval or packet verification fails.
+            SecurityAuthorizationError: If human approval, user ownership, or packet verification fails.
             UnconfirmedSubmissionError: If trying to set 'Applied' without confirmed=True or valid approval.
         """
+        if new_status is None:
+            raise ValidationError("new_status is required.")
+
         valid_statuses = ApplicationStatus.list()
         status_value = (
             new_status.value if isinstance(new_status, ApplicationStatus) else str(new_status)
@@ -1529,10 +1577,79 @@ class DatabaseManager:
         if not matched_status:
             raise InvalidStatusError(status_value, valid_statuses)
 
-        # Retrieve current application state
-        app = self.get_application_by_job_id(job_id)
-        if not app:
-            raise ApplicationNotFoundError(f"Job ID {job_id}")
+        clean_user_id: Optional[int] = None
+        if user_id is not None:
+            try:
+                clean_user_id = int(user_id)
+                if clean_user_id <= 0:
+                    raise SecurityAuthorizationError(f"Invalid user_id: {user_id}")
+            except (ValueError, TypeError):
+                raise SecurityAuthorizationError(f"Malformed user_id: {user_id}")
+
+        # Resolve exact target application
+        app: Optional[Application] = None
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if application_id is not None:
+                cursor.execute("SELECT * FROM applications WHERE id = ?", (int(application_id),))
+                row = cursor.fetchone()
+                if not row:
+                    raise ApplicationNotFoundError(f"Application ID {application_id}")
+                app = Application(**dict(row))
+
+                if job_id is not None and app.job_id != int(job_id):
+                    raise SecurityAuthorizationError(
+                        f"Application #{application_id} (Job #{app.job_id}) does not match requested Job #{job_id}."
+                    )
+
+                if app.user_id is not None:
+                    if clean_user_id is None:
+                        raise SecurityAuthorizationError(
+                            f"Candidate-owned application #{app.id} mutation requires authenticated user_id."
+                        )
+                    if int(app.user_id) != clean_user_id:
+                        raise SecurityAuthorizationError(
+                            f"Unauthorized update: Application #{app.id} is owned by User #{app.user_id}, "
+                            f"but request authenticated as User #{clean_user_id}."
+                        )
+            else:
+                if job_id is None:
+                    raise ValidationError("Either application_id or job_id must be provided to update application status.")
+
+                cursor.execute("SELECT * FROM applications WHERE job_id = ?", (int(job_id),))
+                rows = cursor.fetchall()
+                if not rows:
+                    raise ApplicationNotFoundError(f"Job ID {job_id}")
+
+                if len(rows) > 1:
+                    if clean_user_id is None:
+                        raise SecurityAuthorizationError(
+                            f"Ambiguous application update for Job ID {job_id}: multiple candidate applications exist. "
+                            f"Explicit application_id or authenticated user_id is required."
+                        )
+                    matched_rows = [r for r in rows if r["user_id"] is not None and int(r["user_id"]) == clean_user_id]
+                    if len(matched_rows) != 1:
+                        raise SecurityAuthorizationError(
+                            f"Ambiguous or missing application for Job ID {job_id} and User #{clean_user_id}."
+                        )
+                    app = Application(**dict(matched_rows[0]))
+                else:
+                    single_row = rows[0]
+                    if single_row["user_id"] is not None:
+                        if clean_user_id is not None:
+                            if int(single_row["user_id"]) != clean_user_id:
+                                raise SecurityAuthorizationError(
+                                    f"Unauthorized update: Application for Job ID {job_id} belongs to User #{single_row['user_id']}, "
+                                    f"but request authenticated as User #{clean_user_id}."
+                                )
+                        elif matched_status in (ApplicationStatus.APPLIED.value, ApplicationStatus.AWAITING_APPROVAL.value):
+                            raise SecurityAuthorizationError(
+                                f"Candidate-owned application status transition to '{matched_status}' requires authenticated user_id."
+                            )
+                    app = Application(**dict(single_row))
+
+        if app is None:
+            raise ApplicationNotFoundError(f"Application for Job ID {job_id}")
 
         old_status = app.status
         if old_status == matched_status:
@@ -1543,11 +1660,18 @@ class DatabaseManager:
         if matched_status not in allowed:
             raise InvalidStatusTransitionError(old_status=old_status, new_status=matched_status, allowed=allowed)
 
+        effective_user_id = clean_user_id if clean_user_id is not None else app.user_id
+
         # 2. Strict Human Authorization Validation for Awaiting Approval
         if matched_status == ApplicationStatus.AWAITING_APPROVAL.value:
-            if not self.has_valid_human_approval(job_id=job_id, expected_packet_hash=packet_version_hash, user_id=user_id):
+            if not self.has_valid_human_approval(
+                application_id=app.id,
+                job_id=app.job_id,
+                expected_packet_hash=packet_version_hash,
+                user_id=effective_user_id,
+            ):
                 raise SecurityAuthorizationError(
-                    f"Transition to 'Awaiting Approval' rejected: Job #{job_id} requires valid, authenticated "
+                    f"Transition to 'Awaiting Approval' rejected: Application #{app.id} (Job #{app.job_id}) requires valid, authenticated "
                     f"human approval of the reviewed application packet."
                 )
 
@@ -1563,7 +1687,12 @@ class DatabaseManager:
                     new_status=matched_status,
                     allowed=[ApplicationStatus.AWAITING_APPROVAL.value],
                 )
-            if not self.has_valid_human_approval(job_id=job_id, expected_packet_hash=packet_version_hash, user_id=user_id):
+            if not self.has_valid_human_approval(
+                application_id=app.id,
+                job_id=app.job_id,
+                expected_packet_hash=packet_version_hash,
+                user_id=effective_user_id,
+            ):
                 raise UnconfirmedSubmissionError(
                     "STRICT SAFEGUARD: Cannot mark application as 'Applied' without an active, unconsumed human approval record "
                     "matching the reviewed application packet hash in the audit trail."
@@ -1596,7 +1725,14 @@ class DatabaseManager:
             else:
                 params.append(app.notes)
 
-            params.append(job_id)
+            params.append(app.id)
+            params.append(old_status)
+
+            if app.user_id is not None:
+                params.append(app.user_id)
+                owner_where = "AND user_id = ?"
+            else:
+                owner_where = "AND user_id IS NULL"
 
             cursor.execute(
                 f"""
@@ -1608,27 +1744,35 @@ class DatabaseManager:
                     updated_at = CURRENT_TIMESTAMP
                     {date_submitted_clause}
                     {date_prepared_clause}
-                WHERE job_id = ?
+                WHERE id = ? AND status = ? {owner_where}
                 """,
                 params,
             )
+
+            if cursor.rowcount != 1:
+                raise DatabaseError(
+                    f"Failed to update application status for Application #{app.id}: "
+                    f"expected 1 row affected, got {cursor.rowcount}. Possible concurrent modification."
+                )
 
             # Record immutable audit log
             log_details = {
                 "old_status": old_status,
                 "new_status": matched_status,
                 "notes": notes,
-                "user_id": str(user_id or "candidate_user"),
+                "application_id": app.id,
+                "user_id": str(app.user_id if app.user_id is not None else (clean_user_id or "candidate_user")),
                 "packet_version_hash": packet_version_hash or "",
             }
             cursor.execute(
                 """
-                INSERT INTO application_logs (job_id, application_id, action, details)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+                VALUES (?, ?, ?, ?, ?)
                 """,
                 (
-                    job_id,
+                    app.job_id,
                     app.id,
+                    app.user_id if app.user_id is not None else clean_user_id,
                     f"STATUS_TRANSITION: {old_status} -> {matched_status}",
                     json.dumps(log_details),
                 ),
@@ -1637,37 +1781,42 @@ class DatabaseManager:
             if matched_status == ApplicationStatus.APPLIED.value:
                 cursor.execute(
                     """
-                    INSERT INTO application_logs (job_id, application_id, action, details)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+                    VALUES (?, ?, ?, ?, ?)
                     """,
                     (
-                        job_id,
+                        app.job_id,
                         app.id,
+                        app.user_id if app.user_id is not None else clean_user_id,
                         "HUMAN_APPROVAL_CONSUMED",
                         json.dumps({
                             "action": "CONSUMED",
                             "consumed_at": datetime.now().isoformat(),
-                            "user_id": str(user_id or "candidate_user"),
+                            "application_id": app.id,
+                            "user_id": str(app.user_id if app.user_id is not None else (clean_user_id or "candidate_user")),
                             "packet_version_hash": packet_version_hash or "",
                             "notes": notes or "Approval record consumed for confirmed manual application submission.",
                         }),
                     ),
                 )
 
-            cursor.execute("SELECT * FROM applications WHERE job_id = ?", (job_id,))
+            cursor.execute("SELECT * FROM applications WHERE id = ?", (app.id,))
             updated_row = cursor.fetchone()
-            logger.info("Updated application for job %d: %s -> %s", job_id, old_status, matched_status)
+            logger.info("Updated application #%d for job %s: %s -> %s", app.id, str(app.job_id), old_status, matched_status)
             return Application(**dict(updated_row))
 
     def record_human_approval(
         self,
-        job_id: int,
-        approver_name: str,
+        job_id: Optional[int] = None,
+        approver_name: str = "",
         approver_id: Optional[str] = None,
         session_id: Optional[str] = None,
         packet_version_hash: Optional[str] = None,
         ticket_nonce: Optional[str] = None,
         approval_notes: Optional[str] = None,
+        *,
+        application_id: Optional[int] = None,
+        user_id: Optional[Union[str, int]] = None,
     ) -> ApplicationLog:
         """Records an explicit human approval record in the application audit trail.
 
@@ -1683,13 +1832,28 @@ class DatabaseManager:
                 f"Unauthorized approver '{clean_approver}'. Automated engines/agents are strictly forbidden from approving applications."
             )
 
-        app = self.get_application_by_job_id(job_id)
-        if not app:
-            raise ApplicationNotFoundError(f"Job ID {job_id}")
+        app: Optional[Application] = None
+        if application_id is not None:
+            app = self.get_application_by_id(int(application_id))
+            if not app:
+                raise ApplicationNotFoundError(f"Application ID {application_id}")
+            effective_job_id = app.job_id
+        else:
+            if job_id is None:
+                raise ValidationError("job_id or application_id is required.")
+            resolved_user = user_id or (int(approver_id) if approver_id and approver_id.isdigit() else None)
+            app = self.get_application_by_job_id(job_id, user_id=resolved_user)
+            if not app:
+                raise ApplicationNotFoundError(f"Job ID {job_id}")
+            effective_job_id = job_id
+
+        effective_user_id = user_id if user_id is not None else app.user_id
 
         details = {
             "approver": clean_approver,
-            "approver_id": approver_id or "candidate_user",
+            "approver_id": approver_id or (str(effective_user_id) if effective_user_id else "candidate_user"),
+            "user_id": str(effective_user_id) if effective_user_id is not None else "candidate_user",
+            "application_id": app.id,
             "session_id": session_id or "",
             "packet_version_hash": packet_version_hash or "",
             "ticket_nonce": ticket_nonce or "",
@@ -1703,35 +1867,49 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO application_logs (job_id, application_id, action, details)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (job_id, app.id, "HUMAN_APPROVAL_GRANTED", json.dumps(details)),
+                (effective_job_id, app.id, effective_user_id, "HUMAN_APPROVAL_GRANTED", json.dumps(details)),
             )
             log_id = cursor.lastrowid
             cursor.execute("SELECT * FROM application_logs WHERE id = ?", (log_id,))
-            logger.info("Human approval granted for job %d by '%s'", job_id, clean_approver)
+            logger.info("Human approval granted for app %d (job %s) by '%s'", app.id, str(effective_job_id), clean_approver)
             return ApplicationLog(**dict(cursor.fetchone()))
 
     def consume_human_approval(
         self,
-        job_id: int,
+        job_id: Optional[int] = None,
         packet_version_hash: Optional[str] = None,
         session_id: Optional[str] = None,
         user_id: Optional[Union[str, int]] = None,
         ticket_nonce: Optional[str] = None,
         notes: Optional[str] = None,
+        *,
+        application_id: Optional[int] = None,
     ) -> None:
         """Marks a prior human approval as consumed upon manual submission confirmation, preventing replay."""
-        app = self.get_application_by_job_id(job_id)
-        if not app:
-            raise ApplicationNotFoundError(f"Job ID {job_id}")
+        app: Optional[Application] = None
+        if application_id is not None:
+            app = self.get_application_by_id(int(application_id))
+            if not app:
+                raise ApplicationNotFoundError(f"Application ID {application_id}")
+            effective_job_id = app.job_id
+        else:
+            if job_id is None:
+                raise ValidationError("job_id or application_id is required.")
+            app = self.get_application_by_job_id(job_id, user_id=user_id)
+            if not app:
+                raise ApplicationNotFoundError(f"Job ID {job_id}")
+            effective_job_id = job_id
+
+        effective_user_id = user_id if user_id is not None else app.user_id
 
         if ticket_nonce:
             self.consume_action_nonce_persistently(
                 ticket_nonce=ticket_nonce,
                 key_id="v1",
-                user_id=int(user_id) if (user_id and str(user_id).isdigit()) else None,
+                user_id=int(effective_user_id) if (effective_user_id and str(effective_user_id).isdigit()) else None,
                 action_type="SUBMIT_APPLICATION",
             )
         else:
@@ -1759,7 +1937,8 @@ class DatabaseManager:
         details = {
             "action": "CONSUMED",
             "consumed_at": datetime.now().isoformat(),
-            "user_id": str(user_id or "candidate_user"),
+            "user_id": str(effective_user_id or "candidate_user"),
+            "application_id": app.id,
             "session_id": session_id or "",
             "packet_version_hash": packet_version_hash or "",
             "ticket_nonce": ticket_nonce or "",
@@ -1769,12 +1948,12 @@ class DatabaseManager:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO application_logs (job_id, application_id, action, details)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (job_id, app.id, "HUMAN_APPROVAL_CONSUMED", json.dumps(details)),
+                (effective_job_id, app.id, effective_user_id, "HUMAN_APPROVAL_CONSUMED", json.dumps(details)),
             )
-            logger.info("Human approval consumed for job %d (replay prevention active)", job_id)
+            logger.info("Human approval consumed for app %d (job %s) (replay prevention active)", app.id, str(effective_job_id))
 
     def has_valid_human_approval(
         self,
@@ -1908,6 +2087,9 @@ class DatabaseManager:
                 if pkt_count > 0:
                     return False
 
+                leg_app_id = app_id
+                leg_job_id = app_row["job_id"]
+
             # 2. Legacy job_id lookup
             if job_id is not None and application_id is None:
                 if clean_user_id is not None:
@@ -1929,6 +2111,14 @@ class DatabaseManager:
 
                 leg_app = app_rows[0]
                 leg_app_id = leg_app["id"]
+                leg_job_id = job_id
+
+                # Candidate-owned application REQUIRES valid authenticated user_id matching owner
+                if leg_app["user_id"] is not None:
+                    if clean_user_id is None or int(leg_app["user_id"]) != clean_user_id:
+                        return False
+                elif clean_user_id is not None:
+                    return False
 
                 # Modern applications with prepared packets must never fall back to legacy logs
                 cursor.execute(
@@ -1938,6 +2128,7 @@ class DatabaseManager:
                 if cursor.fetchone()["pkt_count"] > 0:
                     return False
 
+            if "leg_app_id" in locals():
                 # Retrieve audit logs scoped to exact application_id and job_id
                 cursor.execute(
                     """
@@ -1946,7 +2137,7 @@ class DatabaseManager:
                     WHERE application_id = ? AND job_id = ?
                     ORDER BY id DESC
                     """,
-                    (leg_app_id, job_id),
+                    (leg_app_id, leg_job_id),
                 )
                 logs = cursor.fetchall()
                 if not logs:
@@ -1992,14 +2183,34 @@ class DatabaseManager:
 
         return False
 
-    def get_application_logs(self, job_id: int) -> List[ApplicationLog]:
-        """Retrieves audit trail logs for a given job."""
+    def get_application_logs(
+        self,
+        job_id: Optional[int] = None,
+        *,
+        application_id: Optional[int] = None,
+        user_id: Optional[Union[str, int]] = None,
+    ) -> List[ApplicationLog]:
+        """Retrieves audit trail logs for a given job or application."""
+        query = "SELECT * FROM application_logs"
+        conditions = []
+        params: List[Any] = []
+        if application_id is not None:
+            conditions.append("application_id = ?")
+            params.append(int(application_id))
+        if job_id is not None:
+            conditions.append("job_id = ?")
+            params.append(int(job_id))
+        if user_id is not None and str(user_id).isdigit():
+            conditions.append("user_id = ?")
+            params.append(int(user_id))
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += " ORDER BY id ASC, timestamp ASC"
+
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                "SELECT * FROM application_logs WHERE job_id = ? ORDER BY timestamp ASC",
-                (job_id,),
-            )
+            cursor.execute(query, params)
             return [ApplicationLog(**dict(row)) for row in cursor.fetchall()]
 
     # -------------------------------------------------------------------------

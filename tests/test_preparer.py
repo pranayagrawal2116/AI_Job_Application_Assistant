@@ -142,6 +142,7 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         self.session = self.session_mgr.authenticate_candidate(
             candidate_id="candidate_pranay",
             candidate_name="Pranay Agrawal",
+            user_id=self.user_id,
         )
         self.gate = HumanApprovalGate(db_manager=self.db, session_manager=self.session_mgr)
 
@@ -309,11 +310,11 @@ class TestApplicationPreparationEngine(unittest.TestCase):
         )
 
         # Transition job to Application Prepared first
-        app = self.db.get_application_by_job_id(self.test_job.id)
+        app = self.db.get_application_by_job_id(self.test_job.id, user_id=self.user_id)
         if app.status == ApplicationStatus.DISCOVERED.value:
-            self.db.update_application_status(self.test_job.id, ApplicationStatus.UNDER_REVIEW)
-            self.db.update_application_status(self.test_job.id, ApplicationStatus.SHORTLISTED)
-            self.db.update_application_status(self.test_job.id, ApplicationStatus.APPLICATION_PREPARED)
+            self.db.update_application_status(self.test_job.id, ApplicationStatus.UNDER_REVIEW, user_id=self.user_id)
+            self.db.update_application_status(self.test_job.id, ApplicationStatus.SHORTLISTED, user_id=self.user_id)
+            self.db.update_application_status(self.test_job.id, ApplicationStatus.APPLICATION_PREPARED, user_id=self.user_id)
 
         action_ticket = self.session_mgr.issue_action_ticket(
             session_id=self.session.session_id,

@@ -9,11 +9,13 @@ Enforces:
 6. Atomic file writes and SHA-256 integrity verification.
 """
 
+import errno
 import hashlib
 import io
 import os
 import re
 import secrets
+import stat
 import uuid
 import warnings
 import zipfile
@@ -700,39 +702,142 @@ class FileSecurityValidator:
         if ".." in rel.parts:
             raise FileSecurityError(f"Path traversal detected in {resource_desc} path: '{file_path}'")
 
-        curr = candidate_root
-        for part in rel.parts:
-            curr = curr / part
-            if os.path.lexists(curr) and (os.path.islink(curr) or curr.is_symlink()):
-                raise FileSecurityError(
-                    f"Symbolic link detected: {resource_desc} path component '{curr}' cannot be a symbolic link."
-                )
+        if not rel.parts:
+            raise FileSecurityError(f"Empty relative path in {resource_desc}: '{file_path}'")
 
-        # 3. Resolve path only after original path components have been checked
-        resolved_target = effective_path.resolve()
+        # Check platform descriptor-relative support
+        if os.open not in os.supports_dir_fd or os.lstat not in os.supports_dir_fd or not hasattr(os, "O_NOFOLLOW"):
+            raise FileSecurityError("Descriptor-relative path validation with O_NOFOLLOW is not supported on this platform.")
+
+        parent_parts = rel.parts[:-1]
+        filename = rel.parts[-1]
+        if not filename or filename in ("", ".", "..") or "/" in filename or "\\" in filename:
+            raise FileSecurityError(f"Invalid filename '{filename}' in {resource_desc} path.")
+
+        open_fds: list[int] = []
+        file_fd: int | None = None
+
         try:
-            resolved_target.relative_to(candidate_root)
-        except ValueError:
-            raise FileSecurityError(
-                f"Path containment violation: {resource_desc} '{file_path}' resolves outside candidate storage root '{candidate_root}'."
-            )
-
-        if not resolved_target.exists():
-            raise FileNotFoundError(f"{resource_desc} not found on disk at '{resolved_target}'.")
-
-        if os.path.islink(resolved_target) or resolved_target.is_symlink() or not resolved_target.is_file():
-            raise ValidationError(f"{resource_desc} path '{resolved_target}' is not a regular file.")
-
-        # 4. Open and read actual bytes using O_NOFOLLOW
-        try:
-            flags = os.O_RDONLY
+            # 1. Open the trusted candidate root directory
+            root_flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                root_flags |= os.O_DIRECTORY
             if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            fd = os.open(resolved_target, flags)
-            with os.fdopen(fd, "rb") as f:
-                file_bytes = f.read()
-        except OSError as read_err:
-            raise CorruptedFileError(f"Failed to read {resource_desc} file on disk: {read_err}")
+                root_flags |= os.O_NOFOLLOW
+
+            try:
+                root_fd = os.open(str(candidate_root), root_flags)
+                open_fds.append(root_fd)
+            except OSError as e:
+                raise FileSecurityError(f"Cannot open trusted candidate root '{candidate_root}': {e}")
+
+            root_st = os.fstat(root_fd)
+            if not stat.S_ISDIR(root_st.st_mode):
+                raise FileSecurityError(f"Candidate storage root is not a directory: '{candidate_root}'")
+
+            # 2. Traverse each parent directory using dir_fd with O_DIRECTORY | O_NOFOLLOW
+            current_dir_fd = root_fd
+            for part in parent_parts:
+                if not part or part in ("", ".", "..") or "/" in part or "\\" in part:
+                    raise FileSecurityError(f"Invalid path component '{part}' in {resource_desc} path.")
+
+                # Check for symlink in intermediate directory component
+                try:
+                    st_link = os.lstat(part, dir_fd=current_dir_fd)
+                    if stat.S_ISLNK(st_link.st_mode):
+                        raise FileSecurityError(
+                            f"Symbolic link detected: {resource_desc} path component '{part}' cannot be a symbolic link."
+                        )
+                except FileNotFoundError:
+                    raise FileNotFoundError(f"{resource_desc} path component '{part}' not found on disk.")
+                except OSError as err:
+                    raise FileSecurityError(f"Error inspecting parent path component '{part}': {err}")
+
+                dir_flags = os.O_RDONLY
+                if hasattr(os, "O_DIRECTORY"):
+                    dir_flags |= os.O_DIRECTORY
+                if hasattr(os, "O_NOFOLLOW"):
+                    dir_flags |= os.O_NOFOLLOW
+
+                try:
+                    next_fd = os.open(part, dir_flags, dir_fd=current_dir_fd)
+                    open_fds.append(next_fd)
+                except OSError as e:
+                    if getattr(e, "errno", None) in (errno.ELOOP, errno.ENOTDIR):
+                        raise FileSecurityError(
+                            f"Symbolic link detected: {resource_desc} path component '{part}' cannot be a symbolic link."
+                        )
+                    if getattr(e, "errno", None) == errno.ENOENT:
+                        raise FileNotFoundError(f"{resource_desc} parent directory '{part}' not found on disk.")
+                    raise FileSecurityError(f"Error opening parent directory '{part}': {e}")
+
+                part_st = os.fstat(next_fd)
+                if not stat.S_ISDIR(part_st.st_mode):
+                    raise FileSecurityError(f"Parent path component '{part}' is not a directory.")
+                current_dir_fd = next_fd
+
+            # 3. Open the final file relative to the verified parent descriptor with O_NOFOLLOW
+            try:
+                st_file_lstat = os.lstat(filename, dir_fd=current_dir_fd)
+                if stat.S_ISLNK(st_file_lstat.st_mode):
+                    raise FileSecurityError(
+                        f"Symbolic link detected: {resource_desc} '{filename}' cannot be a symbolic link."
+                    )
+            except FileNotFoundError:
+                raise FileNotFoundError(f"{resource_desc} not found on disk at '{effective_path}'.")
+            except OSError as err:
+                raise FileSecurityError(f"Error inspecting {resource_desc} file '{filename}': {err}")
+
+            file_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                file_flags |= os.O_NOFOLLOW
+
+            try:
+                file_fd = os.open(filename, file_flags, dir_fd=current_dir_fd)
+            except OSError as e:
+                if getattr(e, "errno", None) == errno.ELOOP:
+                    raise FileSecurityError(
+                        f"Symbolic link detected: {resource_desc} '{filename}' cannot be a symbolic link."
+                    )
+                if getattr(e, "errno", None) == errno.ENOENT:
+                    raise FileNotFoundError(f"{resource_desc} not found on disk at '{effective_path}'.")
+                raise CorruptedFileError(f"Failed to read {resource_desc} file on disk: {e}")
+
+            # 4. Use fstat() on the opened descriptor and require a regular file
+            file_st = os.fstat(file_fd)
+            if stat.S_ISLNK(file_st.st_mode):
+                raise FileSecurityError(f"{resource_desc} '{filename}' is a symbolic link.")
+            if not stat.S_ISREG(file_st.st_mode):
+                raise ValidationError(f"{resource_desc} path '{filename}' is not a regular file.")
+
+            # 5. Read bytes directly from that exact verified descriptor
+            chunks = []
+            total_read = 0
+            while True:
+                chunk = os.read(file_fd, 64 * 1024)
+                if not chunk:
+                    break
+                total_read += len(chunk)
+                if total_read > MAX_FILE_SIZE_BYTES:
+                    raise FileTooLargeError(
+                        f"{resource_desc} size ({total_read / (1024*1024):.2f} MB) exceeds maximum allowed limit of 10 MB."
+                    )
+                chunks.append(chunk)
+            file_bytes = b"".join(chunks)
+
+        finally:
+            if file_fd is not None:
+                try:
+                    os.close(file_fd)
+                except OSError:
+                    pass
+            for fd in reversed(open_fds):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        resolved_target = effective_path
 
         actual_size = len(file_bytes)
         if actual_size > MAX_FILE_SIZE_BYTES:

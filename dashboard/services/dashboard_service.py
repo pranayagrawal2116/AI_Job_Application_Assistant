@@ -212,6 +212,9 @@ class DashboardService:
         new_status: str,
         notes: Optional[str] = None,
         approver_name: Optional[str] = None,
+        user_id: Optional[Union[int, str]] = None,
+        *,
+        application_id: Optional[int] = None,
     ) -> Tuple[bool, str]:
         """Updates job application status enforcing human-in-the-loop authorization."""
         try:
@@ -238,9 +241,11 @@ class DashboardService:
                 job_id=job_id,
                 new_status=target_status,
                 notes=notes,
+                user_id=user_id,
+                application_id=application_id,
             )
             return True, f"Application status updated to '{target_status.value}'."
-        except (InvalidStatusTransitionError, ApplicationNotFoundError) as exc:
+        except (InvalidStatusTransitionError, ApplicationNotFoundError, SecurityAuthorizationError) as exc:
             self.logger.warning("Disallowed status transition for Job #%d: %s", job_id, exc)
             return False, f"Status update failed: {exc}"
         except Exception as exc:
@@ -702,6 +707,15 @@ class DashboardService:
         if not job:
             return False, f"Job #{job_id} not found."
 
+        resolved_uid = user_id
+        if resolved_uid is None:
+            try:
+                app_entry = self.db.get_application_by_job_id(job_id)
+                if app_entry and app_entry.user_id:
+                    resolved_uid = int(app_entry.user_id)
+            except Exception:
+                pass
+
         res_path_str: str = ""
         res_hash: str = "unverified_hash"
 
@@ -710,7 +724,7 @@ class DashboardService:
             res_path_str = str(p)
             res_hash = ResumeParser.compute_file_hash(p) if p.exists() else "unverified_hash"
         else:
-            uid = user_id or 1
+            uid = resolved_uid or 1
             primary = self.db.get_primary_resume(uid)
             if primary:
                 try:
@@ -758,7 +772,10 @@ class DashboardService:
                 return False, f"Approval rejected: {e}"
         else:
             try:
-                sess = self._legacy_get_or_create_candidate_session_for_tests(candidate_name=approver_name or "Authorized Candidate")
+                sess = self._legacy_get_or_create_candidate_session_for_tests(
+                    candidate_name=approver_name or "Authorized Candidate",
+                    user_id=resolved_uid,
+                )
             except Exception as e:
                 self.logger.error("Failed to create candidate session for authorization (Job #%d): %s", job_id, e, exc_info=True)
                 return False, f"Approval rejected: {e}"
@@ -786,6 +803,9 @@ class DashboardService:
         session_id: Optional[str] = None,
         submission_ticket: Optional[str] = None,
         packet_version_hash: Optional[str] = None,
+        *,
+        application_id: Optional[int] = None,
+        user_id: Optional[Union[str, int]] = None,
     ) -> Tuple[bool, str]:
         """Legacy compatibility method for Phase 6 single-job manual submission confirmation.
 
@@ -796,7 +816,7 @@ class DashboardService:
 
         p_hash = packet_version_hash
         if not p_hash:
-            logs = self.db.get_application_logs(job_id)
+            logs = self.db.get_application_logs(job_id=job_id, application_id=application_id, user_id=user_id)
             for log in logs:
                 if log.action == "HUMAN_APPROVAL_GRANTED" and log.details:
                     try:
@@ -818,7 +838,18 @@ class DashboardService:
                 return False, f"Submission rejected: {e}"
         else:
             try:
-                sess = self._legacy_get_or_create_candidate_session_for_tests(candidate_name=approver_name or "Authorized Candidate")
+                resolved_uid = int(user_id) if (user_id and str(user_id).isdigit()) else None
+                if resolved_uid is None:
+                    try:
+                        app_entry = self.db.get_application_by_id(application_id) if application_id else self.db.get_application_by_job_id(job_id)
+                        if app_entry and app_entry.user_id:
+                            resolved_uid = int(app_entry.user_id)
+                    except Exception:
+                        pass
+                sess = self._legacy_get_or_create_candidate_session_for_tests(
+                    candidate_name=approver_name or "Authorized Candidate",
+                    user_id=resolved_uid,
+                )
             except Exception as e:
                 self.logger.error("Failed to create candidate session for submission (Job #%d): %s", job_id, e, exc_info=True)
                 return False, f"Submission rejected: {e}"
@@ -837,6 +868,7 @@ class DashboardService:
             submission_ticket=ticket,
             packet_version_hash=p_hash,
             submission_notes=submission_notes,
+            application_id=application_id,
         )
 
     # -------------------------------------------------------------------------

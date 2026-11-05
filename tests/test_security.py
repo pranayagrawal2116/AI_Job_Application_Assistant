@@ -88,6 +88,7 @@ class TestSecurityAndAuthorization(unittest.TestCase):
             candidate_id=self.candidate_id,
             candidate_name=self.candidate_name,
             ttl_seconds=3600,
+            user_id=self.user_id,
         )
 
         # Create unique test job for each test run
@@ -104,9 +105,9 @@ class TestSecurityAndAuthorization(unittest.TestCase):
             ),
             user_id=self.user_id,
         )
-        self.db.update_application_status(self.job_a.id, ApplicationStatus.UNDER_REVIEW)
-        self.db.update_application_status(self.job_a.id, ApplicationStatus.SHORTLISTED)
-        self.db.update_application_status(self.job_a.id, ApplicationStatus.APPLICATION_PREPARED)
+        self.db.update_application_status(self.job_a.id, ApplicationStatus.UNDER_REVIEW, user_id=self.user_id)
+        self.db.update_application_status(self.job_a.id, ApplicationStatus.SHORTLISTED, user_id=self.user_id)
+        self.db.update_application_status(self.job_a.id, ApplicationStatus.APPLICATION_PREPARED, user_id=self.user_id)
 
         # Build clean test packet for job_a
         self.packet_a = self.gate.build_review_packet(
@@ -376,30 +377,30 @@ class TestSecurityAndAuthorization(unittest.TestCase):
             ),
             user_id=self.user_id,
         )
-        app_c = self.db.get_application_by_job_id(job_c.id)
+        app_c = self.db.get_application_by_job_id(job_c.id, user_id=self.user_id)
         self.assertEqual(app_c.status, ApplicationStatus.DISCOVERED.value)
 
         # 1. Discovered -> Applied directly MUST fail
         with self.assertRaises(InvalidStatusTransitionError) as ctx1:
-            self.db.update_application_status(job_c.id, ApplicationStatus.APPLIED, confirmed=True)
+            self.db.update_application_status(job_c.id, ApplicationStatus.APPLIED, confirmed=True, user_id=self.user_id)
         self.assertIn("Illegal status transition from 'Discovered' to 'Applied'", str(ctx1.exception))
 
         # 2. Discovered -> Awaiting Approval directly MUST fail
         with self.assertRaises(InvalidStatusTransitionError) as ctx2:
-            self.db.update_application_status(job_c.id, ApplicationStatus.AWAITING_APPROVAL)
+            self.db.update_application_status(job_c.id, ApplicationStatus.AWAITING_APPROVAL, user_id=self.user_id)
         self.assertIn("Illegal status transition from 'Discovered' to 'Awaiting Approval'", str(ctx2.exception))
 
         # 3. Discovered -> Under Review succeeds
-        app_c = self.db.update_application_status(job_c.id, ApplicationStatus.UNDER_REVIEW)
+        app_c = self.db.update_application_status(job_c.id, ApplicationStatus.UNDER_REVIEW, user_id=self.user_id)
         self.assertEqual(app_c.status, ApplicationStatus.UNDER_REVIEW.value)
 
         # 4. Under Review -> Shortlisted succeeds
-        app_c = self.db.update_application_status(job_c.id, ApplicationStatus.SHORTLISTED)
+        app_c = self.db.update_application_status(job_c.id, ApplicationStatus.SHORTLISTED, user_id=self.user_id)
         self.assertEqual(app_c.status, ApplicationStatus.SHORTLISTED.value)
 
         # 5. Shortlisted -> Applied directly MUST fail
         with self.assertRaises(InvalidStatusTransitionError):
-            self.db.update_application_status(job_c.id, ApplicationStatus.APPLIED, confirmed=True)
+            self.db.update_application_status(job_c.id, ApplicationStatus.APPLIED, confirmed=True, user_id=self.user_id)
 
     # -------------------------------------------------------------------------
     # 6. SCOPE ISOLATION TESTS

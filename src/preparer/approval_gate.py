@@ -22,6 +22,7 @@ from src.database.exceptions import (
     ValidationError,
 )
 from src.database.models import (
+    Application,
     ApplicationApproval,
     ApplicationStatus,
     Job,
@@ -991,6 +992,7 @@ class HumanApprovalGate:
                 approver_id=session.candidate_id,
                 session_id=session_id,
                 packet_version_hash=packet.packet_version_hash,
+                user_id=getattr(session, "user_id", None),
                 approval_notes=(
                     f"Session: {session_id[:8]}... Approver: {cleaned_approver} ({session.candidate_id}). "
                     f"Packet Hash: {packet.packet_version_hash}. Unanswered questions: {len(packet.unanswered_questions)}."
@@ -1015,14 +1017,16 @@ class HumanApprovalGate:
 
     def record_manual_submission(
         self,
-        job_id: int,
-        approver_name: str,
-        session_id: str,
-        submission_ticket: str,
-        packet_version_hash: str,
+        job_id: Optional[int] = None,
+        approver_name: str = "",
+        session_id: str = "",
+        submission_ticket: str = "",
+        packet_version_hash: str = "",
         submission_notes: Optional[str] = None,
+        *,
+        application_id: Optional[int] = None,
     ) -> Tuple[bool, str]:
-        """Records confirmed manual application submission by the candidate."""
+        """Records confirmed manual application submission by the candidate, enforcing application-scoped isolation."""
         cleaned_approver = approver_name.strip() if approver_name else ""
         if not cleaned_approver:
             return False, "Candidate approver name is required to confirm submission."
@@ -1032,34 +1036,93 @@ class HumanApprovalGate:
         except (InvalidSessionError, SessionExpiredError) as e:
             return False, f"Submission rejected: {e}"
 
+        session_user_id = getattr(session, "user_id", None)
+        if session_user_id is None and hasattr(session, "candidate_id") and session.candidate_id:
+            if session.candidate_id.startswith("user_"):
+                try:
+                    session_user_id = int(session.candidate_id.split("_")[1])
+                except (ValueError, IndexError):
+                    pass
+            elif str(session.candidate_id).isdigit():
+                session_user_id = int(session.candidate_id)
+
+        # Resolve exact target application
+        app: Optional[Application] = None
+        if application_id is not None:
+            app = self.db.get_application_by_id(int(application_id))
+            if not app:
+                return False, f"Submission rejected: Application #{application_id} not found."
+            if job_id is not None and app.job_id != int(job_id):
+                return False, f"Submission rejected: Application #{application_id} does not match Job #{job_id}."
+            if app.user_id is not None:
+                if session_user_id is None or int(app.user_id) != int(session_user_id):
+                    return False, f"Submission rejected: Application #{application_id} does not belong to authenticated candidate."
+        else:
+            if job_id is None:
+                return False, "Submission rejected: application_id or job_id must be provided."
+            try:
+                app = self.db.get_application_by_job_id(int(job_id), user_id=session_user_id)
+            except SecurityAuthorizationError as auth_err:
+                return False, f"Submission rejected: {auth_err}"
+            if not app:
+                if not self.db.has_valid_human_approval(job_id=int(job_id), user_id=session_user_id, expected_packet_hash=packet_version_hash):
+                    return False, (
+                        f"Submission rejected: Job #{job_id} does not have an active, unconsumed human approval record "
+                        f"matching packet version hash '{packet_version_hash[:12] if packet_version_hash else ''}...' in the audit trail."
+                    )
+                return False, f"Submission rejected: Application for Job #{job_id} not found."
+            if app.user_id is not None:
+                if session_user_id is None or int(app.user_id) != int(session_user_id):
+                    return False, f"Submission rejected: Application #{app.id} for Job #{job_id} requires authenticated user ownership."
+
+        target_app_id = app.id
+        effective_user_id = app.user_id if app.user_id is not None else session_user_id
+
+        # Determine ticket verification application_id (supports tickets bound to app.id or job.id)
+        ticket_target_id = target_app_id
+        try:
+            _, nonce, _, _ = self.session_manager.parse_action_ticket(submission_ticket)
+            with self.session_manager._session_lock:
+                if nonce in session.issued_tickets:
+                    issued_app_id = session.issued_tickets[nonce].get("application_id")
+                    if issued_app_id == app.job_id:
+                        ticket_target_id = app.job_id
+        except Exception:
+            pass
+
         valid_ticket, ticket_msg = self.session_manager.verify_and_consume_action_ticket(
             session_id=session_id,
             ticket_str=submission_ticket,
             action_type="MANUAL_SUBMISSION",
-            application_id=job_id,
+            application_id=ticket_target_id,
             packet_hash=packet_version_hash,
             db_manager=self.db,
         )
         if not valid_ticket:
             return False, f"Submission rejected: {ticket_msg}"
 
-        if not self.db.has_valid_human_approval(job_id=job_id, user_id=getattr(session, "user_id", None), expected_packet_hash=packet_version_hash):
+        if not self.db.has_valid_human_approval(
+            application_id=target_app_id,
+            user_id=effective_user_id,
+            expected_packet_hash=packet_version_hash,
+        ):
             return False, (
-                f"Submission rejected: Job #{job_id} does not have an active, unconsumed human approval record "
-                f"matching packet version hash '{packet_version_hash[:12]}...' in the audit trail."
+                f"Submission rejected: Application #{target_app_id} (Job #{app.job_id}) does not have an active, unconsumed human approval record "
+                f"matching packet version hash '{packet_version_hash[:12] if packet_version_hash else ''}...' in the audit trail."
             )
 
         try:
             self.db.update_application_status(
-                job_id=job_id,
+                application_id=target_app_id,
+                job_id=app.job_id,
                 new_status=ApplicationStatus.APPLIED.value,
                 confirmed=True,
                 packet_version_hash=packet_version_hash,
-                user_id=getattr(session, "user_id", None),
+                user_id=effective_user_id,
                 notes=f"[Manual Submission Confirmed by {cleaned_approver}]: {submission_notes or 'Submitted via official employer portal'}",
             )
         except Exception as exc:
             return False, f"Submission transition rejected: {exc}"
 
-        logger.info("Confirmed manual submission recorded by '%s' for Job #%d.", cleaned_approver, job_id)
+        logger.info("Confirmed manual submission recorded by '%s' for Application #%d (Job #%s).", cleaned_approver, target_app_id, str(app.job_id))
         return True, "Application recorded as Applied. Confirmation logged in audit trail."

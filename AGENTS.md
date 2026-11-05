@@ -489,6 +489,29 @@ When interacting with the browser via Playwright MCP:
     - Rolls back profile updates, approval revocation, status changes, and timeline events atomically on any write failure.
   - Verification & Regressions: Added 27 comprehensive tests in `tests/test_phase_8_1_3_final_trust_boundary_security.py`. All 1,228 tests across the entire repository test suite passing (100% pass rate). 0 ruff errors, 0 compileall errors, 0 git diff errors.
 
+- [x] **Architecture v2.1.1 Phase 8.1.4: Application-Scoped Status Transitions & Final Trust-Boundary Remediation** (Complete)
+  - Finding A — Application-Scoped Status Updates (Critical):
+    - `DatabaseManager.get_application_by_id(application_id)`: fetches application by exact primary key ID.
+    - `DatabaseManager.get_application_by_job_id(job_id, user_id)`: requires authenticated `user_id` when multiple applications exist for a catalog job, failing closed with `SecurityAuthorizationError` on ambiguity. Returns single application when unambiguous or matching candidate user.
+    - `DatabaseManager.update_application_status()`: accepts `application_id: Optional[int] = None` as primary identifier alongside `job_id: Optional[int] = None`. Enforces candidate ownership validation against `user_id`. Mutates SQL via exact application primary key: `UPDATE applications SET status = ?, ... WHERE id = ? AND status = ? AND user_id = ?` (or `user_id IS NULL` for unowned). Enforces `cursor.rowcount == 1`, raising `DatabaseError` on concurrency race or mismatch. Inserts immutable audit log into `application_logs` with exact `(job_id, application_id, user_id)`. Re-fetches application by exact `id`.
+    - `HumanApprovalGate.record_manual_submission()`: accepts `application_id: Optional[int] = None`. Resolves target application by exact application ID or `(job_id, session_user_id)`. Verifies candidate ownership against authenticated session user. Supports action tickets bound to either application ID or job ID. Verifies approval via `has_valid_human_approval(application_id=target_app_id, user_id=effective_user_id, ...)`. Updates status via exact `(application_id, job_id, user_id)`.
+    - Verified multi-tenant catalog job isolation: when Candidate A submits an application for Job 555, Candidate B's application for Job 555 remains untouched, Candidate B receives zero audit logs, and Candidate B cannot submit using Candidate A's ticket or approval. Order of candidate application insertion does not affect isolation.
+  - Finding B — Fail-Closed Legacy Approval Lookup:
+    - `DatabaseManager.has_valid_human_approval()`: enforces candidate ownership check on legacy `job_id` lookup. Rejects missing, zero, negative, malformed, or mismatched user IDs (`user_id=None`, `0`, `-1`, `'invalid'`, wrong user all return `False`).
+    - Unowned legacy application lookups reject candidate user IDs.
+    - Applications with prepared packet history (`prepared_packets` count > 0) never fall back to legacy audit logs.
+  - Finding C — Descriptor-Relative File Verification & Traversal Hardening:
+    - `FileSecurityValidator.resolve_and_verify_candidate_file()`: implements descriptor-relative directory traversal using `dir_fd` with `O_DIRECTORY | O_NOFOLLOW` relative to the verified candidate root directory.
+    - Inspects each directory segment via `os.lstat(..., dir_fd=current_dir_fd)` and opens each parent descriptor with `O_NOFOLLOW | O_DIRECTORY`, detecting and rejecting intermediate directory symlinks with `FileSecurityError` (`ELOOP` / `ENOTDIR`).
+    - Opens final file descriptor relative to parent `dir_fd` with `O_NOFOLLOW`.
+    - Verifies regular file status via `os.fstat(file_fd)` requiring `stat.S_ISREG`, rejecting non-regular files (directories, FIFOs, devices) with `ValidationError` / `FileSecurityError`.
+    - Reads file bytes directly from the verified file descriptor (`os.read(file_fd, 64 * 1024)` up to size limit), verifying size, SHA-256 hash, and format headers directly from descriptor bytes with zero TOCTOU window.
+    - Closes all opened descriptors in `finally` blocks.
+  - Finding D — End-to-End Regression & Dashboard Integration:
+    - `DatabaseManager.get_application_logs()`: supports filtering by `application_id` and `user_id`.
+    - `DashboardService.update_application_status()` and `confirm_manual_submission()`: delegate exact `application_id` and `user_id` to `DatabaseManager`, ensuring dashboard transitions are strictly candidate-scoped.
+    - Added 20 comprehensive unit and integration tests in `tests/test_phase_8_1_4_application_scoped_transitions.py`. All 1,248 tests across the entire repository test suite passing (100% pass rate). 0 ruff errors, 0 compileall errors, 0 git diff errors.
+
 ---
 
 ## 7. Approval Requirement
