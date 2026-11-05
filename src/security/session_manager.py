@@ -108,9 +108,13 @@ class KeyRotationManager:
         if mode == self.MODE_GRACEFUL:
             if old_secret:
                 self._retired_keys[old_key_id] = (old_secret, time.time() + overlap_window_seconds)
+            if old_key_id in self._keys:
+                del self._keys[old_key_id]
             logger.info("Graceful key rotation: active %s -> %s (retired %s for %ds)", old_key_id, new_key_id, old_key_id, overlap_window_seconds)
         elif mode == self.MODE_EMERGENCY:
             self._revoked_keys.add(old_key_id)
+            if old_key_id in self._keys:
+                del self._keys[old_key_id]
             if old_key_id in self._retired_keys:
                 del self._retired_keys[old_key_id]
             logger.warning("EMERGENCY key rotation: revoked %s immediately, active is now %s", old_key_id, new_key_id)
@@ -471,6 +475,7 @@ class SessionManager:
         application_id: int,
         packet_hash: str,
         ttl_seconds: int = 900,
+        packet_id: Optional[int] = None,
     ) -> str:
         """Issues a single-use cryptographically signed action ticket bound to active key_id."""
         with self._session_lock:
@@ -491,6 +496,7 @@ class SessionManager:
                 "key_id": key_id,
                 "action_type": action_type,
                 "application_id": application_id,
+                "packet_id": packet_id,
                 "packet_hash": packet_hash,
                 "timestamp": timestamp,
                 "ttl": ttl_seconds,
@@ -643,6 +649,8 @@ class SessionManager:
                 return False, f"Authorization rejected: Ticket scope mismatch. Expected HUMAN_APPROVAL, got {meta.get('action_type')}.", None
             if meta.get("application_id") != application_id:
                 return False, f"Authorization rejected: Ticket application ID mismatch. Expected {application_id}, got {meta.get('application_id')}.", None
+            if meta.get("packet_id") is not None and packet_id is not None and meta.get("packet_id") != packet_id:
+                return False, f"Authorization rejected: Ticket packet ID mismatch. Expected {packet_id}, got {meta.get('packet_id')}.", None
             if meta.get("packet_hash") != packet_hash:
                 return False, "Authorization rejected: Ticket packet version mismatch. Application packet was modified after ticket issuance.", None
 
@@ -1035,3 +1043,42 @@ class SessionManager:
                 for gid in grants_to_purge:
                     del self._active_grants[gid]
         return purged_count
+
+    def rotate_keys(
+        self,
+        new_key_id: str,
+        new_secret: Union[str, bytes],
+        mode: str = KeyRotationManager.MODE_GRACEFUL,
+        overlap_window_seconds: int = 900,
+    ) -> None:
+        """Rotates HMAC signing keys on KeyRotationManager with immediate grant/ticket revocation on emergency."""
+        with self._session_lock:
+            old_key_id = self.key_rotation_mgr.active_key_id
+            self.key_rotation_mgr.rotate_keys(
+                new_key_id=new_key_id,
+                new_secret=new_secret,
+                mode=mode,
+                overlap_window_seconds=overlap_window_seconds,
+            )
+            self._active_key_id = new_key_id
+            self._server_secret = self.key_rotation_mgr._keys[new_key_id]
+            if mode == KeyRotationManager.MODE_EMERGENCY:
+                with self._grant_lock:
+                    grants_to_purge = [
+                        gid for gid, ginfo in self._active_grants.items()
+                        if getattr(ginfo.get("grant"), "key_id", None) == old_key_id
+                    ]
+                    for gid in grants_to_purge:
+                        del self._active_grants[gid]
+
+                for sess in self._sessions.values():
+                    sess.issued_tickets = {
+                        nonce: tinfo for nonce, tinfo in sess.issued_tickets.items()
+                        if tinfo.get("key_id") != old_key_id
+                    }
+                    sess.active_grants = {
+                        gid: grant for gid, grant in sess.active_grants.items()
+                        if getattr(grant, "key_id", None) != old_key_id
+                    }
+                    if sess.latest_approval_grant and getattr(sess.latest_approval_grant, "key_id", None) == old_key_id:
+                        sess.latest_approval_grant = None

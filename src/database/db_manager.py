@@ -1768,7 +1768,7 @@ class DatabaseManager:
         # 1. Check application_approvals table if application exists
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id, user_id FROM applications WHERE job_id = ?", (job_id,))
+            cursor.execute("SELECT id, user_id FROM applications WHERE id = ? OR job_id = ?", (job_id, job_id))
             app_row = cursor.fetchone()
             if app_row:
                 app_id = app_row["id"]
@@ -1783,15 +1783,33 @@ class DatabaseManager:
                         (app_id, expected_packet_hash),
                     )
                 else:
+                    # If expected_packet_hash not specified, check if active prepared packet exists
                     cursor.execute(
-                        """
-                        SELECT id, is_consumed, packet_version_hash
-                        FROM application_approvals
-                        WHERE application_id = ?
-                        ORDER BY approved_at DESC LIMIT 1
-                        """,
+                        "SELECT packet_version_hash FROM prepared_packets WHERE application_id = ? AND is_active_revision = 1",
                         (app_id,),
                     )
+                    act_pkt = cursor.fetchone()
+                    if act_pkt and act_pkt["packet_version_hash"]:
+                        target_hash = act_pkt["packet_version_hash"]
+                        cursor.execute(
+                            """
+                            SELECT id, is_consumed, packet_version_hash
+                            FROM application_approvals
+                            WHERE application_id = ? AND packet_version_hash = ?
+                            ORDER BY approved_at DESC LIMIT 1
+                            """,
+                            (app_id, target_hash),
+                        )
+                    else:
+                        cursor.execute(
+                            """
+                            SELECT id, is_consumed, packet_version_hash
+                            FROM application_approvals
+                            WHERE application_id = ?
+                            ORDER BY approved_at DESC LIMIT 1
+                            """,
+                            (app_id,),
+                        )
                 appr_row = cursor.fetchone()
                 if appr_row:
                     if appr_row["is_consumed"]:
@@ -2015,13 +2033,24 @@ class DatabaseManager:
         Uses immediate transaction locking and unique constraint enforcement to
         prevent concurrent race conditions and replay attacks.
         """
-        if not ticket_nonce or not ticket_nonce.strip():
+        if not ticket_nonce or not isinstance(ticket_nonce, str) or not ticket_nonce.strip():
             raise ValidationError("ticket_nonce cannot be empty.")
 
         clean_nonce = ticket_nonce.strip()
+        import re
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", clean_nonce) or len(clean_nonce) < 8 or len(clean_nonce) > 128:
+            raise ValidationError(f"Invalid ticket_nonce format: '{clean_nonce}'.")
+
+        clean_key = (key_id or "v1").strip()
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", clean_key):
+            raise ValidationError(f"Invalid key_id format: '{clean_key}'.")
+
+        clean_action = (action_type or "SUBMIT_APPLICATION").strip()
+        if not clean_action:
+            raise ValidationError("action_type cannot be empty.")
 
         # Connect and acquire an immediate transaction lock
-        conn = self.get_connection()
+        conn = self.get_connection(timeout=10.0)
         conn.isolation_level = None  # Autocommit mode to allow explicit BEGIN IMMEDIATE
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -2041,7 +2070,7 @@ class DatabaseManager:
                 (clean_nonce,),
             )
             approval_row = cursor.fetchone()
-            if approval_row and approval_row["is_consumed"]:
+            if approval_row and (approval_row["is_consumed"] or clean_action == "HUMAN_APPROVAL"):
                 conn.execute("ROLLBACK")
                 raise TicketAlreadyConsumedError(
                     f"Action ticket nonce '{clean_nonce}' was previously consumed on an approved packet."
@@ -2054,7 +2083,7 @@ class DatabaseManager:
                     INSERT INTO consumed_action_nonces (nonce, key_id, user_id, action_type, consumed_at)
                     VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
-                    (clean_nonce, key_id, user_id, action_type),
+                    (clean_nonce, clean_key, user_id, clean_action),
                 )
             except sqlite3.IntegrityError:
                 conn.execute("ROLLBACK")
@@ -2062,8 +2091,8 @@ class DatabaseManager:
                     f"Action ticket nonce '{clean_nonce}' has already been consumed (race condition detected)."
                 )
 
-            # 4. Mark approval record as consumed if exists
-            if approval_row:
+            # 4. Mark approval record as consumed if exists (for submission action)
+            if approval_row and clean_action != "HUMAN_APPROVAL":
                 cursor.execute(
                     """
                     UPDATE application_approvals
@@ -2074,7 +2103,13 @@ class DatabaseManager:
                 )
 
             conn.execute("COMMIT")
-            logger.info("Successfully consumed ticket nonce '%s' for action '%s'", clean_nonce, action_type)
+            logger.info("Successfully consumed ticket nonce '%s' for action '%s'", clean_nonce, clean_action)
+        except (TicketAlreadyConsumedError, ValidationError):
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -2178,6 +2213,13 @@ class DatabaseManager:
                     raise ValidationError("Packet version hash mismatch with active prepared packet.")
                 packet_id = pkt_row["id"]
 
+        if ticket_nonce:
+            cursor.execute("SELECT nonce FROM consumed_action_nonces WHERE nonce = ?", (ticket_nonce,))
+            if cursor.fetchone():
+                raise TicketAlreadyConsumedError(
+                    f"Ticket nonce '{ticket_nonce}' is already registered in approvals."
+                )
+
         try:
             cursor.execute(
                 """
@@ -2208,6 +2250,15 @@ class DatabaseManager:
         approval_id = cursor.lastrowid
         cursor.execute("SELECT * FROM application_approvals WHERE id = ?", (approval_id,))
         row = cursor.fetchone()
+
+        # Ensure ticket_nonce is also registered in consumed_action_nonces within this atomic transaction
+        cursor.execute(
+            """
+            INSERT OR IGNORE INTO consumed_action_nonces (nonce, key_id, user_id, action_type, consumed_at)
+            VALUES (?, ?, ?, 'HUMAN_APPROVAL', CURRENT_TIMESTAMP)
+            """,
+            (ticket_nonce, key_id, user_id),
+        )
 
         # Also log to application_logs
         cursor.execute(

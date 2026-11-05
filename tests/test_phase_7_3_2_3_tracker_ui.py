@@ -73,6 +73,7 @@ from src.database.models import (
     PreparedPacket,
     SubmissionChannel,
 )
+from src.utils.canonical_json import canonical_json_bytes, canonical_json_hash
 from src.lifecycle.follow_up_engine import FollowUpRecommendationEngine
 from src.lifecycle.state_machine import ApplicationStateMachine
 from src.security.session_manager import SessionManager
@@ -187,8 +188,8 @@ class BaseTrackerUITest(unittest.TestCase):
             "screening_questions": [{"question": "Years of experience?", "answer": "4 years"}],
             "attachments_manifest": attachments_manifest or [],
         }
-        canonical_snapshot_json = json.dumps(payload, sort_keys=True)
-        packet_version_hash = hashlib.sha256(canonical_snapshot_json.encode("utf-8")).hexdigest()
+        canonical_snapshot_json = canonical_json_bytes(payload).decode("utf-8")
+        packet_version_hash = canonical_json_hash(payload)
 
         pkt = self.db.create_prepared_packet(
             application_id=application_id,

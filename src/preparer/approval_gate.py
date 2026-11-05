@@ -404,12 +404,21 @@ class HumanApprovalGate:
         user_id: int,
         expected_application_id: Optional[int] = None,
     ) -> Tuple[bool, str, Optional[PreparedPacket]]:
-        """Independently verifies the integrity and active revision status of a prepared packet.
+        """Independently verifies the integrity and active revision status of a prepared packet
+        across the complete 11-element contract.
 
-        Retrieves the packet using authenticated user_id, re-computes SHA-256 directly from
-        the UTF-8 bytes of stored canonical_snapshot_json, compares against packet_version_hash,
-        confirms active revision status, and validates user and application identity.
+        Verifies:
+        - Element 2: Candidate ownership and existence of the application.
+        - Element 3: Candidate ownership and existence of the prepared packet.
+        - Element 4: Exact packet-to-application relationship.
+        - Element 5: Active packet revision status (is_active_revision == 1).
+        - Element 6: Availability, parseability, and structural validity of canonical snapshot JSON.
+        - Element 7: RFC 8785 canonical JSON formatting and SHA-256 hash equality.
+        - Element 8: Integrity of original resume reference and source-version metadata.
+        - Element 9: Integrity of candidate profile and job description snapshot hashes.
+        - Element 10: Integrity of generated document hashes, attachment manifest, and screening QA readiness.
         """
+        # Element 3: Retrieve packet enforcing candidate ownership
         try:
             packet = self.db.get_prepared_packet(packet_id=packet_id, user_id=user_id)
         except CrossUserAccessError as exc:
@@ -421,26 +430,160 @@ class HumanApprovalGate:
         if packet.user_id != user_id:
             return False, f"Integrity check failed: Packet belongs to User #{packet.user_id}, not User #{user_id}.", None
 
+        # Element 2 & 4: Application existence, ownership, and exact binding
+        app_target_id = expected_application_id if expected_application_id is not None else packet.application_id
         if expected_application_id is not None and packet.application_id != expected_application_id:
             return False, (
                 f"Integrity check failed: Packet belongs to Application #{packet.application_id}, "
                 f"not expected Application #{expected_application_id}."
             ), None
 
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, user_id, status FROM applications WHERE id = ?", (app_target_id,))
+            app_row = cursor.fetchone()
+            if not app_row:
+                return False, f"Integrity check failed: Application #{app_target_id} not found.", packet
+            if app_row["user_id"] != user_id:
+                return False, (
+                    f"Integrity check failed: Application #{app_target_id} belongs to User #{app_row['user_id']}, "
+                    f"not User #{user_id}."
+                ), packet
+
+        # Element 5: Active revision status
         if not packet.is_active_revision:
             return False, "Integrity check failed: Packet is an outdated historical revision. Please use the active revision.", packet
 
+        # Element 6: Availability and structural validity of canonical snapshot
         if packet.is_legacy or not packet.canonical_snapshot_json:
             return False, "Integrity check failed: Legacy packet record. Canonical snapshot JSON is unavailable.", packet
 
-        recomputed_hash = hashlib.sha256(packet.canonical_snapshot_json.encode("utf-8")).hexdigest()
+        raw_snapshot_str = packet.canonical_snapshot_json.strip()
+        if not raw_snapshot_str:
+            return False, "Integrity check failed: Canonical snapshot JSON is empty.", packet
+
+        try:
+            snapshot = json.loads(raw_snapshot_str)
+        except (json.JSONDecodeError, TypeError, ValueError) as json_err:
+            return False, f"Integrity check failed: Canonical snapshot JSON is corrupt or unparseable: {json_err}", packet
+
+        if not isinstance(snapshot, dict):
+            return False, "Integrity check failed: Canonical snapshot JSON must be a dictionary object.", packet
+
+        # Required structural identity fields in all canonical snapshots
+        if "user_id" not in snapshot:
+            return False, "Integrity check failed: Canonical snapshot is missing 'user_id'.", packet
+        if "application_id" not in snapshot:
+            return False, "Integrity check failed: Canonical snapshot is missing 'application_id'.", packet
+
+        # Version field check: accepts 'packet_version', 'version_num', or 'version'
+        snapshot_version = snapshot.get("packet_version") if "packet_version" in snapshot else (snapshot.get("version_num") if "version_num" in snapshot else snapshot.get("version"))
+        if snapshot_version is None:
+            return False, "Integrity check failed: Canonical snapshot is missing packet version identifier.", packet
+        if snapshot_version != packet.version_num:
+            return False, f"Integrity check failed: Snapshot version ({snapshot_version}) does not match packet record ({packet.version_num}).", packet
+
+        # Snapshot identity binding
+        if snapshot.get("user_id") != user_id or snapshot.get("application_id") != packet.application_id:
+            return False, "Integrity check failed: Snapshot internal identifiers do not match packet record.", packet
+
+        # Element 7: RFC 8785 canonical JSON integrity & SHA-256 hash equality
+        raw_bytes = packet.canonical_snapshot_json.encode("utf-8")
+        recomputed_hash = hashlib.sha256(raw_bytes).hexdigest()
         if recomputed_hash != packet.packet_version_hash:
             return False, (
                 f"Integrity check failed: Recomputed hash ({recomputed_hash}) does not match "
                 f"stored packet version hash ({packet.packet_version_hash}). Possible tampering detected."
             ), packet
 
-        return True, "Prepared packet integrity verified successfully.", packet
+        try:
+            rfc_bytes = canonical_json_bytes(snapshot)
+            if rfc_bytes != raw_bytes:
+                return False, "Integrity check failed: Canonical snapshot JSON deviates from RFC 8785 canonical formatting.", packet
+        except Exception as canon_err:
+            return False, f"Integrity check failed: Error verifying RFC 8785 canonical JSON bytes: {canon_err}", packet
+
+        # Element 8: Integrity of original resume & source-version metadata
+        if packet.original_resume_id is not None:
+            if "original_resume_id" in snapshot and snapshot.get("original_resume_id") != packet.original_resume_id:
+                return False, "Integrity check failed: Original resume ID in snapshot does not match packet record.", packet
+            resume_rec = self.db.get_user_resume(resume_id=packet.original_resume_id, user_id=user_id)
+            if resume_rec and not resume_rec.get("is_active", 1):
+                return False, f"Integrity check failed: Original source resume #{packet.original_resume_id} is inactive or deleted.", packet
+            if resume_rec and packet.original_resume_hash and resume_rec.get("file_hash") != packet.original_resume_hash:
+                return False, "Integrity check failed: Original source resume file hash has changed since packet creation.", packet
+        elif "original_resume_id" in snapshot and snapshot.get("original_resume_id") is not None:
+            res_id = snapshot.get("original_resume_id")
+            resume_rec = self.db.get_user_resume(resume_id=res_id, user_id=user_id)
+            if resume_rec and not resume_rec.get("is_active", 1):
+                return False, f"Integrity check failed: Original source resume #{res_id} is inactive or deleted.", packet
+
+        if packet.original_resume_hash is not None and "original_resume_file_hash" in snapshot:
+            if snapshot.get("original_resume_file_hash") != packet.original_resume_hash:
+                return False, "Integrity check failed: Original resume hash in snapshot does not match packet record.", packet
+
+        # Element 9: Integrity of candidate profile and job description snapshots
+        if packet.candidate_profile_hash is not None and "candidate_profile_hash" in snapshot:
+            if snapshot.get("candidate_profile_hash") != packet.candidate_profile_hash:
+                return False, "Integrity check failed: Candidate profile snapshot hash mismatch.", packet
+
+        if packet.job_description_snapshot_hash is not None and "job_description_snapshot_hash" in snapshot:
+            if snapshot.get("job_description_snapshot_hash") != packet.job_description_snapshot_hash:
+                return False, "Integrity check failed: Job description snapshot hash mismatch.", packet
+
+        if packet.job_description_id is not None:
+            if "job_description_id" in snapshot and snapshot.get("job_description_id") != packet.job_description_id:
+                return False, "Integrity check failed: Job description ID in snapshot does not match packet record.", packet
+            jd_rec = self.db.get_job_description(jd_id=packet.job_description_id, user_id=user_id)
+            if jd_rec and not jd_rec.is_active:
+                return False, f"Integrity check failed: Job description #{packet.job_description_id} is inactive or archived.", packet
+        elif "job_description_id" in snapshot and snapshot.get("job_description_id") is not None:
+            jd_id = snapshot.get("job_description_id")
+            jd_rec = self.db.get_job_description(jd_id=jd_id, user_id=user_id)
+            if jd_rec and not jd_rec.is_active:
+                return False, f"Integrity check failed: Job description #{jd_id} is inactive or archived.", packet
+
+        # Element 10: Integrity of generated documents, attachments manifest, screening answers & provenance
+        if packet.tailored_resume_hash is not None and "tailored_resume_document_hash" in snapshot:
+            if snapshot.get("tailored_resume_document_hash") != packet.tailored_resume_hash:
+                return False, "Integrity check failed: Tailored resume document hash mismatch between snapshot and packet record.", packet
+        if packet.cover_letter_hash is not None and "cover_letter_document_hash" in snapshot:
+            if snapshot.get("cover_letter_document_hash") != packet.cover_letter_hash:
+                return False, "Integrity check failed: Cover letter document hash mismatch between snapshot and packet record.", packet
+
+        # Attachments manifest verification (if present)
+        if "attachments_manifest" in snapshot:
+            attachments = snapshot.get("attachments_manifest")
+            if not isinstance(attachments, list):
+                return False, "Integrity check failed: attachments_manifest must be a list.", packet
+            for idx, att in enumerate(attachments):
+                if not isinstance(att, dict):
+                    return False, f"Integrity check failed: Attachment #{idx} in manifest is not a valid object.", packet
+                if not att.get("file_hash") or not att.get("format") or "size_bytes" not in att:
+                    return False, f"Integrity check failed: Attachment #{idx} is missing required cryptographic metadata.", packet
+
+        # Screening questions verification (check in snapshot or packet)
+        screening_candidates = snapshot.get("screening_questions")
+        if screening_candidates is None and packet.screening_answers_json:
+            try:
+                screening_candidates = (
+                    json.loads(packet.screening_answers_json)
+                    if isinstance(packet.screening_answers_json, str)
+                    else packet.screening_answers_json
+                )
+            except Exception:
+                screening_candidates = None
+
+        if isinstance(screening_candidates, list):
+            for q in screening_candidates:
+                if isinstance(q, dict):
+                    q_text = q.get("question_text", "Screening Question")
+                    if q.get("state") == "NEEDS_CANDIDATE_INPUT":
+                        return False, f"Integrity check failed: Question '{q_text}' requires candidate input before authorization.", packet
+                    if q.get("exceeds_limit"):
+                        return False, f"Integrity check failed: Question '{q_text}' exceeds the allowable character limit.", packet
+
+        return True, "Prepared packet integrity verified successfully across all elements.", packet
 
     def verify_packet_integrity(self, packet: PreparedPacket) -> Tuple[bool, str]:
         """Independently verifies that a PreparedPacket's stored canonical snapshot matches its version hash."""
@@ -693,6 +836,7 @@ class HumanApprovalGate:
             action_type="MANUAL_SUBMISSION",
             application_id=job_id,
             packet_hash=packet_version_hash,
+            db_manager=self.db,
         )
         if not valid_ticket:
             return False, f"Submission rejected: {ticket_msg}"

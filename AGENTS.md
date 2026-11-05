@@ -403,6 +403,29 @@ When interacting with the browser via Playwright MCP:
   - Finding D — AuthManager Pepper Hardening: Updated `AuthManager.__init__` in `src/security/auth.py` so the development fallback pepper (`DEFAULT_PWD_PEPPER`) is strictly restricted to `APP_ENV in ("development", "test", "dev")` and fails closed with `SecurityAuthorizationError` in production, staging, or any unrecognized environment when `PASSWORD_RESET_PEPPER` is not provided.
   - Verification & Regressions: Added 22 comprehensive unit, concurrency, view authentication, and pepper configuration tests in `tests/test_phase_7_6_1_remediation.py`. All 1,113 tests in the full repository test suite passing (100% pass rate). 0 pyflakes errors, 0 ruff errors.
 
+- [x] **Architecture v2.1.1 Phase 8: Human Approval Gate & Persistent Nonces** (Complete)
+  - Deliverable A — Comprehensive 11-Element Packet Verification: Implemented and hardened comprehensive 11-element verification in `src/preparer/approval_gate.py`:
+    1. Authenticated candidate identity & active server-side session (`sess.user_id == user_id`).
+    2. Candidate ownership and existence of application (`app.user_id == user_id`).
+    3. Candidate ownership of prepared packet (`packet.user_id == user_id`).
+    4. Exact packet-to-application relationship (`packet.application_id == application_id`).
+    5. Active packet revision status (`is_active_revision == 1`).
+    6. Availability & structural validity of canonical snapshot (JSON dict object, mandatory identity and version fields, non-empty).
+    7. RFC 8785 canonical JSON formatting and SHA-256 hash equality (`SHA256(canonical_snapshot_json.encode('utf-8')) == packet_version_hash`).
+    8. Integrity of original resume & source-version metadata (matches DB resume, active status, file hash consistency).
+    9. Integrity of candidate profile and job description snapshots (matches DB, active status, content hash consistency).
+    10. Integrity of generated documents, attachments manifest (valid format, size, SHA-256 hash), and screening QA readiness (zero `NEEDS_CANDIDATE_INPUT`, character limit compliance).
+    11. Consistency of single-use action ticket with exact packet being approved (bound to `HUMAN_APPROVAL`, `application_id`, `packet_id`, `packet_version_hash`, unconsumed).
+  - Deliverable B — Single-Use HMAC Action Tickets: Hardened ticket parsing, issuance, and verification in `src/security/session_manager.py`. Tickets bound to candidate, session, action type, application ID, packet ID, packet version hash, unique nonce, timestamp/TTL, and active `key_id`. Validated using constant-time comparisons (`hmac.compare_digest`). Reused, expired, forged, or cross-scoped tickets fail closed.
+  - Deliverable C — HMAC Key Rotation: Hardened and verified both rotation modes on `SessionManager.rotate_keys()` and `KeyRotationManager`:
+    - Mode A (Graceful): Active key rotated to new key ID; retired keys remain verifiable within 15-minute overlap window (`overlap_window_seconds`), failing after expiry.
+    - Mode B (Emergency): Compromised key is revoked immediately (`_revoked_keys`); tickets signed with revoked key fail immediately; all unconsumed grants in `SessionManager._active_grants` and session-level active tickets/grants tied to compromised key are purged immediately.
+  - Deliverable D — Persistent SQLite Nonce Consumption: Hardened `DatabaseManager.consume_action_nonce_persistently()` with input validation (regex length 8-128, valid key ID and action type), `BEGIN IMMEDIATE` write lock, checks across `consumed_action_nonces` and `application_approvals`, and atomic rollback on contention. Proved with concurrent multi-threaded tests that for N concurrent attempts across independent SQLite connections, exactly 1 succeeds and N-1 fail with `TicketAlreadyConsumedError`. Simulated process restarts prove persistent replay prevention without relying on in-memory caches.
+  - Deliverable E — Post-Approval Invalidation: Any modification to constituent materials (resume, cover letter, screening questions, candidate profile, job description) activates a new packet revision (`is_active_revision = 0` on older), transitions application back to unapproved state, and invalidates prior approvals and tickets. `DatabaseManager.has_valid_human_approval` checks active packet revision hash, preventing stale approval survival.
+  - Deliverable F — Strict Protection Against Autonomous Submission: Enforced strict human-in-the-loop submission boundary across all paths (`HumanApprovalGate`, `DashboardService`, `DatabaseManager`, `ApplicationStateMachine`, and Streamlit UI). Generic status transitions to `SUBMITTED` or `Applied` unconditionally raise `SecurityAuthorizationError`. Submission requires active candidate session, application ownership, active approved packet, unconsumed approval, valid `MANUAL_SUBMISSION` action ticket, and explicit candidate confirmation.
+  - Atomicity & Failure Injection: Verified complete rollback under injected database failures with zero partial records, burned ticket nonces preventing replay, and intact event hash chains.
+  - Verification & Regressions: Added 34 dedicated unit, security, concurrency, rotation, and failure-injection tests in `tests/test_phase_8_human_approval_security.py`. All 1,159 tests in the full repository test suite passing (100% pass rate). 0 pyflakes errors, 0 ruff errors, and clean git diff check.
+
 ---
 
 ## 7. Approval Requirement
