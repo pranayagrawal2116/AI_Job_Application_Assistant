@@ -382,6 +382,205 @@ class TestServerSideSessionValidationInViews(unittest.TestCase):
             mock_st.error.assert_called_with("⚠️ Authentication required: You must be logged in to access Resume Match Analysis.")
 
 
+class TestApplicationPreparerServerSessionAuthentication(unittest.TestCase):
+    """Specific regression test suite verifying server session enforcement in Application Preparer (Phase 7.6.1.2).
+
+    Verifies:
+    1. Empty session state rejects access and fails closed.
+    2. user_id only (without session_id) is rejected and fails closed.
+    3. authenticated_user_id only (without session_id) is rejected and fails closed.
+    4. Both user-ID fields present without session_id are rejected and fail closed.
+    5. Invalid session_id is rejected and fails closed.
+    6. Expired session is rejected and fails closed.
+    7. Revoked session is rejected and fails closed.
+    8. User-ID mismatch (cross-user spoofing) is rejected and fails closed.
+    9. Valid authenticated session successfully resolves the candidate user ID.
+    10. Actual render_application_preparer() entry point performs NO candidate data access
+        (no JD fetching, no resume fetching, no profile fetching, no tab rendering) when unauthenticated.
+    """
+
+    def setUp(self):
+        self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        self.db = DatabaseManager(db_path=self.temp_db.name)
+        self.service = DashboardService(db_manager=self.db)
+        DashboardService._instance = self.service
+
+        SessionManager.reset_instance()
+        self.session_mgr = SessionManager.get_instance()
+
+        # Create valid session for user 1
+        self.valid_session = self.session_mgr.authenticate_candidate(
+            candidate_id="1",
+            candidate_name="Alice Candidate",
+            user_id=1,
+            email="alice@example.com",
+        )
+
+    def tearDown(self):
+        DashboardService._instance = None
+        SessionManager.reset_instance()
+        if os.path.exists(self.temp_db.name):
+            os.unlink(self.temp_db.name)
+
+    def test_empty_session_state_fails_closed(self):
+        """Empty session state must fail closed and return None."""
+        mock_st = MagicMock()
+        mock_st.session_state = {}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_user_id_only_without_session_id_fails_closed(self):
+        """user_id only in session_state without session_id must fail closed and return None."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"user_id": 1}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_authenticated_user_id_only_without_session_id_fails_closed(self):
+        """authenticated_user_id only in session_state without session_id must fail closed and return None."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"authenticated_user_id": 1}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_both_user_id_fields_present_without_session_id_fails_closed(self):
+        """Both user_id and authenticated_user_id present without session_id must fail closed and return None."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"user_id": 1, "authenticated_user_id": 1}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_invalid_session_id_fails_closed(self):
+        """Invalid session ID in session_state must fail closed and return None."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"session_id": "invalid_session_hex_deadbeef"}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_expired_session_fails_closed(self):
+        """Expired session must fail closed and return None."""
+        expired = self.session_mgr.authenticate_candidate(
+            candidate_id="2",
+            candidate_name="Bob Expired",
+            user_id=2,
+            ttl_seconds=-10,
+        )
+        mock_st = MagicMock()
+        mock_st.session_state = {"session_id": expired.session_id, "user_id": 2}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_revoked_session_fails_closed(self):
+        """Revoked session must fail closed and return None."""
+        rev = self.session_mgr.authenticate_candidate(
+            candidate_id="3",
+            candidate_name="Charlie Revoked",
+            user_id=3,
+        )
+        self.session_mgr.revoke_session(rev.session_id)
+        mock_st = MagicMock()
+        mock_st.session_state = {"session_id": rev.session_id, "user_id": 3}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_user_id_mismatch_fails_closed(self):
+        """Client user_id mismatching session user_id must fail closed and return None."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"session_id": self.valid_session.session_id, "user_id": 999}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+        # Also test with authenticated_user_id
+        mock_st.session_state = {"session_id": self.valid_session.session_id, "authenticated_user_id": 999}
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertIsNone(uid)
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+    def test_valid_authenticated_session_succeeds(self):
+        """Valid active session in session_state successfully resolves the candidate user ID."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"session_id": self.valid_session.session_id, "user_id": 1}
+
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertEqual(uid, 1)
+
+        # Also test with authenticated_session_id alias
+        mock_st.session_state = {"authenticated_session_id": self.valid_session.session_id}
+        with patch("dashboard.views.application_preparer.st", mock_st):
+            uid = preparer_get_uid()
+            self.assertEqual(uid, 1)
+
+    def test_render_application_preparer_entry_point_blocks_candidate_data_access(self):
+        """render_application_preparer() entry point performs NO candidate data access when authentication fails."""
+        mock_st = MagicMock()
+        # Spoofed user ID without session
+        mock_st.session_state = {"user_id": 1, "authenticated_user_id": 1}
+
+        with patch("dashboard.views.application_preparer.st", mock_st), \
+             patch.object(self.service, "get_user_job_descriptions") as mock_get_jds, \
+             patch.object(self.service, "get_user_resumes") as mock_get_resumes, \
+             patch.object(self.db, "get_user_candidate_profile") as mock_get_profile:
+
+            render_application_preparer()
+
+            # Ensure authentication error was displayed
+            mock_st.error.assert_called_with("🔒 Authentication required. Please sign in to prepare job applications.")
+
+            # Ensure tabs were NEVER rendered
+            mock_st.tabs.assert_not_called()
+
+            # Ensure NO candidate-specific database reads occurred
+            mock_get_jds.assert_not_called()
+            mock_get_resumes.assert_not_called()
+            mock_get_profile.assert_not_called()
+
+    def test_render_application_preparer_entry_point_succeeds_with_valid_session(self):
+        """render_application_preparer() renders tabs when authenticated with valid session."""
+        mock_st = MagicMock()
+        mock_st.session_state = {"session_id": self.valid_session.session_id, "user_id": 1}
+        mock_st.tabs.return_value = tuple(MagicMock() for _ in range(8))
+        mock_st.columns.return_value = (MagicMock(), MagicMock())
+        mock_st.button.return_value = False
+        mock_st.selectbox.return_value = None
+
+        with patch("dashboard.views.application_preparer.st", mock_st), \
+             patch.object(self.service, "get_user_job_descriptions", return_value=[]) as mock_get_jds, \
+             patch.object(self.service, "get_user_resumes", return_value=[]) as mock_get_resumes:
+
+            render_application_preparer()
+
+            mock_st.error.assert_not_called()
+            mock_st.tabs.assert_called_once()
+            mock_get_jds.assert_called_once_with(user_id=1)
+            mock_get_resumes.assert_called_once_with(user_id=1)
+
+
 class TestAuthManagerPepperHardening(unittest.TestCase):
     """Verifies that AuthManager enforces explicit peppers across non-dev environments."""
 

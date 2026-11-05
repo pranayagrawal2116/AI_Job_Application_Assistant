@@ -134,10 +134,27 @@ class TestPhase61Hardening(unittest.TestCase):
         self.assertIsNone(uid, "Unauthenticated session must resolve to None, never defaulting to User 1.")
 
     def test_authenticated_user_resolution_success(self):
-        """get_current_user_id correctly extracts authenticated_user_id when set."""
+        """get_current_user_id correctly extracts user_id when accompanied by an active server session."""
         import streamlit as st
+        from dashboard.services.dashboard_service import DashboardService
+        service = DashboardService.get_instance(db_manager=self.db)
+        DashboardService._instance = service
+        sess = self.session_mgr.authenticate_candidate(
+            candidate_id="42",
+            candidate_name="Test Candidate",
+            user_id=42,
+        )
+        st.session_state["session_id"] = sess.session_id
         st.session_state["authenticated_user_id"] = 42
         self.assertEqual(get_current_user_id(), 42)
+        st.session_state.clear()
+
+    def test_bare_authenticated_user_id_without_session_fails_closed(self):
+        """Bare authenticated_user_id without a valid server session fails closed and returns None."""
+        import streamlit as st
+        st.session_state.clear()
+        st.session_state["authenticated_user_id"] = 42
+        self.assertIsNone(get_current_user_id())
         st.session_state.clear()
 
     # =========================================================================

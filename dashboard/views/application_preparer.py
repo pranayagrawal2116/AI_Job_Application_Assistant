@@ -22,22 +22,12 @@ from src.preparer.tailored_resume_generator import TailoredResume
 
 def get_current_user_id() -> int | None:
     """Returns the authoritatively verified user_id from active session. Fails closed if not authenticated."""
-    session_id = st.session_state.get("authenticated_session_id") or st.session_state.get("session_id")
-    if session_id:
-        user_id, _ = resolve_view_authenticated_user(
-            view_name="Application Preparer",
-            custom_error_message="🔒 Authentication required. Please sign in to prepare job applications.",
-            st_module=st,
-        )
-        return user_id
-
-    uid = st.session_state.get("authenticated_user_id") or st.session_state.get("user_id")
-    if uid is not None:
-        try:
-            return int(uid)
-        except (ValueError, TypeError):
-            return None
-    return None
+    user_id, _ = resolve_view_authenticated_user(
+        view_name="Application Preparer",
+        custom_error_message="🔒 Authentication required. Please sign in to prepare job applications.",
+        st_module=st,
+    )
+    return user_id
 
 
 def build_real_attachments_manifest(
@@ -108,11 +98,7 @@ def render_application_preparer():
         "Strict zero-hallucination policy with claim-level auditability under human governance."
     )
 
-    user_id, _ = resolve_view_authenticated_user(
-        view_name="Application Preparer",
-        custom_error_message="🔒 Authentication required. Please sign in to prepare job applications.",
-        st_module=st,
-    )
+    user_id = get_current_user_id()
     if not user_id:
         return
 
