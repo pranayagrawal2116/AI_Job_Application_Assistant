@@ -52,6 +52,8 @@ from src.database.models import (
     SubmissionChannel,
     SubmissionConfirmation,
     VerifiedApprovalGrant,
+    SecurityScan,
+    SecurityScanOverride,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
@@ -364,6 +366,71 @@ class DatabaseManager:
                     WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
                 END
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS security_scans (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    source_type TEXT NOT NULL CHECK(source_type IN ('job_description', 'resume')),
+                    source_id INTEGER NOT NULL,
+                    source_version INTEGER NOT NULL DEFAULT 1,
+                    source_hash TEXT NOT NULL,
+                    snapshot_hash TEXT,
+                    scanner_version TEXT NOT NULL,
+                    policy_version TEXT NOT NULL,
+                    risk_score REAL NOT NULL,
+                    classification TEXT NOT NULL CHECK(classification IN ('CLEAN', 'SUSPICIOUS', 'QUARANTINED')),
+                    threats_detected_json TEXT NOT NULL,
+                    key_id TEXT NOT NULL,
+                    hmac_signature TEXT NOT NULL,
+                    scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scans_update
+                BEFORE UPDATE ON security_scans
+                BEGIN
+                    SELECT RAISE(FAIL, 'security_scans records are append-only and cannot be updated.');
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scans_delete
+                BEFORE DELETE ON security_scans
+                BEGIN
+                    SELECT RAISE(FAIL, 'security_scans records are immutable and cannot be deleted except via authorized privacy erasure.')
+                    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
+                END
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS security_scan_overrides (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    scan_id INTEGER NOT NULL REFERENCES security_scans(id),
+                    source_type TEXT NOT NULL,
+                    source_id INTEGER NOT NULL,
+                    source_version INTEGER NOT NULL,
+                    override_reason TEXT NOT NULL,
+                    actor_type TEXT NOT NULL DEFAULT 'candidate',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scan_overrides_update
+                BEFORE UPDATE ON security_scan_overrides
+                BEGIN
+                    SELECT RAISE(FAIL, 'security_scan_overrides records are append-only and cannot be updated.');
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scan_overrides_delete
+                BEFORE DELETE ON security_scan_overrides
+                BEGIN
+                    SELECT RAISE(FAIL, 'security_scan_overrides records are immutable and cannot be deleted except via authorized privacy erasure.')
+                    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
+                END
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_security_scans_lookup ON security_scans(user_id, source_type, source_id, source_version)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_security_scans_hash ON security_scans(source_hash)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_security_scan_overrides_lookup ON security_scan_overrides(user_id, scan_id)")
         except sqlite3.OperationalError:
             pass
 
@@ -4495,6 +4562,246 @@ class DatabaseManager:
             query += " ORDER BY id DESC"
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
+
+    def save_security_scan(
+        self,
+        user_id: int,
+        source_type: str,
+        source_id: int,
+        source_version: int,
+        source_hash: str,
+        snapshot_hash: Optional[str],
+        scanner_version: str,
+        policy_version: str,
+        risk_score: float,
+        classification: str,
+        threats_detected: List[Dict[str, Any]],
+        key_id: str,
+        hmac_signature: str,
+        scanned_at: Optional[str] = None,
+    ) -> SecurityScan:
+        """Persists an authenticated, HMAC-signed security scan record."""
+        threats_json = json.dumps(threats_detected)
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            if scanned_at:
+                cursor.execute(
+                    """
+                    INSERT INTO security_scans (
+                        user_id, source_type, source_id, source_version,
+                        source_hash, snapshot_hash, scanner_version, policy_version,
+                        risk_score, classification, threats_detected_json,
+                        key_id, hmac_signature, scanned_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id, source_type, source_id, source_version,
+                        source_hash, snapshot_hash, scanner_version, policy_version,
+                        risk_score, classification, threats_json,
+                        key_id, hmac_signature, scanned_at,
+                    ),
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO security_scans (
+                        user_id, source_type, source_id, source_version,
+                        source_hash, snapshot_hash, scanner_version, policy_version,
+                        risk_score, classification, threats_detected_json,
+                        key_id, hmac_signature
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        user_id, source_type, source_id, source_version,
+                        source_hash, snapshot_hash, scanner_version, policy_version,
+                        risk_score, classification, threats_json,
+                        key_id, hmac_signature,
+                    ),
+                )
+            scan_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM security_scans WHERE id = ?", (scan_id,))
+            row = cursor.fetchone()
+            return SecurityScan(
+                id=row["id"],
+                user_id=row["user_id"],
+                source_type=row["source_type"],
+                source_id=row["source_id"],
+                source_version=row["source_version"],
+                source_hash=row["source_hash"],
+                snapshot_hash=row["snapshot_hash"],
+                scanner_version=row["scanner_version"],
+                policy_version=row["policy_version"],
+                risk_score=row["risk_score"],
+                classification=row["classification"],
+                threats_detected_json=row["threats_detected_json"],
+                key_id=row["key_id"],
+                hmac_signature=row["hmac_signature"],
+                scanned_at=row["scanned_at"],
+            )
+
+    def get_latest_security_scan(
+        self,
+        user_id: int,
+        source_type: str,
+        source_id: int,
+        source_version: Optional[int] = None,
+    ) -> Optional[SecurityScan]:
+        """Retrieves the newest security scan record for a given source."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if source_version is not None:
+                cursor.execute(
+                    """
+                    SELECT * FROM security_scans
+                    WHERE user_id = ? AND source_type = ? AND source_id = ? AND source_version = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (user_id, source_type, source_id, source_version),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM security_scans
+                    WHERE user_id = ? AND source_type = ? AND source_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (user_id, source_type, source_id),
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return SecurityScan(
+                id=row["id"],
+                user_id=row["user_id"],
+                source_type=row["source_type"],
+                source_id=row["source_id"],
+                source_version=row["source_version"],
+                source_hash=row["source_hash"],
+                snapshot_hash=row["snapshot_hash"],
+                scanner_version=row["scanner_version"],
+                policy_version=row["policy_version"],
+                risk_score=row["risk_score"],
+                classification=row["classification"],
+                threats_detected_json=row["threats_detected_json"],
+                key_id=row["key_id"],
+                hmac_signature=row["hmac_signature"],
+                scanned_at=row["scanned_at"],
+            )
+
+    def list_security_scans(
+        self,
+        user_id: int,
+        source_type: Optional[str] = None,
+        source_id: Optional[int] = None,
+    ) -> List[SecurityScan]:
+        """Lists historical security scan records for a user."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            query = "SELECT * FROM security_scans WHERE user_id = ?"
+            params: List[Any] = [user_id]
+            if source_type is not None:
+                query += " AND source_type = ?"
+                params.append(source_type)
+            if source_id is not None:
+                query += " AND source_id = ?"
+                params.append(source_id)
+            query += " ORDER BY id DESC"
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+            return [
+                SecurityScan(
+                    id=row["id"],
+                    user_id=row["user_id"],
+                    source_type=row["source_type"],
+                    source_id=row["source_id"],
+                    source_version=row["source_version"],
+                    source_hash=row["source_hash"],
+                    snapshot_hash=row["snapshot_hash"],
+                    scanner_version=row["scanner_version"],
+                    policy_version=row["policy_version"],
+                    risk_score=row["risk_score"],
+                    classification=row["classification"],
+                    threats_detected_json=row["threats_detected_json"],
+                    key_id=row["key_id"],
+                    hmac_signature=row["hmac_signature"],
+                    scanned_at=row["scanned_at"],
+                )
+                for row in rows
+            ]
+
+    def record_security_scan_override(
+        self,
+        user_id: int,
+        scan_id: int,
+        override_reason: str,
+        actor_type: str = "candidate",
+    ) -> int:
+        """Records an immutable candidate or admin override for a quarantined security scan."""
+        if not override_reason or not override_reason.strip():
+            raise ValidationError("Security scan override reason cannot be empty.")
+
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM security_scans WHERE id = ?", (scan_id,))
+            scan_row = cursor.fetchone()
+            if not scan_row:
+                raise ValidationError(f"Security scan #{scan_id} not found.")
+            if scan_row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=scan_row["user_id"],
+                    resource=f"security_scans #{scan_id}",
+                )
+
+            cursor.execute(
+                """
+                INSERT INTO security_scan_overrides (
+                    user_id, scan_id, source_type, source_id, source_version,
+                    override_reason, actor_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    scan_id,
+                    scan_row["source_type"],
+                    scan_row["source_id"],
+                    scan_row["source_version"],
+                    override_reason.strip(),
+                    actor_type,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_security_scan_override(
+        self,
+        user_id: int,
+        scan_id: int,
+    ) -> Optional[SecurityScanOverride]:
+        """Retrieves override audit record for a security scan."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM security_scan_overrides
+                WHERE user_id = ? AND scan_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id, scan_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return SecurityScanOverride(
+                id=row["id"],
+                user_id=row["user_id"],
+                scan_id=row["scan_id"],
+                source_type=row["source_type"],
+                source_id=row["source_id"],
+                source_version=row["source_version"],
+                override_reason=row["override_reason"],
+                actor_type=row["actor_type"],
+                created_at=row["created_at"],
+            )
 
     def delete_user_resume(
         self,

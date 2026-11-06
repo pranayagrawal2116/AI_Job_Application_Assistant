@@ -170,7 +170,18 @@ class HumanApprovalGate:
         generation_timestamp: Optional[str] = None,
     ) -> PreparedPacket:
         """Assembles and stores an immutable PreparedPacket revision in SQLite."""
+        # 0. Security Preflight & Quarantine Verification for Job Description (Phase 9.1.2)
+        from src.security.security_preflight import SecurityPreflightManager
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        if job_description_id is not None:
+            preflight.check_job_description_security(
+                user_id=user_id,
+                jd_id=job_description_id,
+                target_action="packet_preparation",
+            )
+
         # 0. JIT Resume Integrity Verification before packet preparation
+        verified_res = None
         if original_resume_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
@@ -207,7 +218,23 @@ class HumanApprovalGate:
                 app_row = cursor.fetchone()
                 if app_row and app_row["job_description_id"] is not None:
                     job_description_id = app_row["job_description_id"]
+                    preflight.check_job_description_security(
+                        user_id=user_id,
+                        jd_id=job_description_id,
+                        target_action="packet_preparation",
+                    )
 
+        if original_resume_id is not None:
+            preflight.check_resume_security(
+                user_id=user_id,
+                resume_id=original_resume_id,
+                version_num=original_resume_version_num,
+                target_action="packet_preparation",
+                verified_resume=verified_res,
+            )
+
+        with self.db.connection() as conn:
+            cursor = conn.cursor()
             if candidate_profile_version is None or candidate_profile_hash is None:
                 cursor.execute(
                     "SELECT version, profile_hash FROM candidate_profiles WHERE user_id = ? ORDER BY version DESC LIMIT 1",

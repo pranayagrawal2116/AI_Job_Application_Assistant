@@ -465,6 +465,68 @@ BEGIN
 END;
 
 -- ---------------------------------------------------------------------
+-- 17. SECURITY SCANS (Phase 9.1.2 Authenticated Ingestion Scanning)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS security_scans (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    source_type TEXT NOT NULL CHECK(source_type IN ('job_description', 'resume')),
+    source_id INTEGER NOT NULL,
+    source_version INTEGER NOT NULL DEFAULT 1,
+    source_hash TEXT NOT NULL,
+    snapshot_hash TEXT,
+    scanner_version TEXT NOT NULL,
+    policy_version TEXT NOT NULL,
+    risk_score REAL NOT NULL,
+    classification TEXT NOT NULL CHECK(classification IN ('CLEAN', 'SUSPICIOUS', 'QUARANTINED')),
+    threats_detected_json TEXT NOT NULL,
+    key_id TEXT NOT NULL,
+    hmac_signature TEXT NOT NULL,
+    scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scans_update
+BEFORE UPDATE ON security_scans
+BEGIN
+    SELECT RAISE(FAIL, 'security_scans records are append-only and cannot be updated.');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scans_delete
+BEFORE DELETE ON security_scans
+BEGIN
+    SELECT RAISE(FAIL, 'security_scans records are immutable and cannot be deleted except via authorized privacy erasure.')
+    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
+END;
+
+-- ---------------------------------------------------------------------
+-- 18. SECURITY SCAN OVERRIDES (Audit-Trail for Candidate/Admin Overrides)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS security_scan_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    scan_id INTEGER NOT NULL REFERENCES security_scans(id),
+    source_type TEXT NOT NULL,
+    source_id INTEGER NOT NULL,
+    source_version INTEGER NOT NULL,
+    override_reason TEXT NOT NULL,
+    actor_type TEXT NOT NULL DEFAULT 'candidate',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scan_overrides_update
+BEFORE UPDATE ON security_scan_overrides
+BEGIN
+    SELECT RAISE(FAIL, 'security_scan_overrides records are append-only and cannot be updated.');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_security_scan_overrides_delete
+BEFORE DELETE ON security_scan_overrides
+BEGIN
+    SELECT RAISE(FAIL, 'security_scan_overrides records are immutable and cannot be deleted except via authorized privacy erasure.')
+    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
+END;
+
+-- ---------------------------------------------------------------------
 -- INDEXES FOR PERFORMANCE, FAST SEARCH, AND ISOLATION
 -- ---------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
@@ -510,3 +572,6 @@ CREATE INDEX IF NOT EXISTS idx_jobs_match_score ON jobs(match_score);
 CREATE INDEX IF NOT EXISTS idx_jobs_is_eligible ON jobs(is_eligible);
 CREATE INDEX IF NOT EXISTS idx_jobs_url ON jobs(job_url);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_company_title ON jobs(company_name COLLATE NOCASE, job_title COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_security_scans_lookup ON security_scans(user_id, source_type, source_id, source_version);
+CREATE INDEX IF NOT EXISTS idx_security_scans_hash ON security_scans(source_hash);
+CREATE INDEX IF NOT EXISTS idx_security_scan_overrides_lookup ON security_scan_overrides(user_id, scan_id);

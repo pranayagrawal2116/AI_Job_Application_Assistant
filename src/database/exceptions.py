@@ -309,3 +309,31 @@ class EventIntegrityError(DatabaseError):
     """Raised when an application timeline event fails cryptographic hash or chain verification."""
     pass
 
+
+# -----------------------------------------------------------------------------
+# PHASE 9.1.2: SECURITY PREFLIGHT & QUARANTINE EXCEPTIONS
+# -----------------------------------------------------------------------------
+
+class SecurityPreflightError(SecurityAuthorizationError):
+    """Raised when security preflight detects a missing, invalid, or quarantined source scan."""
+    pass
+
+
+class QuarantinedSourceError(SecurityPreflightError):
+    """Raised when an operation attempts to consume a quarantined source."""
+
+    def __init__(
+        self,
+        message: str,
+        source_type: str,
+        source_id: int,
+        classification: str = "QUARANTINED",
+        risk_score: float = 1.0,
+    ):
+        super().__init__(message)
+        self.source_type = source_type
+        self.source_id = source_id
+        self.classification = classification
+        self.risk_score = risk_score
+
+

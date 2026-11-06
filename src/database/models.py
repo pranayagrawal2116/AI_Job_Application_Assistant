@@ -580,3 +580,54 @@ class VerifiedApprovalGrant:
 VerifiedApprovalContext = VerifiedApprovalGrant
 
 
+# -----------------------------------------------------------------------------
+# PHASE 9.1.2: SECURITY SCANS & OVERRIDES
+# -----------------------------------------------------------------------------
+
+@dataclass
+class SecurityScan:
+    """Authenticated, immutable security scan record."""
+    id: int
+    user_id: int
+    source_type: str  # 'job_description' or 'resume'
+    source_id: int
+    source_version: int
+    source_hash: str
+    snapshot_hash: Optional[str]
+    scanner_version: str
+    policy_version: str
+    risk_score: float
+    classification: str  # CLEAN, SUSPICIOUS, QUARANTINED
+    threats_detected_json: str
+    key_id: str
+    hmac_signature: str
+    scanned_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        data = asdict(self)
+        if isinstance(self.threats_detected_json, str):
+            try:
+                data["threats_detected"] = json.loads(self.threats_detected_json)
+            except Exception:
+                data["threats_detected"] = []
+        return data
+
+
+@dataclass
+class SecurityScanOverride:
+    """Audit log of candidate or administrator security scan override."""
+    id: int
+    user_id: int
+    scan_id: int
+    source_type: str
+    source_id: int
+    source_version: int
+    override_reason: str
+    actor_type: str = "candidate"
+    created_at: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+

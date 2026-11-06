@@ -55,10 +55,11 @@ class DashboardService:
         self.matcher = JobMatcher(db_manager=self.db)
         self.coordinator = SearchCoordinator(db_manager=self.db, job_matcher=self.matcher)
         self.url_resolver = url_resolver
-        from src.security.file_security import DEFAULT_USER_STORAGE_BASE
+        from src.security.file_security import DEFAULT_USER_STORAGE_BASE, FileSecurityValidator
         self.storage_base_dir = (
             Path(storage_base_dir).resolve() if storage_base_dir else DEFAULT_USER_STORAGE_BASE.resolve()
         )
+        self.file_validator = FileSecurityValidator(base_storage_dir=self.storage_base_dir)
 
     def _resolve_url(self, hostname: str, port: int) -> List[str]:
         """Resolves hostname via injected url_resolver or socket.getaddrinfo with test domain mapping."""
@@ -387,6 +388,52 @@ class DashboardService:
                 target_role=target_role,
                 set_as_primary=set_as_primary,
             )
+
+            # Execute and persist authenticated security scan (Phase 9.1.2)
+            try:
+                from src.preparer.resume_parser import ResumeParser
+                from src.security.prompt_injection_detector import PromptInjectionDetector
+                from src.security.scan_signer import SecurityScanSigner
+                parser = ResumeParser()
+                parsed_res = parser.parse_bytes(file_bytes, record["storage_filename"])
+                res_text = parsed_res.raw_text if hasattr(parsed_res, "raw_text") and parsed_res.raw_text else ""
+                if not res_text:
+                    res_text = " ".join([
+                        parsed_res.summary or "",
+                        " ".join(parsed_res.skills or []),
+                        " ".join(exp.get("description", "") for exp in (parsed_res.work_experience or [])),
+                    ])
+                detector = PromptInjectionDetector()
+                scan_res = detector.scan(res_text)
+                signer = SecurityScanSigner()
+                manifest, sig, key_id = signer.sign_scan_result(
+                    user_id=user_id,
+                    source_type="resume",
+                    source_id=record["id"],
+                    source_version=1,
+                    source_hash=record["file_hash"],
+                    snapshot_hash=None,
+                    scan_result=scan_res,
+                )
+                self.db.save_security_scan(
+                    user_id=user_id,
+                    source_type="resume",
+                    source_id=record["id"],
+                    source_version=1,
+                    source_hash=record["file_hash"],
+                    snapshot_hash=None,
+                    scanner_version=scan_res.engine_version,
+                    policy_version=scan_res.policy_version,
+                    risk_score=scan_res.risk_score,
+                    classification=scan_res.classification,
+                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
+                    key_id=key_id,
+                    hmac_signature=sig,
+                    scanned_at=manifest["scanned_at"],
+                )
+            except Exception as scan_err:
+                self.logger.warning("Failed to persist security scan for Resume #%d: %s", record["id"], scan_err)
+
             return True, f"Successfully uploaded '{original_filename}'.", record
         except (DuplicateResumeError, FileSecurityError, ValidationError) as e:
             self.logger.warning("Resume validation failed for user %d ('%s'): %s", user_id, original_filename, e)
@@ -415,6 +462,52 @@ class DashboardService:
                 original_filename=original_filename,
                 change_notes=change_notes,
             )
+
+            # Execute and persist authenticated security scan (Phase 9.1.2)
+            try:
+                from src.preparer.resume_parser import ResumeParser
+                from src.security.prompt_injection_detector import PromptInjectionDetector
+                from src.security.scan_signer import SecurityScanSigner
+                parser = ResumeParser()
+                parsed_res = parser.parse_bytes(file_bytes, ver.get("storage_filename", original_filename))
+                res_text = parsed_res.raw_text if hasattr(parsed_res, "raw_text") and parsed_res.raw_text else ""
+                if not res_text:
+                    res_text = " ".join([
+                        parsed_res.summary or "",
+                        " ".join(parsed_res.skills or []),
+                        " ".join(exp.get("description", "") for exp in (parsed_res.work_experience or [])),
+                    ])
+                detector = PromptInjectionDetector()
+                scan_res = detector.scan(res_text)
+                signer = SecurityScanSigner()
+                manifest, sig, key_id = signer.sign_scan_result(
+                    user_id=user_id,
+                    source_type="resume",
+                    source_id=resume_id,
+                    source_version=ver["version_num"],
+                    source_hash=ver["file_hash"],
+                    snapshot_hash=None,
+                    scan_result=scan_res,
+                )
+                self.db.save_security_scan(
+                    user_id=user_id,
+                    source_type="resume",
+                    source_id=resume_id,
+                    source_version=ver["version_num"],
+                    source_hash=ver["file_hash"],
+                    snapshot_hash=None,
+                    scanner_version=scan_res.engine_version,
+                    policy_version=scan_res.policy_version,
+                    risk_score=scan_res.risk_score,
+                    classification=scan_res.classification,
+                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
+                    key_id=key_id,
+                    hmac_signature=sig,
+                    scanned_at=manifest["scanned_at"],
+                )
+            except Exception as scan_err:
+                self.logger.warning("Failed to persist security scan for Resume #%d v%d: %s", resume_id, ver.get("version_num", 1), scan_err)
+
             return True, f"Successfully created Version {ver['version_num']} for Resume #{resume_id}.", ver
         except (DuplicateResumeError, FileSecurityError, CrossUserAccessError, ResumeNotFoundError, ValidationError) as e:
             self.logger.warning("Resume version rejected for user %d on resume %d: %s", user_id, resume_id, e)
@@ -2571,6 +2664,42 @@ class DashboardService:
                 extraction_confidence=parsed.extraction_confidence,
                 parsed_data=parsed.to_dict(),
             )
+
+            # Execute and persist authenticated security scan (Phase 9.1.2)
+            try:
+                from src.security.prompt_injection_detector import PromptInjectionDetector
+                from src.security.scan_signer import SecurityScanSigner
+                detector = PromptInjectionDetector()
+                scan_res = detector.scan(raw_text)
+                signer = SecurityScanSigner()
+                manifest, sig, key_id = signer.sign_scan_result(
+                    user_id=user_id,
+                    source_type="job_description",
+                    source_id=jd.id,
+                    source_version=1,
+                    source_hash=jd.content_hash,
+                    snapshot_hash=jd.snapshot_hash,
+                    scan_result=scan_res,
+                )
+                self.db.save_security_scan(
+                    user_id=user_id,
+                    source_type="job_description",
+                    source_id=jd.id,
+                    source_version=1,
+                    source_hash=jd.content_hash,
+                    snapshot_hash=jd.snapshot_hash,
+                    scanner_version=scan_res.engine_version,
+                    policy_version=scan_res.policy_version,
+                    risk_score=scan_res.risk_score,
+                    classification=scan_res.classification,
+                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
+                    key_id=key_id,
+                    hmac_signature=sig,
+                    scanned_at=manifest["scanned_at"],
+                )
+            except Exception as scan_err:
+                self.logger.warning("Failed to persist security scan for JobDescription #%d: %s", jd.id, scan_err)
+
             return True, f"Successfully analyzed and saved '{title}' at '{company}'.", jd
         except Exception as e:
             self.logger.warning("Failed to ingest pasted job text for user %d: %s", user_id, e)
@@ -2589,6 +2718,42 @@ class DashboardService:
                 file_bytes=file_bytes,
                 original_filename=original_filename,
             )
+
+            # Execute and persist authenticated security scan (Phase 9.1.2)
+            try:
+                from src.security.prompt_injection_detector import PromptInjectionDetector
+                from src.security.scan_signer import SecurityScanSigner
+                detector = PromptInjectionDetector()
+                scan_res = detector.scan(jd.raw_content)
+                signer = SecurityScanSigner()
+                manifest, sig, key_id = signer.sign_scan_result(
+                    user_id=user_id,
+                    source_type="job_description",
+                    source_id=jd.id,
+                    source_version=1,
+                    source_hash=jd.content_hash,
+                    snapshot_hash=jd.snapshot_hash,
+                    scan_result=scan_res,
+                )
+                self.db.save_security_scan(
+                    user_id=user_id,
+                    source_type="job_description",
+                    source_id=jd.id,
+                    source_version=1,
+                    source_hash=jd.content_hash,
+                    snapshot_hash=jd.snapshot_hash,
+                    scanner_version=scan_res.engine_version,
+                    policy_version=scan_res.policy_version,
+                    risk_score=scan_res.risk_score,
+                    classification=scan_res.classification,
+                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
+                    key_id=key_id,
+                    hmac_signature=sig,
+                    scanned_at=manifest["scanned_at"],
+                )
+            except Exception as scan_err:
+                self.logger.warning("Failed to persist security scan for JobDescription #%d: %s", jd.id, scan_err)
+
             return True, f"Successfully uploaded and extracted '{jd.job_title}' from '{original_filename}'.", jd
         except Exception as e:
             self.logger.warning("Failed to ingest job file '%s' for user %d: %s", original_filename, user_id, e)
@@ -2629,6 +2794,42 @@ class DashboardService:
                 extraction_confidence=parsed.extraction_confidence,
                 parsed_data=parsed.to_dict(),
             )
+
+            # Execute and persist authenticated security scan (Phase 9.1.2)
+            try:
+                from src.security.prompt_injection_detector import PromptInjectionDetector
+                from src.security.scan_signer import SecurityScanSigner
+                detector = PromptInjectionDetector()
+                scan_res = detector.scan(fetched.raw_text)
+                signer = SecurityScanSigner()
+                manifest, sig, key_id = signer.sign_scan_result(
+                    user_id=user_id,
+                    source_type="job_description",
+                    source_id=jd.id,
+                    source_version=1,
+                    source_hash=jd.content_hash,
+                    snapshot_hash=jd.snapshot_hash,
+                    scan_result=scan_res,
+                )
+                self.db.save_security_scan(
+                    user_id=user_id,
+                    source_type="job_description",
+                    source_id=jd.id,
+                    source_version=1,
+                    source_hash=jd.content_hash,
+                    snapshot_hash=jd.snapshot_hash,
+                    scanner_version=scan_res.engine_version,
+                    policy_version=scan_res.policy_version,
+                    risk_score=scan_res.risk_score,
+                    classification=scan_res.classification,
+                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
+                    key_id=key_id,
+                    hmac_signature=sig,
+                    scanned_at=manifest["scanned_at"],
+                )
+            except Exception as scan_err:
+                self.logger.warning("Failed to persist security scan for JobDescription #%d: %s", jd.id, scan_err)
+
             return True, f"Successfully retrieved and parsed '{title}' at '{company}'.", jd, fetched
         except Exception as e:
             self.logger.warning("Failed to ingest job URL '%s' for user %d: %s", target_url, user_id, e)
@@ -2892,6 +3093,29 @@ class DashboardService:
             target_res_id = resume_data.get("id") or resume_data.get("resume_id")
 
         generator = UniversalTailoredResumeGenerator()
+
+        # Security Preflight Enforcement (Phase 9.1.2)
+        from src.security.security_preflight import SecurityPreflightManager
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        if isinstance(job_description, dict) and job_description.get("id"):
+            preflight.check_job_description_security(user_id=user_id, jd_id=job_description["id"], target_action="document_generation")
+        elif isinstance(job_description, dict) and (job_description.get("raw_content") or job_description.get("job_description")):
+            raw_text = job_description.get("raw_content") or job_description.get("job_description")
+            from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
+            from src.database.exceptions import QuarantinedSourceError
+            det = PromptInjectionDetector()
+            scan_res = det.scan(raw_text)
+            if scan_res.classification == ScanClassification.QUARANTINED:
+                raise QuarantinedSourceError(
+                    f"Action 'document_generation' blocked: Job description contains QUARANTINED prompt injection (Risk: {scan_res.risk_score:.2f}).",
+                    source_type="job_description",
+                    source_id=0,
+                    classification=scan_res.classification,
+                    risk_score=scan_res.risk_score,
+                )
+        if target_res_id is not None:
+            preflight.check_resume_security(user_id=user_id, resume_id=target_res_id, version_num=resume_version_num, target_action="document_generation")
+
         return generator.generate(
             user_id=user_id,
             candidate_profile=candidate_profile,
@@ -2960,6 +3184,28 @@ class DashboardService:
         else:
             resume_data = {}
 
+        # Security Preflight Enforcement (Phase 9.1.2)
+        from src.security.security_preflight import SecurityPreflightManager
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        if isinstance(job_description, dict) and job_description.get("id"):
+            preflight.check_job_description_security(user_id=user_id, jd_id=job_description["id"], target_action="document_generation")
+        elif isinstance(job_description, dict) and (job_description.get("raw_content") or job_description.get("job_description")):
+            raw_text = job_description.get("raw_content") or job_description.get("job_description")
+            from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
+            from src.database.exceptions import QuarantinedSourceError
+            det = PromptInjectionDetector()
+            scan_res = det.scan(raw_text)
+            if scan_res.classification == ScanClassification.QUARANTINED:
+                raise QuarantinedSourceError(
+                    f"Action 'document_generation' blocked: Job description contains QUARANTINED prompt injection (Risk: {scan_res.risk_score:.2f}).",
+                    source_type="job_description",
+                    source_id=0,
+                    classification=scan_res.classification,
+                    risk_score=scan_res.risk_score,
+                )
+        if target_res_id is not None:
+            preflight.check_resume_security(user_id=user_id, resume_id=target_res_id, version_num=resume_version_num, target_action="document_generation")
+
         generator = CoverLetterGenerator(candidate_profile=candidate_profile)
         user_app_dir = Path(f"data/users/{user_id}/applications")
         selected_tone = tone or LetterTone.PROFESSIONAL_DIRECT
@@ -3025,6 +3271,28 @@ class DashboardService:
         else:
             resume_data = {}
 
+        # Security Preflight Enforcement (Phase 9.1.2)
+        from src.security.security_preflight import SecurityPreflightManager
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        if isinstance(job_description, dict) and job_description.get("id"):
+            preflight.check_job_description_security(user_id=user_id, jd_id=job_description["id"], target_action="document_generation")
+        elif isinstance(job_description, dict) and (job_description.get("raw_content") or job_description.get("job_description")):
+            raw_text = job_description.get("raw_content") or job_description.get("job_description")
+            from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
+            from src.database.exceptions import QuarantinedSourceError
+            det = PromptInjectionDetector()
+            scan_res = det.scan(raw_text)
+            if scan_res.classification == ScanClassification.QUARANTINED:
+                raise QuarantinedSourceError(
+                    f"Action 'document_generation' blocked: Job description contains QUARANTINED prompt injection (Risk: {scan_res.risk_score:.2f}).",
+                    source_type="job_description",
+                    source_id=0,
+                    classification=scan_res.classification,
+                    risk_score=scan_res.risk_score,
+                )
+        if target_res_id is not None:
+            preflight.check_resume_security(user_id=user_id, resume_id=target_res_id, version_num=resume_version_num, target_action="document_generation")
+
         answerer = QuestionAnswerer(candidate_profile=candidate_profile)
         return answerer.batch_answer_questions(
             questions=questions,
@@ -3045,6 +3313,19 @@ class DashboardService:
         template: Any = None,
     ) -> Dict[str, Any]:
         """Generates professional PDF and DOCX files for all application materials."""
+        # Security Preflight Enforcement (Phase 9.1.2)
+        from src.security.security_preflight import SecurityPreflightManager
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        with self.db.connection() as conn:
+            c = conn.cursor()
+            c.execute("SELECT resume_id, job_description_id FROM applications WHERE id = ? AND user_id = ?", (application_id, user_id))
+            app_r = c.fetchone()
+            if app_r:
+                if app_r["job_description_id"]:
+                    preflight.check_job_description_security(user_id=user_id, jd_id=app_r["job_description_id"], target_action="document_export")
+                if app_r["resume_id"]:
+                    preflight.check_resume_security(user_id=user_id, resume_id=app_r["resume_id"], target_action="document_export")
+
         from src.preparer.document_generator import (
             DocumentTemplate,
             UniversalDocumentGenerator,

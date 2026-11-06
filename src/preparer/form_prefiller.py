@@ -64,6 +64,50 @@ class FormPrefiller:
         answers: Optional[Dict[str, Any]] = None,
     ) -> FormFillPlan:
         """Constructs an executable form filling plan without executing forbidden actions."""
+        # Security preflight: Scan text inputs for prompt injection before prefilling
+        from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
+        from src.database.exceptions import QuarantinedSourceError
+        detector = PromptInjectionDetector()
+        if cover_letter_text:
+            cl_scan = detector.scan(cover_letter_text)
+            if cl_scan.classification == ScanClassification.QUARANTINED:
+                raise QuarantinedSourceError(
+                    f"Action 'form_prefilling' blocked: Cover letter text is QUARANTINED (Risk: {cl_scan.risk_score:.2f}).",
+                    source_type="cover_letter",
+                    source_id=0,
+                    classification=cl_scan.classification,
+                    risk_score=cl_scan.risk_score,
+                )
+
+        jd_text = ""
+        if isinstance(job, dict):
+            jd_text = job.get("job_description") or job.get("raw_content") or ""
+        elif hasattr(job, "job_description"):
+            jd_text = job.job_description or ""
+        if jd_text:
+            jd_scan = detector.scan(jd_text)
+            if jd_scan.classification == ScanClassification.QUARANTINED:
+                raise QuarantinedSourceError(
+                    f"Action 'form_prefilling' blocked: Job description text is QUARANTINED (Risk: {jd_scan.risk_score:.2f}).",
+                    source_type="job_description",
+                    source_id=job.get("id", 0) if isinstance(job, dict) else (job.id or 0),
+                    classification=jd_scan.classification,
+                    risk_score=jd_scan.risk_score,
+                )
+
+        if answers and isinstance(answers, dict):
+            for k, val in answers.items():
+                if isinstance(val, str) and len(val) > 10:
+                    ans_scan = detector.scan(val)
+                    if ans_scan.classification == ScanClassification.QUARANTINED:
+                        raise QuarantinedSourceError(
+                            f"Action 'form_prefilling' blocked: Screening question answer '{k}' is QUARANTINED (Risk: {ans_scan.risk_score:.2f}).",
+                            source_type="screening_answer",
+                            source_id=0,
+                            classification=ans_scan.classification,
+                            risk_score=ans_scan.risk_score,
+                        )
+
         if isinstance(job, dict):
             job_id = job.get("id", 0)
             company_name = job.get("company_name", "Unknown")

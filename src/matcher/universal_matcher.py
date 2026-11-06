@@ -1945,6 +1945,24 @@ class UniversalMatcher:
                 resume_id = None
                 resume_version_num = 1
                 resume_file_hash = None
+
+            # Security Preflight Enforcement (Phase 9.1.2)
+            if job_description_id is not None:
+                from src.security.security_preflight import SecurityPreflightManager
+                preflight = SecurityPreflightManager(db_manager=self.db)
+                preflight.check_job_description_security(
+                    user_id=user_id,
+                    jd_id=job_description_id,
+                    target_action="matching_evaluation",
+                )
+                if resume_id is not None:
+                    preflight.check_resume_security(
+                        user_id=user_id,
+                        resume_id=resume_id,
+                        version_num=resume_version_num,
+                        target_action="matching_evaluation",
+                        verified_resume=locals().get("verified_res") or verified_resume,
+                    )
         else:
             # Non-persistent matching (persist=False) - preserves synthetic unit testing
             if enforce_resume_verification and resume_id is not None:

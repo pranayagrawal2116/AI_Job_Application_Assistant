@@ -1,0 +1,52 @@
+{
+  "version": "16.0.0",
+  "base_uts39_revision": "30",
+  "joining_control_a1_policy": "Revision 34 stricter modification (contextual single-script dual/left + transparent* + ZWNJ + transparent* + right/dual)",
+  "files": {
+    "UnicodeData.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/UnicodeData.txt",
+      "sha256": "ff58e5823bd095166564a006e47d111130813dcf8bf234ef79fa51a870edb48f",
+      "size_bytes": 2175362
+    },
+    "CompositionExclusions.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/CompositionExclusions.txt",
+      "sha256": "89e83cf9cc8bef6c1f8bf77e42cf6f0341dfa42e66261f4dbe9b492e7a23c8ee",
+      "size_bytes": 9007
+    },
+    "DerivedNormalizationProps.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/DerivedNormalizationProps.txt",
+      "sha256": "4d4c03892dea9146d674b686e495df2d55a28d071ac474041d73518f887abddc",
+      "size_bytes": 1372269
+    },
+    "Scripts.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/Scripts.txt",
+      "sha256": "9e88f0a677df47311106340be8ede2ecdacd9c1c931831218d2be6d5508e0039",
+      "size_bytes": 189588
+    },
+    "ScriptExtensions.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/ScriptExtensions.txt",
+      "sha256": "049117ce26b9769fe2749b06eef51a50a89faef4a97764dd2d81daa715980700",
+      "size_bytes": 20576
+    },
+    "DerivedJoiningType.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/extracted/DerivedJoiningType.txt",
+      "sha256": "6bd08b97da66b70ccfdab105a352de2984e02625239ec5695422c99b33d854f0",
+      "size_bytes": 40009
+    },
+    "IndicSyllabicCategory.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/IndicSyllabicCategory.txt",
+      "sha256": "615f1b92ba7ec76e18c5b5c05d2e1836e4b98bc791eb9e27946c7621fc047ae7",
+      "size_bytes": 85247
+    },
+    "confusables.txt": {
+      "url": "https://www.unicode.org/Public/security/16.0.0/confusables.txt",
+      "sha256": "95bd0aad6dced5ebc63436f459c06ab21a8d107cd842fb57f5c3a1e91bca8611",
+      "size_bytes": 722509
+    },
+    "NormalizationTest.txt": {
+      "url": "https://www.unicode.org/Public/16.0.0/ucd/NormalizationTest.txt",
+      "sha256": "d811971453e7075e1ad56fb1b301eece5aa80757b81f6156e74a1bfb3ae5ceb1",
+      "size_bytes": 2798671
+    }
+  }
+}

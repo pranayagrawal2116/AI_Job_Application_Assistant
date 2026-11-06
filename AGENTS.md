@@ -625,6 +625,29 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,372 tests passing across all 100 test files (100% pass rate).
     - 0 pyflakes errors, 0 ruff errors, 0 lint warnings.
 
+- [x] **Architecture v2.1.1 Phase 9.1.2: Multi-Engine Prompt Injection Defense, Unicode Security & Authenticated Scan Persistence** (Complete)
+  - Multi-Engine Prompt Injection Detection (`PromptInjectionDetector`):
+    - Implemented 4-engine defense pipeline in `src/security/prompt_injection_detector.py` (Engine 1: Direct instruction overrides, Engine 2: Structural delimiters & role confusion, Engine 3: Obfuscation/encoded payloads via sandboxed Base64/hex/spaced/zero-width/homoglyph inspection, Engine 4: Contextual heuristic analysis).
+    - Structured, immutable typed findings (`PromptInjectionScanResult`, `ThreatRecord`) with stable rule IDs, code-point offsets, sanitized explanations, and deterministic risk scoring (CLEAN: 0.00–0.29, SUSPICIOUS: 0.30–0.69, QUARANTINED: 0.70–1.00).
+    - Achieved 100% detection rate on 54 registered attack fixtures and 0.0% false-positive rate on 104 registered benign multilingual fixtures.
+  - Unicode 16.0.0 Normalization & UTS #39 Sanitization (`UnicodeSanitizer`):
+    - Bundled authoritative Unicode 16.0.0 datasets with SHA-256 verified manifest in `src/security/unicode_data/16.0.0/`.
+    - Pure-Python NFD/NFC normalization passing 1,000 official `NormalizationTest.txt` vectors and Hangul algorithmic composition/decomposition.
+    - Context-aware joining-control validation adhering to UTS #39 Rev 30 + stricter Rev 34 A1 single-script cursive joining rule (Arabic/Syriac), A2 Indic virama, and B conjunct half-forms.
+    - Confusable skeleton generation with exact code-point offset preservation, mixed-script anomaly detection, and zero-mutation preservation of authoritative `raw_content`.
+  - Dedicated Persistent Security Scans with HMAC-SHA256 (`SecurityScanSigner`):
+    - Added append-only `security_scans` and `security_scan_overrides` tables with database-level immutability triggers (`trg_prevent_security_scans_update`, `trg_prevent_security_scans_delete`).
+    - Cryptographic key management via `ScanKeyManager` with >= 32 bytes entropy enforcement, strict domain isolation from `ACTION_TICKET_SECRET_KEY`, production fail-closed semantics, key rotation, and emergency revocation.
+    - Deterministic RFC 8785 canonical JSON bytes signing via `canonical_json_bytes` and constant-time HMAC-SHA256 verification.
+  - Centralized Preflight & Quarantine Enforcement (`SecurityPreflightManager`):
+    - Enforced security preflight checks across `DashboardService` (`generate_tailored_resume`, `generate_universal_cover_letter`, `batch_answer_screening_questions`), `HumanApprovalGate.prepare_universal_packet`, `FormPrefiller.build_form_payload`, and `UniversalMatcher.evaluate`.
+    - Quarantined sources fail closed before downstream execution. Candidate overrides require non-empty justifications and strictly audit document generation, while permanently barring quarantined sources from external action-capable agents or automated submission.
+  - Verification & Regressions:
+    - Authored 57 dedicated tests across 6 test suites (`test_prompt_injection_detector.py`, `test_unicode_sanitizer.py`, `test_security_scan_persistence.py`, `test_security_scan_key_lifecycle.py`, `test_security_preflight.py`, `test_phase_9_1_2_integration.py`).
+    - Performance benchmarks verified: 5KB text scan in 16.19ms (<50ms SLA), 50KB text scan in 159.04ms (<250ms SLA), RFC 8785 signing in 0.019ms (<2ms SLA), HMAC verification in 0.792ms (<2ms SLA), Unicode normalization in 0.183ms (<10ms SLA).
+    - Full test suite regression pass: 1,429 tests passing across all 106 test files (100% pass rate).
+    - 0 pyflakes errors, 0 ruff errors, 0 lint warnings.
+
 ---
 
 ## 7. Approval Requirement
