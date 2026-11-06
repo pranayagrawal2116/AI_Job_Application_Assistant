@@ -487,7 +487,7 @@ class DatabaseManager:
         add_col_if_missing("legacy_integrity_exceptions", "evidence_type", "TEXT")
         add_col_if_missing("legacy_integrity_exceptions", "evidence_reference_id", "TEXT")
 
-        # Legacy evidence attestations table and triggers (Phase 9.1.2.5 Authoritative Provenance)
+        # Legacy evidence attestations table and triggers (Phase 9.1.2.5 & 9.1.2.6 Authoritative Provenance)
         try:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS legacy_evidence_attestations (
@@ -497,8 +497,16 @@ class DatabaseManager:
                     evidence_type TEXT NOT NULL,
                     evidence_reference_id TEXT NOT NULL,
                     source_snapshot_hash TEXT NOT NULL,
+                    evidence_artifact_hash TEXT,
+                    evidence_payload_hash TEXT,
+                    issuer_id TEXT,
+                    key_id TEXT,
+                    signature_algorithm TEXT,
+                    evidence_signature TEXT,
+                    migration_boundary TEXT,
                     attested_by TEXT NOT NULL,
                     attested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    verified_at DATETIME,
                     details TEXT
                 )
             """)
@@ -520,6 +528,15 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        add_col_if_missing("legacy_evidence_attestations", "evidence_artifact_hash", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "evidence_payload_hash", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "issuer_id", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "key_id", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "signature_algorithm", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "evidence_signature", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "migration_boundary", "TEXT")
+        add_col_if_missing("legacy_evidence_attestations", "verified_at", "DATETIME")
+
         # Database schema migration ledger table (Phase 9.1.2.4 Migration Finality)
         try:
             cursor.execute("""
@@ -535,6 +552,7 @@ class DatabaseManager:
 
         self._migrate_historical_job_description_integrity(cursor)
         self._migrate_phase_9_1_2_5_legacy_evidence_reconciliation(cursor)
+        self._migrate_phase_9_1_2_6_legacy_evidence_verification_closure(cursor)
 
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
@@ -697,7 +715,7 @@ class DatabaseManager:
 
             cursor.execute(
                 """
-                SELECT evidence_type, evidence_reference_id, source_snapshot_hash
+                SELECT evidence_type, evidence_reference_id, source_snapshot_hash, attested_by
                 FROM legacy_evidence_attestations
                 WHERE job_description_id = ? AND user_id = ?
                 LIMIT 1
@@ -713,10 +731,28 @@ class DatabaseManager:
             ev_type = attestation[0] if isinstance(attestation, tuple) else attestation["evidence_type"]
             ev_ref = attestation[1] if isinstance(attestation, tuple) else attestation["evidence_reference_id"]
             ev_hash = attestation[2] if isinstance(attestation, tuple) else attestation["source_snapshot_hash"]
+            att_by = attestation[3] if len(attestation) > 3 else "system_migration"
 
             if not ev_type or not str(ev_type).strip() or not ev_ref or not str(ev_ref).strip():
                 continue
             if ev_hash != s_hash:
+                continue
+
+            # Phase 9.1.2.6 Section 5.1: Independently resolve and cryptographically verify evidence artifact
+            from src.security.legacy_evidence_verifier import LegacyEvidenceVerifier
+
+            verifier = LegacyEvidenceVerifier(db_manager=self)
+            try:
+                verifier.verify(
+                    evidence_type=ev_type,
+                    evidence_reference_id=ev_ref,
+                    user_id=u_id,
+                    job_description_id=jd_id,
+                    source_snapshot_hash=s_hash,
+                    attesting_principal=att_by or "system_migration_coordinator",
+                )
+            except Exception as e:
+                logger.warning("Historical migration evidence verification failed for JD #%d: %s", jd_id, e)
                 continue
 
             # Check if already recorded in legacy_integrity_exceptions
@@ -871,6 +907,144 @@ class DatabaseManager:
             migration_id="phase_9_1_2_5_legacy_evidence_closure",
             migration_version="9.1.2.5",
             details=f"Reconciled {reconciled_count} verified legacy records; reverted {reverted_count} unattested records to REQUIRED",
+            cursor=cursor,
+        )
+
+    def _migrate_phase_9_1_2_6_legacy_evidence_verification_closure(
+        self,
+        cursor: sqlite3.Cursor,
+        verifier: Optional[Any] = None,
+    ) -> None:
+        """Phase 9.1.2.6 cryptographic legacy evidence verification reconciliation migration.
+
+        Enforces Section 5.2:
+        1. Checks if 'phase_9_1_2_6_legacy_evidence_verification_closure' has already been recorded in schema_migrations. If so, skips.
+        2. Queries all records currently claiming LEGACY_TEXT_ONLY state.
+        3. For each record:
+           - Retrieves independent evidence attestation from legacy_evidence_attestations.
+           - Invokes LegacyEvidenceVerifier to independently resolve and cryptographically verify the backing artifact.
+           - If verified: preserves 'LEGACY_TEXT_ONLY', records reconciliation audit in legacy_integrity_exceptions (outcome='RECONCILED').
+           - If missing, unverifiable, or tampered evidence:
+             Reverts binary_integrity_state to 'REQUIRED'.
+             Records audit in legacy_integrity_exceptions (outcome='REVERTED', assigned_legacy_state='REQUIRED',
+             previous_binary_state='LEGACY_TEXT_ONLY', migration_version='phase_9_1_2_6',
+             migration_reason='Phase 9.1.2.6 reconciliation: evidence artifact could not be independently verified').
+        4. Atomically records completion marker 'phase_9_1_2_6_legacy_evidence_verification_closure' in schema_migrations.
+        """
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
+        if not cursor.fetchone():
+            return
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                migration_version TEXT NOT NULL,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                details TEXT
+            )
+        """)
+
+        cursor.execute("SELECT 1 FROM schema_migrations WHERE migration_id = 'phase_9_1_2_6_legacy_evidence_verification_closure'")
+        if cursor.fetchone():
+            logger.debug("Migration phase_9_1_2_6_legacy_evidence_verification_closure already applied; skipping.")
+            return
+
+        from src.security.legacy_evidence_verifier import LegacyEvidenceVerifier
+
+        active_verifier = verifier or LegacyEvidenceVerifier(db_manager=self)
+
+        cursor.execute(
+            """
+            SELECT id, user_id, source_type, snapshot_hash, binary_integrity_state
+            FROM job_descriptions
+            WHERE binary_integrity_state = 'LEGACY_TEXT_ONLY'
+            """
+        )
+        legacy_records = cursor.fetchall()
+        reconciled_count = 0
+        reverted_count = 0
+
+        for rec in legacy_records:
+            jd_id = rec[0] if isinstance(rec, tuple) else rec["id"]
+            u_id = rec[1] if isinstance(rec, tuple) else rec["user_id"]
+            s_type = rec[2] if isinstance(rec, tuple) else rec["source_type"]
+            s_hash = rec[3] if isinstance(rec, tuple) else rec["snapshot_hash"]
+
+            cursor.execute(
+                """
+                SELECT evidence_type, evidence_reference_id, source_snapshot_hash, attested_by
+                FROM legacy_evidence_attestations
+                WHERE job_description_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (jd_id, u_id),
+            )
+            attestation = cursor.fetchone()
+
+            has_valid_evidence = False
+            ev_type = None
+            ev_ref = None
+
+            if attestation:
+                ev_type = attestation[0] if isinstance(attestation, tuple) else attestation["evidence_type"]
+                ev_ref = attestation[1] if isinstance(attestation, tuple) else attestation["evidence_reference_id"]
+                ev_hash = attestation[2] if isinstance(attestation, tuple) else attestation["source_snapshot_hash"]
+                att_by = attestation[3] if len(attestation) > 3 else "system_migration"
+
+                if ev_type and str(ev_type).strip() and ev_ref and str(ev_ref).strip() and ev_hash == s_hash:
+                    try:
+                        active_verifier.verify(
+                            evidence_type=ev_type,
+                            evidence_reference_id=ev_ref,
+                            user_id=u_id,
+                            job_description_id=jd_id,
+                            source_snapshot_hash=s_hash,
+                            attesting_principal=att_by or "system_migration_coordinator",
+                        )
+                        has_valid_evidence = True
+                    except Exception as e:
+                        logger.warning("Phase 9.1.2.6 reconciliation: failed to verify evidence for JD #%d: %s", jd_id, e)
+                        has_valid_evidence = False
+
+            if has_valid_evidence:
+                cursor.execute(
+                    """
+                    INSERT INTO legacy_integrity_exceptions (
+                        user_id, job_description_id, original_source_type,
+                        previous_binary_state, assigned_legacy_state,
+                        source_snapshot_hash, migration_version,
+                        evidence_type, evidence_reference_id,
+                        migration_reason, outcome
+                    ) VALUES (?, ?, ?, 'LEGACY_TEXT_ONLY', 'LEGACY_TEXT_ONLY', ?, 'phase_9_1_2_6', ?, ?,
+                              'Phase 9.1.2.6 evidence reconciliation: authoritative external evidence verified', 'RECONCILED')
+                    """,
+                    (u_id, jd_id, s_type, s_hash, ev_type, ev_ref),
+                )
+                reconciled_count += 1
+            else:
+                cursor.execute(
+                    "UPDATE job_descriptions SET binary_integrity_state = 'REQUIRED' WHERE id = ?",
+                    (jd_id,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO legacy_integrity_exceptions (
+                        user_id, job_description_id, original_source_type,
+                        previous_binary_state, assigned_legacy_state,
+                        source_snapshot_hash, migration_version,
+                        evidence_type, evidence_reference_id,
+                        migration_reason, outcome
+                    ) VALUES (?, ?, ?, 'LEGACY_TEXT_ONLY', 'REQUIRED', ?, 'phase_9_1_2_6', ?, ?,
+                              'Phase 9.1.2.6 reconciliation: evidence artifact could not be independently verified; reverted to REQUIRED', 'REVERTED')
+                    """,
+                    (u_id, jd_id, s_type, s_hash, ev_type or "NONE", ev_ref or "NONE"),
+                )
+                reverted_count += 1
+
+        self.record_schema_migration(
+            migration_id="phase_9_1_2_6_legacy_evidence_verification_closure",
+            migration_version="phase_9_1_2_6",
+            details=f"Reconciled {reconciled_count} verified records, reverted {reverted_count} unverified records to REQUIRED",
             cursor=cursor,
         )
 
@@ -1601,6 +1775,8 @@ class DatabaseManager:
             self._migrate_historical_job_description_integrity(cursor)
             conn.commit()
             self._migrate_phase_9_1_2_5_legacy_evidence_reconciliation(cursor)
+            conn.commit()
+            self._migrate_phase_9_1_2_6_legacy_evidence_verification_closure(cursor)
             conn.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
 
@@ -5526,30 +5702,62 @@ class DatabaseManager:
 
     def record_legacy_evidence_attestation(
         self,
-        user_id: int,
-        job_description_id: int,
-        evidence_type: str,
-        evidence_reference_id: str,
-        source_snapshot_hash: str,
-        attested_by: str = "system_migration",
+        verified_evidence: Any,
+        attesting_principal: Optional[str] = None,
         details: Optional[str] = None,
         cursor: Optional[sqlite3.Cursor] = None,
+        **kwargs: Any,
     ) -> int:
-        """Records an authoritative independent evidence attestation for a historical job description."""
+        """Records an authoritative independent evidence attestation for a historical job description.
+
+        Enforces Section 4:
+        - Requires a VerifiedLegacyEvidence instance produced by LegacyEvidenceVerifier.verify().
+        - Rejects arbitrary string calls, unverified references, and candidate self-attestation.
+        """
+        from src.security.legacy_evidence_verifier import VerifiedLegacyEvidence
+
+        if not isinstance(verified_evidence, VerifiedLegacyEvidence):
+            raise SecurityAuthorizationError(
+                "Direct insertion or arbitrary evidence references are strictly prohibited. "
+                "record_legacy_evidence_attestation() requires a VerifiedLegacyEvidence instance "
+                "produced by LegacyEvidenceVerifier.verify()."
+            )
+
+        principal = attesting_principal or verified_evidence.attested_by
+        if not principal or not isinstance(principal, str) or not principal.strip():
+            raise SecurityAuthorizationError("attesting_principal is required and cannot be empty.")
+
+        clean_principal = principal.strip()
+        if clean_principal in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user"):
+            raise SecurityAuthorizationError(
+                f"Candidate user '{clean_principal}' cannot self-attest own source as historical evidence."
+            )
+
         sql = """
             INSERT INTO legacy_evidence_attestations (
                 user_id, job_description_id, evidence_type,
                 evidence_reference_id, source_snapshot_hash,
-                attested_by, details
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                evidence_artifact_hash, evidence_payload_hash,
+                issuer_id, key_id, signature_algorithm,
+                evidence_signature, migration_boundary,
+                attested_by, verified_at, details
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
-            user_id,
-            job_description_id,
-            evidence_type,
-            evidence_reference_id,
-            source_snapshot_hash,
-            attested_by,
+            verified_evidence.user_id,
+            verified_evidence.job_description_id,
+            verified_evidence.evidence_type,
+            verified_evidence.evidence_reference_id,
+            verified_evidence.source_snapshot_hash,
+            verified_evidence.evidence_artifact_hash,
+            verified_evidence.evidence_payload_hash,
+            verified_evidence.issuer_id,
+            verified_evidence.key_id,
+            verified_evidence.signature_algorithm,
+            verified_evidence.evidence_signature,
+            verified_evidence.migration_boundary,
+            clean_principal,
+            verified_evidence.verified_at,
             details,
         )
         if cursor:
@@ -5595,15 +5803,23 @@ class DatabaseManager:
         if not row:
             return None
         return LegacyEvidenceAttestation(
-            id=row["id"] if isinstance(row, dict) else row[0],
-            user_id=row["user_id"] if isinstance(row, dict) else row[1],
-            job_description_id=row["job_description_id"] if isinstance(row, dict) else row[2],
-            evidence_type=row["evidence_type"] if isinstance(row, dict) else row[3],
-            evidence_reference_id=row["evidence_reference_id"] if isinstance(row, dict) else row[4],
-            source_snapshot_hash=row["source_snapshot_hash"] if isinstance(row, dict) else row[5],
-            attested_by=row["attested_by"] if isinstance(row, dict) else row[6],
-            attested_at=row["attested_at"] if isinstance(row, dict) else row[7],
-            details=row["details"] if isinstance(row, dict) else (row[8] if len(row) > 8 else None),
+            id=row["id"],
+            user_id=row["user_id"],
+            job_description_id=row["job_description_id"],
+            evidence_type=row["evidence_type"],
+            evidence_reference_id=row["evidence_reference_id"],
+            source_snapshot_hash=row["source_snapshot_hash"],
+            attested_by=row["attested_by"],
+            attested_at=row["attested_at"],
+            evidence_artifact_hash=row["evidence_artifact_hash"] if "evidence_artifact_hash" in row.keys() else None,
+            evidence_payload_hash=row["evidence_payload_hash"] if "evidence_payload_hash" in row.keys() else None,
+            issuer_id=row["issuer_id"] if "issuer_id" in row.keys() else None,
+            key_id=row["key_id"] if "key_id" in row.keys() else None,
+            signature_algorithm=row["signature_algorithm"] if "signature_algorithm" in row.keys() else None,
+            evidence_signature=row["evidence_signature"] if "evidence_signature" in row.keys() else None,
+            migration_boundary=row["migration_boundary"] if "migration_boundary" in row.keys() else None,
+            verified_at=row["verified_at"] if "verified_at" in row.keys() else None,
+            details=row["details"] if "details" in row.keys() else None,
         )
 
     def record_schema_migration(

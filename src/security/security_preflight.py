@@ -18,6 +18,7 @@ from src.database.exceptions import (
     SecurityAuthorizationError,
     ValidationError,
 )
+from src.security.legacy_evidence_verifier import LegacyEvidenceVerifier
 from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
 from src.security.resume_verifier import ResumeIntegrityVerifier, VerifiedResume
 from src.security.scan_signer import ScanKeyManager, SecurityScanSigner
@@ -52,12 +53,14 @@ class SecurityPreflightManager:
         key_manager: Optional[ScanKeyManager] = None,
         detector: Optional[PromptInjectionDetector] = None,
         file_validator: Optional[Any] = None,
+        evidence_verifier: Optional[LegacyEvidenceVerifier] = None,
     ):
         self.db = db_manager
         self.key_manager = key_manager or ScanKeyManager(db_manager=db_manager)
         self.signer = SecurityScanSigner(key_manager=self.key_manager)
         self.detector = detector or PromptInjectionDetector()
         self.file_validator = file_validator
+        self.evidence_verifier = evidence_verifier or LegacyEvidenceVerifier(db_manager=db_manager)
 
     # -------------------------------------------------------------------------
     # JOB DESCRIPTION PREFLIGHT
@@ -163,11 +166,28 @@ class SecurityPreflightManager:
                         f"JobDescription #{jd_id} snapshot hash '{jd.snapshot_hash}' does not match grandfathered snapshot hash '{legacy_exc.source_snapshot_hash}'."
                     )
 
-                # Phase 9.1.2.5 Part C: Verify independent evidence provenance
+                # Phase 9.1.2.5 Part C & Phase 9.1.2.6 Section 5.3: Verify independent evidence provenance and authenticate artifact
                 if not getattr(legacy_exc, "evidence_type", None) or not getattr(legacy_exc, "evidence_reference_id", None):
                     raise SecurityAuthorizationError(
                         f"JobDescription #{jd_id} legacy integrity exception lacks required independent evidence proof (evidence_type / evidence_reference_id missing)."
                     )
+
+                attestation = self.db.get_legacy_evidence_attestation(
+                    job_description_id=jd_id,
+                    user_id=user_id,
+                )
+                if not attestation:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} claims LEGACY_TEXT_ONLY state but lacks an authoritative evidence attestation."
+                    )
+
+                # Independently verify the evidence artifact
+                self.evidence_verifier.verify_attestation(
+                    attestation=attestation,
+                    user_id=user_id,
+                    job_description_id=jd_id,
+                    snapshot_hash=jd.snapshot_hash,
+                )
 
                 has_binary_meta = False
                 logger.info("JobDescription #%d verified as auditable LEGACY_TEXT_ONLY record; proceeding with text scanning.", jd_id)

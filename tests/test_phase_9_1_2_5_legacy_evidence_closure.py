@@ -45,9 +45,25 @@ class TestPhase9125LegacyEvidenceClosure(unittest.TestCase):
 
         self.db = DatabaseManager(db_path=str(self.db_path))
         self.file_validator = FileSecurityValidator(base_storage_dir=self.storage_dir)
-        self.preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
         self.detector = PromptInjectionDetector()
         self.signer = SecurityScanSigner()
+
+        # Synthetic trust store & resolver for testing legitimate historical migration paths
+        from src.security.legacy_evidence_verifier import (
+            LegacyEvidenceTrustStore,
+            InMemoryEvidenceResolver,
+            LegacyEvidenceVerifier,
+            set_default_evidence_resolver,
+            set_default_evidence_trust_store,
+        )
+        self.trust_store = LegacyEvidenceTrustStore(db_manager=self.db)
+        self.trust_store.register_trusted_issuer("system_migration_authority")
+        self.trust_store.register_trusted_key("test_key_9125", b"test_secret_32_bytes_long_9125!!")
+        set_default_evidence_trust_store(self.trust_store)
+        self.resolver = InMemoryEvidenceResolver()
+        set_default_evidence_resolver(self.resolver)
+        self.verifier = LegacyEvidenceVerifier(trust_store=self.trust_store, resolver=self.resolver, db_manager=self.db)
+        self.preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator, evidence_verifier=self.verifier)
 
         # Create test users
         with self.db.transaction() as conn:
@@ -64,6 +80,9 @@ class TestPhase9125LegacyEvidenceClosure(unittest.TestCase):
             self.user2_id = c.lastrowid
 
     def tearDown(self):
+        from src.security.legacy_evidence_verifier import set_default_evidence_resolver, set_default_evidence_trust_store
+        set_default_evidence_resolver(None)
+        set_default_evidence_trust_store(None)
         import shutil
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
@@ -107,10 +126,21 @@ class TestPhase9125LegacyEvidenceClosure(unittest.TestCase):
                 INSERT INTO legacy_evidence_attestations (
                     user_id, job_description_id, evidence_type, evidence_reference_id,
                     source_snapshot_hash, attested_by
-                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_2024_04_15_001', ?, 'system_migration')
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_2024_04_15_001', ?, 'system_migration_coordinator')
                 """,
                 (self.user1_id, jd_id, snap_hash),
             )
+
+        from src.security.legacy_evidence_verifier import create_signed_evidence_artifact
+        art_bytes, _ = create_signed_evidence_artifact(
+            evidence_type="historical_import_manifest",
+            evidence_reference_id="MANIFEST_2024_04_15_001",
+            issuer_id="system_migration_authority",
+            key_id="test_key_9125",
+            signing_key=b"test_secret_32_bytes_long_9125!!",
+            entries=[{"user_id": self.user1_id, "job_description_id": jd_id, "source_snapshot_hash": snap_hash}],
+        )
+        self.resolver.register_artifact("historical_import_manifest", "MANIFEST_2024_04_15_001", art_bytes)
 
         with self.db.immediate_transaction() as conn:
             self.db._migrate_historical_job_description_integrity(conn.cursor())
@@ -703,10 +733,21 @@ class TestPhase9125LegacyEvidenceClosure(unittest.TestCase):
                 INSERT INTO legacy_evidence_attestations (
                     user_id, job_description_id, evidence_type, evidence_reference_id,
                     source_snapshot_hash, attested_by
-                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_FAIL_AUDIT', ?, 'system_migration')
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_FAIL_AUDIT', ?, 'system_migration_coordinator')
                 """,
                 (self.user1_id, jd_id, snap_hash),
             )
+
+        from src.security.legacy_evidence_verifier import create_signed_evidence_artifact
+        art_bytes, _ = create_signed_evidence_artifact(
+            evidence_type="historical_import_manifest",
+            evidence_reference_id="MANIFEST_FAIL_AUDIT",
+            issuer_id="system_migration_authority",
+            key_id="test_key_9125",
+            signing_key=b"test_secret_32_bytes_long_9125!!",
+            entries=[{"user_id": self.user1_id, "job_description_id": jd_id, "source_snapshot_hash": snap_hash}],
+        )
+        self.resolver.register_artifact("historical_import_manifest", "MANIFEST_FAIL_AUDIT", art_bytes)
 
         with self.assertRaises((sqlite3.OperationalError, sqlite3.IntegrityError)) as ctx:
             with self.db.immediate_transaction() as conn:

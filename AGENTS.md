@@ -789,6 +789,29 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,571 tests passing across 108 test suites (100% pass rate in 80.74s).
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_5_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.6: Cryptographic Legacy Attestation & Reconciliation Closure** (Complete)
+  - Empirical Evidence Investigation (Part A):
+    - Investigated active repository backups (`data/backups/`) and database storage (`data/storage/job_assistant.db`).
+    - Established that no external signed historical archival evidence provider exists in deployment; fail-closed default enforces that zero production records can be grandfathered without authentic signed evidence.
+  - Dedicated Legacy Evidence Verifier & Trust Store (Part B):
+    - Created `src/security/legacy_evidence_verifier.py` with `LegacyEvidenceVerifier`, `LegacyEvidenceTrustStore`, and resolvers (`InMemoryEvidenceResolver`, `FilesystemEvidenceResolver` with path traversal defense).
+    - Allowlisted evidence types (`archival_import_manifest`, `historical_import_manifest`, `pre_phase9_signed_backup`) and signature algorithms (`HMAC-SHA256`, `Ed25519`).
+    - Enforced private token pattern (`VerifiedLegacyEvidence` protected by `_VERIFICATION_TOKEN`).
+    - Implemented canonical artifact creation helper `create_signed_evidence_artifact()` using RFC 8785 canonical JSON and digital signatures.
+  - Attestation Creation Hardening & Cryptographic Audit Schema (Part C):
+    - Updated `DatabaseManager.record_legacy_evidence_attestation()` to strictly require a `VerifiedLegacyEvidence` instance.
+    - Added cryptographic fields to `legacy_evidence_attestations` (`evidence_artifact_hash`, `evidence_payload_hash`, `issuer_id`, `key_id`, `signature_algorithm`, `evidence_signature`, `migration_boundary`, `verified_at`).
+    - Rejection of candidate self-attestation, empty principals, and untrusted issuers.
+  - Migration & Preflight Hardening (Part D):
+    - Updated `DatabaseManager._migrate_historical_job_description_integrity()` to verify backing artifacts via `LegacyEvidenceVerifier.verify()` before granting `LEGACY_TEXT_ONLY`.
+    - Implemented `_migrate_phase_9_1_2_6_legacy_evidence_verification_closure()` reverifying existing `LEGACY_TEXT_ONLY` records, reconciling verified records (`outcome='RECONCILED'`), and reverting unverifiable records to `REQUIRED` (`outcome='REVERTED'`).
+    - Updated `SecurityPreflightManager.check_job_description_security()` to verify attestation backing artifacts via `self.evidence_verifier.verify_attestation()`.
+  - Verification & Regressions (Parts E, F, G, H & I):
+    - Authored 25 dedicated test cases in `tests/test_phase_9_1_2_6_legacy_evidence_authenticity.py` covering all required scenarios (25/25 passing, 100%).
+    - Harmonized existing Phase 9.1.2.2, 9.1.2.3, 9.1.2.4, and 9.1.2.5 test suites with signed synthetic fixtures (278/278 Phase 9 tests passing).
+    - Full test suite regression pass: 1,596 tests passing across 109 test suites (100% pass rate).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_6_IMPLEMENTATION_REPORT.md`.
 
 ---
 

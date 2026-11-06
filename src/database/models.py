@@ -667,6 +667,14 @@ class LegacyEvidenceAttestation:
     source_snapshot_hash: str
     attested_by: str
     attested_at: str
+    evidence_artifact_hash: Optional[str] = None
+    evidence_payload_hash: Optional[str] = None
+    issuer_id: Optional[str] = None
+    key_id: Optional[str] = None
+    signature_algorithm: Optional[str] = None
+    evidence_signature: Optional[str] = None
+    migration_boundary: Optional[str] = None
+    verified_at: Optional[str] = None
     details: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

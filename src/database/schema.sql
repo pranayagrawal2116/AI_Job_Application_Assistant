@@ -560,8 +560,16 @@ CREATE TABLE IF NOT EXISTS legacy_evidence_attestations (
     evidence_type TEXT NOT NULL,
     evidence_reference_id TEXT NOT NULL,
     source_snapshot_hash TEXT NOT NULL,
+    evidence_artifact_hash TEXT,
+    evidence_payload_hash TEXT,
+    issuer_id TEXT,
+    key_id TEXT,
+    signature_algorithm TEXT,
+    evidence_signature TEXT,
+    migration_boundary TEXT,
     attested_by TEXT NOT NULL,
     attested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    verified_at DATETIME,
     details TEXT
 );
 

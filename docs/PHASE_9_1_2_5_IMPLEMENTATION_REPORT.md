@@ -262,6 +262,7 @@ pytest tests/ -q
 
 1. **Physical File Re-Upload Requirement:** In deployed installations where historical job descriptions were uploaded prior to Phase 9.1.1 without independent archival evidence, those records cannot be used for security-sensitive workflows until the user re-uploads the source file via `recover_unverified_job_description()`. This is by design: backward compatibility must never compromise binary-integrity guarantees.
 2. **Text-Only Pasted/URL Disclaimers:** Pasted and URL job descriptions retain `NOT_APPLICABLE` status and are subject to Unicode and prompt injection scanning, but cannot offer binary file provenance.
+3. **Database Row Presence vs. Cryptographic Artifact Verification (Addendum - Phase 9.1.2.6 Precursor):** While Phase 9.1.2.5 introduced the `legacy_evidence_attestations` table and verified the presence of reference records, mere database row presence is only an internal pointer and does not independently prove evidence authenticity. Direct resolution, cryptographic digital signature verification (HMAC-SHA256 / Ed25519), and canonical artifact payload integrity checks are required to prevent row-fabrication and are addressed authoritatively in Phase 9.1.2.6.
 
 ---
 

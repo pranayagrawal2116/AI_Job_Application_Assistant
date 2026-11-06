@@ -60,8 +60,24 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
 
         self.db = DatabaseManager(db_path=str(self.db_path))
         self.file_validator = FileSecurityValidator(base_storage_dir=self.storage_dir)
+
+        from src.security.legacy_evidence_verifier import (
+            LegacyEvidenceTrustStore,
+            InMemoryEvidenceResolver,
+            LegacyEvidenceVerifier,
+            set_default_evidence_trust_store,
+            set_default_evidence_resolver,
+        )
+        self.trust_store = LegacyEvidenceTrustStore(db_manager=self.db)
+        self.trust_store.register_trusted_issuer("system_migration_authority")
+        self.trust_store.register_trusted_key("test_key_9122", b"test_secret_32_bytes_long_9122!!")
+        self.resolver = InMemoryEvidenceResolver()
+        set_default_evidence_trust_store(self.trust_store)
+        set_default_evidence_resolver(self.resolver)
+        self.verifier = LegacyEvidenceVerifier(trust_store=self.trust_store, resolver=self.resolver, db_manager=self.db)
+
         self.service = DashboardService(db_manager=self.db, storage_base_dir=self.storage_dir)
-        self.preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        self.preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator, evidence_verifier=self.verifier)
         self.sanitizer = UnicodeSanitizer()
 
         # Create two test users
@@ -83,6 +99,9 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
         self.docx_bytes = generate_persona_docx("backend_engineer")
 
     def tearDown(self):
+        from src.security.legacy_evidence_verifier import set_default_evidence_resolver, set_default_evidence_trust_store
+        set_default_evidence_resolver(None)
+        set_default_evidence_trust_store(None)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     # -------------------------------------------------------------------------
@@ -506,6 +525,30 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
                 """,
                 (jd.id,),
             )
+        from src.security.legacy_evidence_verifier import create_signed_evidence_artifact
+        art_bytes, _ = create_signed_evidence_artifact(
+            evidence_type="historical_import_manifest",
+            evidence_reference_id="MANIFEST-PHASE9122-001",
+            issuer_id="system_migration_authority",
+            key_id="test_key_9122",
+            signing_key=b"test_secret_32_bytes_long_9122!!",
+            entries=[{"user_id": self.user1_id, "job_description_id": jd.id, "source_snapshot_hash": jd.snapshot_hash}],
+        )
+        self.resolver.register_artifact("historical_import_manifest", "MANIFEST-PHASE9122-001", art_bytes)
+
+        verified = self.verifier.verify(
+            evidence_type="historical_import_manifest",
+            evidence_reference_id="MANIFEST-PHASE9122-001",
+            user_id=self.user1_id,
+            job_description_id=jd.id,
+            source_snapshot_hash=jd.snapshot_hash,
+            attesting_principal="system_migration_coordinator",
+        )
+        self.db.record_legacy_evidence_attestation(
+            verified_evidence=verified,
+            attesting_principal="system_migration_coordinator",
+        )
+
         self.db.record_legacy_integrity_exception(
             user_id=self.user1_id,
             job_description_id=jd.id,
