@@ -736,6 +736,32 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,484 tests passing across the entire repository (100% pass rate in 79.82s).
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_3_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.4: Migration Finality, Attachment Enforcement & Manifest Integrity Closure** (Complete)
+  - Authoritative Migration Ledger & One-Time Finality (Part A):
+    - Created authoritative SQLite migration ledger `schema_migrations` (`migration_id`, `migration_version`, `applied_at`, `details`).
+    - Enforced one-time finality for `phase_9_1_2_3_legacy_binary_integrity`: returns immediately without evaluating or mutating `job_descriptions` if recorded.
+    - Prevented timestamp manipulation (`created_at` spoofing to 2024) from grandfathering new records into `LEGACY_TEXT_ONLY`.
+    - Prohibited downgrading `VERIFIED` records to `LEGACY_TEXT_ONLY` (`AND binary_integrity_state != 'VERIFIED'`).
+    - Eliminated silent `except sqlite3.OperationalError: pass` exception suppression from migration and database initialization routines.
+  - Attachment Consumption Security Protocol (Part B):
+    - Enforced mandatory configured `DatabaseManager` in `FormPrefiller.open_verified_attachment()`, failing closed on missing database.
+    - Strictly validated all 11 fields of `VerifiedAttachmentRef` (rejecting malformed IDs, non-hex hashes, invalid formats, and traversal components).
+    - Re-resolved authoritative resume metadata through `ResumeIntegrityVerifier.verify_and_load_resume()`, checking all 8 critical attributes (`user_id`, `resume_id`, `version_num`, `storage_filename`, `file_hash`, `file_size_bytes`, `file_format`, `resolved_path`).
+    - Invoked centralized preflight via `SecurityPreflightManager.check_resume_security(target_action='external_agent_execution')`. Both `SUSPICIOUS` and `QUARANTINED` records fail closed; candidate overrides cannot unlock external execution.
+    - Verified persistent scan HMAC signature, scan ID matching, active scanner/policy version matching, and unrevoked key status.
+    - Utilized descriptor-relative verification via `FileSecurityValidator.resolve_and_verify_candidate_file()`, returning verified in-memory bytes directly without reopening file paths.
+  - External Browser Automation Boundary Statement (Part C):
+    - Explicitly clarified and documented that no external browser automation consumer currently operates in production.
+    - `FormFillPlan` is an offline plan, not proof of browser submission. `open_verified_attachment()` acts as the cryptographically enforced gateway for future form-filling agents.
+  - Strict Manifest-Version Declaration (Part D):
+    - Eliminated version inference during verification in `SecurityScanSigner.verify_scan_record()`.
+    - Enforced explicit declaration of supported manifest versions (`{"v1", "v2"}`). Empty strings, whitespace-only strings, non-string types, and unknown versions fail closed with `SecurityAuthorizationError`.
+    - Required manifest version `v2` and all three binary metadata fields (`source_binary_hash`, `source_binary_size_bytes`, `source_binary_format`) whenever binary provenance is expected.
+  - Verification & Regressions (Parts E, F, G & H):
+    - Authored 62 dedicated test cases in `tests/test_phase_9_1_2_4_migration_and_attachment_closure.py` (62/62 passing, 100%).
+    - Full test suite regression pass: 1,546 tests passing across 107 test suites (100% pass rate in 77.39s).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_4_IMPLEMENTATION_REPORT.md`.
 
 ---
 

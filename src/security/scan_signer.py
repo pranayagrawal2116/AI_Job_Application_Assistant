@@ -461,27 +461,40 @@ class SecurityScanSigner:
                 )
 
         raw_manifest_version = scan_row.get("manifest_version")
-        if not raw_manifest_version:
-            manifest_version = "v2" if scan_row.get("source_binary_hash") is not None else "v1"
-        else:
-            if not isinstance(raw_manifest_version, str) or raw_manifest_version.strip() not in SUPPORTED_MANIFEST_VERSIONS:
-                raise SecurityAuthorizationError(
-                    f"Stored scan record #{scan_row.get('id')} has unsupported manifest_version '{raw_manifest_version}'. "
-                    f"Supported manifest versions: {sorted(SUPPORTED_MANIFEST_VERSIONS)}"
-                )
-            manifest_version = raw_manifest_version.strip()
+        if raw_manifest_version is None:
+            raise SecurityAuthorizationError(
+                f"Stored scan record #{scan_row.get('id')} is missing manifest_version. "
+                f"Supported manifest versions: {sorted(SUPPORTED_MANIFEST_VERSIONS)}."
+            )
+        if not isinstance(raw_manifest_version, str):
+            raise SecurityAuthorizationError(
+                f"Stored scan record #{scan_row.get('id')} has invalid manifest_version type '{type(raw_manifest_version).__name__}'. "
+                f"Must be a string in {sorted(SUPPORTED_MANIFEST_VERSIONS)}."
+            )
+        manifest_version = raw_manifest_version.strip()
+        if not manifest_version or manifest_version not in SUPPORTED_MANIFEST_VERSIONS:
+            raise SecurityAuthorizationError(
+                f"Stored scan record #{scan_row.get('id')} has unsupported manifest_version '{raw_manifest_version}'. "
+                f"Supported manifest versions: {sorted(SUPPORTED_MANIFEST_VERSIONS)}."
+            )
 
         row_bin_hash = scan_row.get("source_binary_hash")
         row_bin_size = scan_row.get("source_binary_size_bytes")
         row_bin_fmt = scan_row.get("source_binary_format")
 
-        # Strict v2 enforcement: reject v1 records when expected binary provenance is supplied
+        # Strict v2 enforcement: reject v1 records and missing binary metadata when expected binary provenance is supplied
         if expected_source_binary_hash is not None:
             if manifest_version == "v1":
                 raise SecurityAuthorizationError(
                     f"Scan record #{scan_row.get('id')} has manifest version 'v1' lacking binary provenance, "
                     f"but binary provenance is required for this source. A 'v2' rescan is required."
                 )
+            if manifest_version == "v2":
+                if row_bin_hash is None or row_bin_size is None or row_bin_fmt is None:
+                    raise SecurityAuthorizationError(
+                        f"Scan record #{scan_row.get('id')} has manifest version 'v2' but is missing required binary metadata "
+                        f"(hash={row_bin_hash}, size={row_bin_size}, format={row_bin_fmt})."
+                    )
 
         if manifest_version == "v2":
             if expected_source_binary_hash is not None and row_bin_hash != expected_source_binary_hash:

@@ -42,6 +42,16 @@ class VerifiedAttachmentRef:
 
 @dataclass
 class FormFillPlan:
+    """Offline preparation plan for job application form filling.
+
+    IMPORTANT SAFETY BOUNDARY:
+    FormFillPlan represents an offline preparation artifact and must NEVER be interpreted as proof
+    that external browser upload has occurred. External browser automation and automated form submission
+    remain strictly disabled until an authoritative ApplicationFormFillingBroker is implemented in future
+    milestones. Raw filesystem paths ('resume_file_path') must NEVER be consumed directly by external
+    browser automation; all consumption MUST go through open_verified_attachment() which performs
+    descriptor-relative verification and enforces clean security scans.
+    """
     job_id: int
     company_name: str
     target_url: str
@@ -403,28 +413,47 @@ class FormPrefiller:
         plan_or_ref: Union[FormFillPlan, VerifiedAttachmentRef],
         user_id: int,
     ) -> bytes:
-        """Opens and verifies an authoritative attachment binary immediately before form upload (use-time TOCTOU defense).
+        """Opens, verifies, and returns the authoritative attachment binary immediately before external upload.
 
-        Re-validates:
-        1. User ownership and identity binding
-        2. Physical file existence, symlink traversal prevention, and candidate directory containment
-        3. Exact SHA-256 hash matching attachment_ref
-        4. Exact file byte size matching attachment_ref
-        5. File format magic byte headers (%PDF- or PK\x03\x04)
-        6. Security scan record HMAC validity, key active/unrevoked status, and non-quarantine status
+        CRITICAL SECURITY ENFORCEMENT (Phase 9.1.2.4 Part B):
+        1. Mandatory authoritative database manager: fails closed with SecurityAuthorizationError if self.db is None.
+        2. Reference integrity validation: strictly validates all fields of VerifiedAttachmentRef (no malformed IDs,
+           invalid hashes, bad formats, traversal characters, or cross-user references).
+        3. Authoritative resume re-resolution: invokes ResumeIntegrityVerifier.verify_and_load_resume() for the exact
+           referenced version and compares all 8 fields against VerifiedAttachmentRef.
+        4. Centralized security preflight: calls SecurityPreflightManager.check_resume_security(target_action='external_agent_execution').
+           Enforces active scanner and policy versions, valid scan HMAC, and clean scan status.
+           BOTH SUSPICIOUS and QUARANTINED scans strictly fail closed; overrides NEVER unlock external attachment.
+        5. Scan identity and signature binding: verifies scan ID, HMAC signature, and unrevoked key status.
+        6. Descriptor-relative verification: invokes FileSecurityValidator.resolve_and_verify_candidate_file()
+           and returns the actual verified in-memory bytes directly without reopening the path.
+
+        NOTE ON EXTERNAL AUTOMATION:
+        External browser form upload execution remains disabled until a restricted ApplicationFormFillingBroker is
+        implemented in future milestones. This method serves as the authorized attachment gateway for such execution.
 
         Returns:
-            bytes: The verified raw file binary.
+            bytes: The verified raw file binary read from descriptor-relative inspection.
 
         Raises:
             CrossUserAccessError: If user_id mismatches attachment_ref.user_id.
-            SecurityAuthorizationError: If any binary integrity, format, or cryptographic check fails.
+            SecurityAuthorizationError: If any verification, preflight, or cryptographic check fails.
         """
-        import hashlib
         from src.database.exceptions import CrossUserAccessError, SecurityAuthorizationError
         from src.security.file_security import FileSecurityValidator
         from src.security.scan_signer import SecurityScanSigner
+        from src.security.resume_verifier import ResumeIntegrityVerifier
+        from src.security.security_preflight import SecurityPreflightManager
+        from src.security.prompt_injection_detector import ScanClassification
 
+        # 4.1 Mandatory database requirement
+        if not self.db:
+            raise SecurityAuthorizationError(
+                "Authoritative attachment verification requires a configured DatabaseManager. "
+                "Path-only and filesystem-only fallbacks are strictly prohibited."
+            )
+
+        # 4.6 Reference integrity & input resolution
         if isinstance(plan_or_ref, FormFillPlan):
             ref = plan_or_ref.attachment_ref
             if not ref:
@@ -434,6 +463,8 @@ class FormPrefiller:
         else:
             raise SecurityAuthorizationError(f"Invalid plan_or_ref of type {type(plan_or_ref)}.")
 
+        if not ref.user_id or not isinstance(ref.user_id, int) or ref.user_id <= 0:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid user_id.")
         if ref.user_id != user_id:
             raise CrossUserAccessError(
                 user_id=user_id,
@@ -441,83 +472,146 @@ class FormPrefiller:
                 resource=f"VerifiedAttachmentRef for Resume #{ref.resume_id}",
             )
 
-        file_validator = self.file_validator or FileSecurityValidator()
-        res_dir = file_validator.get_user_resumes_dir(user_id)
-        path = Path(ref.file_path).resolve()
-
-        # Symlink / directory containment check
+        if not ref.resume_id or not isinstance(ref.resume_id, int) or ref.resume_id <= 0:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid resume_id.")
+        if not ref.version_num or not isinstance(ref.version_num, int) or ref.version_num <= 0:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid version_num.")
+        if not ref.storage_filename or not isinstance(ref.storage_filename, str) or not ref.storage_filename.strip():
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid storage_filename.")
+        if "/" in ref.storage_filename or "\\" in ref.storage_filename or "\x00" in ref.storage_filename or ".." in ref.storage_filename:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains illegal path components in storage_filename.")
+        if not ref.file_path or not isinstance(ref.file_path, str) or not ref.file_path.strip():
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid file_path.")
+        if not ref.file_hash or not isinstance(ref.file_hash, str) or len(ref.file_hash) != 64:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid SHA-256 file_hash.")
         try:
-            path.relative_to(res_dir.resolve())
+            int(ref.file_hash, 16)
         except ValueError:
-            raise SecurityAuthorizationError(
-                f"Attachment path '{ref.file_path}' traverses outside authorized candidate directory '{res_dir}'."
-            )
+            raise SecurityAuthorizationError("VerifiedAttachmentRef file_hash is not valid hex.")
+        if not ref.file_size_bytes or not isinstance(ref.file_size_bytes, int) or ref.file_size_bytes <= 0:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid file_size_bytes.")
+        clean_ref_fmt = (ref.file_format or "").lower().strip()
+        if clean_ref_fmt not in ("pdf", "docx"):
+            raise SecurityAuthorizationError(f"VerifiedAttachmentRef contains unsupported file_format '{ref.file_format}'.")
+        if not ref.scan_id or not isinstance(ref.scan_id, int) or ref.scan_id <= 0:
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid scan_id.")
+        if not ref.scan_signature or not isinstance(ref.scan_signature, str) or not ref.scan_signature.strip():
+            raise SecurityAuthorizationError("VerifiedAttachmentRef contains invalid scan_signature.")
 
-        if not path.is_file():
-            raise SecurityAuthorizationError(f"Attachment file '{ref.file_path}' does not exist or is not a regular file.")
-
+        # 4.2 Re-resolve authoritative resume record from database
+        verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
         try:
-            with open(path, "rb") as f:
-                content_bytes = f.read()
-        except Exception as e:
-            raise SecurityAuthorizationError(f"Failed to read attachment file '{ref.file_path}': {e}") from e
-
-        # Use-time size check
-        if len(content_bytes) != ref.file_size_bytes:
-            raise SecurityAuthorizationError(
-                f"TOCTOU detection: Attachment file size altered. Expected {ref.file_size_bytes} bytes, got {len(content_bytes)} bytes."
-            )
-
-        # Use-time SHA-256 check
-        actual_hash = hashlib.sha256(content_bytes).hexdigest()
-        if actual_hash != ref.file_hash:
-            raise SecurityAuthorizationError(
-                f"TOCTOU detection: Attachment file hash altered. Expected '{ref.file_hash}', got '{actual_hash}'."
-            )
-
-        # Use-time format magic bytes check
-        fmt = (ref.file_format or "").lower().strip()
-        if fmt == "pdf":
-            if not content_bytes.startswith(b"%PDF-"):
-                raise SecurityAuthorizationError("Attachment file lacks valid PDF header magic bytes.")
-        elif fmt == "docx":
-            if not content_bytes.startswith(b"PK\x03\x04"):
-                raise SecurityAuthorizationError("Attachment file lacks valid DOCX (ZIP) header magic bytes.")
-        else:
-            raise SecurityAuthorizationError(f"Unsupported attachment file format '{fmt}'.")
-
-        # Reverity security scan in database
-        if self.db:
-            scan = self.db.get_latest_security_scan(
+            v_res = verifier.verify_and_load_resume(
                 user_id=user_id,
-                source_type="resume",
-                source_id=ref.resume_id,
-                source_version=ref.version_num,
+                resume_id=ref.resume_id,
+                version_num=ref.version_num,
+                fresh_parse=False,
             )
-            if not scan:
-                raise SecurityAuthorizationError(f"No security scan record found for Resume #{ref.resume_id} v{ref.version_num}.")
-            if scan.id != ref.scan_id:
-                raise SecurityAuthorizationError(
-                    f"Scan ID mismatch: attachment ref refers to scan #{ref.scan_id}, but latest scan is #{scan.id}."
-                )
-            if scan.classification == "QUARANTINED":
-                raise SecurityAuthorizationError(f"Attachment Resume #{ref.resume_id} is QUARANTINED and cannot be opened for form upload.")
+        except Exception as e:
+            raise SecurityAuthorizationError(f"TOCTOU detection: Authoritative resume re-resolution failed for Resume #{ref.resume_id}: {e}") from e
 
-            signer = SecurityScanSigner(db_manager=self.db)
-            signer.verify_scan_record(
-                expected_user_id=user_id,
-                expected_source_type="resume",
-                expected_source_id=ref.resume_id,
-                expected_source_version=ref.version_num,
-                expected_source_hash=ref.file_hash,
-                expected_snapshot_hash=None,
-                scan_row=scan.to_dict() if hasattr(scan, "to_dict") else dict(scan),
-                expected_source_binary_hash=ref.file_hash,
-                expected_source_binary_size_bytes=ref.file_size_bytes,
-                expected_source_binary_format=ref.file_format,
+        # Compare verified result against VerifiedAttachmentRef
+        if v_res.user_id != ref.user_id:
+            raise SecurityAuthorizationError(
+                f"Authoritative resume user_id '{v_res.user_id}' does not match attachment_ref user_id '{ref.user_id}'."
+            )
+        if v_res.resume_id != ref.resume_id:
+            raise SecurityAuthorizationError(
+                f"Authoritative resume_id '{v_res.resume_id}' does not match attachment_ref resume_id '{ref.resume_id}'."
+            )
+        if v_res.version_num != ref.version_num:
+            raise SecurityAuthorizationError(
+                f"Authoritative version '{v_res.version_num}' does not match attachment_ref version '{ref.version_num}'."
+            )
+        if v_res.storage_filename != ref.storage_filename:
+            raise SecurityAuthorizationError(
+                f"Authoritative storage_filename '{v_res.storage_filename}' does not match attachment_ref '{ref.storage_filename}'."
+            )
+        if v_res.file_hash.lower() != ref.file_hash.lower():
+            raise SecurityAuthorizationError(
+                f"Authoritative file_hash '{v_res.file_hash}' does not match attachment_ref '{ref.file_hash}'."
+            )
+        if v_res.file_size_bytes != ref.file_size_bytes:
+            raise SecurityAuthorizationError(
+                f"Authoritative file_size_bytes {v_res.file_size_bytes} does not match attachment_ref {ref.file_size_bytes}."
+            )
+        if v_res.file_format.lower() != clean_ref_fmt:
+            raise SecurityAuthorizationError(
+                f"Authoritative file_format '{v_res.file_format}' does not match attachment_ref '{ref.file_format}'."
+            )
+        if v_res.resolved_path is not None and v_res.resolved_path.resolve() != Path(ref.file_path).resolve():
+            raise SecurityAuthorizationError(
+                f"Authoritative resolved_path '{v_res.resolved_path}' does not match attachment_ref file_path '{ref.file_path}'."
             )
 
-        return content_bytes
+        # 4.3 Mandatory centralized security preflight
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        preflight_res = preflight.check_resume_security(
+            user_id=user_id,
+            resume_id=ref.resume_id,
+            version_num=ref.version_num,
+            verified_resume=v_res,
+            target_action="external_agent_execution",
+        )
+        if preflight_res.classification != ScanClassification.CLEAN:
+            raise SecurityAuthorizationError(
+                f"Attachment Resume #{ref.resume_id} is classified as {preflight_res.classification.value}; "
+                "only CLEAN resumes may be opened for external attachment."
+            )
+
+        # 4.4 Scan identity and signature binding
+        scan = self.db.get_latest_security_scan(
+            user_id=user_id,
+            source_type="resume",
+            source_id=ref.resume_id,
+            source_version=ref.version_num,
+        )
+        if not scan:
+            raise SecurityAuthorizationError(f"No security scan record found for Resume #{ref.resume_id} v{ref.version_num}.")
+        if scan.id != ref.scan_id:
+            raise SecurityAuthorizationError(
+                f"Scan ID mismatch: attachment ref refers to scan #{ref.scan_id}, but latest authoritative scan is #{scan.id}."
+            )
+        if scan.hmac_signature != ref.scan_signature:
+            raise SecurityAuthorizationError(
+                f"Scan signature mismatch: attachment ref signature does not match authoritative scan #{scan.id} signature."
+            )
+        if scan.scanner_version != preflight.detector.engine_version:
+            raise SecurityAuthorizationError(
+                f"Scan #{scan.id} has stale scanner_version '{scan.scanner_version}' vs current '{preflight.detector.engine_version}'."
+            )
+        if scan.policy_version != preflight.detector.policy_version:
+            raise SecurityAuthorizationError(
+                f"Scan #{scan.id} has stale policy_version '{scan.policy_version}' vs current '{preflight.detector.policy_version}'."
+            )
+
+        signer = SecurityScanSigner(db_manager=self.db)
+        signer.verify_scan_record(
+            expected_user_id=user_id,
+            expected_source_type="resume",
+            expected_source_id=ref.resume_id,
+            expected_source_version=ref.version_num,
+            expected_source_hash=ref.file_hash,
+            expected_snapshot_hash=None,
+            scan_row=scan.to_dict() if hasattr(scan, "to_dict") else dict(scan),
+            expected_source_binary_hash=ref.file_hash,
+            expected_source_binary_size_bytes=ref.file_size_bytes,
+            expected_source_binary_format=ref.file_format,
+        )
+
+        # 4.5 Descriptor-relative file verification and direct byte return (no reopening)
+        file_validator = self.file_validator or FileSecurityValidator()
+        resolved_path, file_bytes, actual_hash, actual_size = file_validator.resolve_and_verify_candidate_file(
+            user_id=user_id,
+            file_path=ref.file_path,
+            expected_hash=ref.file_hash,
+            expected_size=ref.file_size_bytes,
+            expected_format=clean_ref_fmt,
+            is_mandatory=True,
+            resource_desc=f"Attachment Resume #{ref.resume_id}",
+        )
+
+        return file_bytes
 
     def ingest_and_prepare_attachment(
         self,

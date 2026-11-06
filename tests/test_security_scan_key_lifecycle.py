@@ -123,6 +123,7 @@ class TestSecurityScanKeyLifecycle(unittest.TestCase):
             "classification": "CLEAN",
             "threats_detected_json": "[]",
             "scanned_at": "2026-11-06T12:00:00Z",
+            "manifest_version": "v1",
             "key_id": "key_v1",
             "hmac_signature": sig_v1,
         }
@@ -190,6 +191,7 @@ class TestSecurityScanKeyLifecycle(unittest.TestCase):
             "classification": "CLEAN",
             "threats_detected_json": "[]",
             "scanned_at": "2026-11-06T12:00:00Z",
+            "manifest_version": "v1",
             "key_id": "compromised_key",
             "hmac_signature": sig,
         }
@@ -229,6 +231,7 @@ class TestSecurityScanKeyLifecycle(unittest.TestCase):
             "classification": "CLEAN",
             "threats_detected_json": "[]",
             "scanned_at": "2026-11-06T12:00:00Z",
+            "manifest_version": "v1",
             "key_id": "completely_unknown_key_id",
             "hmac_signature": "fake_signature",
         }

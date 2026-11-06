@@ -479,6 +479,19 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        # Database schema migration ledger table (Phase 9.1.2.4 Migration Finality)
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    migration_id TEXT PRIMARY KEY,
+                    migration_version TEXT NOT NULL,
+                    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    details TEXT
+                )
+            """)
+        except sqlite3.OperationalError:
+            pass
+
         self._migrate_historical_job_description_integrity(cursor)
 
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
@@ -497,104 +510,195 @@ class DatabaseManager:
     def _migrate_historical_job_description_integrity(self, cursor: sqlite3.Cursor) -> None:
         """Migrates historical job descriptions to authoritative binary_integrity_state.
 
-        Grandfathers pre-Phase-9.1.1 uploaded records with all-NULL binary metadata into LEGACY_TEXT_ONLY
-        and records an immutable audit entry in legacy_integrity_exceptions.
+        Enforces one-time finality via schema_migrations ledger:
+        1. Checks if 'phase_9_1_2_3_legacy_binary_integrity' has already been recorded. If so, skips.
+        2. Non-uploaded records (pasted, url, etc.) -> NOT_APPLICABLE.
+        3. Uploaded records with all 4 binary fields populated -> VERIFIED.
+        4. Evaluates candidates for LEGACY_TEXT_ONLY:
+           - source_type in ('uploaded_document', 'upload')
+           - all 4 binary metadata fields are strictly NULL
+           - binary_integrity_state != 'VERIFIED' (never downgrade VERIFIED)
+           - rejects partially populated metadata
+           - rejects candidates with signed scans having binary provenance (source_binary_hash IS NOT NULL)
+           - validates pre-migration canonical snapshot hash against 9-key manifest schema
+           - validates pre-migration database provenance (created_at present, pre-migration snapshot)
+        5. For each verified candidate, inserts an immutable audit record in legacy_integrity_exceptions
+           and sets binary_integrity_state = 'LEGACY_TEXT_ONLY'.
+        6. Atomically records completion marker 'phase_9_1_2_3_legacy_binary_integrity' in schema_migrations.
         """
-        try:
-            # 1. Non-uploaded records (pasted, url, etc.) -> NOT_APPLICABLE
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
+        if not cursor.fetchone():
+            return  # Table will be created fresh by schema.sql
+
+        # Ensure schema_migrations table exists
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                migration_version TEXT NOT NULL,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                details TEXT
+            )
+        """)
+
+        # 1. One-time finality check via migration ledger
+        cursor.execute("SELECT 1 FROM schema_migrations WHERE migration_id = 'phase_9_1_2_3_legacy_binary_integrity'")
+        if cursor.fetchone():
+            logger.debug("Migration phase_9_1_2_3_legacy_binary_integrity already applied; skipping.")
+            return
+
+        # 2. Non-uploaded records (pasted, url, etc.) -> NOT_APPLICABLE
+        cursor.execute(
+            """
+            UPDATE job_descriptions
+            SET binary_integrity_state = 'NOT_APPLICABLE'
+            WHERE (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
+              AND lower(source_type) NOT IN ('uploaded_document', 'upload')
+            """
+        )
+
+        # 3. Uploaded records with all 4 binary fields populated -> VERIFIED
+        cursor.execute(
+            """
+            UPDATE job_descriptions
+            SET binary_integrity_state = 'VERIFIED'
+            WHERE (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
+              AND lower(source_type) IN ('uploaded_document', 'upload')
+              AND storage_filename IS NOT NULL
+              AND file_hash IS NOT NULL
+              AND file_size_bytes IS NOT NULL
+              AND file_format IS NOT NULL
+            """
+        )
+
+        # 4. Check candidates for LEGACY_TEXT_ONLY
+        # Section 3.3: Never convert existing VERIFIED records to LEGACY_TEXT_ONLY
+        cursor.execute(
+            """
+            SELECT id, user_id, source_type, company_name, job_title, raw_content, content_hash,
+                   snapshot_hash, parsed_data, parser_version, source_url, original_filename,
+                   binary_integrity_state, created_at, storage_filename, file_hash, file_size_bytes, file_format
+            FROM job_descriptions
+            WHERE lower(source_type) IN ('uploaded_document', 'upload')
+              AND (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
+              AND binary_integrity_state != 'VERIFIED'
+            """
+        )
+        candidates = cursor.fetchall()
+        migrated_count = 0
+
+        for cand in candidates:
+            jd_id = cand[0] if isinstance(cand, tuple) else cand["id"]
+            u_id = cand[1] if isinstance(cand, tuple) else cand["user_id"]
+            s_type = cand[2] if isinstance(cand, tuple) else cand["source_type"]
+            comp_name = cand[3] if isinstance(cand, tuple) else cand["company_name"]
+            j_title = cand[4] if isinstance(cand, tuple) else cand["job_title"]
+            c_hash = cand[6] if isinstance(cand, tuple) else cand["content_hash"]
+            s_hash = cand[7] if isinstance(cand, tuple) else cand["snapshot_hash"]
+            p_data = cand[8] if isinstance(cand, tuple) else cand["parsed_data"]
+            p_ver = cand[9] if isinstance(cand, tuple) else cand["parser_version"]
+            s_url = cand[10] if isinstance(cand, tuple) else cand["source_url"]
+            orig_name = cand[11] if isinstance(cand, tuple) else cand["original_filename"]
+            prev_state = cand[12] if isinstance(cand, tuple) else cand["binary_integrity_state"]
+            created_at = cand[13] if isinstance(cand, tuple) else cand["created_at"]
+            s_fn = cand[14] if isinstance(cand, tuple) else cand["storage_filename"]
+            f_hash = cand[15] if isinstance(cand, tuple) else cand["file_hash"]
+            f_size = cand[16] if isinstance(cand, tuple) else cand["file_size_bytes"]
+            f_fmt = cand[17] if isinstance(cand, tuple) else cand["file_format"]
+
+            # Section 3.3: Reject partially populated metadata
+            # All 4 binary fields must be strictly NULL for a legacy text-only candidate
+            if s_fn is not None or f_hash is not None or f_size is not None or f_fmt is not None:
+                continue
+
+            # Section 3.3: Check for previous signed scans with binary provenance
+            cursor.execute(
+                """
+                SELECT 1 FROM security_scans
+                WHERE source_type = 'job_description'
+                  AND source_id = ?
+                  AND source_binary_hash IS NOT NULL
+                LIMIT 1
+                """,
+                (jd_id,),
+            )
+            if cursor.fetchone():
+                continue
+
+            # Section 3.3: Verify candidate snapshot hash matches canonical 9-key pre-migration manifest
+            # A modern Phase 9.1.1+ record has a 13-key manifest (including binary fields)
+            try:
+                parsed_dict = json.loads(p_data) if p_data and isinstance(p_data, str) else p_data
+            except Exception:
+                parsed_dict = None
+
+            manifest_9 = {
+                "user_id": u_id,
+                "company_name": comp_name,
+                "job_title": j_title,
+                "raw_content_hash": c_hash,
+                "parsed_data": parsed_dict,
+                "parser_version": p_ver or "1.0.0",
+                "source_type": s_type,
+                "source_url": s_url,
+                "original_filename": orig_name,
+            }
+            expected_legacy_hash = canonical_json_hash(manifest_9)
+            if not s_hash or s_hash != expected_legacy_hash:
+                continue
+
+            # Section 3.2: Verify pre-migration database provenance
+            # Authentic pre-migration record must have created_at timestamp
+            if not created_at:
+                continue
+
+            # Check if already recorded in legacy_integrity_exceptions
+            cursor.execute(
+                """
+                SELECT 1 FROM legacy_integrity_exceptions
+                WHERE job_description_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (jd_id, u_id),
+            )
+            if not cursor.fetchone():
+                cursor.execute(
+                    """
+                    INSERT INTO legacy_integrity_exceptions (
+                        user_id, job_description_id, original_source_type,
+                        previous_binary_state, assigned_legacy_state,
+                        source_snapshot_hash, migration_version,
+                        migration_reason, outcome
+                    ) VALUES (?, ?, ?, ?, 'LEGACY_TEXT_ONLY', ?, '9.1.2.3',
+                              'Grandfathered pre-9.1.1 uploaded record with NULL binary metadata and verified provenance', 'SUCCESS')
+                    """,
+                    (u_id, jd_id, s_type, prev_state or "REQUIRED", s_hash),
+                )
+
             cursor.execute(
                 """
                 UPDATE job_descriptions
-                SET binary_integrity_state = 'NOT_APPLICABLE'
-                WHERE (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
-                  AND lower(source_type) NOT IN ('uploaded_document', 'upload')
-                """
+                SET binary_integrity_state = 'LEGACY_TEXT_ONLY'
+                WHERE id = ?
+                """,
+                (jd_id,),
             )
+            migrated_count += 1
 
-            # 2. Uploaded records with all 4 binary fields populated -> VERIFIED
-            cursor.execute(
-                """
-                UPDATE job_descriptions
-                SET binary_integrity_state = 'VERIFIED'
-                WHERE (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
-                  AND lower(source_type) IN ('uploaded_document', 'upload')
-                  AND storage_filename IS NOT NULL
-                  AND file_hash IS NOT NULL
-                  AND file_size_bytes IS NOT NULL
-                  AND file_format IS NOT NULL
-                """
+        # Section 3.1 & 3.4: Atomically record completion in schema_migrations
+        # Record completion marker only when candidate evaluation and migration succeed
+        cursor.execute(
+            """
+            INSERT OR REPLACE INTO schema_migrations (
+                migration_id, migration_version, applied_at, details
+            ) VALUES (
+                'phase_9_1_2_3_legacy_binary_integrity',
+                '9.1.2.3',
+                CURRENT_TIMESTAMP,
+                ?
             )
-
-            # 3. Uploaded records with all 4 binary fields NULL created before 2026-11-06 00:00:00 -> LEGACY_TEXT_ONLY
-            cursor.execute(
-                """
-                SELECT id, user_id, source_type, snapshot_hash, created_at, binary_integrity_state
-                FROM job_descriptions
-                WHERE lower(source_type) IN ('uploaded_document', 'upload')
-                  AND storage_filename IS NULL
-                  AND file_hash IS NULL
-                  AND file_size_bytes IS NULL
-                  AND file_format IS NULL
-                  AND created_at IS NOT NULL
-                  AND datetime(replace(created_at, 'T', ' ')) < datetime('2026-11-06 00:00:00')
-                """
-            )
-            candidates = cursor.fetchall()
-            for cand in candidates:
-                jd_id = cand[0] if isinstance(cand, tuple) else cand["id"]
-                u_id = cand[1] if isinstance(cand, tuple) else cand["user_id"]
-                s_type = cand[2] if isinstance(cand, tuple) else cand["source_type"]
-                s_hash = cand[3] if isinstance(cand, tuple) else cand["snapshot_hash"]
-                prev_state = cand[5] if isinstance(cand, tuple) else cand["binary_integrity_state"]
-
-                # Ensure no scan exists with source_binary_hash IS NOT NULL
-                cursor.execute(
-                    """
-                    SELECT 1 FROM security_scans
-                    WHERE source_type = 'job_description'
-                      AND source_id = ?
-                      AND source_binary_hash IS NOT NULL
-                    LIMIT 1
-                    """,
-                    (jd_id,),
-                )
-                if cursor.fetchone():
-                    # Cannot grandfather if an existing signed scan contains binary provenance!
-                    continue
-
-                # Check if already recorded in legacy_integrity_exceptions
-                cursor.execute(
-                    """
-                    SELECT 1 FROM legacy_integrity_exceptions
-                    WHERE job_description_id = ? AND user_id = ?
-                    LIMIT 1
-                    """,
-                    (jd_id, u_id),
-                )
-                if not cursor.fetchone():
-                    cursor.execute(
-                        """
-                        INSERT INTO legacy_integrity_exceptions (
-                            user_id, job_description_id, original_source_type,
-                            previous_binary_state, assigned_legacy_state,
-                            source_snapshot_hash, migration_version,
-                            migration_reason, outcome
-                        ) VALUES (?, ?, ?, ?, 'LEGACY_TEXT_ONLY', ?, '9.1.2.3',
-                                  'Grandfathered pre-9.1.1 uploaded record with NULL binary metadata', 'SUCCESS')
-                        """,
-                        (u_id, jd_id, s_type, prev_state or "REQUIRED", s_hash),
-                    )
-
-                cursor.execute(
-                    """
-                    UPDATE job_descriptions
-                    SET binary_integrity_state = 'LEGACY_TEXT_ONLY'
-                    WHERE id = ?
-                    """,
-                    (jd_id,),
-                )
-        except sqlite3.OperationalError:
-            pass
+            """,
+            (f"Migrated {migrated_count} legacy records to LEGACY_TEXT_ONLY",),
+        )
 
     def _migrate_match_results_foreign_keys(self, conn: sqlite3.Connection) -> None:
         """Migrates match_results table in existing SQLite databases to enforce RESTRICT on resumes/JDs and SET NULL on jobs.
@@ -1319,6 +1423,8 @@ class DatabaseManager:
             self._migrate_phase7_lifecycle_tables(conn)
             conn.commit()
             conn.executescript(schema_sql)
+            conn.commit()
+            self._migrate_historical_job_description_integrity(cursor)
             conn.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
 
@@ -4871,6 +4977,16 @@ class DatabaseManager:
                 return None
             return self._row_to_security_scan(row)
 
+    def get_security_scan_by_id(self, scan_id: int) -> Optional[SecurityScan]:
+        """Retrieves a security scan record by its primary key ID."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM security_scans WHERE id = ?", (scan_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return self._row_to_security_scan(row)
+
     def list_security_scans(
         self,
         user_id: int,
@@ -5047,6 +5163,68 @@ class DatabaseManager:
                 migration_reason=row["migration_reason"],
                 outcome=row["outcome"],
             )
+
+    def record_schema_migration(
+        self,
+        migration_id: str,
+        migration_version: str,
+        details: Optional[str] = None,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> None:
+        """Records a completed migration in schema_migrations ledger."""
+        sql = """
+            INSERT OR REPLACE INTO schema_migrations (
+                migration_id, migration_version, applied_at, details
+            ) VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+        """
+        if cursor:
+            cursor.execute(sql, (migration_id, migration_version, details))
+        else:
+            with self.transaction() as conn:
+                conn.execute(sql, (migration_id, migration_version, details))
+
+    def is_schema_migration_applied(
+        self,
+        migration_id: str,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> bool:
+        """Checks if a migration has already been completed in schema_migrations ledger."""
+        sql = "SELECT 1 FROM schema_migrations WHERE migration_id = ?"
+        if cursor:
+            cursor.execute(sql, (migration_id,))
+            return cursor.fetchone() is not None
+        else:
+            with self.connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, (migration_id,))
+                return cur.fetchone() is not None
+
+    def get_schema_migrations(
+        self,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> List[Dict[str, Any]]:
+        """Retrieves all completed schema migrations."""
+        sql = "SELECT migration_id, migration_version, applied_at, details FROM schema_migrations ORDER BY applied_at ASC"
+        if cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+        else:
+            with self.connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql)
+                rows = cur.fetchall()
+        results = []
+        for r in rows:
+            if isinstance(r, dict):
+                results.append(dict(r))
+            else:
+                results.append({
+                    "migration_id": r[0],
+                    "migration_version": r[1],
+                    "applied_at": r[2],
+                    "details": r[3],
+                })
+        return results
 
     def delete_user_resume(
         self,

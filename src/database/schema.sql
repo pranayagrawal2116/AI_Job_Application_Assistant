@@ -548,6 +548,16 @@ CREATE TABLE IF NOT EXISTS legacy_integrity_exceptions (
     outcome TEXT NOT NULL
 );
 
+-- ---------------------------------------------------------------------
+-- 15. DATABASE SCHEMA MIGRATION LEDGER (Phase 9.1.2.4 Migration Finality)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    migration_id TEXT PRIMARY KEY,
+    migration_version TEXT NOT NULL,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    details TEXT
+);
+
 CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_integrity_exceptions_update
 BEFORE UPDATE ON legacy_integrity_exceptions
 BEGIN

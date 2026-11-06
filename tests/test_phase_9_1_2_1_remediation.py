@@ -821,6 +821,7 @@ class TestPhase9121Remediation(unittest.TestCase):
             "classification": "SUSPICIOUS",
             "threats_detected_json": [t.to_dict() for t in scan_res.threats_detected],
             "key_id": key_id,
+            "manifest_version": "v1",
             "hmac_signature": sig,
             "scanned_at": manifest["scanned_at"],
         }

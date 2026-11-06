@@ -153,6 +153,7 @@ class TestSecurityScanPersistence(unittest.TestCase):
             "classification": ScanClassification.QUARANTINED,
             "threats_detected_json": json.dumps([t.to_dict() for t in scan_res.threats_detected]),
             "key_id": key_id,
+            "manifest_version": "v1",
             "hmac_signature": sig,
             "scanned_at": scan_res.scan_timestamp,
         }
@@ -196,6 +197,7 @@ class TestSecurityScanPersistence(unittest.TestCase):
             "classification": ScanClassification.CLEAN,  # Tampered!
             "threats_detected_json": json.dumps([t.to_dict() for t in scan_res.threats_detected]),
             "key_id": key_id,
+            "manifest_version": "v1",
             "hmac_signature": sig,
             "scanned_at": scan_res.scan_timestamp,
         }
@@ -238,6 +240,7 @@ class TestSecurityScanPersistence(unittest.TestCase):
             "classification": ScanClassification.CLEAN,
             "threats_detected_json": "[]",
             "key_id": key_id,
+            "manifest_version": "v1",
             "hmac_signature": sig,
             "scanned_at": scan_res.scan_timestamp,
         }
@@ -281,6 +284,7 @@ class TestSecurityScanPersistence(unittest.TestCase):
             "classification": ScanClassification.CLEAN,
             "threats_detected_json": "[]",
             "key_id": key_id,
+            "manifest_version": "v1",
             "hmac_signature": sig,
             "scanned_at": scan_res.scan_timestamp,
         }

@@ -344,6 +344,7 @@ class TestPhase912Integration(unittest.TestCase):
             "classification": scan_res.classification,
             "threats_detected_json": json.dumps([t.to_dict() for t in scan_res.threats_detected]),
             "scanned_at": manifest["scanned_at"],
+            "manifest_version": "v1",
             "key_id": key_id,
             "hmac_signature": sig,
         }

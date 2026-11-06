@@ -193,7 +193,9 @@ class TestPhase9123ProvenanceAndIdentityClosure(unittest.TestCase):
         }
         snapshot_hash = canonical_json_hash(manifest)
 
+        # Un-mark migration to simulate pre-migration unmigrated historical database
         with self.db.transaction() as conn:
+            conn.execute("DELETE FROM schema_migrations WHERE migration_id = 'phase_9_1_2_3_legacy_binary_integrity'")
             c = conn.cursor()
             c.execute(
                 """
