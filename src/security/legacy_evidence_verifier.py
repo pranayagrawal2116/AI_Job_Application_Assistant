@@ -13,7 +13,7 @@ cryptographically authentic, and strictly bound evidence artifact.
 from abc import ABC, abstractmethod
 import base64
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
@@ -101,14 +101,19 @@ def resolve_app_env() -> str:
 class AuthenticatedMigrationPrincipal:
     """Represents a verified service identity authorized to verify and attest historical legacy evidence.
 
-    Security Invariant (Phase 9.1.2.9):
+    Security Invariant (Phase 9.1.2.10):
     - Cannot be directly constructed by callers or manufactured with unverified Boolean flags.
     - Can ONLY be issued by ServiceAuthenticationProvider after authenticating genuine credentials.
+    - Strictly bound to issuing ServiceAuthenticationProvider instance via _provider_instance_id and _provider_sentinel.
     - Bound to 'legacy_migration' authorization scope.
+    - Principal type must be strictly 'service'.
+    - Must have explicit issued_at and expires_at; credential lifetime enforced.
     - Candidate users are strictly prohibited from holding this context.
     """
 
     _token: Any = None
+    _provider_instance_id: str = ""
+    _provider_sentinel: Any = None
     principal_id: str = ""
     issuer: str = "internal_service_authority"
     audience: str = "legacy_migration"
@@ -116,6 +121,7 @@ class AuthenticatedMigrationPrincipal:
     issued_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
     credential_id: Optional[str] = None
+    credential_key_id: Optional[str] = None
     principal_type: str = "service"
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -130,14 +136,24 @@ class AuthenticatedMigrationPrincipal:
         clean_id = self.principal_id.strip()
         if clean_id in ("candidate_user",) or clean_id.startswith("user_") or clean_id.startswith("candidate_"):
             raise SecurityAuthorizationError(f"Candidate user '{clean_id}' cannot be an authenticated migration principal.")
-        if self.principal_type in ("candidate", "unauthenticated", "anonymous"):
-            raise SecurityAuthorizationError(f"Invalid principal_type '{self.principal_type}' for migration principal.")
+        if self.principal_type != "service":
+            raise SecurityAuthorizationError(
+                f"Invalid principal_type '{self.principal_type}'. Only 'service' principal_type is authorized for migration principals."
+            )
         if "legacy_migration" not in self.scopes and "all" not in self.scopes:
             raise SecurityAuthorizationError(f"Principal '{clean_id}' lacks legacy_migration authorization scope.")
-        if self.expires_at is not None:
-            now_utc = datetime.now(timezone.utc)
-            if self.expires_at <= now_utc:
-                raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' has expired.")
+
+        now_utc = datetime.now(timezone.utc)
+        if self.expires_at is None:
+            raise SecurityAuthorizationError(f"Authenticated migration principal '{clean_id}' missing mandatory expiration timestamp.")
+        if self.expires_at <= now_utc:
+            raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' has expired.")
+        if self.issued_at is None:
+            raise SecurityAuthorizationError(f"Authenticated migration principal '{clean_id}' missing mandatory issued_at timestamp.")
+        if self.issued_at > now_utc + timedelta(seconds=60):
+            raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' issued in the future.")
+        if self.expires_at <= self.issued_at:
+            raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' has non-positive lifetime (exp <= iat).")
 
     @property
     def is_authenticated(self) -> bool:
@@ -189,12 +205,15 @@ class VerifiedLegacyEvidence:
 class ServiceAuthenticationProvider:
     """Authenticates internal service credentials and issues AuthenticatedMigrationPrincipal instances.
 
-    Security Boundary (Phase 9.1.2.9):
+    Security Boundary (Phase 9.1.2.10):
     - Validates cryptographic signatures (Ed25519 or HMAC-SHA256 based on policy).
     - In production, strictly enforces Ed25519 signatures and rejects HMAC.
+    - Strictly binds issued AuthenticatedMigrationPrincipal to provider instance via unique sentinel and ID.
     - Validates trusted issuer, intended audience, principal identity, scopes, and expiration.
+    - Strict JWT claims: typ == 'JWT', reject crit, mandatory numeric iat and exp, exp > iat, max 24h lifetime.
+    - Enforces key-algorithm binding and key immutability.
     - Enforces revocation checks against DatabaseManager and trust store.
-    - Rejects candidate identities, expired credentials, invalid signatures, wrong scopes.
+    - Rejects candidate identities, expired credentials, invalid signatures, wrong scopes, non-service principal types.
     """
 
     DEFAULT_AUDIENCE = "legacy_migration"
@@ -212,8 +231,11 @@ class ServiceAuthenticationProvider:
         self.db_manager = db_manager
         self.trust_store = trust_store
         self._lock = threading.RLock()
+        self._provider_id = f"sap_{uuid.uuid4().hex}"
+        self._provider_sentinel = object()
         self._trusted_keys: Dict[str, Tuple[bytes, str]] = {}
         self._trusted_issuers: Set[str] = set()
+        self._issued_credentials: Dict[str, Dict[str, Any]] = {}
 
         if self.app_env in ("production", "staging", "qa") and self.db_manager is None:
             raise SecurityAuthorizationError(
@@ -227,8 +249,49 @@ class ServiceAuthenticationProvider:
                     self._trusted_issuers.add(clean_iss)
 
         if trusted_keys:
+            staged: Dict[str, Tuple[bytes, str]] = {}
             for k_id, k_val in trusted_keys.items():
-                self.register_trusted_key(k_id, k_val)
+                clean_id = (k_id or "").strip()
+                if not clean_id:
+                    raise SecurityAuthorizationError("Service authentication key ID cannot be empty or whitespace.")
+
+                if self.db_manager and hasattr(self.db_manager, "is_key_revoked") and self.db_manager.is_key_revoked(clean_id):
+                    raise KeyRevokedError(clean_id)
+                if self.trust_store and hasattr(self.trust_store, "is_key_revoked") and self.trust_store.is_key_revoked(clean_id):
+                    raise KeyRevokedError(clean_id)
+
+                if isinstance(k_val, dict):
+                    k_bytes = k_val.get("key") or k_val.get("key_bytes") or b""
+                    k_algo = k_val.get("algorithm") or "HMAC-SHA256"
+                else:
+                    k_bytes = k_val
+                    k_algo = "Ed25519" if len(self._coerce_bytes(k_val)) == 32 and self.app_env in ("production", "staging", "qa") else "HMAC-SHA256"
+
+                if k_algo not in ("Ed25519", "EdDSA", "HMAC-SHA256", "HS256"):
+                    raise SecurityAuthorizationError(f"Unsupported service signing algorithm '{k_algo}'.")
+
+                if self.app_env in ("production", "staging", "qa") and k_algo in ("HMAC-SHA256", "HS256"):
+                    raise SecurityAuthorizationError(
+                        f"HMAC service signing keys are strictly prohibited in '{self.app_env}'. Production requires asymmetric Ed25519 keys."
+                    )
+
+                coerced = self._coerce_bytes(k_bytes)
+                if k_algo in ("Ed25519", "EdDSA"):
+                    from cryptography.hazmat.primitives.asymmetric import ed25519
+                    if len(coerced) != 32:
+                        raise SecurityAuthorizationError(f"Ed25519 public key must be exactly 32 bytes (got {len(coerced)} bytes).")
+                    try:
+                        _ = ed25519.Ed25519PublicKey.from_public_bytes(coerced)
+                    except Exception as e:
+                        raise SecurityAuthorizationError(f"Invalid Ed25519 public key '{clean_id}': {e}")
+                    norm_algo = "Ed25519"
+                else:
+                    if len(coerced) < 32:
+                        raise SecurityAuthorizationError(f"HMAC secret must have at least 32 bytes of entropy (got {len(coerced)}).")
+                    norm_algo = "HMAC-SHA256"
+
+                staged[clean_id] = (coerced, norm_algo)
+            self._trusted_keys.update(staged)
 
     @staticmethod
     def _coerce_bytes(val: Union[str, bytes]) -> bytes:
@@ -257,6 +320,14 @@ class ServiceAuthenticationProvider:
         clean_id = (key_id or "").strip()
         if not clean_id:
             raise SecurityAuthorizationError("Service authentication key ID cannot be empty or whitespace.")
+
+        if self.db_manager and hasattr(self.db_manager, "is_key_revoked"):
+            if self.db_manager.is_key_revoked(clean_id):
+                raise KeyRevokedError(clean_id)
+
+        if self.trust_store and hasattr(self.trust_store, "is_key_revoked"):
+            if self.trust_store.is_key_revoked(clean_id):
+                raise KeyRevokedError(clean_id)
 
         if isinstance(key_data, dict):
             k_bytes = key_data.get("key") or key_data.get("key_bytes") or b""
@@ -289,6 +360,19 @@ class ServiceAuthenticationProvider:
             norm_algo = "HMAC-SHA256"
 
         with self._lock:
+            if clean_id in self._trusted_keys:
+                existing_bytes, existing_algo = self._trusted_keys[clean_id]
+                if existing_bytes == coerced and existing_algo == norm_algo:
+                    return
+                if existing_bytes != coerced:
+                    raise SecurityAuthorizationError(
+                        f"Trusted service authentication key ID '{clean_id}' already registered with different key material. Immutability violation."
+                    )
+                if existing_algo != norm_algo:
+                    raise SecurityAuthorizationError(
+                        f"Trusted service authentication key ID '{clean_id}' already registered with different algorithm ('{existing_algo}' != '{norm_algo}'). Immutability violation."
+                    )
+
             self._trusted_keys[clean_id] = (coerced, norm_algo)
 
     def authenticate(self, credential: Any) -> AuthenticatedMigrationPrincipal:
@@ -313,11 +397,23 @@ class ServiceAuthenticationProvider:
         except Exception as e:
             raise SecurityAuthorizationError(f"Invalid service credential header: {e}")
 
+        if not isinstance(header, dict):
+            raise SecurityAuthorizationError("Invalid service credential header: must be a JSON object.")
+
+        if header.get("typ") != "JWT":
+            raise SecurityAuthorizationError("Service credential header must specify 'typ': 'JWT'.")
+
+        if "crit" in header:
+            raise SecurityAuthorizationError("Critical header parameters ('crit') are not supported.")
+
         try:
             payload_json = self._b64url_decode(payload_b64).decode("utf-8")
             payload = json.loads(payload_json)
         except Exception as e:
             raise SecurityAuthorizationError(f"Invalid service credential payload: {e}")
+
+        if not isinstance(payload, dict):
+            raise SecurityAuthorizationError("Invalid service credential payload: must be a JSON object.")
 
         try:
             signature_bytes = self._b64url_decode(sig_b64)
@@ -327,11 +423,6 @@ class ServiceAuthenticationProvider:
         alg = header.get("alg")
         if not alg or alg == "none":
             raise SecurityAuthorizationError("Unsigned service credentials (alg='none') are strictly prohibited.")
-
-        if self.app_env in ("production", "staging", "qa") and alg in ("HS256", "HMAC-SHA256"):
-            raise SecurityAuthorizationError(
-                f"HMAC service credentials are prohibited under '{self.app_env}' policy. Production requires EdDSA / Ed25519."
-            )
 
         kid = header.get("kid")
         if not kid or not str(kid).strip():
@@ -345,7 +436,30 @@ class ServiceAuthenticationProvider:
 
         if self.db_manager and hasattr(self.db_manager, "is_key_revoked"):
             if self.db_manager.is_key_revoked(clean_kid):
-                raise SecurityAuthorizationError(f"Service signing key '{clean_kid}' has been revoked.")
+                raise KeyRevokedError(clean_kid)
+
+        if self.trust_store and hasattr(self.trust_store, "is_key_revoked"):
+            if self.trust_store.is_key_revoked(clean_kid):
+                raise KeyRevokedError(clean_kid)
+
+        # Strict algorithm-to-key binding (prevents algorithm confusion)
+        if key_algo == "Ed25519":
+            if alg not in ("EdDSA", "Ed25519"):
+                raise SecurityAuthorizationError(
+                    f"Algorithm mismatch: key '{clean_kid}' is registered as Ed25519, but credential header specifies '{alg}'."
+                )
+        elif key_algo == "HMAC-SHA256":
+            if alg not in ("HS256", "HMAC-SHA256"):
+                raise SecurityAuthorizationError(
+                    f"Algorithm mismatch: key '{clean_kid}' is registered as HMAC-SHA256, but credential header specifies '{alg}'."
+                )
+        else:
+            raise SecurityAuthorizationError(f"Unsupported key algorithm '{key_algo}'.")
+
+        if self.app_env in ("production", "staging", "qa") and alg in ("HS256", "HMAC-SHA256"):
+            raise SecurityAuthorizationError(
+                f"HMAC service credentials are prohibited under '{self.app_env}' policy. Production requires EdDSA / Ed25519."
+            )
 
         signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
 
@@ -364,9 +478,9 @@ class ServiceAuthenticationProvider:
             raise SecurityAuthorizationError(f"Unsupported credential algorithm '{alg}'.")
 
         iss = payload.get("iss")
-        if not iss or not str(iss).strip():
+        if not iss or not isinstance(iss, str) or not iss.strip():
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'iss' claim.")
-        clean_iss = str(iss).strip()
+        clean_iss = iss.strip()
         with self._lock:
             if clean_iss not in self._trusted_issuers:
                 raise SecurityAuthorizationError(f"Untrusted service credential issuer '{clean_iss}'.")
@@ -374,57 +488,73 @@ class ServiceAuthenticationProvider:
         aud = payload.get("aud")
         if not aud:
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'aud' claim.")
-        aud_list = [aud] if isinstance(aud, str) else list(aud)
+        if isinstance(aud, str):
+            aud_list = [aud]
+        elif isinstance(aud, (list, tuple)):
+            aud_list = [str(x) for x in aud]
+        else:
+            raise SecurityAuthorizationError("Service credential 'aud' must be a string or list of strings.")
         if self.expected_audience not in aud_list:
             raise SecurityAuthorizationError(
                 f"Service credential audience '{aud}' does not match expected audience '{self.expected_audience}'."
             )
 
         sub = payload.get("sub") or payload.get("principal_id")
-        if not sub or not str(sub).strip():
+        if not sub or not isinstance(sub, str) or not sub.strip():
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'sub' claim.")
-        clean_sub = str(sub).strip()
+        clean_sub = sub.strip()
 
         if clean_sub in ("candidate_user",) or clean_sub.startswith("user_") or clean_sub.startswith("candidate_"):
             raise SecurityAuthorizationError(f"Candidate user '{clean_sub}' cannot be an authenticated service principal.")
 
-        ptype = payload.get("principal_type", "service")
-        if ptype in ("candidate", "unauthenticated", "anonymous"):
-            raise SecurityAuthorizationError(f"Invalid principal_type '{ptype}' in service credential.")
+        ptype = payload.get("principal_type")
+        if ptype != "service":
+            raise SecurityAuthorizationError(f"Invalid principal_type '{ptype}' in service credential: strictly 'service' required.")
 
-        raw_scopes = payload.get("scope") or payload.get("scopes") or []
+        raw_scopes = payload.get("scope") or payload.get("scopes")
+        if not raw_scopes:
+            raise SecurityAuthorizationError("Service credential payload missing mandatory 'scope' claim.")
         if isinstance(raw_scopes, str):
             scopes = tuple(raw_scopes.split())
+        elif isinstance(raw_scopes, (list, tuple)):
+            scopes = tuple(str(s) for s in raw_scopes)
         else:
-            scopes = tuple(raw_scopes)
+            raise SecurityAuthorizationError("Invalid 'scope' claim format in service credential.")
         if "legacy_migration" not in scopes and "all" not in scopes:
             raise SecurityAuthorizationError("Service credential lacks mandatory 'legacy_migration' authorization scope.")
+
+        now_ts = datetime.now(timezone.utc).timestamp()
+
+        iat = payload.get("iat")
+        if iat is None:
+            raise SecurityAuthorizationError("Service credential payload missing mandatory 'iat' claim.")
+        if isinstance(iat, bool) or not isinstance(iat, (int, float)):
+            raise SecurityAuthorizationError("Invalid 'iat' timestamp in service credential: must be numeric.")
+        iat_float = float(iat)
+        if iat_float > now_ts + 60:
+            raise SecurityAuthorizationError("Service credential issued in the future.")
+        issued_at_dt = datetime.fromtimestamp(iat_float, tz=timezone.utc)
 
         exp = payload.get("exp")
         if exp is None:
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'exp' claim.")
-        try:
-            exp_float = float(exp)
-        except (ValueError, TypeError):
-            raise SecurityAuthorizationError("Invalid 'exp' timestamp in service credential.")
-
-        now_utc = datetime.now(timezone.utc)
-        if exp_float <= now_utc.timestamp():
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
+            raise SecurityAuthorizationError("Invalid 'exp' timestamp in service credential: must be numeric.")
+        exp_float = float(exp)
+        if exp_float <= now_ts:
             raise SecurityAuthorizationError(f"Service credential has expired (exp={exp_float}).")
-
-        iat = payload.get("iat")
-        if iat is not None:
-            try:
-                iat_float = float(iat)
-                if iat_float > now_utc.timestamp() + 300:
-                    raise SecurityAuthorizationError("Service credential issued in the future.")
-                issued_at_dt = datetime.fromtimestamp(iat_float, tz=timezone.utc)
-            except (ValueError, TypeError):
-                issued_at_dt = now_utc
-        else:
-            issued_at_dt = now_utc
-
+        if exp_float <= iat_float:
+            raise SecurityAuthorizationError("Invalid service credential: exp must be greater than iat.")
+        if exp_float - iat_float > 86400:
+            raise SecurityAuthorizationError("Service credential lifetime exceeds maximum allowed threshold (24 hours).")
         expires_at_dt = datetime.fromtimestamp(exp_float, tz=timezone.utc)
+
+        nbf = payload.get("nbf")
+        if nbf is not None:
+            if isinstance(nbf, bool) or not isinstance(nbf, (int, float)):
+                raise SecurityAuthorizationError("Invalid 'nbf' timestamp in service credential: must be numeric.")
+            if now_ts < float(nbf) - 60:
+                raise SecurityAuthorizationError("Service credential is not yet valid (nbf).")
 
         if self.db_manager and hasattr(self.db_manager, "is_principal_revoked"):
             if self.db_manager.is_principal_revoked(clean_sub):
@@ -435,18 +565,102 @@ class ServiceAuthenticationProvider:
                 raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
 
         jti = payload.get("jti")
+        token_jti = str(jti).strip() if jti else f"jti_{uuid.uuid4().hex}"
+
+        with self._lock:
+            self._issued_credentials[token_jti] = {
+                "principal_id": clean_sub,
+                "credential_key_id": clean_kid,
+                "issuer": clean_iss,
+                "exp": exp_float,
+                "iat": iat_float,
+            }
 
         return AuthenticatedMigrationPrincipal(
             _token=_AUTH_TOKEN,
+            _provider_instance_id=self._provider_id,
+            _provider_sentinel=self._provider_sentinel,
             principal_id=clean_sub,
             issuer=clean_iss,
             audience=self.expected_audience,
             scopes=scopes,
             issued_at=issued_at_dt,
             expires_at=expires_at_dt,
-            credential_id=str(jti) if jti else None,
+            credential_id=token_jti,
+            credential_key_id=clean_kid,
             principal_type=ptype,
         )
+
+    def validate_principal(self, principal: Any) -> None:
+        """Validates that an AuthenticatedMigrationPrincipal was minted by this exact provider instance and remains valid.
+
+        Enforces:
+        1. Correct type (AuthenticatedMigrationPrincipal) and non-tampered _token.
+        2. Provider instance binding (_provider_instance_id == self._provider_id and _provider_sentinel is self._provider_sentinel).
+        3. Valid credential tracking in _issued_credentials if jti/credential_id present.
+        4. Credential lifetime (expires_at > now_utc, issued_at <= now_utc + 60s).
+        5. Principal identity non-empty, non-candidate, not revoked in DB or trust store.
+        6. Signing key used remains registered in this provider and not revoked.
+        7. Authorized scope and principal_type == 'service'.
+        """
+        if not isinstance(principal, AuthenticatedMigrationPrincipal):
+            raise SecurityAuthorizationError(
+                f"Invalid principal context: expected AuthenticatedMigrationPrincipal, got '{type(principal).__name__}'."
+            )
+        if principal._token is not _AUTH_TOKEN:
+            raise SecurityAuthorizationError("Tampered AuthenticatedMigrationPrincipal token.")
+        if (
+            principal._provider_instance_id != self._provider_id
+            or principal._provider_sentinel is not self._provider_sentinel
+        ):
+            raise SecurityAuthorizationError(
+                "Principal context was minted by an unauthorized or independent ServiceAuthenticationProvider instance. "
+                "Cross-provider credential reuse is strictly prohibited."
+            )
+        clean_sub = principal.principal_id.strip()
+        if not clean_sub:
+            raise SecurityAuthorizationError("Principal ID cannot be empty.")
+        if clean_sub in ("candidate_user",) or clean_sub.startswith("user_") or clean_sub.startswith("candidate_"):
+            raise SecurityAuthorizationError(f"Candidate user '{clean_sub}' cannot be an authenticated service principal.")
+
+        if principal.principal_type != "service":
+            raise SecurityAuthorizationError(f"Invalid principal_type '{principal.principal_type}'. Expected 'service'.")
+
+        if "legacy_migration" not in principal.scopes and "all" not in principal.scopes:
+            raise SecurityAuthorizationError(f"Principal '{clean_sub}' lacks 'legacy_migration' authorization scope.")
+
+        now_utc = datetime.now(timezone.utc)
+        if principal.expires_at is None or principal.expires_at <= now_utc:
+            raise SecurityAuthorizationError(f"Principal credential for '{clean_sub}' has expired.")
+        if principal.issued_at is None or principal.issued_at > now_utc + timedelta(seconds=60):
+            raise SecurityAuthorizationError(f"Principal credential for '{clean_sub}' was issued in the future.")
+
+        if principal.credential_id:
+            with self._lock:
+                record = self._issued_credentials.get(principal.credential_id)
+                if record is not None:
+                    if record.get("principal_id") != clean_sub or record.get("credential_key_id") != principal.credential_key_id:
+                        raise SecurityAuthorizationError("Tampered principal context claims do not match issued record.")
+
+        if principal.credential_key_id:
+            with self._lock:
+                if principal.credential_key_id not in self._trusted_keys:
+                    raise SecurityAuthorizationError(
+                        f"Credential signing key '{principal.credential_key_id}' is no longer registered in service provider."
+                    )
+            if self.db_manager and hasattr(self.db_manager, "is_key_revoked"):
+                if self.db_manager.is_key_revoked(principal.credential_key_id):
+                    raise KeyRevokedError(principal.credential_key_id)
+            if self.trust_store and hasattr(self.trust_store, "is_key_revoked"):
+                if self.trust_store.is_key_revoked(principal.credential_key_id):
+                    raise KeyRevokedError(principal.credential_key_id)
+
+        if self.db_manager and hasattr(self.db_manager, "is_principal_revoked"):
+            if self.db_manager.is_principal_revoked(clean_sub):
+                raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
+        if self.trust_store and hasattr(self.trust_store, "is_principal_revoked"):
+            if self.trust_store.is_principal_revoked(clean_sub):
+                raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
 
     @classmethod
     def mint_service_token(
@@ -508,6 +722,7 @@ def create_test_authenticated_principal(
     scopes: Optional[List[str]] = None,
     ttl_seconds: int = 3600,
     db_manager: Optional[Any] = None,
+    provider: Optional[ServiceAuthenticationProvider] = None,
 ) -> AuthenticatedMigrationPrincipal:
     """Explicitly isolated testing fixture to obtain a genuine AuthenticatedMigrationPrincipal for tests.
 
@@ -526,12 +741,16 @@ def create_test_authenticated_principal(
     pub = priv.public_key().public_bytes_raw()
     key_id = f"test_key_{principal_id}"
 
-    provider = ServiceAuthenticationProvider(
-        trusted_keys={key_id: {"key": pub, "algorithm": "Ed25519"}},
-        trusted_issuers={issuer},
-        expected_audience=audience,
-        db_manager=db_manager,
-    )
+    if provider is None:
+        provider = ServiceAuthenticationProvider(
+            trusted_keys={key_id: {"key": pub, "algorithm": "Ed25519"}},
+            trusted_issuers={issuer},
+            expected_audience=audience,
+            db_manager=db_manager,
+        )
+    else:
+        provider.register_trusted_key(key_id, pub, algorithm="Ed25519")
+
     token = provider.mint_service_token(
         principal_id=principal_id,
         signing_key=priv,
@@ -542,6 +761,7 @@ def create_test_authenticated_principal(
         ttl_seconds=ttl_seconds,
         algorithm="EdDSA",
     )
+    return provider.authenticate(token)
     return provider.authenticate(token)
 
 
@@ -1210,6 +1430,19 @@ class LegacyEvidenceVerifier:
             or self.trust_store.algorithm_policy in ("production", "ed25519_only")
         )
 
+        if self.app_env in ("production", "staging", "qa"):
+            if self.trust_store.algorithm_policy == "permissive":
+                raise SecurityAuthorizationError(
+                    f"Trust store algorithm policy 'permissive' is incompatible with '{self.app_env}' environment."
+                )
+            if self.service_authenticator is not None:
+                auth_env = getattr(self.service_authenticator, "app_env", None)
+                if auth_env not in ("production", "staging", "qa"):
+                    raise SecurityAuthorizationError(
+                        f"ServiceAuthenticationProvider configured for '{auth_env}' "
+                        f"cannot be used in production-like environment '{self.app_env}'."
+                    )
+
         if is_production_like:
             if require_authenticated_context is False:
                 raise SecurityAuthorizationError(
@@ -1283,7 +1516,7 @@ class LegacyEvidenceVerifier:
             raise KeyRevokedError(key_id)
 
         sig_algo = str(artifact_dict.get("signature_algorithm", "")).strip()
-        if self.trust_store.algorithm_policy in ("production", "ed25519_only") and sig_algo != "Ed25519":
+        if (self.app_env in ("production", "staging", "qa") or self.trust_store.algorithm_policy in ("production", "ed25519_only")) and sig_algo != "Ed25519":
             raise SecurityAuthorizationError("Signature algorithm rejected under Ed25519-only policy.")
 
         stored_sig = str(artifact_dict.get("signature") or artifact_dict.get("evidence_signature", "")).strip()
@@ -1388,13 +1621,23 @@ class LegacyEvidenceVerifier:
                 f"Evidence type '{clean_type}' is not on the supported allowlist: {sorted(SUPPORTED_EVIDENCE_TYPES)}"
             )
 
-        # 2. Attesting principal authorization & authenticated context verification (Phase 9.1.2.9)
+        # 2. Attesting principal authorization & authenticated context verification (Phase 9.1.2.10)
         if attesting_principal is None:
             raise SecurityAuthorizationError("Missing authenticated service context: attesting_principal is required.")
 
         if isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
             if attesting_principal._token is not _AUTH_TOKEN:
                 raise SecurityAuthorizationError("Tampered or unverified AuthenticatedMigrationPrincipal context.")
+            if is_production_like and self.service_authenticator is None:
+                raise SecurityAuthorizationError(
+                    "Production service authentication provider is not configured. Production legacy attestation creation is disabled."
+                )
+            if self.service_authenticator is not None:
+                self.service_authenticator.validate_principal(attesting_principal)
+            else:
+                now_utc = datetime.now(timezone.utc)
+                if attesting_principal.expires_at is not None and attesting_principal.expires_at <= now_utc:
+                    raise SecurityAuthorizationError(f"Principal credential for '{attesting_principal.principal_id}' has expired.")
             clean_principal = attesting_principal.principal_id.strip()
         elif isinstance(attesting_principal, str):
             clean_str = attesting_principal.strip()
@@ -1417,8 +1660,8 @@ class LegacyEvidenceVerifier:
                 "An AuthenticatedMigrationPrincipal context is required."
             )
 
-        # In production, require service authenticator or genuine AuthenticatedMigrationPrincipal
-        if is_production_like and self.service_authenticator is None and not isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
+        # In production, require service authentication provider (Finding 2)
+        if is_production_like and self.service_authenticator is None:
             raise SecurityAuthorizationError(
                 "Production service authentication provider is not configured. Production legacy attestation creation is disabled."
             )
@@ -1476,7 +1719,7 @@ class LegacyEvidenceVerifier:
                 f"Supported: {sorted(SUPPORTED_SIGNATURE_ALGORITHMS)}"
             )
 
-        if self.trust_store.algorithm_policy in ("production", "ed25519_only") and algorithm != "Ed25519":
+        if (is_production_like or self.trust_store.algorithm_policy in ("production", "ed25519_only")) and algorithm != "Ed25519":
             raise SecurityAuthorizationError(
                 f"Evidence artifact signature algorithm '{algorithm}' is rejected: "
                 "production policy requires Ed25519 asymmetric digital signatures."

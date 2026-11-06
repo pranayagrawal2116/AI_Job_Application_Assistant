@@ -5,7 +5,12 @@
 **Architecture:** v2.1.1  
 **Target Branch:** `main`  
 **Verified Starting Commit Baseline:** `976f83616dc873bc21cfdbf3aea5b3f2a98b7299`  
-**Milestone:** Phase 9.1.2.9 — Genuine Service Identity Authentication & Environment Fail-Closed Closure  
+**Previous Milestone:** Phase 9.1.2.8 — Production Cryptographic Policy & Authenticated Attester Identity Closure  
+**Successor Milestone:** Phase 9.1.2.10 — Provider-Bound Credential Context, JWT Claim & Key Integrity Closure  
+
+> [!NOTE]
+> **Subsequent Hardening Note (Phase 9.1.2.10):**  
+> While Phase 9.1.2.9 established initial service credential verification via `ServiceAuthenticationProvider`, Phase 9.1.2.10 subsequently completed provider-instance binding (`_provider_instance_id`, `_provider_sentinel`), strict JWT claims validation, key immutability, credential lifetime revalidation at every point of use, and explicit rejection of cross-provider credential reuse.
 
 ---
 

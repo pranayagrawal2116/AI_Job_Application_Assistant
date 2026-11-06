@@ -892,6 +892,36 @@ When interacting with the browser via Playwright MCP:
     - Harmonized root-level test environment with `tests/conftest.py` setting `APP_ENV=test`.
     - Updated `docs/PHASE_9_1_2_8_IMPLEMENTATION_REPORT.md` to clearly distinguish principal identifiers, authorized principals, caller contexts, and credential-verified identities.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_9_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.10: Provider-Bound Credential Context, JWT Claim & Key Integrity Closure** (Complete)
+  - Provider-Bound Credential Context & Isolation:
+    - Added unique instance IDs (`_provider_id = f"sap_{uuid.uuid4().hex}"`) and private object sentinels (`_provider_sentinel = object()`) to `ServiceAuthenticationProvider`.
+    - `AuthenticatedMigrationPrincipal` is bound to the exact issuing provider instance via `_provider_instance_id` and `_provider_sentinel`.
+    - Added `validate_principal(principal)` method on `ServiceAuthenticationProvider` enforcing provider binding, credential lifetime, valid key registration, mandatory scopes, and revocation status.
+    - Strictly blocked cross-provider credential reuse: credentials minted by an independent or unauthorized provider are rejected with `SecurityAuthorizationError`.
+    - Internal issued credentials registry (`_issued_credentials`) prevents tampering with claims on issued principal objects via `object.__setattr__`.
+  - Production No-Provider Guarantee Closure:
+    - Eliminated bypass in `LegacyEvidenceVerifier.verify`: production unconditionally requires a configured `service_authenticator`. Without one, all attestation creation attempts fail closed immediately.
+  - Credential Lifetime Revalidation at Every Use:
+    - Enforced mandatory `issued_at` and `expires_at` in `AuthenticatedMigrationPrincipal.__post_init__`, rejecting missing, expired, future, or non-positive lifetimes.
+    - Added dynamic lifetime revalidation in `validate_principal()`, `LegacyEvidenceVerifier.verify()`, and `DatabaseManager.record_legacy_evidence_attestation()`.
+  - Algorithm Confusion Defense & Key Immutability:
+    - Enforced strict algorithm-to-key binding in `ServiceAuthenticationProvider.authenticate`: Ed25519 keys accept only `EdDSA`/`Ed25519`; HMAC keys accept only `HS256`/`HMAC-SHA256`; HMAC is rejected outright in production/staging/QA.
+    - Enforced key immutability in `ServiceAuthenticationProvider.register_trusted_key`: identical re-registration is idempotent; differing key material or algorithms raise `SecurityAuthorizationError`; revoked keys raise `KeyRevokedError`.
+  - Strict JWT Claim Conformance:
+    - Mandatory `typ: "JWT"`, rejection of critical parameters (`"crit"`), mandatory non-empty `kid`, `iss`, `aud`, `sub` (rejecting candidate users).
+    - Mandatory `principal_type == "service"`, rejecting all other types (`admin`, `client`, `user`, etc.).
+    - Mandatory numeric `iat` (rejecting boolean/missing/future) and numeric `exp` (rejecting boolean/missing/expired/non-positive).
+    - Maximum credential lifetime capped at 24 hours (86,400 seconds); valid `nbf` checking.
+  - Environment & Trust-Store Consistency:
+    - `LegacyEvidenceVerifier.__init__` enforces environment consistency, rejecting permissive trust store policies and development-configured service authenticators in production/staging/QA.
+    - Directly enforces Ed25519 signature algorithm requirement from `APP_ENV` in both live verification and archival audit verification.
+  - Verification & Regressions:
+    - Authored 52 dedicated test cases in `tests/test_phase_9_1_2_10_provider_binding_and_credential_lifecycle.py` (52/52 passing, 100%).
+    - Harmonized Phase 9.1.2.8 (34/34 passing) and Phase 9.1.2.9 (45/45 passing) test suites.
+    - Verified all 435 Phase 9 test cases pass (100%).
+    - Verified all 1,753 repository test cases pass (100%).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Updated `docs/PHASE_9_1_2_9_IMPLEMENTATION_REPORT.md` and authored comprehensive report in `docs/PHASE_9_1_2_10_IMPLEMENTATION_REPORT.md`.
 
 ---
 

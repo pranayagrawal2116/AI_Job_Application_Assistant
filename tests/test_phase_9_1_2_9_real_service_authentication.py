@@ -118,6 +118,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
         issuer: str = "archival_authority",
         audience: str = "legacy_migration",
         scopes: Optional[List[str]] = None,
+        verifier: Optional[LegacyEvidenceVerifier] = None,
     ) -> AuthenticatedMigrationPrincipal:
         kid = f"key_{principal_id}"
         provider = ServiceAuthenticationProvider(
@@ -136,7 +137,10 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             ttl_seconds=3600,
             algorithm="EdDSA",
         )
-        return provider.authenticate(token)
+        principal = provider.authenticate(token)
+        if verifier is not None:
+            verifier.service_authenticator = provider
+        return principal
 
     # =========================================================================
     # PART 1: ENVIRONMENT POLICY TESTS (Tests 1 - 12)
@@ -528,7 +532,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "UNBOUND_01", raw_bytes)
 
-            auth_p = self._create_authenticated_principal("migration_svc")
+            auth_p = self._create_authenticated_principal("migration_svc", verifier=verifier)
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 verifier.verify(
                     evidence_type="historical_import_manifest",
@@ -569,7 +573,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "BOUND_A", raw_bytes)
 
-            auth_b = self._create_authenticated_principal("principal_b")
+            auth_b = self._create_authenticated_principal("principal_b", verifier=verifier)
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 verifier.verify(
                     evidence_type="historical_import_manifest",
@@ -609,7 +613,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "VALID_ED_01", raw_bytes)
 
-            auth_p = self._create_authenticated_principal("authorized_runner")
+            auth_p = self._create_authenticated_principal("authorized_runner", verifier=verifier)
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="VALID_ED_01",
@@ -653,7 +657,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             tampered_bytes = json.dumps(tampered_dict).encode("utf-8")
             resolver.register_artifact("historical_import_manifest", "TAMPER_01", tampered_bytes)
 
-            auth_p = self._create_authenticated_principal("authorized_runner")
+            auth_p = self._create_authenticated_principal("authorized_runner", verifier=verifier)
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 verifier.verify(
                     evidence_type="historical_import_manifest",
@@ -698,7 +702,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
         )
         resolver.register_artifact("historical_import_manifest", "PERS_01", raw_bytes)
 
-        auth_p = self._create_authenticated_principal("persisted_runner")
+        auth_p = self._create_authenticated_principal("persisted_runner", verifier=verifier)
         verified = verifier.verify(
             evidence_type="historical_import_manifest",
             evidence_reference_id="PERS_01",
@@ -745,7 +749,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "OVERRIDE_01", raw_bytes)
 
-            auth_p = self._create_authenticated_principal("authorized_runner")
+            auth_p = self._create_authenticated_principal("authorized_runner", verifier=verifier)
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="OVERRIDE_01",
@@ -807,7 +811,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
         )
         resolver.register_artifact("historical_import_manifest", "LATE_REV_01", raw_bytes)
 
-        auth_p = self._create_authenticated_principal("late_revoked_runner")
+        auth_p = self._create_authenticated_principal("late_revoked_runner", verifier=verifier)
         verified = verifier.verify(
             evidence_type="historical_import_manifest",
             evidence_reference_id="LATE_REV_01",
@@ -914,7 +918,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
         resolver.register_artifact("historical_import_manifest", "PRE_REF_01", raw_bytes)
 
         verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
-        auth_p = self._create_authenticated_principal("reliable_runner")
+        auth_p = self._create_authenticated_principal("reliable_runner", verifier=verifier)
         verified = verifier.verify(
             evidence_type="historical_import_manifest",
             evidence_reference_id="PRE_REF_01",
@@ -980,7 +984,7 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
             resolver.register_artifact("historical_import_manifest", "COMP_REF_01", raw_bytes)
 
             verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
-            auth_p = self._create_authenticated_principal("compromised_svc", issuer="prod_authority")
+            auth_p = self._create_authenticated_principal("compromised_svc", issuer="prod_authority", verifier=verifier)
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="COMP_REF_01",
@@ -1117,6 +1121,19 @@ class TestPhase9129RealServiceAuthentication(unittest.TestCase):
                     attesting_principal="some_svc",
                 )
             self.assertIn("Caller cannot authenticate by supplying an arbitrary allowed string", str(ctx.exception))
+
+            # Even passing an AuthenticatedMigrationPrincipal minted elsewhere fails closed
+            auth_p = self._create_authenticated_principal("some_svc")
+            with self.assertRaises(SecurityAuthorizationError) as ctx2:
+                verifier.verify(
+                    evidence_type="historical_import_manifest",
+                    evidence_reference_id="REF_NO_AUTH",
+                    user_id=self.user1_id,
+                    job_description_id=jd_id,
+                    source_snapshot_hash=snap,
+                    attesting_principal=auth_p,
+                )
+            self.assertIn("Production service authentication provider is not configured", str(ctx2.exception))
 
     def test_42_production_without_archival_provider_grants_zero_exceptions(self) -> None:
         """TC-42: Production without configured archival authority grants exactly zero legacy exceptions."""

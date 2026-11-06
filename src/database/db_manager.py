@@ -5812,6 +5812,11 @@ class DatabaseManager:
                     raise SecurityAuthorizationError(
                         f"Migration principal '{attesting_principal.principal_id}' has been revoked."
                     )
+                now_utc = datetime.now(timezone.utc)
+                if attesting_principal.expires_at is not None and attesting_principal.expires_at <= now_utc:
+                    raise SecurityAuthorizationError(
+                        f"Principal credential for '{attesting_principal.principal_id}' has expired."
+                    )
                 passed_principal = attesting_principal.principal_id.strip()
             elif isinstance(attesting_principal, str):
                 app_env = os.environ.get("APP_ENV", "development").strip().lower()

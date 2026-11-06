@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from typing import Optional
 import unittest
 from unittest.mock import patch
 
@@ -108,6 +109,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
         principal_id: str,
         issuer: str = "archival_authority",
         audience: str = "legacy_migration",
+        verifier: Optional[LegacyEvidenceVerifier] = None,
     ) -> AuthenticatedMigrationPrincipal:
         from cryptography.hazmat.primitives.asymmetric import ed25519
         priv = ed25519.Ed25519PrivateKey.generate()
@@ -129,7 +131,10 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             ttl_seconds=3600,
             algorithm="EdDSA",
         )
-        return provider.authenticate(token)
+        principal = provider.authenticate(token)
+        if verifier is not None:
+            verifier.service_authenticator = provider
+        return principal
 
     # =========================================================================
     # PART 6.1 — ENVIRONMENT-POLICY TESTS (Tests 1 - 12)
@@ -223,7 +228,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "REF_ED_01", raw_bytes)
 
-            auth_p = self._create_authenticated_principal("migration_svc")
+            auth_p = self._create_authenticated_principal("migration_svc", verifier=verifier)
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="REF_ED_01",
@@ -455,7 +460,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "UNBOUND_REF", raw_bytes)
 
-            auth_p = self._create_authenticated_principal("migration_svc")
+            auth_p = self._create_authenticated_principal("migration_svc", verifier=verifier)
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 verifier.verify(
                     evidence_type="historical_import_manifest",
@@ -532,7 +537,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
         )
         resolver.register_artifact("historical_import_manifest", "PERS_REF_01", raw_bytes)
 
-        auth_p = self._create_authenticated_principal("auth_svc", issuer="auth_issuer")
+        auth_p = self._create_authenticated_principal("auth_svc", issuer="auth_issuer", verifier=verifier)
         verified = verifier.verify(
             evidence_type="historical_import_manifest",
             evidence_reference_id="PERS_REF_01",
@@ -729,7 +734,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             resolver.register_artifact("historical_import_manifest", "PERM_REF_01", raw_bytes)
 
             verifier1 = LegacyEvidenceVerifier(trust_store=store1, resolver=resolver, db_manager=self.db)
-            auth_p = self._create_authenticated_principal("service_runner", issuer="prod_authority")
+            auth_p = self._create_authenticated_principal("service_runner", issuer="prod_authority", verifier=verifier1)
             verified = verifier1.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="PERM_REF_01",
@@ -803,7 +808,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             resolver.register_artifact("historical_import_manifest", "REV_REF_01", raw_bytes)
 
             verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
-            auth_p = self._create_authenticated_principal("revokable_runner", issuer="prod_authority")
+            auth_p = self._create_authenticated_principal("revokable_runner", issuer="prod_authority", verifier=verifier)
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="REV_REF_01",
@@ -901,6 +906,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             auth_principal = self._create_authenticated_principal(
                 "prod_migration_coordinator",
                 issuer="authorized_archive_org",
+                verifier=verifier,
             )
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
