@@ -36,6 +36,21 @@ S_COUNT = L_COUNT * N_COUNT  # 11172
 CHAR_ZWNJ = "\u200c"  # U+200C ZERO WIDTH NON-JOINER
 CHAR_ZWJ = "\u200d"   # U+200D ZERO WIDTH JOINER
 
+# ISO 15924 Script Code <-> Standard Name Mapping
+SCRIPT_NAME_TO_CODE: Dict[str, str] = {
+    "Latin": "Latn", "Cyrillic": "Cyrl", "Greek": "Grek", "Arabic": "Arab",
+    "Devanagari": "Deva", "Bengali": "Beng", "Gurmukhi": "Guru", "Gujarati": "Gujr",
+    "Oriya": "Orya", "Tamil": "Taml", "Telugu": "Telu", "Kannada": "Knda",
+    "Malayalam": "Mlym", "Sinhala": "Sinh", "Thai": "Thai", "Lao": "Laoo",
+    "Tibetan": "Tibt", "Myanmar": "Mymr", "Georgian": "Geor", "Ethiopic": "Ethi",
+    "Cherokee": "Cher", "Canadian_Aboriginal": "Cans", "Ogham": "Ogam", "Runic": "Runr",
+    "Khmer": "Khmr", "Mongolian": "Mong", "Han": "Hani", "Hiragana": "Hira",
+    "Katakana": "Kana", "Bopomofo": "Bopo", "Hangul": "Hang", "Hebrew": "Hebr",
+    "Syriac": "Syrc", "Thaana": "Thaa", "NKo": "Nkoo", "Armenian": "Armn",
+    "Common": "Zyyy", "Inherited": "Zinh", "Unknown": "Zzzz",
+}
+SCRIPT_CODE_TO_NAME: Dict[str, str] = {v: k for k, v in SCRIPT_NAME_TO_CODE.items()}
+
 # Common invisible and format characters
 INVISIBLE_CODEPOINTS: Dict[int, str] = {
     0x200B: "ZERO WIDTH SPACE",
@@ -133,6 +148,7 @@ class UnicodePropertyDatabase:
         self.compose_map: Dict[Tuple[int, int], int] = {}
         self.general_category: Dict[int, str] = {}
         self.scripts: List[Tuple[int, int, str]] = []  # sorted (start_cp, end_cp, script_name)
+        self.script_extensions: Dict[int, Set[str]] = {}
         self.joining_type: Dict[int, str] = {}         # U, C, D, L, R, T
         self.indic_syllabic: Dict[int, str] = {}       # Vowel_Dependent, Virama, etc.
         self.confusables: Dict[int, Tuple[int, ...]] = {}
@@ -191,7 +207,8 @@ class UnicodePropertyDatabase:
                     else:
                         self.comp_exclusions.add(int(val, 16))
 
-        # 3. Load UnicodeData.txt
+        # 3. Load UnicodeData.txt (supporting paired <..., First> and <..., Last> range records)
+        pending_range: Optional[Tuple[int, str, int]] = None
         with open(self.data_dir / "UnicodeData.txt", "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -199,9 +216,30 @@ class UnicodePropertyDatabase:
                     continue
                 fields = line.split(";")
                 cp = int(fields[0], 16)
+                name = fields[1].strip()
                 gc = fields[2]
                 ccc = int(fields[3])
                 decomp = fields[5].strip()
+
+                if name.startswith("<") and name.endswith(", First>"):
+                    pending_range = (cp, gc, ccc)
+                    self.general_category[cp] = gc
+                    if ccc != 0:
+                        self.ccc_map[cp] = ccc
+                    continue
+                elif name.startswith("<") and name.endswith(", Last>"):
+                    if pending_range is not None:
+                        start_cp, r_gc, r_ccc = pending_range
+                        for range_cp in range(start_cp, cp + 1):
+                            self.general_category[range_cp] = r_gc
+                            if r_ccc != 0:
+                                self.ccc_map[range_cp] = r_ccc
+                        pending_range = None
+                    else:
+                        self.general_category[cp] = gc
+                        if ccc != 0:
+                            self.ccc_map[cp] = ccc
+                    continue
 
                 self.general_category[cp] = gc
                 if ccc != 0:
@@ -231,6 +269,25 @@ class UnicodePropertyDatabase:
                         raw_scripts.append((single, single, script_name))
         raw_scripts.sort(key=lambda x: (x[0], x[1]))
         self.scripts = raw_scripts
+
+        # 5. Load ScriptExtensions.txt
+        scx_path = self.data_dir / "ScriptExtensions.txt"
+        if scx_path.exists():
+            with open(scx_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.split("#")[0].strip()
+                    if not line:
+                        continue
+                    parts = [p.strip() for p in line.split(";")]
+                    if len(parts) >= 2:
+                        range_s = parts[0]
+                        scx_codes = set(parts[1].split())
+                        if ".." in range_s:
+                            s_s, e_s = range_s.split("..")
+                            for scx_cp in range(int(s_s, 16), int(e_s, 16) + 1):
+                                self.script_extensions[scx_cp] = scx_codes
+                        else:
+                            self.script_extensions[int(range_s, 16)] = scx_codes
 
         # 5. Load DerivedJoiningType.txt
         with open(self.data_dir / "DerivedJoiningType.txt", "r", encoding="utf-8") as f:
@@ -291,6 +348,26 @@ class UnicodePropertyDatabase:
             else:
                 low = mid + 1
         return "Unknown"
+
+    def get_script_extensions(self, cp: int) -> Set[str]:
+        """Returns the set of script codes / names for the code point.
+
+        If explicitly defined in ScriptExtensions.txt, returns that set (including resolved names).
+        Otherwise defaults to {get_script(cp)}.
+        """
+        if cp in self.script_extensions:
+            codes = self.script_extensions[cp]
+            expanded = set(codes)
+            for c in codes:
+                if c in SCRIPT_CODE_TO_NAME:
+                    expanded.add(SCRIPT_CODE_TO_NAME[c])
+            return expanded
+
+        base_script = self.get_script(cp)
+        res = {base_script}
+        if base_script in SCRIPT_NAME_TO_CODE:
+            res.add(SCRIPT_NAME_TO_CODE[base_script])
+        return res
 
     def get_joining_type(self, cp: int) -> str:
         """Returns Joining_Type (U=Non_Joining, C=Join_Causing, D=Dual, L=Left, R=Right, T=Transparent)."""
@@ -546,12 +623,15 @@ class UnicodeSanitizer:
                 if prev_non_t is not None and next_non_t is not None:
                     prev_jt = self.db.get_joining_type(prev_non_t)
                     next_jt = self.db.get_joining_type(next_non_t)
-                    prev_script = self.db.get_script(prev_non_t)
-                    next_script = self.db.get_script(next_non_t)
+                    prev_scx = self.db.get_script_extensions(prev_non_t)
+                    next_scx = self.db.get_script_extensions(next_non_t)
 
                     is_prev_lj = prev_jt in ("D", "L")
                     is_next_rj = next_jt in ("D", "R")
-                    same_script = (prev_script == next_script) and (prev_script not in ("Common", "Inherited"))
+                    
+                    common_set = {"Common", "Inherited", "Unknown", "Zyyy", "Zinh", "Zzzz"}
+                    shared_scripts = (prev_scx & next_scx) - common_set
+                    same_script = len(shared_scripts) > 0
 
                     if is_prev_lj and is_next_rj and same_script:
                         findings.append(JoiningControlFinding(
@@ -560,7 +640,7 @@ class UnicodeSanitizer:
                             offset=i,
                             is_valid=True,
                             rule="UTS39_CONDITION_A1_REV34",
-                            explanation=f"Valid ZWNJ breaking cursive connection in {prev_script} script.",
+                            explanation=f"Valid ZWNJ breaking cursive connection in {sorted(list(shared_scripts))[0]} script.",
                         ))
                         continue
 
@@ -678,10 +758,22 @@ class UnicodeSanitizer:
                     continue
 
                 primary_script = max(scripts.keys(), key=lambda s: len(scripts[s]))
-                conflicting = [s for s in scripts.keys() if s != primary_script]
+                conflicting = []
                 conflicting_chars = []
-                for s in conflicting:
-                    conflicting_chars.extend(scripts[s])
+                for s, chars in scripts.items():
+                    if s == primary_script:
+                        continue
+                    non_compatible_chars = []
+                    for offset, ch, char_s in chars:
+                        ch_scx = self.db.get_script_extensions(ord(ch))
+                        if primary_script not in ch_scx and SCRIPT_NAME_TO_CODE.get(primary_script) not in ch_scx:
+                            non_compatible_chars.append((offset, ch, char_s))
+                    if non_compatible_chars:
+                        conflicting.append(s)
+                        conflicting_chars.extend(non_compatible_chars)
+
+                if not conflicting:
+                    continue
 
                 findings.append(MixedScriptFinding(
                     token=token,

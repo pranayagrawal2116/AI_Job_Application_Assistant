@@ -165,6 +165,14 @@ class TestMatchResultPersistence(unittest.TestCase):
         from src.security.resume_verifier import VerifiedResume
         from src.preparer.resume_parser import ParsedResume
 
+        jd_eval = self.db.create_job_description(
+            user_id=self.user1_id,
+            company_name="Acme AI",
+            job_title="ML Engineer",
+            raw_content="Python and ML required",
+            parsed_data={"mandatory_skills": ["Python"]},
+        )
+
         v_resume = VerifiedResume(
             resume_id=self.u1_resume_id,
             user_id=self.user1_id,
@@ -181,7 +189,7 @@ class TestMatchResultPersistence(unittest.TestCase):
         matcher.evaluate(
             user_id=self.user1_id,
             verified_resume=v_resume,
-            job_description_id=self.u1_jd_id,
+            job_description_id=jd_eval.id,
             scoring_profile_id="general_baseline",
             persist=True,
         )
@@ -189,7 +197,7 @@ class TestMatchResultPersistence(unittest.TestCase):
         matcher.evaluate(
             user_id=self.user1_id,
             verified_resume=v_resume,
-            job_description_id=self.u1_jd_id,
+            job_description_id=jd_eval.id,
             scoring_profile_id="student_intern",
             persist=True,
         )
@@ -197,7 +205,7 @@ class TestMatchResultPersistence(unittest.TestCase):
         history = self.db.get_user_match_results(
             user_id=self.user1_id,
             resume_id=self.u1_resume_id,
-            job_description_id=self.u1_jd_id,
+            job_description_id=jd_eval.id,
         )
         self.assertEqual(len(history), 2)
         # Evaluated at newest first

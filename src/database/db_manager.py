@@ -2634,6 +2634,14 @@ class DatabaseManager:
             )
             return revoked_count
 
+    def record_key_revocation(
+        self,
+        key_id: str,
+        reason: str = "EMERGENCY_KEY_REVOCATION",
+    ) -> int:
+        """Records a signing key revocation in SQLite (delegates to revoke_signing_key_approvals)."""
+        return self.revoke_signing_key_approvals(key_id=key_id, reason=reason)
+
     def is_key_revoked(self, key_id: str) -> bool:
         """Checks if a signing key has been revoked in SQLite."""
         if not key_id:

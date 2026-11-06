@@ -62,7 +62,7 @@ class TestMatchDashboard(unittest.TestCase):
             cursor.execute(
                 """
                 INSERT INTO job_descriptions (user_id, source_type, company_name, job_title, raw_content, content_hash, parsed_data)
-                VALUES (?, 'pasted', 'AI Lab', 'AI Intern', 'Python required', 'hash_jd', '{"mandatory_skills": ["Python"], "internship_duration": "3 months"}')
+                VALUES (?, 'pasted', 'AI Lab', 'AI Intern', 'Python required', 'c51d76bc7ed4a94ebb2663672bafb76273c6c99794e9428ea3798ef86c629054', '{"mandatory_skills": ["Python"], "internship_duration": "3 months"}')
                 """,
                 (self.user_id,),
             )

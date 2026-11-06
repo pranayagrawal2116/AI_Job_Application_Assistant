@@ -369,6 +369,106 @@ class DashboardService:
         """Returns list of user resumes."""
         return self.db.list_user_resumes(user_id)
 
+    def _scan_and_persist_resume(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: int,
+        file_bytes: bytes,
+        original_filename: str,
+        file_hash: str,
+        file_format: Optional[str] = None,
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """Parses verified resume bytes, executes prompt injection scan, signs HMAC, persists, and verifies scan."""
+        try:
+            from src.preparer.resume_parser import ResumeParser
+            from src.security.prompt_injection_detector import PromptInjectionDetector
+            from src.security.scan_signer import SecurityScanSigner
+
+            # 1. Derive and validate format from authoritative metadata or extension
+            fmt = (file_format or Path(original_filename).suffix).strip().lower().lstrip(".")
+            if fmt not in ("pdf", "docx", "doc"):
+                return False, f"Unsupported file format '{fmt}' for security scan.", None
+
+            # 2. Parse exact uploaded binary bytes
+            parser = ResumeParser()
+            parsed_res = parser.parse_bytes(file_bytes, fmt)
+            res_text = parsed_res.raw_text if hasattr(parsed_res, "raw_text") and parsed_res.raw_text else ""
+            if not res_text:
+                res_text = " ".join([
+                    parsed_res.summary or "",
+                    " ".join(parsed_res.skills or []),
+                    " ".join(exp.get("description", "") for exp in (parsed_res.work_experience or [])),
+                ])
+
+            # 3. Scan freshly extracted text
+            detector = PromptInjectionDetector()
+            scan_res = detector.scan(res_text)
+
+            # 4. Sign scan result
+            signer = SecurityScanSigner()
+            manifest, sig, key_id = signer.sign_scan_result(
+                user_id=user_id,
+                source_type="resume",
+                source_id=resume_id,
+                source_version=version_num,
+                source_hash=file_hash,
+                snapshot_hash=None,
+                scan_result=scan_res,
+            )
+
+            # 5. Persist scan
+            threats_dicts = [t.to_dict() for t in scan_res.threats_detected]
+            saved_scan = self.db.save_security_scan(
+                user_id=user_id,
+                source_type="resume",
+                source_id=resume_id,
+                source_version=version_num,
+                source_hash=file_hash,
+                snapshot_hash=None,
+                scanner_version=scan_res.engine_version,
+                policy_version=scan_res.policy_version,
+                risk_score=scan_res.risk_score,
+                classification=scan_res.classification,
+                threats_detected=threats_dicts,
+                key_id=key_id,
+                hmac_signature=sig,
+                scanned_at=manifest["scanned_at"],
+            )
+
+            # 6. Verify persisted scan record HMAC and integrity
+            scan_dict = {
+                "id": saved_scan.id,
+                "user_id": saved_scan.user_id,
+                "source_type": saved_scan.source_type,
+                "source_id": saved_scan.source_id,
+                "source_version": saved_scan.source_version,
+                "source_hash": saved_scan.source_hash,
+                "snapshot_hash": saved_scan.snapshot_hash,
+                "scanner_version": saved_scan.scanner_version,
+                "policy_version": saved_scan.policy_version,
+                "risk_score": saved_scan.risk_score,
+                "classification": saved_scan.classification,
+                "threats_detected_json": saved_scan.threats_detected_json,
+                "key_id": saved_scan.key_id,
+                "hmac_signature": saved_scan.hmac_signature,
+                "scanned_at": saved_scan.scanned_at,
+            }
+            signer.verify_scan_record(
+                expected_user_id=user_id,
+                expected_source_type="resume",
+                expected_source_id=resume_id,
+                expected_source_version=version_num,
+                expected_source_hash=file_hash,
+                expected_snapshot_hash=None,
+                scan_row=scan_dict,
+            )
+
+            return True, "Scan verified", scan_dict
+        except Exception as scan_err:
+            self.logger.warning("Failed to complete/persist security scan for Resume #%d v%d: %s", resume_id, version_num, scan_err)
+            return False, str(scan_err), None
+
     def upload_user_resume(
         self,
         user_id: int,
@@ -380,6 +480,7 @@ class DashboardService:
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Uploads, validates, parses, and saves a user resume."""
         try:
+            user_resumes_dir = self.file_validator.get_user_resumes_dir(user_id)
             record = self.db.upload_user_resume(
                 user_id=user_id,
                 file_bytes=file_bytes,
@@ -387,54 +488,28 @@ class DashboardService:
                 label=label,
                 target_role=target_role,
                 set_as_primary=set_as_primary,
+                user_base_dir=user_resumes_dir,
             )
 
-            # Execute and persist authenticated security scan (Phase 9.1.2)
-            try:
-                from src.preparer.resume_parser import ResumeParser
-                from src.security.prompt_injection_detector import PromptInjectionDetector
-                from src.security.scan_signer import SecurityScanSigner
-                parser = ResumeParser()
-                parsed_res = parser.parse_bytes(file_bytes, record["storage_filename"])
-                res_text = parsed_res.raw_text if hasattr(parsed_res, "raw_text") and parsed_res.raw_text else ""
-                if not res_text:
-                    res_text = " ".join([
-                        parsed_res.summary or "",
-                        " ".join(parsed_res.skills or []),
-                        " ".join(exp.get("description", "") for exp in (parsed_res.work_experience or [])),
-                    ])
-                detector = PromptInjectionDetector()
-                scan_res = detector.scan(res_text)
-                signer = SecurityScanSigner()
-                manifest, sig, key_id = signer.sign_scan_result(
-                    user_id=user_id,
-                    source_type="resume",
-                    source_id=record["id"],
-                    source_version=1,
-                    source_hash=record["file_hash"],
-                    snapshot_hash=None,
-                    scan_result=scan_res,
-                )
-                self.db.save_security_scan(
-                    user_id=user_id,
-                    source_type="resume",
-                    source_id=record["id"],
-                    source_version=1,
-                    source_hash=record["file_hash"],
-                    snapshot_hash=None,
-                    scanner_version=scan_res.engine_version,
-                    policy_version=scan_res.policy_version,
-                    risk_score=scan_res.risk_score,
-                    classification=scan_res.classification,
-                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
-                    key_id=key_id,
-                    hmac_signature=sig,
-                    scanned_at=manifest["scanned_at"],
-                )
-            except Exception as scan_err:
-                self.logger.warning("Failed to persist security scan for Resume #%d: %s", record["id"], scan_err)
+            # Execute and persist authenticated security scan (Phase 9.1.2 & 9.1.2.1 Part A)
+            scan_ok, scan_msg, scan_data = self._scan_and_persist_resume(
+                user_id=user_id,
+                resume_id=record["id"],
+                version_num=record.get("version_num", 1),
+                file_bytes=file_bytes,
+                original_filename=original_filename,
+                file_hash=record["file_hash"],
+                file_format=record.get("file_format"),
+            )
+            if scan_ok:
+                record["security_scan_status"] = "VERIFIED"
+                record["security_scan"] = scan_data
+                return True, f"Successfully uploaded '{original_filename}'.", record
+            else:
+                record["security_scan_status"] = "SECURITY_SCAN_PENDING"
+                record["security_scan_error"] = scan_msg
+                return True, f"Uploaded '{original_filename}', but security scan is pending verification: {scan_msg}", record
 
-            return True, f"Successfully uploaded '{original_filename}'.", record
         except (DuplicateResumeError, FileSecurityError, ValidationError) as e:
             self.logger.warning("Resume validation failed for user %d ('%s'): %s", user_id, original_filename, e)
             return False, str(e), None
@@ -455,60 +530,35 @@ class DashboardService:
     ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
         """Uploads a new version of a resume."""
         try:
+            user_resumes_dir = self.file_validator.get_user_resumes_dir(user_id)
             ver = self.db.add_resume_version(
                 user_id=user_id,
                 resume_id=resume_id,
                 file_bytes=file_bytes,
                 original_filename=original_filename,
                 change_notes=change_notes,
+                user_base_dir=user_resumes_dir,
             )
 
-            # Execute and persist authenticated security scan (Phase 9.1.2)
-            try:
-                from src.preparer.resume_parser import ResumeParser
-                from src.security.prompt_injection_detector import PromptInjectionDetector
-                from src.security.scan_signer import SecurityScanSigner
-                parser = ResumeParser()
-                parsed_res = parser.parse_bytes(file_bytes, ver.get("storage_filename", original_filename))
-                res_text = parsed_res.raw_text if hasattr(parsed_res, "raw_text") and parsed_res.raw_text else ""
-                if not res_text:
-                    res_text = " ".join([
-                        parsed_res.summary or "",
-                        " ".join(parsed_res.skills or []),
-                        " ".join(exp.get("description", "") for exp in (parsed_res.work_experience or [])),
-                    ])
-                detector = PromptInjectionDetector()
-                scan_res = detector.scan(res_text)
-                signer = SecurityScanSigner()
-                manifest, sig, key_id = signer.sign_scan_result(
-                    user_id=user_id,
-                    source_type="resume",
-                    source_id=resume_id,
-                    source_version=ver["version_num"],
-                    source_hash=ver["file_hash"],
-                    snapshot_hash=None,
-                    scan_result=scan_res,
-                )
-                self.db.save_security_scan(
-                    user_id=user_id,
-                    source_type="resume",
-                    source_id=resume_id,
-                    source_version=ver["version_num"],
-                    source_hash=ver["file_hash"],
-                    snapshot_hash=None,
-                    scanner_version=scan_res.engine_version,
-                    policy_version=scan_res.policy_version,
-                    risk_score=scan_res.risk_score,
-                    classification=scan_res.classification,
-                    threats_detected=[t.to_dict() for t in scan_res.threats_detected],
-                    key_id=key_id,
-                    hmac_signature=sig,
-                    scanned_at=manifest["scanned_at"],
-                )
-            except Exception as scan_err:
-                self.logger.warning("Failed to persist security scan for Resume #%d v%d: %s", resume_id, ver.get("version_num", 1), scan_err)
+            # Execute and persist authenticated security scan (Phase 9.1.2 & 9.1.2.1 Part A)
+            scan_ok, scan_msg, scan_data = self._scan_and_persist_resume(
+                user_id=user_id,
+                resume_id=resume_id,
+                version_num=ver["version_num"],
+                file_bytes=file_bytes,
+                original_filename=original_filename,
+                file_hash=ver["file_hash"],
+                file_format=ver.get("file_format"),
+            )
+            if scan_ok:
+                ver["security_scan_status"] = "VERIFIED"
+                ver["security_scan"] = scan_data
+                return True, f"Successfully created Version {ver['version_num']} for Resume #{resume_id}.", ver
+            else:
+                ver["security_scan_status"] = "SECURITY_SCAN_PENDING"
+                ver["security_scan_error"] = scan_msg
+                return True, f"Created Version {ver['version_num']} for Resume #{resume_id}, but security scan is pending verification: {scan_msg}", ver
 
-            return True, f"Successfully created Version {ver['version_num']} for Resume #{resume_id}.", ver
         except (DuplicateResumeError, FileSecurityError, CrossUserAccessError, ResumeNotFoundError, ValidationError) as e:
             self.logger.warning("Resume version rejected for user %d on resume %d: %s", user_id, resume_id, e)
             return False, str(e), None
@@ -3088,13 +3138,44 @@ class DashboardService:
     ):
         """Generates role-specific tailored resume using UniversalTailoredResumeGenerator with JIT verification."""
         from src.preparer.tailored_resume_generator import UniversalTailoredResumeGenerator
+        from src.security.resume_verifier import VerifiedResume
+        from src.database.exceptions import CrossUserAccessError, ResumeIntegrityError
+
         target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict):
+        v_res = None
+
+        if isinstance(resume_data, VerifiedResume):
+            if resume_data.user_id != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=resume_data.user_id,
+                    resource=f"VerifiedResume #{resume_data.resume_id}",
+                )
+            target_res_id = resume_data.resume_id
+            resume_version_num = resume_data.version_num
+            v_res = resume_data
+        elif target_res_id is None and isinstance(resume_data, dict):
             target_res_id = resume_data.get("id") or resume_data.get("resume_id")
+
+        if v_res is None and target_res_id is not None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
+            v_res = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=target_res_id,
+                version_num=resume_version_num,
+                fresh_parse=True,
+            )
+            resume_version_num = v_res.version_num
+        elif v_res is None and isinstance(resume_data, dict) and len(resume_data) > 0:
+            raise ResumeIntegrityError(
+                "Unverified resume dictionary provided without authoritative identity. "
+                "Resume-backed operations require an authoritative resume ID or a VerifiedResume artifact."
+            )
 
         generator = UniversalTailoredResumeGenerator()
 
-        # Security Preflight Enforcement (Phase 9.1.2)
+        # Security Preflight Enforcement (Phase 9.1.2 & 9.1.2.1 Part B)
         from src.security.security_preflight import SecurityPreflightManager
         preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
         if isinstance(job_description, dict) and job_description.get("id"):
@@ -3105,21 +3186,27 @@ class DashboardService:
             from src.database.exceptions import QuarantinedSourceError
             det = PromptInjectionDetector()
             scan_res = det.scan(raw_text)
-            if scan_res.classification == ScanClassification.QUARANTINED:
+            if scan_res.classification in (ScanClassification.SUSPICIOUS, ScanClassification.QUARANTINED):
                 raise QuarantinedSourceError(
-                    f"Action 'document_generation' blocked: Job description contains QUARANTINED prompt injection (Risk: {scan_res.risk_score:.2f}).",
+                    f"Action 'document_generation' blocked: Job description contains {scan_res.classification} prompt injection (Risk: {scan_res.risk_score:.2f}).",
                     source_type="job_description",
                     source_id=0,
                     classification=scan_res.classification,
                     risk_score=scan_res.risk_score,
                 )
         if target_res_id is not None:
-            preflight.check_resume_security(user_id=user_id, resume_id=target_res_id, version_num=resume_version_num, target_action="document_generation")
+            preflight.check_resume_security(
+                user_id=user_id,
+                resume_id=target_res_id,
+                version_num=resume_version_num,
+                target_action="document_generation",
+                verified_resume=v_res,
+            )
 
         return generator.generate(
             user_id=user_id,
             candidate_profile=candidate_profile,
-            resume_data=resume_data,
+            resume_data=v_res or resume_data,
             job_description=job_description,
             match_result=match_result,
             custom_instructions=custom_instructions,
@@ -3151,9 +3238,7 @@ class DashboardService:
         from src.database.exceptions import CrossUserAccessError, ResumeIntegrityError
 
         target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict):
-            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
-
+        v_res = None
         if isinstance(resume_data, VerifiedResume):
             if resume_data.user_id != user_id:
                 raise CrossUserAccessError(
@@ -3161,30 +3246,37 @@ class DashboardService:
                     target_user_id=resume_data.user_id,
                     resource=f"VerifiedResume #{resume_data.resume_id}",
                 )
-            resume_data = resume_data.parsed_resume.to_dict()
-        elif target_res_id is not None:
+            target_res_id = resume_data.resume_id
+            resume_version_num = resume_data.version_num
+            v_res = resume_data
+            parsed_resume_dict = resume_data.parsed_resume.to_dict()
+        elif target_res_id is None and isinstance(resume_data, dict):
+            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
+
+        if v_res is None and target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
             verifier = ResumeIntegrityVerifier(
                 db_manager=self.db,
                 file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
             )
-            verified_res = verifier.verify_and_load_resume(
+            v_res = verifier.verify_and_load_resume(
                 user_id=user_id,
                 resume_id=target_res_id,
                 version_num=resume_version_num,
                 fresh_parse=True,
             )
-            resume_data = verified_res.parsed_resume.to_dict()
-        elif isinstance(resume_data, dict) and len(resume_data) > 0:
+            resume_version_num = v_res.version_num
+            parsed_resume_dict = v_res.parsed_resume.to_dict()
+        elif v_res is None and isinstance(resume_data, dict) and len(resume_data) > 0:
             raise ResumeIntegrityError(
                 "Unverified resume dictionary provided without authoritative identity. "
                 "Resume-backed operations require an authoritative resume ID or a VerifiedResume artifact."
             )
-        else:
-            resume_data = {}
+        elif v_res is None:
+            parsed_resume_dict = {}
 
-        # Security Preflight Enforcement (Phase 9.1.2)
+        # Security Preflight Enforcement (Phase 9.1.2 & 9.1.2.1 Part B)
         from src.security.security_preflight import SecurityPreflightManager
         preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
         if isinstance(job_description, dict) and job_description.get("id"):
@@ -3195,16 +3287,22 @@ class DashboardService:
             from src.database.exceptions import QuarantinedSourceError
             det = PromptInjectionDetector()
             scan_res = det.scan(raw_text)
-            if scan_res.classification == ScanClassification.QUARANTINED:
+            if scan_res.classification in (ScanClassification.SUSPICIOUS, ScanClassification.QUARANTINED):
                 raise QuarantinedSourceError(
-                    f"Action 'document_generation' blocked: Job description contains QUARANTINED prompt injection (Risk: {scan_res.risk_score:.2f}).",
+                    f"Action 'document_generation' blocked: Job description contains {scan_res.classification} prompt injection (Risk: {scan_res.risk_score:.2f}).",
                     source_type="job_description",
                     source_id=0,
                     classification=scan_res.classification,
                     risk_score=scan_res.risk_score,
                 )
         if target_res_id is not None:
-            preflight.check_resume_security(user_id=user_id, resume_id=target_res_id, version_num=resume_version_num, target_action="document_generation")
+            preflight.check_resume_security(
+                user_id=user_id,
+                resume_id=target_res_id,
+                version_num=resume_version_num,
+                target_action="document_generation",
+                verified_resume=v_res,
+            )
 
         generator = CoverLetterGenerator(candidate_profile=candidate_profile)
         user_app_dir = Path(f"data/users/{user_id}/applications")
@@ -3213,7 +3311,7 @@ class DashboardService:
             user_id=user_id,
             candidate_profile=candidate_profile,
             job_description=job_description,
-            resume_data=resume_data,
+            resume_data=parsed_resume_dict,
             match_result=match_result,
             tone=selected_tone,
             career_level=career_level,
@@ -3238,9 +3336,7 @@ class DashboardService:
         from src.database.exceptions import CrossUserAccessError, ResumeIntegrityError
 
         target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict):
-            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
-
+        v_res = None
         if isinstance(resume_data, VerifiedResume):
             if resume_data.user_id != user_id:
                 raise CrossUserAccessError(
@@ -3248,30 +3344,37 @@ class DashboardService:
                     target_user_id=resume_data.user_id,
                     resource=f"VerifiedResume #{resume_data.resume_id}",
                 )
-            resume_data = resume_data.parsed_resume.to_dict()
-        elif target_res_id is not None:
+            target_res_id = resume_data.resume_id
+            resume_version_num = resume_data.version_num
+            v_res = resume_data
+            parsed_resume_dict = resume_data.parsed_resume.to_dict()
+        elif target_res_id is None and isinstance(resume_data, dict):
+            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
+
+        if v_res is None and target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
             verifier = ResumeIntegrityVerifier(
                 db_manager=self.db,
                 file_validator=FileSecurityValidator(base_storage_dir=self.storage_base_dir),
             )
-            verified_res = verifier.verify_and_load_resume(
+            v_res = verifier.verify_and_load_resume(
                 user_id=user_id,
                 resume_id=target_res_id,
                 version_num=resume_version_num,
                 fresh_parse=True,
             )
-            resume_data = verified_res.parsed_resume.to_dict()
-        elif isinstance(resume_data, dict) and len(resume_data) > 0:
+            resume_version_num = v_res.version_num
+            parsed_resume_dict = v_res.parsed_resume.to_dict()
+        elif v_res is None and isinstance(resume_data, dict) and len(resume_data) > 0:
             raise ResumeIntegrityError(
                 "Unverified resume dictionary provided without authoritative identity. "
                 "Resume-backed operations require an authoritative resume ID or a VerifiedResume artifact."
             )
-        else:
-            resume_data = {}
+        elif v_res is None:
+            parsed_resume_dict = {}
 
-        # Security Preflight Enforcement (Phase 9.1.2)
+        # Security Preflight Enforcement (Phase 9.1.2 & 9.1.2.1 Part B)
         from src.security.security_preflight import SecurityPreflightManager
         preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
         if isinstance(job_description, dict) and job_description.get("id"):
@@ -3282,23 +3385,29 @@ class DashboardService:
             from src.database.exceptions import QuarantinedSourceError
             det = PromptInjectionDetector()
             scan_res = det.scan(raw_text)
-            if scan_res.classification == ScanClassification.QUARANTINED:
+            if scan_res.classification in (ScanClassification.SUSPICIOUS, ScanClassification.QUARANTINED):
                 raise QuarantinedSourceError(
-                    f"Action 'document_generation' blocked: Job description contains QUARANTINED prompt injection (Risk: {scan_res.risk_score:.2f}).",
+                    f"Action 'document_generation' blocked: Job description contains {scan_res.classification} prompt injection (Risk: {scan_res.risk_score:.2f}).",
                     source_type="job_description",
                     source_id=0,
                     classification=scan_res.classification,
                     risk_score=scan_res.risk_score,
                 )
         if target_res_id is not None:
-            preflight.check_resume_security(user_id=user_id, resume_id=target_res_id, version_num=resume_version_num, target_action="document_generation")
+            preflight.check_resume_security(
+                user_id=user_id,
+                resume_id=target_res_id,
+                version_num=resume_version_num,
+                target_action="document_generation",
+                verified_resume=v_res,
+            )
 
         answerer = QuestionAnswerer(candidate_profile=candidate_profile)
         return answerer.batch_answer_questions(
             questions=questions,
             user_id=user_id,
             candidate_profile=candidate_profile,
-            resume_data=resume_data,
+            resume_data=parsed_resume_dict,
             job_description=job_description,
             character_limit=character_limit,
         )
@@ -3313,18 +3422,56 @@ class DashboardService:
         template: Any = None,
     ) -> Dict[str, Any]:
         """Generates professional PDF and DOCX files for all application materials."""
-        # Security Preflight Enforcement (Phase 9.1.2)
-        from src.security.security_preflight import SecurityPreflightManager
-        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        # Fail-closed application authorization and security preflight (Phase 9.1.2.1 Part G.1)
         with self.db.connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT resume_id, job_description_id FROM applications WHERE id = ? AND user_id = ?", (application_id, user_id))
+            c.execute("SELECT id, user_id, resume_id, job_description_id FROM applications WHERE id = ?", (application_id,))
             app_r = c.fetchone()
-            if app_r:
-                if app_r["job_description_id"]:
-                    preflight.check_job_description_security(user_id=user_id, jd_id=app_r["job_description_id"], target_action="document_export")
-                if app_r["resume_id"]:
-                    preflight.check_resume_security(user_id=user_id, resume_id=app_r["resume_id"], target_action="document_export")
+            if not app_r:
+                from src.database.exceptions import ApplicationNotFoundError
+                raise ApplicationNotFoundError(f"Application #{application_id} not found.")
+            if app_r["user_id"] != user_id:
+                from src.database.exceptions import CrossUserAccessError
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=app_r["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+
+            from src.security.security_preflight import SecurityPreflightManager
+            preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+            if app_r["job_description_id"]:
+                preflight.check_job_description_security(user_id=user_id, jd_id=app_r["job_description_id"], target_action="document_export")
+            if app_r["resume_id"]:
+                preflight.check_resume_security(user_id=user_id, resume_id=app_r["resume_id"], target_action="document_export")
+
+        from src.preparer.document_generator import (
+            DocumentTemplate,
+            UniversalDocumentGenerator,
+        )
+        generator = UniversalDocumentGenerator()
+        app_dir = Path(f"data/users/{user_id}/applications/{application_id}")
+        app_dir.mkdir(parents=True, exist_ok=True)
+        selected_template = template or DocumentTemplate.MODERN
+
+        docs: Dict[str, Any] = {}
+        # 1. Resume PDF & DOCX
+        docs["resume_pdf"] = generator.generate_resume_pdf(resume, app_dir, selected_template)
+        docs["resume_docx"] = generator.generate_resume_docx(resume, app_dir, selected_template)
+
+        # 2. Cover Letter PDF & DOCX
+        docs["cover_letter_pdf"] = generator.generate_cover_letter_pdf(cover_letter, app_dir, selected_template)
+        docs["cover_letter_docx"] = generator.generate_cover_letter_docx(cover_letter, app_dir, selected_template)
+
+        # 3. Screening QA PDF & DOCX
+        docs["screening_qa_pdf"] = generator.generate_screening_qa_pdf(qa_packet, app_dir)
+        docs["screening_qa_docx"] = generator.generate_screening_qa_docx(qa_packet, app_dir)
+
+        # 4. Consolidated Application Packet PDF & DOCX
+        docs["packet_pdf"] = generator.generate_application_packet_pdf(resume, cover_letter, qa_packet, app_dir, selected_template)
+        docs["packet_docx"] = generator.generate_application_packet_docx(resume, cover_letter, qa_packet, app_dir, selected_template)
+
+        return docs
 
         from src.preparer.document_generator import (
             DocumentTemplate,

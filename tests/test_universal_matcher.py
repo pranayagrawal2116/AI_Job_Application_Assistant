@@ -632,7 +632,8 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
             cursor = conn.cursor()
             cursor.execute("INSERT INTO resumes (user_id, storage_filename, original_filename, file_format, file_hash, file_size_bytes) VALUES (?, 'r.pdf', 'r.pdf', 'pdf', 'h1', 100)", (self.user_id,))
             rid = cursor.lastrowid
-            cursor.execute("INSERT INTO job_descriptions (user_id, source_type, company_name, job_title, raw_content, content_hash) VALUES (?, 'pasted', 'C', 'T', 'raw', 'h2')", (self.user_id,))
+            h2 = "d7439bee24773bcbfa2d0a97947ee36227b10d1022b1a55847e928965bb6bfde"
+            cursor.execute("INSERT INTO job_descriptions (user_id, source_type, company_name, job_title, raw_content, content_hash) VALUES (?, 'pasted', 'C', 'T', 'raw', ?)", (self.user_id, h2))
             jdid = cursor.lastrowid
 
         from src.security.resume_verifier import VerifiedResume

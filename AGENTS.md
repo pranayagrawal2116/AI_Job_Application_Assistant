@@ -648,6 +648,45 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,429 tests passing across all 106 test files (100% pass rate).
     - 0 pyflakes errors, 0 ruff errors, 0 lint warnings.
 
+- [x] **Architecture v2.1.1 Phase 9.1.2.1: Security Enforcement & Unicode Conformance Remediation** (Complete)
+  - Resume Scanning & Version Binding (Part A):
+    - Added centralized helper `DashboardService._scan_and_persist_resume()` scanning PDF/DOCX resumes with validated format, `SECURITY_SCAN_PENDING` fail-closed default status, and authenticated HMAC persistence.
+    - Updated `add_resume_version()` to execute security scans binding to `(resume_id, version_num, file_hash)`.
+  - Trust Boundary Enforcement & Cross-User Closure (Part B):
+    - Closed `VerifiedResume` preflight bypass in `generate_tailored_resume()`, `generate_universal_cover_letter()`, and `batch_answer_screening_questions()`.
+    - Enforced strict user ownership assertions (`v_res.user_id == user_id`), rejecting foreign-user `VerifiedResume`s with `CrossUserAccessError`.
+    - Passed `verified_resume=v_res` to `check_resume_security()` and blocked quarantined resumes from document generation and question answering.
+  - FormPrefiller Centralized Enforcement (Part C):
+    - Integrated `SecurityPreflightManager` with `target_action="external_agent_execution"`, strictly blocking BOTH `SUSPICIOUS` and `QUARANTINED` sources from external agent exposure.
+    - Persisted job descriptions verify scan HMAC signatures through centralized preflight; unpersisted text inputs undergo ephemeral injection scanning.
+  - Job Description Text & Binary Source Integrity (Part D):
+    - `check_job_description_security()` independently recomputes `SHA256(raw_content.strip().encode("utf-8"))` and compares against `jd.content_hash`.
+    - Independently reconstructs RFC 8785 canonical snapshot manifest and verifies `canonical_json_hash(manifest)` against `jd.snapshot_hash`, failing closed on metadata tampering.
+    - Uploaded PDF/DOCX job descriptions verify physical binary files on disk via `FileSecurityValidator.resolve_and_verify_candidate_file()`, validating user sandbox containment, symlink absence, magic bytes, byte size, and SHA-256 against `jd.file_hash`.
+    - Maintained backward-compatible NULL binary metadata policy for historical records; no binary file required for pasted/URL sources.
+  - Scanner & Policy Version Compatibility (Part E):
+    - `check_job_description_security()` and `check_resume_security()` detect stale scanner/policy versions and trigger automatic append-only rescans, failing closed on scan failure.
+    - `verify_scan_record()` enforces that non-empty expected snapshot hash fails closed if stored scan hash is empty or mismatched.
+  - Strict Quarantine Processing Boundary (Part F):
+    - `QUARANTINED` sources are strictly barred from tailored resume generation, cover letter generation, screening question answering, packet preparation, export, matching evaluation, and external execution.
+    - Candidate overrides function exclusively as audit telemetry for candidate inspection and never unblock document generation.
+  - Matcher & Export Fail-Closed Integrity (Part G):
+    - `UniversalMatcher.evaluate()` executes security preflight for authoritative DB IDs (`job_description_id`, `resume_id`) regardless of `persist=False`.
+    - `DashboardService.export_application_documents()` asserts application existence (`ApplicationNotFoundError`) and ownership (`CrossUserAccessError`), verifying preflight before document rendering.
+  - Scan Key Lifecycle Separation & Manifest Completeness (Part H):
+    - `ScanKeyManager` prevents active and rotation keys from matching `ACTION_TICKET_SECRET_KEY` or `ACTION_TICKET_ROTATION_KEYS`.
+    - Validates key IDs against empty/whitespace strings and revoked key records in SQLite; durable key revocation failures propagate as `SecurityAuthorizationError`.
+    - HMAC manifest includes `"explanation": t.explanation or ""` in every threat record, binding human-readable explanations to the cryptographic signature.
+  - Full Unicode 16 Normalization Conformance & ScriptExtensions (Part I):
+    - Removed 1,000 vector test cap; all 19,965 vectors of official Unicode 16 `NormalizationTest.txt` executed and passed (100%).
+    - Handled paired `<..., First>` to `<..., Last>` range records in `UnicodeData.txt` for general category and canonical combining classes.
+    - Loaded `ScriptExtensions.txt` and integrated `get_script_extensions()` into UTS #39 Rev 34 Condition A1, A2, and B joining control validation and mixed-script anomaly detection.
+  - Verification & Regressions (Parts J, K & L):
+    - Authored 20 dedicated remediation tests in `tests/test_phase_9_1_2_1_remediation.py` (20/20 passing).
+    - Full test suite regression pass: 1,451 tests passing across the entire repository (100% pass rate in 74.68s).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_1_REMEDIATION_REPORT.md`.
+
 ---
 
 ## 7. Approval Requirement

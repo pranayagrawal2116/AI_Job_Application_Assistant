@@ -6,6 +6,8 @@ generation, matching, and external agent workflows.
 """
 
 from dataclasses import dataclass
+import hashlib
+import json
 from typing import Any, Dict, Optional
 
 from src.database.db_manager import DatabaseManager
@@ -13,11 +15,13 @@ from src.database.exceptions import (
     CrossUserAccessError,
     JobDescriptionNotFoundError,
     QuarantinedSourceError,
+    SecurityAuthorizationError,
     ValidationError,
 )
 from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
 from src.security.resume_verifier import ResumeIntegrityVerifier, VerifiedResume
 from src.security.scan_signer import ScanKeyManager, SecurityScanSigner
+from src.utils.canonical_json import canonical_json_hash
 from src.utils.logger import setup_logger
 
 logger = setup_logger("SecurityPreflightManager")
@@ -70,7 +74,58 @@ class SecurityPreflightManager:
         if not jd:
             raise JobDescriptionNotFoundError(f"Job description #{jd_id} not found for user {user_id}.")
 
-        # Retrieve latest scan
+        # 1. Extracted-text integrity check (Phase 9.1.2.1 Part D.1)
+        raw_text_clean = (jd.raw_content or "").strip()
+        computed_raw_hash = hashlib.sha256(raw_text_clean.encode("utf-8")).hexdigest()
+        if computed_raw_hash != jd.content_hash:
+            raise SecurityAuthorizationError(
+                f"JobDescription #{jd_id} raw content hash tampering detected: "
+                f"expected '{jd.content_hash}', computed '{computed_raw_hash}'."
+            )
+
+        # 2. Canonical snapshot manifest integrity check (RFC 8785)
+        parsed_data = jd.to_dict().get("parsed_data") if hasattr(jd, "to_dict") else None
+        if parsed_data is None and isinstance(jd.parsed_data, str) and jd.parsed_data.strip():
+            try:
+                parsed_data = json.loads(jd.parsed_data)
+            except Exception:
+                parsed_data = None
+
+        manifest = {
+            "user_id": jd.user_id,
+            "company_name": (jd.company_name or "").strip(),
+            "job_title": (jd.job_title or "").strip(),
+            "raw_content_hash": computed_raw_hash,
+            "parsed_data": parsed_data,
+            "parser_version": jd.parser_version,
+            "source_type": jd.source_type,
+            "source_url": jd.source_url,
+            "original_filename": jd.original_filename,
+        }
+        computed_snapshot_hash = canonical_json_hash(manifest)
+        if jd.snapshot_hash is not None and computed_snapshot_hash != jd.snapshot_hash:
+            raise SecurityAuthorizationError(
+                f"JobDescription #{jd_id} canonical snapshot tampering detected: "
+                f"expected '{jd.snapshot_hash}', computed '{computed_snapshot_hash}'."
+            )
+
+        # 3. Uploaded job-description physical binary integrity (Phase 9.1.2.1 Part D.2)
+        if jd.file_hash is not None and jd.storage_filename:
+            jd_dir = self.file_validator.get_user_job_descriptions_dir(user_id)
+            jd_file_path = jd_dir / jd.storage_filename
+            self.file_validator.resolve_and_verify_candidate_file(
+                user_id=user_id,
+                file_path=jd_file_path,
+                expected_hash=jd.file_hash,
+                expected_size=jd.file_size_bytes,
+                expected_format=jd.file_format,
+                is_mandatory=True,
+                resource_desc=f"Uploaded Job Description #{jd_id}",
+            )
+        elif jd.source_type == "uploaded" and jd.file_hash is None:
+            logger.info("JobDescription #%d has NULL binary metadata (historical record); proceeding with verified extracted text.", jd_id)
+
+        # 4. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E)
         scan = self.db.get_latest_security_scan(
             user_id=user_id,
             source_type="job_description",
@@ -78,9 +133,18 @@ class SecurityPreflightManager:
             source_version=1,
         )
 
-        if not scan:
-            # Execute JIT scan on authoritative raw content
-            logger.info("Executing JIT security scan for JobDescription #%d (User #%d)...", jd_id, user_id)
+        is_stale = False
+        if scan:
+            if scan.scanner_version != self.detector.engine_version or scan.policy_version != self.detector.policy_version:
+                is_stale = True
+                logger.info(
+                    "Scan #%d for JobDescription #%d has stale version (scanner: %s vs %s, policy: %s vs %s). Triggering rescan.",
+                    scan.id, jd_id, scan.scanner_version, self.detector.engine_version, scan.policy_version, self.detector.policy_version,
+                )
+
+        if (not scan) or is_stale:
+            # Execute fresh scan on authoritative raw content
+            logger.info("Executing fresh security scan for JobDescription #%d (User #%d)...", jd_id, user_id)
             scan_result = self.detector.scan(jd.raw_content)
             manifest, sig, key_id = self.signer.sign_scan_result(
                 user_id=user_id,
@@ -109,7 +173,7 @@ class SecurityPreflightManager:
                 scanned_at=manifest["scanned_at"],
             )
 
-        # Verify scan record HMAC and integrity
+        # 5. Verify scan record HMAC and integrity
         scan_dict = {
             "id": scan.id,
             "user_id": scan.user_id,
@@ -138,7 +202,7 @@ class SecurityPreflightManager:
             scan_row=scan_dict,
         )
 
-        # Check for candidate override
+        # Check for candidate override (audit telemetry only)
         override = self.db.get_security_scan_override(user_id=user_id, scan_id=scan.id)
         has_override = override is not None
         override_reason = override.override_reason if override else None
@@ -191,6 +255,9 @@ class SecurityPreflightManager:
             )
 
         # scan.classification == ScanClassification.QUARANTINED
+        # Strict processing boundary: Quarantined content can NEVER be used for document generation,
+        # matching, packet preparation, export, prefilling, or external execution!
+        # Candidate override is append-only audit telemetry for candidate inspection only.
         if target_action in ("external_agent_execution", "automated_submission"):
             raise QuarantinedSourceError(
                 f"Action '{target_action}' strictly blocked: Job description #{jd_id} is QUARANTINED "
@@ -201,21 +268,17 @@ class SecurityPreflightManager:
                 risk_score=scan.risk_score,
             )
 
-        if not has_override:
+        if target_action not in ("audit_inspection", "candidate_review", "telemetry_view"):
             raise QuarantinedSourceError(
                 f"Action '{target_action}' blocked: Job description #{jd_id} is QUARANTINED "
                 f"(Risk: {scan.risk_score:.2f}, {threat_count} threats detected). "
-                "Candidate review and explicit security override required.",
+                "Quarantined content cannot be exposed to external agents or used in document generation, matching, preparation, prefilling, export, or external actions.",
                 source_type="job_description",
                 source_id=jd_id,
                 classification=scan.classification,
                 risk_score=scan.risk_score,
             )
 
-        logger.info(
-            "Permitting %s for QUARANTINED JobDescription #%d under verified candidate override (Reason: '%s').",
-            target_action, jd_id, override_reason,
-        )
         return PreflightCheckResult(
             is_allowed=True,
             classification=scan.classification,
@@ -224,10 +287,10 @@ class SecurityPreflightManager:
             source_id=jd_id,
             source_version=1,
             source_hash=jd.content_hash,
-            has_override=True,
+            has_override=has_override,
             override_reason=override_reason,
             threat_count=threat_count,
-            summary=f"Quarantined source permitted under candidate override (Reason: {override_reason}).",
+            summary=f"Quarantined source inspected under candidate audit review (Override: {has_override}).",
         )
 
     # -------------------------------------------------------------------------
@@ -264,7 +327,7 @@ class SecurityPreflightManager:
         target_ver = v_res.version_num
         target_hash = v_res.file_hash
 
-        # 2. Retrieve latest scan
+        # 2. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E)
         scan = self.db.get_latest_security_scan(
             user_id=user_id,
             source_type="resume",
@@ -272,9 +335,18 @@ class SecurityPreflightManager:
             source_version=target_ver,
         )
 
-        if not scan:
-            # Execute JIT scan on fresh in-memory parsed text / raw representation
-            logger.info("Executing JIT security scan for Resume #%d v%d (User #%d)...", resume_id, target_ver, user_id)
+        is_stale = False
+        if scan:
+            if scan.scanner_version != self.detector.engine_version or scan.policy_version != self.detector.policy_version:
+                is_stale = True
+                logger.info(
+                    "Scan #%d for Resume #%d v%d has stale version (scanner: %s vs %s, policy: %s vs %s). Triggering rescan.",
+                    scan.id, resume_id, target_ver, scan.scanner_version, self.detector.engine_version, scan.policy_version, self.detector.policy_version,
+                )
+
+        if (not scan) or is_stale:
+            # Execute fresh scan on fresh in-memory parsed text / raw representation
+            logger.info("Executing fresh security scan for Resume #%d v%d (User #%d)...", resume_id, target_ver, user_id)
             # Reconstruct searchable text from parsed_resume
             text_to_scan = v_res.raw_text if hasattr(v_res, "raw_text") and v_res.raw_text else ""
             if not text_to_scan:
@@ -412,6 +484,10 @@ class SecurityPreflightManager:
                 summary=f"Suspicious security scan (Risk: {scan.risk_score:.2f}). Permitted with audit warnings.",
             )
 
+        # scan.classification == ScanClassification.QUARANTINED
+        # Strict processing boundary: Quarantined content can NEVER be used for document generation,
+        # matching, packet preparation, export, prefilling, or external execution!
+        # Candidate override is append-only audit telemetry for candidate inspection only.
         if target_action in ("external_agent_execution", "automated_submission"):
             raise QuarantinedSourceError(
                 f"Action '{target_action}' strictly blocked: Resume #{resume_id} v{target_ver} is QUARANTINED "
@@ -422,21 +498,17 @@ class SecurityPreflightManager:
                 risk_score=scan.risk_score,
             )
 
-        if not has_override:
+        if target_action not in ("audit_inspection", "candidate_review", "telemetry_view"):
             raise QuarantinedSourceError(
                 f"Action '{target_action}' blocked: Resume #{resume_id} v{target_ver} is QUARANTINED "
                 f"(Risk: {scan.risk_score:.2f}, {threat_count} threats detected). "
-                "Candidate review and explicit security override required.",
+                "Quarantined content cannot be exposed to external agents or used in document generation, matching, preparation, prefilling, export, or external actions.",
                 source_type="resume",
                 source_id=resume_id,
                 classification=scan.classification,
                 risk_score=scan.risk_score,
             )
 
-        logger.info(
-            "Permitting %s for QUARANTINED Resume #%d v%d under verified candidate override (Reason: '%s').",
-            target_action, resume_id, target_ver, override_reason,
-        )
         return PreflightCheckResult(
             is_allowed=True,
             classification=scan.classification,
@@ -445,10 +517,10 @@ class SecurityPreflightManager:
             source_id=resume_id,
             source_version=target_ver,
             source_hash=target_hash,
-            has_override=True,
+            has_override=has_override,
             override_reason=override_reason,
             threat_count=threat_count,
-            summary=f"Quarantined source permitted under candidate override (Reason: {override_reason}).",
+            summary=f"Quarantined resume inspected under candidate audit review (Override: {has_override}).",
         )
 
     # -------------------------------------------------------------------------

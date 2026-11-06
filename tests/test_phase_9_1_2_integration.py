@@ -210,14 +210,22 @@ class TestPhase912Integration(unittest.TestCase):
         )
         self.assertTrue(override_id > 0)
 
-        # Generation preflight check now succeeds
-        res = self.preflight.check_job_description_security(
+        # Audit inspection succeeds with override telemetry
+        audit_res = self.preflight.check_job_description_security(
             user_id=self.user1_id,
             jd_id=jd.id,
-            target_action="document_generation",
+            target_action="audit_inspection",
         )
-        self.assertTrue(res.is_allowed)
-        self.assertTrue(res.has_override)
+        self.assertTrue(audit_res.is_allowed)
+        self.assertTrue(audit_res.has_override)
+
+        # Generation preflight check STILL strictly fails closed (Phase 9.1.2.1 Part F)
+        with self.assertRaises(QuarantinedSourceError):
+            self.preflight.check_job_description_security(
+                user_id=self.user1_id,
+                jd_id=jd.id,
+                target_action="document_generation",
+            )
 
         # External agent preflight check STILL fails closed
         with self.assertRaises(QuarantinedSourceError) as ctx:

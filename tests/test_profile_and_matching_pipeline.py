@@ -584,7 +584,7 @@ class TestProfileAndMatchingPipeline(unittest.TestCase):
             cursor.execute(
                 """
                 INSERT INTO job_descriptions (user_id, source_type, company_name, job_title, raw_content, content_hash, parsed_data)
-                VALUES (?, 'pasted', 'TestCorp', 'Backend Dev', 'Content', 'hash_jd', '{"mandatory_skills":["Python"],"required_degree_levels":["Bachelor"]}')
+                VALUES (?, 'pasted', 'TestCorp', 'Backend Dev', 'Content', '47bd29075f8b8019f0beec6d86beda7c9bf67aaf05053dcbe0b3bcb63968517f', '{"mandatory_skills":["Python"],"required_degree_levels":["Bachelor"]}')
                 """,
                 (self.user_id,),
             )

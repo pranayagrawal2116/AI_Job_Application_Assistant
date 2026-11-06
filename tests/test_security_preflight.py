@@ -156,15 +156,23 @@ class TestSecurityPreflight(unittest.TestCase):
         )
         self.assertTrue(override_id > 0)
 
-        # Re-check: now permitted for document generation
-        result = self.preflight.check_job_description_security(
+        # Audit inspection allows viewing with override
+        audit_res = self.preflight.check_job_description_security(
             user_id=self.user1_id,
             jd_id=jd.id,
-            target_action="document_generation",
+            target_action="audit_inspection",
         )
-        self.assertTrue(result.is_allowed)
-        self.assertTrue(result.has_override)
-        self.assertEqual(result.classification, "QUARANTINED")
+        self.assertTrue(audit_res.is_allowed)
+        self.assertTrue(audit_res.has_override)
+        self.assertEqual(audit_res.classification, "QUARANTINED")
+
+        # Document generation strictly remains blocked even with override!
+        with self.assertRaises(QuarantinedSourceError):
+            self.preflight.check_job_description_security(
+                user_id=self.user1_id,
+                jd_id=jd.id,
+                target_action="document_generation",
+            )
 
     def test_04_quarantined_source_strictly_blocked_from_external_agents(self):
         """Even with an override, quarantined sources can NEVER be exposed to external agents."""

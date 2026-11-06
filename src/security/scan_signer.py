@@ -48,7 +48,16 @@ class ScanKeyManager:
 
         # 1. Resolve active key ID
         resolved_key_id = active_key_id or os.environ.get("SECURITY_SCAN_ACTIVE_KEY_ID", "scan_v1")
+        if not resolved_key_id or not isinstance(resolved_key_id, str) or not resolved_key_id.strip():
+            raise SecurityAuthorizationError(f"Invalid active key ID '{resolved_key_id}': cannot be empty.")
+        resolved_key_id = resolved_key_id.strip()
         self.active_key_id = resolved_key_id
+
+        # Check if active key ID is already revoked in DB
+        if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
+            if self._db_manager.is_key_revoked(resolved_key_id):
+                self._revoked_keys.add(resolved_key_id)
+                raise SecurityAuthorizationError(f"Active scan key ID '{resolved_key_id}' is already revoked.")
 
         # 2. Resolve primary signing key
         resolved_secret: Optional[bytes] = None
@@ -59,16 +68,14 @@ class ScanKeyManager:
             if env_secret:
                 resolved_secret = self._coerce_bytes(env_secret)
 
-        # Strictly check for prohibited action-ticket key reuse
-        action_ticket_secret = os.environ.get("ACTION_TICKET_SECRET_KEY")
-        if action_ticket_secret and resolved_secret:
-            if self._coerce_bytes(action_ticket_secret) == resolved_secret:
-                raise SecurityAuthorizationError(
-                    "Security scan key cannot reuse ACTION_TICKET_SECRET_KEY. "
-                    "Cryptographic key separation is strictly enforced."
-                )
+        prohibited = self._get_prohibited_action_ticket_keys()
 
         if resolved_secret:
+            if resolved_secret in prohibited:
+                raise SecurityAuthorizationError(
+                    "Security scan key cannot reuse ACTION_TICKET_SECRET_KEY or action ticket rotation keys. "
+                    "Cryptographic key separation is strictly enforced."
+                )
             if len(resolved_secret) < 32:
                 raise SecurityAuthorizationError(
                     "Security scan signing secret must have at least 32 bytes (256 bits) of entropy."
@@ -99,9 +106,37 @@ class ScanKeyManager:
 
         if raw_rotation and isinstance(raw_rotation, dict):
             for k_id, sec in raw_rotation.items():
+                if not k_id or not isinstance(k_id, str) or not k_id.strip():
+                    raise SecurityAuthorizationError(f"Invalid rotation key ID '{k_id}': cannot be empty.")
+                clean_k_id = k_id.strip()
+                if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
+                    if self._db_manager.is_key_revoked(clean_k_id):
+                        self._revoked_keys.add(clean_k_id)
+                        continue
                 coerced = self._coerce_bytes(sec)
+                if coerced in prohibited:
+                    raise SecurityAuthorizationError(
+                        f"Rotation scan key '{clean_k_id}' cannot reuse ACTION_TICKET_SECRET_KEY or action ticket keys."
+                    )
                 if len(coerced) >= 32:
-                    self._keys[k_id] = coerced
+                    self._keys[clean_k_id] = coerced
+
+    def _get_prohibited_action_ticket_keys(self) -> Set[bytes]:
+        """Collects all configured action-ticket secret keys to enforce strict cryptographic domain separation."""
+        prohibited: Set[bytes] = set()
+        action_ticket_secret = os.environ.get("ACTION_TICKET_SECRET_KEY")
+        if action_ticket_secret:
+            prohibited.add(self._coerce_bytes(action_ticket_secret))
+        rot_env = os.environ.get("ACTION_TICKET_ROTATION_KEYS")
+        if rot_env:
+            try:
+                rot_data = json.loads(rot_env)
+                if isinstance(rot_data, dict):
+                    for v in rot_data.values():
+                        prohibited.add(self._coerce_bytes(v))
+            except Exception:
+                pass
+        return prohibited
 
     @staticmethod
     def _coerce_bytes(val: Union[str, bytes]) -> bytes:
@@ -122,6 +157,10 @@ class ScanKeyManager:
         with self._lock:
             if self.active_key_id in self._revoked_keys:
                 raise KeyRevokedError(self.active_key_id)
+            if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
+                if self._db_manager.is_key_revoked(self.active_key_id):
+                    self._revoked_keys.add(self.active_key_id)
+                    raise KeyRevokedError(self.active_key_id)
             return self.active_key_id, self._keys[self.active_key_id]
 
     def get_verification_key(self, key_id: str) -> bytes:
@@ -131,41 +170,86 @@ class ScanKeyManager:
             KeyRevokedError: If the key was explicitly revoked.
             SecurityAuthorizationError: If the key ID is unknown.
         """
+        if not key_id or not isinstance(key_id, str) or not key_id.strip():
+            raise SecurityAuthorizationError(f"Invalid verification key ID: '{key_id}'")
+        clean_key_id = key_id.strip()
+
         with self._lock:
-            if key_id in self._revoked_keys:
-                raise KeyRevokedError(key_id)
+            if clean_key_id in self._revoked_keys:
+                raise KeyRevokedError(clean_key_id)
 
             if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
-                if self._db_manager.is_key_revoked(key_id):
-                    self._revoked_keys.add(key_id)
-                    raise KeyRevokedError(key_id)
+                if self._db_manager.is_key_revoked(clean_key_id):
+                    self._revoked_keys.add(clean_key_id)
+                    raise KeyRevokedError(clean_key_id)
 
-            if key_id in self._keys:
-                return self._keys[key_id]
+            if clean_key_id in self._keys:
+                return self._keys[clean_key_id]
 
-            raise SecurityAuthorizationError(f"Security scan verification key '{key_id}' is unknown or unavailable.")
+            raise SecurityAuthorizationError(f"Security scan verification key '{clean_key_id}' is unknown or unavailable.")
 
     def rotate_key(self, new_key_id: str, new_secret: Union[str, bytes]) -> None:
-        """Rotates the active scan signing key, retaining the previous key indefinitely for historical verification."""
+        """Rotates the active scan signing key, retaining previous keys for historical verification."""
+        if not new_key_id or not isinstance(new_key_id, str) or not new_key_id.strip():
+            raise SecurityAuthorizationError(f"Invalid rotation key ID '{new_key_id}': cannot be empty.")
+        clean_key_id = new_key_id.strip()
+
+        with self._lock:
+            if clean_key_id in self._revoked_keys:
+                raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_key_id}'.")
+            if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
+                if self._db_manager.is_key_revoked(clean_key_id):
+                    self._revoked_keys.add(clean_key_id)
+                    raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_key_id}'.")
+
         secret_bytes = self._coerce_bytes(new_secret)
         if len(secret_bytes) < 32:
             raise SecurityAuthorizationError("New signing secret must have at least 32 bytes (256 bits) of entropy.")
 
+        prohibited = self._get_prohibited_action_ticket_keys()
+        if secret_bytes in prohibited:
+            raise SecurityAuthorizationError(
+                "Security scan key cannot reuse ACTION_TICKET_SECRET_KEY or configured action ticket keys. "
+                "Cryptographic key separation is strictly enforced."
+            )
+
         with self._lock:
-            self._keys[new_key_id] = secret_bytes
-            self.active_key_id = new_key_id
-            logger.info("Rotated security scan signing key to active key '%s'.", new_key_id)
+            self._keys[clean_key_id] = secret_bytes
+            self.active_key_id = clean_key_id
+            logger.info("Rotated security scan signing key to active key '%s'.", clean_key_id)
 
     def revoke_key(self, key_id: str, reason: str = "Key Revoked") -> None:
-        """Revokes a key ID immediately, preventing further verification of scans signed by it."""
+        """Revokes a key ID immediately and durably in SQLite."""
+        if not key_id or not isinstance(key_id, str) or not key_id.strip():
+            raise SecurityAuthorizationError(f"Invalid key ID to revoke: '{key_id}'")
+        clean_key_id = key_id.strip()
+
         with self._lock:
-            self._revoked_keys.add(key_id)
-            if self._db_manager and hasattr(self._db_manager, "record_key_revocation"):
-                try:
-                    self._db_manager.record_key_revocation(key_id=key_id, reason=reason)
-                except Exception as e:
-                    logger.warning("Failed to persist scan key revocation to DB: %s", e)
-            logger.warning("Revoked security scan key '%s' (Reason: %s).", key_id, reason)
+            self._revoked_keys.add(clean_key_id)
+            if self._db_manager:
+                persisted = False
+                if hasattr(self._db_manager, "record_key_revocation"):
+                    try:
+                        self._db_manager.record_key_revocation(key_id=clean_key_id, reason=reason)
+                        persisted = True
+                    except Exception as e:
+                        logger.error("Failed to persist scan key revocation to DB: %s", e)
+                        raise SecurityAuthorizationError(f"Durable scan key revocation failed for key '{clean_key_id}': {e}") from e
+                elif hasattr(self._db_manager, "revoke_signing_key_approvals"):
+                    try:
+                        self._db_manager.revoke_signing_key_approvals(key_id=clean_key_id, reason=reason)
+                        persisted = True
+                    except Exception as e:
+                        logger.error("Failed to persist scan key revocation to DB: %s", e)
+                        raise SecurityAuthorizationError(f"Durable scan key revocation failed for key '{clean_key_id}': {e}") from e
+                if not persisted:
+                    raise SecurityAuthorizationError(f"Database manager lacks key revocation persistence for '{clean_key_id}'.")
+            else:
+                app_env = os.environ.get("APP_ENV", "development").lower()
+                if app_env == "production":
+                    raise SecurityAuthorizationError("Missing persistent database manager for durable key revocation in production.")
+
+            logger.warning("Revoked security scan key '%s' (Reason: %s).", clean_key_id, reason)
 
 
 class SecurityScanSigner:
@@ -212,6 +296,7 @@ class SecurityScanSigner:
                     "confidence": round(float(t.confidence), 4),
                     "end_offset": t.end_offset,
                     "engine_id": t.engine_id,
+                    "explanation": t.explanation or "",
                     "rule_id": t.rule_id,
                     "severity": t.severity,
                     "start_offset": t.start_offset,
@@ -307,7 +392,7 @@ class SecurityScanSigner:
 
         if expected_snapshot_hash:
             row_snap = scan_row.get("snapshot_hash") or ""
-            if row_snap and row_snap != expected_snapshot_hash:
+            if row_snap != expected_snapshot_hash:
                 raise SecurityAuthorizationError(
                     f"Snapshot hash discrepancy: current snapshot hash '{expected_snapshot_hash}' "
                     f"does not match scanned snapshot hash '{row_snap}'."

@@ -40,8 +40,15 @@ class FormFillPlan:
 class FormPrefiller:
     """Prepares structured form pre-filling payloads while enforcing strict safety gates."""
 
-    def __init__(self, candidate_profile: Optional[Dict[str, Any]] = None):
+    def __init__(
+        self,
+        candidate_profile: Optional[Dict[str, Any]] = None,
+        db_manager: Optional[Any] = None,
+        file_validator: Optional[Any] = None,
+    ):
         self.profile = candidate_profile or {}
+        self.db = db_manager
+        self.file_validator = file_validator
 
     def detect_anti_automation(self, snapshot_text: str) -> bool:
         """Detects anti-bot mechanisms like Cloudflare, CAPTCHA, or login gates."""
@@ -62,51 +69,93 @@ class FormPrefiller:
         cover_letter_text: str = "",
         resume_file_path: Optional[str] = None,
         answers: Optional[Dict[str, Any]] = None,
+        user_id: Optional[int] = None,
+        resume_id: Optional[int] = None,
+        resume_version_num: Optional[int] = None,
     ) -> FormFillPlan:
         """Constructs an executable form filling plan without executing forbidden actions."""
-        # Security preflight: Scan text inputs for prompt injection before prefilling
+        # Security preflight: Centralized HMAC enforcement and strict external agent gate (Phase 9.1.2.1 Part C)
         from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
         from src.database.exceptions import QuarantinedSourceError
+        from src.security.security_preflight import SecurityPreflightManager
+
+        target_action = "external_agent_execution"
+
+        # Resolve user_id
+        uid = (
+            user_id
+            or self.profile.get("user_id")
+            or (job.get("user_id") if isinstance(job, dict) else getattr(job, "user_id", None))
+        )
+        job_id = job.get("id") if isinstance(job, dict) else getattr(job, "id", None)
+
+        # 1. Authoritative Job Description Security Preflight
+        if self.db and uid and job_id:
+            preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+            preflight.check_job_description_security(
+                user_id=uid,
+                jd_id=job_id,
+                target_action=target_action,
+            )
+        else:
+            # Ephemeral scanning for unpersisted text inputs or when DB record is not provided
+            detector = PromptInjectionDetector()
+            jd_text = ""
+            if isinstance(job, dict):
+                jd_text = job.get("job_description") or job.get("raw_content") or ""
+            elif hasattr(job, "job_description"):
+                jd_text = job.job_description or ""
+
+            if jd_text:
+                jd_scan = detector.scan(jd_text)
+                if jd_scan.classification in (ScanClassification.SUSPICIOUS, ScanClassification.QUARANTINED):
+                    raise QuarantinedSourceError(
+                        f"Action '{target_action}' blocked: Job description text is {jd_scan.classification} "
+                        f"(Risk: {jd_scan.risk_score:.2f}) and cannot be exposed to external agents.",
+                        source_type="job_description",
+                        source_id=job_id or 0,
+                        classification=jd_scan.classification,
+                        risk_score=jd_scan.risk_score,
+                    )
+
+        # 2. Cover Letter Text Security Check
         detector = PromptInjectionDetector()
         if cover_letter_text:
             cl_scan = detector.scan(cover_letter_text)
-            if cl_scan.classification == ScanClassification.QUARANTINED:
+            if cl_scan.classification in (ScanClassification.SUSPICIOUS, ScanClassification.QUARANTINED):
                 raise QuarantinedSourceError(
-                    f"Action 'form_prefilling' blocked: Cover letter text is QUARANTINED (Risk: {cl_scan.risk_score:.2f}).",
+                    f"Action '{target_action}' blocked: Cover letter text is {cl_scan.classification} "
+                    f"(Risk: {cl_scan.risk_score:.2f}) and cannot be exposed to external agents.",
                     source_type="cover_letter",
                     source_id=0,
                     classification=cl_scan.classification,
                     risk_score=cl_scan.risk_score,
                 )
 
-        jd_text = ""
-        if isinstance(job, dict):
-            jd_text = job.get("job_description") or job.get("raw_content") or ""
-        elif hasattr(job, "job_description"):
-            jd_text = job.job_description or ""
-        if jd_text:
-            jd_scan = detector.scan(jd_text)
-            if jd_scan.classification == ScanClassification.QUARANTINED:
-                raise QuarantinedSourceError(
-                    f"Action 'form_prefilling' blocked: Job description text is QUARANTINED (Risk: {jd_scan.risk_score:.2f}).",
-                    source_type="job_description",
-                    source_id=job.get("id", 0) if isinstance(job, dict) else (job.id or 0),
-                    classification=jd_scan.classification,
-                    risk_score=jd_scan.risk_score,
-                )
-
+        # 3. Screening Question Answers Security Check
         if answers and isinstance(answers, dict):
             for k, val in answers.items():
                 if isinstance(val, str) and len(val) > 10:
                     ans_scan = detector.scan(val)
-                    if ans_scan.classification == ScanClassification.QUARANTINED:
+                    if ans_scan.classification in (ScanClassification.SUSPICIOUS, ScanClassification.QUARANTINED):
                         raise QuarantinedSourceError(
-                            f"Action 'form_prefilling' blocked: Screening question answer '{k}' is QUARANTINED (Risk: {ans_scan.risk_score:.2f}).",
+                            f"Action '{target_action}' blocked: Screening question answer '{k}' is {ans_scan.classification} "
+                            f"(Risk: {ans_scan.risk_score:.2f}) and cannot be exposed to external agents.",
                             source_type="screening_answer",
                             source_id=0,
                             classification=ans_scan.classification,
                             risk_score=ans_scan.risk_score,
                         )
+
+        # 4. Authoritative Resume Security Preflight
+        if self.db and uid and resume_id:
+            preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+            preflight.check_resume_security(
+                user_id=uid,
+                resume_id=resume_id,
+                version_num=resume_version_num,
+                target_action=target_action,
+            )
 
         if isinstance(job, dict):
             job_id = job.get("id", 0)

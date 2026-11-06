@@ -74,10 +74,9 @@ class TestUnicodeSanitizer(unittest.TestCase):
                 self.assertEqual(self.sanitizer.to_nfc(c3), c2, f"NFC(c3) failed: {parts[2]}")
 
                 tested_count += 1
-                if tested_count >= 1000:
-                    break
 
-        self.assertGreaterEqual(tested_count, 1000)
+        # The bundled official Unicode 16.0.0 NormalizationTest.txt contains exactly 19,965 vectors
+        self.assertEqual(tested_count, 19965)
 
     def test_03_hangul_algorithmic_decomposition_and_composition(self):
         """Tests Hangul LV and LVT syllable decomposition and composition."""
@@ -191,6 +190,47 @@ class TestUnicodeSanitizer(unittest.TestCase):
         analysis = self.sanitizer.analyze_unicode_security(original)
         self.assertEqual(original, copied)
         self.assertIsInstance(analysis.to_dict(), dict)
+
+    def test_14_unicodedata_first_last_range_handling(self):
+        """Tests that code points inside <..., First> and <..., Last> paired ranges are correctly classified."""
+        db = self.sanitizer.db
+        # Interior of CJK Ideograph Extension A (0x3400 to 0x4DBF)
+        self.assertEqual(db.get_general_category(0x3401), "Lo")
+        self.assertEqual(db.get_general_category(0x4DBE), "Lo")
+
+        # Interior of CJK Unified Ideographs (0x4E00 to 0x9FFF)
+        self.assertEqual(db.get_general_category(0x4E01), "Lo")  # '丁'
+        self.assertEqual(db.get_general_category(0x9000), "Lo")
+
+        # Interior of Hangul Syllables (0xAC00 to 0xD7A3)
+        self.assertEqual(db.get_general_category(0xAC05), "Lo")
+
+        # Interior of Private Use Area (0xE000 to 0xF8FF)
+        self.assertEqual(db.get_general_category(0xE001), "Co")
+
+        # Interior of Non Private Use High Surrogates (0xD800 to 0xDB7F)
+        self.assertEqual(db.get_general_category(0xD801), "Cs")
+
+    def test_15_scriptextensions_loading_and_usage(self):
+        """Tests that ScriptExtensions.txt is loaded and queried correctly."""
+        db = self.sanitizer.db
+        self.assertTrue(len(db.script_extensions) > 0)
+
+        # 0x00B7 (MIDDLE DOT) is used in Latin, Greek, Georgian, etc.
+        scx_00b7 = db.get_script_extensions(0x00B7)
+        self.assertTrue("Latn" in scx_00b7 or "Latin" in scx_00b7)
+        self.assertTrue("Grek" in scx_00b7 or "Greek" in scx_00b7)
+        self.assertTrue("Geor" in scx_00b7 or "Georgian" in scx_00b7)
+
+        # 0x02BC (MODIFIER LETTER APOSTROPHE) is used in Cyrillic, Latin, Devanagari, Bengali, Thai, etc.
+        scx_02bc = db.get_script_extensions(0x02BC)
+        self.assertTrue("Cyrl" in scx_02bc or "Cyrillic" in scx_02bc)
+        self.assertTrue("Deva" in scx_02bc or "Devanagari" in scx_02bc)
+        self.assertTrue("Latn" in scx_02bc or "Latin" in scx_02bc)
+
+        # Latin character 'A' (0x0041) not listed in ScriptExtensions defaults to {Latin, Latn}
+        scx_a = db.get_script_extensions(0x0041)
+        self.assertTrue("Latin" in scx_a or "Latn" in scx_a)
 
 
 if __name__ == "__main__":
