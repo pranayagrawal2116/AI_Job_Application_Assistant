@@ -162,10 +162,25 @@ class TestMatchResultPersistence(unittest.TestCase):
     def test_immutability_new_evaluation_creates_new_record(self):
         """Re-running match evaluation creates a new immutable historical record, not an overwrite."""
         matcher = UniversalMatcher(db_manager=self.db)
+        from src.security.resume_verifier import VerifiedResume
+        from src.preparer.resume_parser import ParsedResume
+
+        v_resume = VerifiedResume(
+            resume_id=self.u1_resume_id,
+            user_id=self.user1_id,
+            version_num=1,
+            storage_filename="res1.pdf",
+            file_bytes=b"%PDF-1.4\n%EOF\n",
+            file_hash="a" * 64,
+            file_size_bytes=15,
+            file_format="pdf",
+            raw_text="Python and ML engineer",
+            _parsed_resume=ParsedResume(raw_text="Python and ML engineer", technical_skills=["Python"]),
+        )
 
         matcher.evaluate(
             user_id=self.user1_id,
-            resume_id=self.u1_resume_id,
+            verified_resume=v_resume,
             job_description_id=self.u1_jd_id,
             scoring_profile_id="general_baseline",
             persist=True,
@@ -173,7 +188,7 @@ class TestMatchResultPersistence(unittest.TestCase):
 
         matcher.evaluate(
             user_id=self.user1_id,
-            resume_id=self.u1_resume_id,
+            verified_resume=v_resume,
             job_description_id=self.u1_jd_id,
             scoring_profile_id="student_intern",
             persist=True,

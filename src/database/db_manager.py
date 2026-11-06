@@ -349,6 +349,21 @@ class DatabaseManager:
                     recovered_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_resume_recovery_audit_update
+                BEFORE UPDATE ON resume_recovery_audit
+                BEGIN
+                    SELECT RAISE(FAIL, 'resume_recovery_audit records are append-only and cannot be updated.');
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_resume_recovery_audit_delete
+                BEFORE DELETE ON resume_recovery_audit
+                BEGIN
+                    SELECT RAISE(FAIL, 'resume_recovery_audit records are immutable and cannot be deleted except via authorized privacy erasure.')
+                    WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
+                END
+            """)
         except sqlite3.OperationalError:
             pass
 

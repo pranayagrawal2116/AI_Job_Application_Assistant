@@ -294,8 +294,10 @@ class ProfileUpdater:
             unmodified_fields.append({"field": "work_experience", "current_value": curr_exp, "new_value": new_exp})
 
         # Check skills
-        curr_skills = current_profile.get("technical_skills", {}).get("all_skills", [])
-        new_skills = new_prof.get("technical_skills", {}).get("all_skills", [])
+        raw_curr_skills = current_profile.get("technical_skills", {})
+        curr_skills = raw_curr_skills.get("all_skills", []) if isinstance(raw_curr_skills, dict) else (raw_curr_skills if isinstance(raw_curr_skills, list) else [])
+        raw_new_skills = new_prof.get("technical_skills", {})
+        new_skills = raw_new_skills.get("all_skills", []) if isinstance(raw_new_skills, dict) else (raw_new_skills if isinstance(raw_new_skills, list) else [])
         if set(curr_skills) != set(new_skills):
             prov = field_provenance.get("technical_skills", {})
             status = prov.get("verification_status")
@@ -485,11 +487,30 @@ class ProfileUpdater:
             parsed = verified_res.parsed_resume
         elif resume_path is not None:
             rp_str = str(resume_path).strip()
-            if "\x00" in rp_str or ".." in rp_str:
+            if "\x00" in rp_str:
+                from src.database.exceptions import FileSecurityError
+                raise FileSecurityError(f"Null byte detected in resume_path: '{resume_path}'")
+            if ".." in rp_str or ".." in Path(rp_str).parts:
                 from src.database.exceptions import FileSecurityError
                 raise FileSecurityError(f"Path traversal detected in resume_path: '{resume_path}'")
+
+            from src.security.file_security import FileSecurityValidator
+            f_val = FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else FileSecurityValidator()
+            rp = Path(rp_str)
+            if not rp.is_absolute():
+                target_path = f_val.get_user_resumes_dir(user_id) / rp.name
+            else:
+                target_path = rp
+
+            resolved_path, file_bytes, actual_hash, actual_size = f_val.resolve_and_verify_candidate_file(
+                user_id=user_id,
+                file_path=target_path,
+                is_mandatory=True,
+                resource_desc=f"Resume file for user #{user_id}",
+            )
+            fmt = resolved_path.suffix.lstrip(".").lower()
             parser = ResumeParser()
-            parsed = parser.parse_file(resume_path)
+            parsed = parser.parse_bytes(file_bytes=file_bytes, file_format=fmt, file_path=str(resolved_path))
         else:
             raise ValidationError("Either resume_path or resume_id must be provided to sync user profile.")
 

@@ -261,6 +261,8 @@ def render_application_preparer():
                     job_description=jd_dict,
                     match_result=match_dict,
                     custom_instructions=custom_instructions or None,
+                    resume_id=selected_resume_id,
+                    resume_version_num=selected_res_meta.get("active_version", 1) if selected_res_meta else 1,
                 )
                 st.session_state["tailored_resume"] = tailored
 
@@ -364,6 +366,8 @@ def render_application_preparer():
                     match_result=match_dict,
                     tone=selected_tone,
                     career_level=selected_level,
+                    resume_id=selected_resume_id,
+                    resume_version_num=selected_res_meta.get("active_version", 1) if selected_res_meta else 1,
                 )
                 st.session_state["cover_letter"] = cl
 
@@ -420,6 +424,8 @@ def render_application_preparer():
                     resume_data=selected_res_meta,
                     job_description=jd_dict,
                     character_limit=char_lim,
+                    resume_id=selected_resume_id,
+                    resume_version_num=selected_res_meta.get("active_version", 1) if selected_res_meta else 1,
                 )
                 qa_packet = ScreeningQAPacket(
                     user_id=user_id,
@@ -443,6 +449,8 @@ def render_application_preparer():
                 candidate_profile=candidate_profile,
                 resume_data=selected_res_meta,
                 job_description={"company_name": app.company_name, "role_title": app.job_title},
+                resume_id=selected_resume_id,
+                resume_version_num=selected_res_meta.get("active_version", 1) if selected_res_meta else 1,
             )
             st.session_state["qa_packet"] = ScreeningQAPacket(
                 user_id=user_id,

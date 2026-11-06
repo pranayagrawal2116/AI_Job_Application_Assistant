@@ -635,8 +635,24 @@ class TestUniversalMatcherScenarios(unittest.TestCase):
             cursor.execute("INSERT INTO job_descriptions (user_id, source_type, company_name, job_title, raw_content, content_hash) VALUES (?, 'pasted', 'C', 'T', 'raw', 'h2')", (self.user_id,))
             jdid = cursor.lastrowid
 
-        self.matcher.evaluate(user_id=self.user_id, resume_id=rid, job_description_id=jdid, persist=True)
-        self.matcher.evaluate(user_id=self.user_id, resume_id=rid, job_description_id=jdid, persist=True)
+        from src.security.resume_verifier import VerifiedResume
+        from src.preparer.resume_parser import ParsedResume
+
+        v_resume = VerifiedResume(
+            resume_id=rid,
+            user_id=self.user_id,
+            version_num=1,
+            storage_filename="r.pdf",
+            file_bytes=b"%PDF-1.4\n%EOF\n",
+            file_hash="a" * 64,
+            file_size_bytes=15,
+            file_format="pdf",
+            raw_text="Test resume",
+            _parsed_resume=ParsedResume(raw_text="Test resume"),
+        )
+
+        self.matcher.evaluate(user_id=self.user_id, verified_resume=v_resume, job_description_id=jdid, persist=True)
+        self.matcher.evaluate(user_id=self.user_id, verified_resume=v_resume, job_description_id=jdid, persist=True)
 
         history = self.db.get_user_match_results(user_id=self.user_id, resume_id=rid, job_description_id=jdid)
         self.assertEqual(len(history), 2)

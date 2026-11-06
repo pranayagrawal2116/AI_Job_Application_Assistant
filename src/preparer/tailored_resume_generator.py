@@ -417,25 +417,49 @@ class UniversalTailoredResumeGenerator:
         user_base_dir: Optional[Path] = None,
     ) -> TailoredResume:
         """Generates a tailored resume rooted strictly in verified evidence."""
-        target_res_id = resume_id
-        if target_res_id is None and isinstance(resume_data, dict):
-            target_res_id = resume_data.get("id") or resume_data.get("resume_id")
+        from src.security.resume_verifier import VerifiedResume
+        from src.database.exceptions import CrossUserAccessError, ResumeIntegrityError
 
-        if target_res_id is not None:
+        target_res_id = resume_id
+        resume_dict = {}
+
+        if job_description is None and isinstance(resume_data, dict):
+            has_jd_keys = any(k in resume_data for k in ("company_name", "role_title", "job_title", "raw_content"))
+            has_resume_keys = any(k in resume_data for k in ("work_experience", "education", "experience", "certifications", "technical_skills", "skills"))
+            if has_jd_keys and not has_resume_keys:
+                job_description = resume_data
+                resume_data = None
+
+        if isinstance(resume_data, VerifiedResume):
+            if resume_data.user_id != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=resume_data.user_id,
+                    resource=f"VerifiedResume #{resume_data.resume_id}",
+                )
+            resume_dict = resume_data.parsed_resume.to_dict()
+        elif target_res_id is not None or (isinstance(resume_data, dict) and (resume_data.get("id") or resume_data.get("resume_id"))):
+            resolved_id = target_res_id or (resume_data.get("id") or resume_data.get("resume_id"))
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
             f_val = FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else None
             verifier = ResumeIntegrityVerifier(db_manager=db_manager, file_validator=f_val)
             verified_res = verifier.verify_and_load_resume(
                 user_id=user_id,
-                resume_id=target_res_id,
+                resume_id=resolved_id,
                 version_num=resume_version_num,
                 user_base_dir=user_base_dir,
                 fresh_parse=True,
             )
             resume_dict = verified_res.parsed_resume.to_dict()
+        elif isinstance(resume_data, dict) and len(resume_data) > 0:
+            raise ResumeIntegrityError(
+                "Unverified resume dictionary provided without authoritative identity. "
+                "Resume-backed operations require an authoritative resume ID or a VerifiedResume artifact."
+            )
         else:
-            resume_dict = resume_data or {}
+            # Legitimate profile-only workflow where no resume is supplied
+            resume_dict = {}
         jd_dict = job_description or {}
         prof_dict = candidate_profile or {}
 

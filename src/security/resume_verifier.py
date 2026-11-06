@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from src.database.db_manager import DatabaseManager
 from src.database.exceptions import (
+    ConcurrencyConflictError,
     CorruptedFileError,
     CrossUserAccessError,
     FileSecurityError,
@@ -39,6 +40,33 @@ from src.utils.logger import setup_logger
 logger = setup_logger("ResumeIntegrityVerifier")
 
 _SHA256_HEX_REGEX = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def _sanitize_for_serialization(val: Any) -> Any:
+    """Recursively sanitizes data structures for serialization.
+
+    Excludes sensitive raw text, raw binary bytes, and sanitizes absolute filesystem paths to basenames only.
+    """
+    if isinstance(val, dict):
+        sanitized: Dict[str, Any] = {}
+        for k, v in val.items():
+            k_lower = str(k).lower()
+            if k_lower in ("raw_text", "file_bytes", "bytes"):
+                continue
+            if isinstance(v, (bytes, bytearray, memoryview)):
+                continue
+            if k_lower in ("file_path", "resolved_path") and isinstance(v, (str, Path)):
+                sanitized[k] = Path(str(v)).name
+            else:
+                sanitized[k] = _sanitize_for_serialization(v)
+        return sanitized
+    elif isinstance(val, list):
+        return [_sanitize_for_serialization(item) for item in val if not isinstance(item, (bytes, bytearray, memoryview))]
+    elif isinstance(val, tuple):
+        return tuple(_sanitize_for_serialization(item) for item in val if not isinstance(item, (bytes, bytearray, memoryview)))
+    elif isinstance(val, (bytes, bytearray, memoryview)):
+        return None
+    return val
 
 
 @dataclass(frozen=True)
@@ -62,6 +90,8 @@ class VerifiedResume:
         # Enforce defensive deep-copy of parsed representation upon construction
         if hasattr(self, "_parsed_resume") and self._parsed_resume is not None:
             object.__setattr__(self, "_parsed_resume", copy.deepcopy(self._parsed_resume))
+        if hasattr(self, "file_bytes") and isinstance(self.file_bytes, (bytearray, memoryview)):
+            object.__setattr__(self, "file_bytes", bytes(self.file_bytes))
 
     @property
     def parsed_resume(self) -> Any:
@@ -79,8 +109,9 @@ class VerifiedResume:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        """Returns safe serializable metadata dictionary excluding sensitive raw bytes and server filesystem paths."""
+        """Returns safe serializable metadata dictionary excluding sensitive raw bytes, raw text, and server filesystem paths."""
         parsed_dict = self._parsed_resume.to_dict() if hasattr(self._parsed_resume, "to_dict") else {}
+        sanitized_parsed = _sanitize_for_serialization(parsed_dict)
         return {
             "resume_id": self.resume_id,
             "user_id": self.user_id,
@@ -90,8 +121,8 @@ class VerifiedResume:
             "file_size_bytes": self.file_size_bytes,
             "file_format": self.file_format,
             "original_filename": self.original_filename,
-            "resolved_path": self.storage_filename,
-            "parsed_data": copy.deepcopy(parsed_dict),
+            "resolved_path": Path(str(self.storage_filename)).name,
+            "parsed_data": sanitized_parsed,
         }
 
 
@@ -359,7 +390,10 @@ class ResumeIntegrityVerifier:
         recovered_size: Optional[int] = None,
         details: Optional[str] = None,
     ) -> None:
-        """Safely persists durable audit evidence for recovery operations without leaking candidate data."""
+        """Safely persists durable audit evidence for recovery operations without leaking candidate data.
+
+        Fails closed if the audit record cannot be persisted.
+        """
         try:
             with self.db.transaction() as conn:
                 cursor = conn.cursor()
@@ -382,7 +416,8 @@ class ResumeIntegrityVerifier:
                     ),
                 )
         except Exception as audit_err:
-            logger.warning("Could not persist recovery audit record: %s", audit_err)
+            logger.error("Could not persist recovery audit record: %s", audit_err)
+            raise ResumeIntegrityError(f"Failed to persist recovery audit record: {audit_err}") from audit_err
 
     def reverify_and_backfill_historical_resume(
         self,
@@ -410,6 +445,7 @@ class ResumeIntegrityVerifier:
                 raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
 
             res_row = dict(row)
+            parent_hash = res_row.get("file_hash")
             if res_row["user_id"] != uid:
                 raise CrossUserAccessError(
                     user_id=uid,
@@ -481,7 +517,26 @@ class ResumeIntegrityVerifier:
             user_resumes_dir = self.file_validator.get_user_resumes_dir(uid)
 
         target_path = user_resumes_dir / clean_name
-        expected_fmt = (res_row.get("file_format") or target_path.suffix.lstrip(".")).lower()
+        target_ext = Path(clean_name).suffix.lstrip(".").lower()
+        if target_ext in ("pdf", "docx"):
+            expected_fmt = target_ext
+        else:
+            expected_fmt = ""
+            if target_path.exists() and target_path.is_file():
+                try:
+                    with open(target_path, "rb") as f:
+                        hdr = f.read(8)
+                    if hdr.startswith(b"%PDF"):
+                        expected_fmt = "pdf"
+                    elif hdr.startswith(b"PK\x03\x04"):
+                        expected_fmt = "docx"
+                except Exception:
+                    pass
+            if not expected_fmt:
+                if target_ver == active_ver:
+                    expected_fmt = (res_row.get("file_format") or target_ext).lower()
+                else:
+                    expected_fmt = target_ext
 
         # Finding C 5.1: If record ALREADY contains valid cryptographic metadata and file does not match,
         # treat as potential tampering incident. Never re-sign or overwrite valid cryptographic metadata!
@@ -545,74 +600,122 @@ class ResumeIntegrityVerifier:
             )
             raise CorruptedFileError(f"Failed to parse historical resume file on disk: {parse_err}") from parse_err
 
-        # Atomic transaction with row-count checks (Finding C 5.2)
-        with self.db.transaction() as conn:
-            cursor = conn.cursor()
+        # Atomic transaction with CAS concurrency and row-count checks (Finding F & G)
+        try:
+            with self.db.transaction() as conn:
+                cursor = conn.cursor()
 
-            # 1. Update or insert exact resume_versions row
-            cursor.execute(
-                """
-                UPDATE resume_versions SET
-                    file_hash = ?,
-                    file_size_bytes = ?,
-                    storage_filename = COALESCE(storage_filename, ?)
-                WHERE resume_id = ? AND user_id = ? AND version_num = ?
-                """,
-                (actual_hash, actual_size, clean_name, resume_id, uid, target_ver),
-            )
-            if cursor.rowcount == 0 and target_ver == active_ver:
-                parsed_json = json.dumps(parsed.to_dict()) if hasattr(parsed, "to_dict") else "{}"
+                # Re-verify parent resume state inside transaction
+                cursor.execute(
+                    "SELECT id, user_id, active_version, file_hash, file_size_bytes FROM resumes WHERE id = ? AND user_id = ?",
+                    (resume_id, uid),
+                )
+                curr_parent_row = cursor.fetchone()
+                if not curr_parent_row:
+                    raise ConcurrencyConflictError(f"Resume #{resume_id} was deleted concurrently during recovery.")
+                curr_parent = dict(curr_parent_row)
+
+                if target_ver == active_ver and curr_parent.get("active_version") != active_ver:
+                    raise ConcurrencyConflictError(
+                        f"Active version for Resume #{resume_id} changed concurrently from v{active_ver} to v{curr_parent.get('active_version')}."
+                    )
+
+                # 1. Update or insert exact resume_versions row with CAS conditions
+                if v_row:
+                    cursor.execute(
+                        """
+                        UPDATE resume_versions SET
+                            file_hash = ?,
+                            file_size_bytes = ?,
+                            storage_filename = COALESCE(storage_filename, ?)
+                        WHERE resume_id = ? AND user_id = ? AND version_num = ?
+                          AND (file_hash IS ? OR file_hash = ?)
+                          AND (file_size_bytes IS ? OR file_size_bytes = ?)
+                        """,
+                        (actual_hash, actual_size, clean_name, resume_id, uid, target_ver, existing_hash, existing_hash, existing_size, existing_size),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConcurrencyConflictError(
+                            f"Concurrency conflict: Version {target_ver} of Resume #{resume_id} was modified concurrently."
+                        )
+                elif target_ver == active_ver:
+                    cursor.execute(
+                        "SELECT id FROM resume_versions WHERE resume_id = ? AND version_num = ?",
+                        (resume_id, target_ver),
+                    )
+                    if cursor.fetchone():
+                        raise ConcurrencyConflictError(
+                            f"Concurrency conflict: Version {target_ver} of Resume #{resume_id} was inserted concurrently."
+                        )
+                    parsed_json = json.dumps(parsed.to_dict()) if hasattr(parsed, "to_dict") else "{}"
+                    cursor.execute(
+                        """
+                        INSERT INTO resume_versions (
+                            resume_id, user_id, version_num, storage_filename,
+                            file_hash, file_size_bytes, change_notes, snapshot_json, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'Historical recovery', ?, CURRENT_TIMESTAMP)
+                        """,
+                        (resume_id, uid, target_ver, clean_name, actual_hash, actual_size, parsed_json),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConcurrencyConflictError(f"Failed to insert version {target_ver} of Resume #{resume_id}.")
+
+                # 2. Update parent resumes record ONLY if recovering active_version
+                if target_ver == active_ver:
+                    cursor.execute(
+                        """
+                        UPDATE resumes SET
+                            file_hash = ?,
+                            file_size_bytes = ?,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND user_id = ? AND active_version = ?
+                          AND (file_hash IS ? OR file_hash = ?)
+                        """,
+                        (actual_hash, actual_size, resume_id, uid, active_ver, parent_hash, parent_hash),
+                    )
+                    if cursor.rowcount != 1:
+                        raise ConcurrencyConflictError(
+                            f"Concurrency conflict: Parent record for Resume #{resume_id} was modified concurrently."
+                        )
+
+                # 3. Persist durable audit record atomically within the same transaction
                 cursor.execute(
                     """
-                    INSERT INTO resume_versions (
-                        resume_id, user_id, version_num, storage_filename,
-                        file_hash, file_size_bytes, change_notes, snapshot_json, created_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, 'Historical recovery', ?, CURRENT_TIMESTAMP)
+                    INSERT INTO resume_recovery_audit (
+                        user_id, resume_id, version_num, previous_state_json,
+                        recovered_file_hash, recovered_file_size_bytes, recovery_outcome, details
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', ?)
                     """,
-                    (resume_id, uid, target_ver, clean_name, actual_hash, actual_size, parsed_json),
+                    (
+                        uid,
+                        resume_id,
+                        target_ver,
+                        json.dumps(previous_state),
+                        actual_hash,
+                        actual_size,
+                        f"Recovered {expected_fmt.upper()} binary ({actual_size} bytes)",
+                    ),
                 )
 
-            # 2. Update parent resumes record ONLY if recovering active_version
-            if target_ver == active_ver:
+                # Retrieve updated version / parent info
+                cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
+                updated_parent = dict(cursor.fetchone())
                 cursor.execute(
-                    """
-                    UPDATE resumes SET
-                        file_hash = ?,
-                        file_size_bytes = ?,
-                        updated_at = CURRENT_TIMESTAMP
-                    WHERE id = ? AND user_id = ?
-                    """,
-                    (actual_hash, actual_size, resume_id, uid),
+                    "SELECT * FROM resume_versions WHERE resume_id = ? AND version_num = ?",
+                    (resume_id, target_ver),
                 )
-
-            # 3. Persist durable audit record
-            cursor.execute(
-                """
-                INSERT INTO resume_recovery_audit (
-                    user_id, resume_id, version_num, previous_state_json,
-                    recovered_file_hash, recovered_file_size_bytes, recovery_outcome, details
-                ) VALUES (?, ?, ?, ?, ?, ?, 'SUCCESS', ?)
-                """,
-                (
-                    uid,
-                    resume_id,
-                    target_ver,
-                    json.dumps(previous_state),
-                    actual_hash,
-                    actual_size,
-                    f"Recovered {expected_fmt.upper()} binary ({actual_size} bytes)",
-                ),
+                updated_v_row = cursor.fetchone()
+                updated_version = dict(updated_v_row) if updated_v_row else {}
+        except ConcurrencyConflictError as cc_err:
+            self._record_audit_safe(
+                uid,
+                resume_id,
+                target_ver,
+                previous_state,
+                "REJECTED_CONCURRENCY_CONFLICT",
+                details=str(cc_err),
             )
-
-            # Retrieve updated version / parent info
-            cursor.execute("SELECT * FROM resumes WHERE id = ?", (resume_id,))
-            updated_parent = dict(cursor.fetchone())
-            cursor.execute(
-                "SELECT * FROM resume_versions WHERE resume_id = ? AND version_num = ?",
-                (resume_id, target_ver),
-            )
-            v_row = cursor.fetchone()
-            updated_version = dict(v_row) if v_row else {}
+            raise
 
         logger.info(
             "Successfully recovered historical resume #%d (v%d) for user %d (size: %d, SHA-256: %s...)",

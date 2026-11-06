@@ -2923,10 +2923,22 @@ class DashboardService:
             CoverLetterGenerator,
             LetterTone,
         )
+        from src.security.resume_verifier import VerifiedResume
+        from src.database.exceptions import CrossUserAccessError, ResumeIntegrityError
+
         target_res_id = resume_id
         if target_res_id is None and isinstance(resume_data, dict):
             target_res_id = resume_data.get("id") or resume_data.get("resume_id")
-        if target_res_id is not None:
+
+        if isinstance(resume_data, VerifiedResume):
+            if resume_data.user_id != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=resume_data.user_id,
+                    resource=f"VerifiedResume #{resume_data.resume_id}",
+                )
+            resume_data = resume_data.parsed_resume.to_dict()
+        elif target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
             verifier = ResumeIntegrityVerifier(
@@ -2940,6 +2952,13 @@ class DashboardService:
                 fresh_parse=True,
             )
             resume_data = verified_res.parsed_resume.to_dict()
+        elif isinstance(resume_data, dict) and len(resume_data) > 0:
+            raise ResumeIntegrityError(
+                "Unverified resume dictionary provided without authoritative identity. "
+                "Resume-backed operations require an authoritative resume ID or a VerifiedResume artifact."
+            )
+        else:
+            resume_data = {}
 
         generator = CoverLetterGenerator(candidate_profile=candidate_profile)
         user_app_dir = Path(f"data/users/{user_id}/applications")
@@ -2969,10 +2988,22 @@ class DashboardService:
     ):
         """Answers screening questions across 19 categories rooted strictly in verified evidence with JIT verification."""
         from src.preparer.question_answerer import QuestionAnswerer
+        from src.security.resume_verifier import VerifiedResume
+        from src.database.exceptions import CrossUserAccessError, ResumeIntegrityError
+
         target_res_id = resume_id
         if target_res_id is None and isinstance(resume_data, dict):
             target_res_id = resume_data.get("id") or resume_data.get("resume_id")
-        if target_res_id is not None:
+
+        if isinstance(resume_data, VerifiedResume):
+            if resume_data.user_id != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=resume_data.user_id,
+                    resource=f"VerifiedResume #{resume_data.resume_id}",
+                )
+            resume_data = resume_data.parsed_resume.to_dict()
+        elif target_res_id is not None:
             from src.security.resume_verifier import ResumeIntegrityVerifier
             from src.security.file_security import FileSecurityValidator
             verifier = ResumeIntegrityVerifier(
@@ -2986,6 +3017,13 @@ class DashboardService:
                 fresh_parse=True,
             )
             resume_data = verified_res.parsed_resume.to_dict()
+        elif isinstance(resume_data, dict) and len(resume_data) > 0:
+            raise ResumeIntegrityError(
+                "Unverified resume dictionary provided without authoritative identity. "
+                "Resume-backed operations require an authoritative resume ID or a VerifiedResume artifact."
+            )
+        else:
+            resume_data = {}
 
         answerer = QuestionAnswerer(candidate_profile=candidate_profile)
         return answerer.batch_answer_questions(

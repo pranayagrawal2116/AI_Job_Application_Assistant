@@ -590,6 +590,41 @@ When interacting with the browser via Playwright MCP:
     - All 1,345 tests across 59 test suites passing (100% pass rate).
     - 0 ruff errors, 0 pyflakes errors, 0 lint warnings.
 
+- [x] **Architecture v2.1.1 Phase 9.1.1.3: Final Resume Trust-Boundary & Recovery Audit Closure** (Complete)
+  - Finding A — Strict Input Trust Contract Across Generators:
+    - Enforced strict input trust contract across `UniversalTailoredResumeGenerator.generate()`, `DashboardService.generate_tailored_resume()`, `generate_universal_cover_letter()`, and `batch_answer_screening_questions()`.
+    - Plain, unverified resume dictionaries without an authoritative identity (`id` or `resume_id`) are rejected with `ResumeIntegrityError`.
+    - Dictionaries with IDs trigger JIT verification; instances of `VerifiedResume` require authenticated user ownership.
+    - Updated `application_preparer.py` to pass authoritative `resume_id` and `resume_version_num` across all call sites.
+    - Preserved genuine profile-only generation (`resume_data is None` and `resume_id is None`) without accepting arbitrary dictionaries.
+  - Finding B — Persistent Matching Requires Verified Resume Input:
+    - In `UniversalMatcher.evaluate()`, moved job description cross-user access validation upfront, raising `CrossUserAccessError` immediately on cross-user JD access.
+    - When `persist=True` and a resume is referenced, requires a `VerifiedResume` object or executes JIT verification via `ResumeIntegrityVerifier`. Rejects unverified dictionaries with `ResumeIntegrityError`.
+    - Supported configurable `storage_base_dir` and `file_validator` injection; preserved synthetic in-memory testing (`persist=False`).
+  - Finding C — Complete Serialization Sanitization & Zero Leakage in `VerifiedResume`:
+    - Added `_sanitize_for_serialization()` recursively stripping `raw_text`, `file_bytes`, `bytes` and normalizing paths to base filenames.
+    - `VerifiedResume.to_dict()` sanitizes all nested output, guaranteeing zero leakage of absolute filesystem paths, binary blobs, or OCR text.
+  - Finding D — Boundary Immutability via Defensive Deepcopy:
+    - Added defensive `copy.deepcopy()` of `parsed_resume` at the construction boundary in `VerifiedResume.__post_init__()` and converted `file_bytes` to immutable `bytes`.
+    - Prevents post-verification mutation of caller dictionaries from affecting verified resume artifacts.
+  - Finding E — Exact-Version Format Selection in Historical Recovery:
+    - In `reverify_and_backfill_historical_resume()`, derives target file format primarily from target version's filename extension or magic bytes, only falling back to parent `file_format` when recovering the active version.
+  - Finding F — Concurrency-Safe Conditional Updates (CAS Semantics):
+    - Implemented Compare-And-Swap (CAS) conditional `UPDATE` statements on `resume_versions` and parent `resumes` comparing against `existing_hash` and `parent_hash`.
+    - Asserts `rowcount == 1`, rolling back and raising `ConcurrencyConflictError` on concurrent modification races.
+  - Finding G — Append-Only Durable Recovery Audit Log (SQLite Triggers):
+    - Added SQLite triggers `trg_prevent_resume_recovery_audit_update` and `trg_prevent_resume_recovery_audit_delete` on `resume_recovery_audit`.
+    - Trigger creation deployed idempotently in `_ensure_backward_compatible_columns()`.
+    - Verified `_record_audit_safe` fails closed (raises `ResumeIntegrityError`) if audit log persistence fails; commits version update and audit row atomically.
+  - Finding H — Profile Sync Sandboxing & Containment Validation:
+    - In `ProfileUpdater.sync_user_profile()`, validates `resume_path` against null bytes, path traversal (`..`), and sandbox containment via `FileSecurityValidator.resolve_and_verify_candidate_file()`.
+    - Rejects symlinks and parses directly from verified in-memory bytes (`parse_bytes`).
+    - Handled both list and dict structures of `technical_skills` in `diff_profile_with_resume()`.
+  - Verification & Regressions:
+    - Authored 27 comprehensive regression tests in `tests/test_phase_9_1_1_3_trust_boundary_closure.py`.
+    - Full test suite regression pass: 1,372 tests passing across all 100 test files (100% pass rate).
+    - 0 pyflakes errors, 0 ruff errors, 0 lint warnings.
+
 ---
 
 ## 7. Approval Requirement

@@ -9,6 +9,7 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 import hashlib
 import json
+from pathlib import Path
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -17,6 +18,7 @@ from src.database.exceptions import (
     CrossUserAccessError,
     JobDescriptionNotFoundError,
     JobNotFoundError,
+    ResumeIntegrityError,
     ResumeNotFoundError,
 )
 from src.database.models import JobDescription, MatchResult, ResumeRecord
@@ -1840,8 +1842,20 @@ class MatchResultPersistenceService:
 class UniversalMatcher:
     """Universal Explainable Resume-to-Job Matching Engine."""
 
-    def __init__(self, db_manager: Optional[DatabaseManager] = None):
+    def __init__(
+        self,
+        db_manager: Optional[DatabaseManager] = None,
+        file_validator: Optional[Any] = None,
+        storage_base_dir: Optional[Path] = None,
+    ):
         self.db = db_manager or DatabaseManager()
+        from src.security.file_security import FileSecurityValidator
+        if file_validator is not None:
+            self.file_validator = file_validator
+        elif storage_base_dir is not None:
+            self.file_validator = FileSecurityValidator(base_storage_dir=storage_base_dir)
+        else:
+            self.file_validator = None
 
     def evaluate(
         self,
@@ -1859,6 +1873,8 @@ class UniversalMatcher:
         job_id: Optional[int] = None,
         verified_resume: Optional[Any] = None,
         enforce_resume_verification: bool = False,
+        user_base_dir: Optional[Path] = None,
+        file_validator: Optional[Any] = None,
     ) -> UniversalMatchResult:
         """Runs universal match evaluation between a candidate profile/resume and a job opportunity.
         
@@ -1867,6 +1883,24 @@ class UniversalMatcher:
         """
         # 1. Composite Ownership Validation and Verified Resume Resolution
         resume_file_hash = None
+
+        # Check job description / job ownership upfront
+        job_snapshot_hash = None
+        if job_description_id is not None:
+            jd_rec = self.db.get_job_description(user_id=user_id, jd_id=job_description_id)
+            if not jd_rec:
+                raise JobDescriptionNotFoundError(f"Job Description #{job_description_id} not found.")
+            job_snapshot_hash = jd_rec.snapshot_hash or jd_rec.content_hash
+            if job_data is None:
+                job_data = jd_rec.to_dict()
+
+        if job_id is not None and job_data is None:
+            job_obj = self.db.get_job_by_id(job_id)
+            if not job_obj:
+                raise JobNotFoundError(job_id)
+            job_data = job_obj.to_dict()
+
+        # Check if verified_resume artifact was passed
         if verified_resume is not None:
             if verified_resume.user_id != user_id:
                 raise CrossUserAccessError(
@@ -1878,30 +1912,68 @@ class UniversalMatcher:
             resume_version_num = verified_resume.version_num
             resume_file_hash = verified_resume.file_hash
             resume_data = verified_resume.parsed_resume
-        elif enforce_resume_verification and resume_id is not None:
-            from src.security.resume_verifier import ResumeIntegrityVerifier
-            verifier = ResumeIntegrityVerifier(db_manager=self.db)
-            verified_res = verifier.verify_and_load_resume(
-                user_id=user_id,
-                resume_id=resume_id,
-                version_num=resume_version_num,
-                fresh_parse=True,
-            )
-            resume_id = verified_res.resume_id
-            resume_version_num = verified_res.version_num
-            resume_file_hash = verified_res.file_hash
-            resume_data = verified_res.parsed_resume
-        elif resume_id is not None:
-            res_rec = self.db.get_user_resume(resume_id, user_id=user_id)
-            if not res_rec:
-                raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
-            resume_file_hash = res_rec.get("file_hash")
-            if resume_version_num is None:
-                resume_version_num = res_rec.get("active_version", 1)
-            if resume_data is None:
-                resume_data = res_rec.get("parsed_data")
-        elif resume_version_num is None:
-            resume_version_num = 1
+        elif persist:
+            # Persistent matching requires verified resume input whenever a resume is referenced
+            target_res_id = resume_id
+            if target_res_id is None and isinstance(resume_data, dict):
+                target_res_id = resume_data.get("id") or resume_data.get("resume_id")
+
+            if target_res_id is not None:
+                from src.security.resume_verifier import ResumeIntegrityVerifier
+                from src.security.file_security import FileSecurityValidator
+                f_val = file_validator or self.file_validator or (FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else None)
+                verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=f_val)
+                verified_res = verifier.verify_and_load_resume(
+                    user_id=user_id,
+                    resume_id=target_res_id,
+                    version_num=resume_version_num,
+                    user_base_dir=user_base_dir,
+                    fresh_parse=True,
+                )
+                resume_id = verified_res.resume_id
+                resume_version_num = verified_res.version_num
+                resume_file_hash = verified_res.file_hash
+                resume_data = verified_res.parsed_resume
+            elif resume_data is not None and (not isinstance(resume_data, dict) or len(resume_data) > 0):
+                # An unverified resume object or non-empty dictionary was supplied without authoritative identity
+                raise ResumeIntegrityError(
+                    "Persistent matching requires a verified resume. "
+                    "Unverified caller-supplied resume data cannot be persisted."
+                )
+            else:
+                # Legitimate profile-only match (no resume referenced)
+                resume_id = None
+                resume_version_num = 1
+                resume_file_hash = None
+        else:
+            # Non-persistent matching (persist=False) - preserves synthetic unit testing
+            if enforce_resume_verification and resume_id is not None:
+                from src.security.resume_verifier import ResumeIntegrityVerifier
+                from src.security.file_security import FileSecurityValidator
+                f_val = file_validator or self.file_validator or (FileSecurityValidator(base_storage_dir=user_base_dir) if user_base_dir else None)
+                verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=f_val)
+                verified_res = verifier.verify_and_load_resume(
+                    user_id=user_id,
+                    resume_id=resume_id,
+                    version_num=resume_version_num,
+                    user_base_dir=user_base_dir,
+                    fresh_parse=True,
+                )
+                resume_id = verified_res.resume_id
+                resume_version_num = verified_res.version_num
+                resume_file_hash = verified_res.file_hash
+                resume_data = verified_res.parsed_resume
+            elif resume_id is not None:
+                res_rec = self.db.get_user_resume(resume_id, user_id=user_id)
+                if not res_rec:
+                    raise ResumeNotFoundError(f"Resume #{resume_id} not found.")
+                resume_file_hash = res_rec.get("file_hash")
+                if resume_version_num is None:
+                    resume_version_num = res_rec.get("active_version", 1)
+                if resume_data is None:
+                    resume_data = res_rec.get("parsed_data")
+            elif resume_version_num is None:
+                resume_version_num = 1
 
         # Resolve candidate profile from database if not explicitly provided
         if profile_data is None:
@@ -1917,21 +1989,6 @@ class UniversalMatcher:
 
         if candidate_profile_version is None:
             candidate_profile_version = 1
-
-        job_snapshot_hash = None
-        if job_description_id is not None:
-            jd_rec = self.db.get_job_description(user_id=user_id, jd_id=job_description_id)
-            if not jd_rec:
-                raise JobDescriptionNotFoundError(f"Job Description #{job_description_id} not found.")
-            job_snapshot_hash = jd_rec.snapshot_hash or jd_rec.content_hash
-            if job_data is None:
-                job_data = jd_rec.to_dict()
-
-        if job_id is not None and job_data is None:
-            job_obj = self.db.get_job_by_id(job_id)
-            if not job_obj:
-                raise JobNotFoundError(job_id)
-            job_data = job_obj.to_dict()
 
         # 2. Normalize Candidate Facts and Job Requirements
         facts = CandidateFactNormalizer.normalize(resume_data=resume_data, profile_data=profile_data)
