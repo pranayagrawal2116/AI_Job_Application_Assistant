@@ -55,6 +55,7 @@ from src.database.models import (
     SecurityScan,
     SecurityScanOverride,
     LegacyIntegrityException,
+    LegacyEvidenceAttestation,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
@@ -330,6 +331,8 @@ class DatabaseManager:
         add_col_if_missing("security_scans", "source_binary_size_bytes", "INTEGER")
         add_col_if_missing("security_scans", "source_binary_format", "TEXT")
         add_col_if_missing("security_scans", "manifest_version", "TEXT DEFAULT 'v1'")
+        add_col_if_missing("legacy_integrity_exceptions", "evidence_type", "TEXT")
+        add_col_if_missing("legacy_integrity_exceptions", "evidence_reference_id", "TEXT")
 
         try:
             cursor.execute("""
@@ -456,6 +459,8 @@ class DatabaseManager:
                     assigned_legacy_state TEXT NOT NULL,
                     source_snapshot_hash TEXT,
                     migration_version TEXT NOT NULL,
+                    evidence_type TEXT,
+                    evidence_reference_id TEXT,
                     migration_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                     migration_reason TEXT NOT NULL,
                     outcome TEXT NOT NULL
@@ -479,6 +484,42 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        add_col_if_missing("legacy_integrity_exceptions", "evidence_type", "TEXT")
+        add_col_if_missing("legacy_integrity_exceptions", "evidence_reference_id", "TEXT")
+
+        # Legacy evidence attestations table and triggers (Phase 9.1.2.5 Authoritative Provenance)
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS legacy_evidence_attestations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    job_description_id INTEGER NOT NULL REFERENCES job_descriptions(id) ON DELETE CASCADE,
+                    evidence_type TEXT NOT NULL,
+                    evidence_reference_id TEXT NOT NULL,
+                    source_snapshot_hash TEXT NOT NULL,
+                    attested_by TEXT NOT NULL,
+                    attested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    details TEXT
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_evidence_attestations_update
+                BEFORE UPDATE ON legacy_evidence_attestations
+                BEGIN
+                    SELECT RAISE(FAIL, 'legacy_evidence_attestations records are append-only and cannot be updated.');
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_evidence_attestations_delete
+                BEFORE DELETE ON legacy_evidence_attestations
+                BEGIN
+                    SELECT RAISE(FAIL, 'legacy_evidence_attestations records are immutable and cannot be deleted.');
+                END
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_legacy_evidence_attestations_lookup ON legacy_evidence_attestations(job_description_id, user_id)")
+        except sqlite3.OperationalError:
+            pass
+
         # Database schema migration ledger table (Phase 9.1.2.4 Migration Finality)
         try:
             cursor.execute("""
@@ -493,6 +534,7 @@ class DatabaseManager:
             pass
 
         self._migrate_historical_job_description_integrity(cursor)
+        self._migrate_phase_9_1_2_5_legacy_evidence_reconciliation(cursor)
 
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
@@ -646,9 +688,35 @@ class DatabaseManager:
             if not s_hash or s_hash != expected_legacy_hash:
                 continue
 
-            # Section 3.2: Verify pre-migration database provenance
-            # Authentic pre-migration record must have created_at timestamp
+            # Section 3.2 & Phase 9.1.2.5 Part B: Evidence-based eligibility
+            # Manifest structure and created_at timestamps alone do not prove historical provenance.
+            # A candidate may enter LEGACY_TEXT_ONLY only when its historical origin is supported
+            # by an authoritative independent evidence source in legacy_evidence_attestations.
             if not created_at:
+                continue
+
+            cursor.execute(
+                """
+                SELECT evidence_type, evidence_reference_id, source_snapshot_hash
+                FROM legacy_evidence_attestations
+                WHERE job_description_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (jd_id, u_id),
+            )
+            attestation = cursor.fetchone()
+            if not attestation:
+                # Unknown historical origin = NOT VERIFIED (Phase 9.1.2.5 Section 4.2).
+                # Remains in REQUIRED (fail-closed); do not grandfather without external evidence.
+                continue
+
+            ev_type = attestation[0] if isinstance(attestation, tuple) else attestation["evidence_type"]
+            ev_ref = attestation[1] if isinstance(attestation, tuple) else attestation["evidence_reference_id"]
+            ev_hash = attestation[2] if isinstance(attestation, tuple) else attestation["source_snapshot_hash"]
+
+            if not ev_type or not str(ev_type).strip() or not ev_ref or not str(ev_ref).strip():
+                continue
+            if ev_hash != s_hash:
                 continue
 
             # Check if already recorded in legacy_integrity_exceptions
@@ -667,11 +735,12 @@ class DatabaseManager:
                         user_id, job_description_id, original_source_type,
                         previous_binary_state, assigned_legacy_state,
                         source_snapshot_hash, migration_version,
+                        evidence_type, evidence_reference_id,
                         migration_reason, outcome
-                    ) VALUES (?, ?, ?, ?, 'LEGACY_TEXT_ONLY', ?, '9.1.2.3',
-                              'Grandfathered pre-9.1.1 uploaded record with NULL binary metadata and verified provenance', 'SUCCESS')
+                    ) VALUES (?, ?, ?, ?, 'LEGACY_TEXT_ONLY', ?, '9.1.2.3', ?, ?,
+                              'Grandfathered historical record supported by authoritative external evidence', 'SUCCESS')
                     """,
-                    (u_id, jd_id, s_type, prev_state or "REQUIRED", s_hash),
+                    (u_id, jd_id, s_type, prev_state or "REQUIRED", s_hash, ev_type, ev_ref),
                 )
 
             cursor.execute(
@@ -684,20 +753,125 @@ class DatabaseManager:
             )
             migrated_count += 1
 
-        # Section 3.1 & 3.4: Atomically record completion in schema_migrations
-        # Record completion marker only when candidate evaluation and migration succeed
+        # Section 3.1 & 3.4 & Phase 9.1.2.5 Section 7: Record completion in schema_migrations
+        self.record_schema_migration(
+            migration_id="phase_9_1_2_3_legacy_binary_integrity",
+            migration_version="9.1.2.3",
+            details=f"Migrated {migrated_count} legacy records to LEGACY_TEXT_ONLY",
+            cursor=cursor,
+        )
+
+    def _migrate_phase_9_1_2_5_legacy_evidence_reconciliation(self, cursor: sqlite3.Cursor) -> None:
+        """Phase 9.1.2.5 corrective migration: reconciles existing legacy exception records.
+
+        Enforces Section 4.3 & 4.4:
+        1. Checks if 'phase_9_1_2_5_legacy_evidence_closure' has already been recorded in schema_migrations. If so, skips.
+        2. Queries all records currently claiming LEGACY_TEXT_ONLY state.
+        3. For each record:
+           - Verifies if authoritative independent evidence exists in legacy_evidence_attestations matching source_snapshot_hash.
+           - If verified evidence exists: records reconciliation audit in legacy_integrity_exceptions (SUCCESS).
+           - If NO verified evidence exists (unknown historical origin): reverts binary_integrity_state to 'REQUIRED' (fail closed)
+             and records reconciliation audit in legacy_integrity_exceptions (REVERTED).
+        4. Atomically records completion marker 'phase_9_1_2_5_legacy_evidence_closure' in schema_migrations.
+        """
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
+        if not cursor.fetchone():
+            return
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                migration_id TEXT PRIMARY KEY,
+                migration_version TEXT NOT NULL,
+                applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                details TEXT
+            )
+        """)
+
+        cursor.execute("SELECT 1 FROM schema_migrations WHERE migration_id = 'phase_9_1_2_5_legacy_evidence_closure'")
+        if cursor.fetchone():
+            logger.debug("Migration phase_9_1_2_5_legacy_evidence_closure already applied; skipping.")
+            return
+
         cursor.execute(
             """
-            INSERT OR REPLACE INTO schema_migrations (
-                migration_id, migration_version, applied_at, details
-            ) VALUES (
-                'phase_9_1_2_3_legacy_binary_integrity',
-                '9.1.2.3',
-                CURRENT_TIMESTAMP,
-                ?
+            SELECT id, user_id, source_type, snapshot_hash, binary_integrity_state
+            FROM job_descriptions
+            WHERE binary_integrity_state = 'LEGACY_TEXT_ONLY'
+            """
+        )
+        legacy_records = cursor.fetchall()
+        reconciled_count = 0
+        reverted_count = 0
+
+        for rec in legacy_records:
+            jd_id = rec[0] if isinstance(rec, tuple) else rec["id"]
+            u_id = rec[1] if isinstance(rec, tuple) else rec["user_id"]
+            s_type = rec[2] if isinstance(rec, tuple) else rec["source_type"]
+            s_hash = rec[3] if isinstance(rec, tuple) else rec["snapshot_hash"]
+
+            # Query authoritative independent evidence
+            cursor.execute(
+                """
+                SELECT evidence_type, evidence_reference_id, source_snapshot_hash
+                FROM legacy_evidence_attestations
+                WHERE job_description_id = ? AND user_id = ?
+                LIMIT 1
+                """,
+                (jd_id, u_id),
             )
-            """,
-            (f"Migrated {migrated_count} legacy records to LEGACY_TEXT_ONLY",),
+            attestation = cursor.fetchone()
+
+            has_valid_evidence = False
+            ev_type = None
+            ev_ref = None
+            if attestation:
+                ev_type = attestation[0] if isinstance(attestation, tuple) else attestation["evidence_type"]
+                ev_ref = attestation[1] if isinstance(attestation, tuple) else attestation["evidence_reference_id"]
+                ev_hash = attestation[2] if isinstance(attestation, tuple) else attestation["source_snapshot_hash"]
+                if ev_type and str(ev_type).strip() and ev_ref and str(ev_ref).strip() and ev_hash == s_hash:
+                    has_valid_evidence = True
+
+            if has_valid_evidence:
+                cursor.execute(
+                    """
+                    INSERT INTO legacy_integrity_exceptions (
+                        user_id, job_description_id, original_source_type,
+                        previous_binary_state, assigned_legacy_state,
+                        source_snapshot_hash, migration_version,
+                        evidence_type, evidence_reference_id,
+                        migration_reason, outcome
+                    ) VALUES (?, ?, ?, 'LEGACY_TEXT_ONLY', 'LEGACY_TEXT_ONLY', ?, '9.1.2.5', ?, ?,
+                              'Phase 9.1.2.5 evidence reconciliation: authoritative external evidence verified', 'SUCCESS')
+                    """,
+                    (u_id, jd_id, s_type, s_hash, ev_type, ev_ref),
+                )
+                reconciled_count += 1
+            else:
+                # Unknown historical origin = NOT VERIFIED (Section 4.2). Revert to REQUIRED.
+                cursor.execute(
+                    "UPDATE job_descriptions SET binary_integrity_state = 'REQUIRED' WHERE id = ?",
+                    (jd_id,),
+                )
+                cursor.execute(
+                    """
+                    INSERT INTO legacy_integrity_exceptions (
+                        user_id, job_description_id, original_source_type,
+                        previous_binary_state, assigned_legacy_state,
+                        source_snapshot_hash, migration_version,
+                        evidence_type, evidence_reference_id,
+                        migration_reason, outcome
+                    ) VALUES (?, ?, ?, 'LEGACY_TEXT_ONLY', 'REQUIRED', ?, '9.1.2.5', 'NONE', 'NONE',
+                              'Phase 9.1.2.5 evidence reconciliation: lacked independent historical evidence proof; reverted to REQUIRED', 'REVERTED')
+                    """,
+                    (u_id, jd_id, s_type, s_hash),
+                )
+                reverted_count += 1
+
+        self.record_schema_migration(
+            migration_id="phase_9_1_2_5_legacy_evidence_closure",
+            migration_version="9.1.2.5",
+            details=f"Reconciled {reconciled_count} verified legacy records; reverted {reverted_count} unattested records to REQUIRED",
+            cursor=cursor,
         )
 
     def _migrate_match_results_foreign_keys(self, conn: sqlite3.Connection) -> None:
@@ -1425,6 +1599,8 @@ class DatabaseManager:
             conn.executescript(schema_sql)
             conn.commit()
             self._migrate_historical_job_description_integrity(cursor)
+            conn.commit()
+            self._migrate_phase_9_1_2_5_legacy_evidence_reconciliation(cursor)
             conn.commit()
         logger.info("Database initialized successfully at: %s", self.db_path)
 
@@ -3785,6 +3961,179 @@ class DatabaseManager:
             parsed_data=structured.to_dict(),
         )
 
+    def recover_unverified_job_description(
+        self,
+        user_id: int,
+        job_description_id: int,
+        file_bytes: bytes,
+        original_filename: str,
+        user_base_dir: Optional[Path] = None,
+    ) -> JobDescription:
+        """Controlled recovery path for historical job descriptions missing verified binary metadata (Phase 9.1.2.5 Section 5.1).
+
+        1. Validates user identity and resource ownership.
+        2. Inspects existing job description: must be active uploaded record in REQUIRED / unverified state.
+        3. Preserves original record and snapshot immutable (superseded via new child revision).
+        4. Validates actual file bytes using FileSecurityValidator (PDF/DOCX, magic bytes, size cap).
+        5. Computes physical SHA-256 and exact size in bytes.
+        6. Persists file securely to user storage.
+        7. Parses text content using JobParser.
+        8. Creates authoritative child revision linked via supersedes_job_description_id, with binary_integrity_state = 'VERIFIED'.
+        9. Performs fresh security scan and persists authenticated v2 scan record with source_binary_hash.
+        10. Audits recovery outcome in application_logs.
+        """
+        from src.security.file_security import FileSecurityValidator
+        from src.preparer.job_parser import JobParser
+        from src.security.security_preflight import SecurityPreflightManager
+        from src.security.scan_signer import SecurityScanSigner
+
+        user = self.get_user_by_id(user_id)
+        if not user:
+            raise UserNotFoundError(f"User #{user_id}")
+
+        existing = self.get_job_description(job_description_id, user_id=user_id)
+        if not existing:
+            raise JobDescriptionNotFoundError(f"Job Description #{job_description_id} not found.")
+
+        if existing.user_id != user_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=existing.user_id,
+                resource=f"JobDescription #{job_description_id}",
+            )
+
+        if not existing.is_active:
+            raise ValidationError(
+                f"Cannot recover Job Description #{job_description_id}: record is inactive."
+            )
+
+        norm_source = (existing.source_type or "").lower().strip()
+        if norm_source not in ("uploaded_document", "upload"):
+            raise ValidationError(
+                f"Cannot recover Job Description #{job_description_id}: only uploaded documents require binary recovery (source_type is '{existing.source_type}')."
+            )
+
+        if existing.binary_integrity_state == "VERIFIED" and existing.file_hash:
+            raise ValidationError(
+                f"Job Description #{job_description_id} already possesses VERIFIED binary integrity metadata."
+            )
+
+        # 4 & 5. Validate file bytes and format
+        validator = FileSecurityValidator(base_storage_dir=user_base_dir)
+        validator.validate_file(file_bytes, original_filename)
+
+        ext = Path(original_filename).suffix.lstrip(".").lower()
+        if ext not in ("pdf", "docx"):
+            raise InvalidFileFormatError(f"Unsupported file format '.{ext}'. Only PDF and DOCX documents are accepted.")
+
+        storage_filename, detected_format, file_size, file_hash = validator.save_user_job_description_file(
+            user_id=user_id,
+            file_bytes=file_bytes,
+            original_filename=original_filename,
+        )
+
+        job_dir = validator.get_user_job_descriptions_dir(user_id)
+        dest_path = job_dir / storage_filename
+
+        # Extract text and parse
+        parser = JobParser()
+        if ext == "pdf":
+            raw_text = parser.extract_text_from_pdf(dest_path)
+        else:
+            raw_text = parser.extract_text_from_docx(dest_path)
+
+        stem_name = Path(original_filename).stem.replace("_", " ").replace("-", " ")
+        structured = parser.parse_job_description(
+            raw_text=raw_text,
+            hint_title=stem_name if len(stem_name) > 3 else None,
+            source=f"upload_{ext}",
+        )
+
+        company = structured.company_name or existing.company_name or "Unknown Company"
+        title = structured.job_title or existing.job_title or stem_name or "Untitled Position"
+
+        # 8. Create child revision linked via supersedes_job_description_id
+        recovered_jd = self.save_job_description_snapshot(
+            user_id=user_id,
+            company_name=company,
+            job_title=title,
+            raw_content=raw_text or existing.raw_content,
+            source_type="upload",
+            original_filename=original_filename,
+            storage_filename=storage_filename,
+            file_hash=file_hash,
+            file_size_bytes=file_size,
+            file_format=detected_format,
+            parser_version=structured.parser_version,
+            extraction_confidence=structured.extraction_confidence,
+            parsed_data=structured.to_dict() if structured else existing.parsed_data,
+            supersedes_job_description_id=job_description_id,
+            binary_integrity_state="VERIFIED",
+        )
+
+        # 9. Perform fresh security scan and persist authenticated v2 scan record
+        preflight = SecurityPreflightManager(db_manager=self, file_validator=validator)
+        scan_signer = SecurityScanSigner()
+
+        scan_res = preflight.detector.scan(
+            raw_text or existing.raw_content
+        )
+
+        manifest, sig, key_id = scan_signer.sign_scan_result(
+            user_id=user_id,
+            source_type="job_description",
+            source_id=recovered_jd.id,
+            source_version=1,
+            source_hash=recovered_jd.content_hash,
+            snapshot_hash=recovered_jd.snapshot_hash,
+            scan_result=scan_res,
+            manifest_version="v2",
+            source_binary_hash=file_hash,
+            source_binary_size_bytes=file_size,
+            source_binary_format=detected_format,
+        )
+
+        self.save_security_scan(
+            user_id=user_id,
+            source_type="job_description",
+            source_id=recovered_jd.id,
+            source_version=1,
+            source_hash=recovered_jd.content_hash,
+            snapshot_hash=recovered_jd.snapshot_hash,
+            scanner_version=scan_res.engine_version,
+            policy_version=scan_res.policy_version,
+            risk_score=scan_res.risk_score,
+            classification=scan_res.classification,
+            threats_detected=[t.to_dict() for t in scan_res.threats_detected],
+            key_id=key_id,
+            hmac_signature=sig,
+            scanned_at=manifest["scanned_at"],
+            source_binary_hash=file_hash,
+            source_binary_size_bytes=file_size,
+            source_binary_format=detected_format,
+            manifest_version="v2",
+        )
+
+        # 10. Audit recovery outcome
+        with self.transaction() as conn:
+            conn.execute(
+                """
+                INSERT INTO application_logs (user_id, action, details)
+                VALUES (?, ?, ?)
+                """,
+                (
+                    user_id,
+                    "JOB_DESCRIPTION_RECOVERED",
+                    f"Job Description #{job_description_id} successfully recovered as #{recovered_jd.id} (SHA-256: {file_hash[:16]}..., size: {file_size} bytes)",
+                ),
+            )
+
+        logger.info(
+            "Successfully recovered historical Job Description #%d as new revision #%d (user %d, SHA-256: %s...)",
+            job_description_id, recovered_jd.id, user_id, file_hash[:16],
+        )
+        return recovered_jd
+
     def get_job_description_file_path(
         self,
         user_id: int,
@@ -5094,32 +5443,41 @@ class DatabaseManager:
         migration_version: str = "9.1.2.3",
         migration_reason: str = "Grandfathered pre-9.1.1 uploaded record with NULL binary metadata",
         outcome: str = "SUCCESS",
+        evidence_type: Optional[str] = None,
+        evidence_reference_id: Optional[str] = None,
+        cursor: Optional[sqlite3.Cursor] = None,
     ) -> int:
         """Records an immutable audit entry in legacy_integrity_exceptions."""
-        with self.immediate_transaction() as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                """
-                INSERT INTO legacy_integrity_exceptions (
-                    user_id, job_description_id, original_source_type,
-                    previous_binary_state, assigned_legacy_state,
-                    source_snapshot_hash, migration_version,
-                    migration_reason, outcome
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    user_id,
-                    job_description_id,
-                    original_source_type,
-                    previous_binary_state,
-                    assigned_legacy_state,
-                    source_snapshot_hash,
-                    migration_version,
-                    migration_reason,
-                    outcome,
-                ),
-            )
+        sql = """
+            INSERT INTO legacy_integrity_exceptions (
+                user_id, job_description_id, original_source_type,
+                previous_binary_state, assigned_legacy_state,
+                source_snapshot_hash, migration_version,
+                evidence_type, evidence_reference_id,
+                migration_reason, outcome
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            user_id,
+            job_description_id,
+            original_source_type,
+            previous_binary_state,
+            assigned_legacy_state,
+            source_snapshot_hash,
+            migration_version,
+            evidence_type,
+            evidence_reference_id,
+            migration_reason,
+            outcome,
+        )
+        if cursor:
+            cursor.execute(sql, params)
             return cursor.lastrowid
+        else:
+            with self.immediate_transaction() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                return cur.lastrowid
 
     def get_legacy_integrity_exception(
         self,
@@ -5162,7 +5520,91 @@ class DatabaseManager:
                 migration_timestamp=row["migration_timestamp"],
                 migration_reason=row["migration_reason"],
                 outcome=row["outcome"],
+                evidence_type=row["evidence_type"] if "evidence_type" in row.keys() else None,
+                evidence_reference_id=row["evidence_reference_id"] if "evidence_reference_id" in row.keys() else None,
             )
+
+    def record_legacy_evidence_attestation(
+        self,
+        user_id: int,
+        job_description_id: int,
+        evidence_type: str,
+        evidence_reference_id: str,
+        source_snapshot_hash: str,
+        attested_by: str = "system_migration",
+        details: Optional[str] = None,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> int:
+        """Records an authoritative independent evidence attestation for a historical job description."""
+        sql = """
+            INSERT INTO legacy_evidence_attestations (
+                user_id, job_description_id, evidence_type,
+                evidence_reference_id, source_snapshot_hash,
+                attested_by, details
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """
+        params = (
+            user_id,
+            job_description_id,
+            evidence_type,
+            evidence_reference_id,
+            source_snapshot_hash,
+            attested_by,
+            details,
+        )
+        if cursor:
+            cursor.execute(sql, params)
+            return cursor.lastrowid
+        else:
+            with self.immediate_transaction() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                return cur.lastrowid
+
+    def get_legacy_evidence_attestation(
+        self,
+        job_description_id: int,
+        user_id: Optional[int] = None,
+        cursor: Optional[sqlite3.Cursor] = None,
+    ) -> Optional[LegacyEvidenceAttestation]:
+        """Retrieves an authoritative evidence attestation for a job description."""
+        if user_id is not None:
+            sql = """
+                SELECT * FROM legacy_evidence_attestations
+                WHERE job_description_id = ? AND user_id = ?
+                ORDER BY id DESC LIMIT 1
+            """
+            params = (job_description_id, user_id)
+        else:
+            sql = """
+                SELECT * FROM legacy_evidence_attestations
+                WHERE job_description_id = ?
+                ORDER BY id DESC LIMIT 1
+            """
+            params = (job_description_id,)
+
+        if cursor:
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+        else:
+            with self.connection() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, params)
+                row = cur.fetchone()
+
+        if not row:
+            return None
+        return LegacyEvidenceAttestation(
+            id=row["id"] if isinstance(row, dict) else row[0],
+            user_id=row["user_id"] if isinstance(row, dict) else row[1],
+            job_description_id=row["job_description_id"] if isinstance(row, dict) else row[2],
+            evidence_type=row["evidence_type"] if isinstance(row, dict) else row[3],
+            evidence_reference_id=row["evidence_reference_id"] if isinstance(row, dict) else row[4],
+            source_snapshot_hash=row["source_snapshot_hash"] if isinstance(row, dict) else row[5],
+            attested_by=row["attested_by"] if isinstance(row, dict) else row[6],
+            attested_at=row["attested_at"] if isinstance(row, dict) else row[7],
+            details=row["details"] if isinstance(row, dict) else (row[8] if len(row) > 8 else None),
+        )
 
     def record_schema_migration(
         self,
@@ -5171,17 +5613,40 @@ class DatabaseManager:
         details: Optional[str] = None,
         cursor: Optional[sqlite3.Cursor] = None,
     ) -> None:
-        """Records a completed migration in schema_migrations ledger."""
-        sql = """
-            INSERT OR REPLACE INTO schema_migrations (
-                migration_id, migration_version, applied_at, details
-            ) VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+        """Records a completed migration in schema_migrations ledger.
+
+        Enforces immutable history (Section 7): does NOT use INSERT OR REPLACE.
+        If migration is already recorded with identical version, no-ops cleanly.
+        If migration is already recorded with an inconsistent version, raises ConcurrencyConflictError.
         """
+        def _execute(cur: sqlite3.Cursor) -> None:
+            cur.execute(
+                "SELECT migration_version, applied_at, details FROM schema_migrations WHERE migration_id = ?",
+                (migration_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                existing_ver = existing[0] if isinstance(existing, tuple) else existing["migration_version"]
+                if existing_ver != migration_version:
+                    raise ConcurrencyConflictError(
+                        f"Migration '{migration_id}' already applied with version '{existing_ver}', "
+                        f"cannot overwrite with inconsistent version '{migration_version}'."
+                    )
+                return  # Identical migration already recorded; preserve original applied_at
+            cur.execute(
+                """
+                INSERT INTO schema_migrations (
+                    migration_id, migration_version, applied_at, details
+                ) VALUES (?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                (migration_id, migration_version, details),
+            )
+
         if cursor:
-            cursor.execute(sql, (migration_id, migration_version, details))
+            _execute(cursor)
         else:
-            with self.transaction() as conn:
-                conn.execute(sql, (migration_id, migration_version, details))
+            with self.immediate_transaction() as conn:
+                _execute(conn.cursor())
 
     def is_schema_migration_applied(
         self,

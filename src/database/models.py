@@ -649,9 +649,29 @@ class LegacyIntegrityException:
     migration_timestamp: str
     migration_reason: str
     outcome: str
+    evidence_type: Optional[str] = None
+    evidence_reference_id: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class LegacyEvidenceAttestation:
+    """Authoritative independent evidence attesting to the historical origin of a job description."""
+    id: int
+    user_id: int
+    job_description_id: int
+    evidence_type: str
+    evidence_reference_id: str
+    source_snapshot_hash: str
+    attested_by: str
+    attested_at: str
+    details: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 
 

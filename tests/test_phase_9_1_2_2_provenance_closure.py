@@ -516,6 +516,8 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
             migration_version="9.1.2.3",
             migration_reason="Auditable legacy migration",
             outcome="SUCCESS",
+            evidence_type="historical_import_manifest",
+            evidence_reference_id="MANIFEST-PHASE9122-001",
         )
 
         # Preflight handles all-NULL as auditable legacy text record

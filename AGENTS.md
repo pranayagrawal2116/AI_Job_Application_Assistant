@@ -762,6 +762,33 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,546 tests passing across 107 test suites (100% pass rate in 77.39s).
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_4_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.5: Legacy Eligibility Proof & Migration Evidence Closure** (Complete)
+  - Historical Database Evidence Audit & Invariant Analysis (Part A):
+    - Conducted empirical database audit proving SQLite `created_at` timestamps and 9-field canonical snapshot hashes alone cannot prove pre-Phase-9.1.1 provenance.
+    - Verified that `save_job_description_snapshot()` computes identical 9-field canonical JSON hashes for both newly uploaded and historical records; snapshot hash equality demonstrates internal row consistency, not historical age.
+  - Fail-Closed Default for Unknown Historical Provenance (Part B):
+    - Enforced mandatory default: Unknown historical origin = NOT VERIFIED (`REQUIRED`).
+    - Untrusted uploads with NULL binary metadata fail closed in `REQUIRED` binary integrity state, blocking unverified job descriptions from security-sensitive matching, document preparation, and packet generation.
+  - Verifiable Evidence Attestation Requirement (Part C):
+    - Created append-only `legacy_evidence_attestations` table with database triggers preventing updates or deletions (`trg_prevent_legacy_evidence_attestations_update`, `trg_prevent_legacy_evidence_attestations_delete`).
+    - Extended `legacy_integrity_exceptions` schema with `evidence_type TEXT` and `evidence_reference_id TEXT`.
+    - Migration `_migrate_historical_job_description_integrity()` requires explicit, independent verifiable evidence (`legacy_evidence_attestations`) matching `(job_description_id, user_id)` and `source_snapshot_hash` before granting `LEGACY_TEXT_ONLY`.
+    - `SecurityPreflightManager` verifies non-empty `evidence_type` and `evidence_reference_id` on any `LEGACY_TEXT_ONLY` record, failing closed on unbacked exceptions.
+  - Downgrade Prevention & Migration Ledger Immutability (Part D):
+    - Prohibited downgrades from `VERIFIED` to `LEGACY_TEXT_ONLY` across migrations and snapshot APIs.
+    - Replaced `INSERT OR REPLACE` with conflict-checking in `DatabaseManager.record_schema_migration()`, preserving original `applied_at` timestamps on identical version re-assertions and raising `ConcurrencyConflictError` on version discrepancies.
+  - Controlled Recovery Procedure (Part E):
+    - Implemented `DatabaseManager.recover_unverified_job_description()` allowing candidates to resolve `REQUIRED` records by uploading verified file bytes.
+    - Validates file format, size, magic bytes, and sandbox containment via `FileSecurityValidator`.
+    - Supersedes the unverified parent, deactivates parent snapshot, creates child revision with `binary_integrity_state = 'VERIFIED'`, links parent ID, and persists an authenticated `v2` security scan signed with active HMAC keys.
+  - Corrective Reconciliation Migration (Part F):
+    - Implemented `_migrate_phase_9_1_2_5_legacy_evidence_reconciliation()` reverting any existing unattested `LEGACY_TEXT_ONLY` records to `REQUIRED` (`outcome='REVERTED'`) and logging to `legacy_integrity_exceptions`.
+    - Recorded one-time ledger entry `phase_9_1_2_5_legacy_evidence_closure` upon completion.
+  - Verification & Regressions (Parts G, H & I):
+    - Authored 25 dedicated test cases in `tests/test_phase_9_1_2_5_legacy_evidence_closure.py` covering all 20 required migration scenarios, critical regression test, controlled recovery, reconciliation, and ledger immutability (25/25 passing, 100%).
+    - Full test suite regression pass: 1,571 tests passing across 108 test suites (100% pass rate in 80.74s).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_5_IMPLEMENTATION_REPORT.md`.
 
 ---
 

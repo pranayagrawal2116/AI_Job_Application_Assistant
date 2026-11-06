@@ -543,10 +543,39 @@ CREATE TABLE IF NOT EXISTS legacy_integrity_exceptions (
     assigned_legacy_state TEXT NOT NULL,
     source_snapshot_hash TEXT,
     migration_version TEXT NOT NULL,
+    evidence_type TEXT,
+    evidence_reference_id TEXT,
     migration_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
     migration_reason TEXT NOT NULL,
     outcome TEXT NOT NULL
 );
+
+-- ---------------------------------------------------------------------
+-- 20. LEGACY EVIDENCE ATTESTATIONS (Phase 9.1.2.5 Authoritative Provenance)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS legacy_evidence_attestations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    job_description_id INTEGER NOT NULL REFERENCES job_descriptions(id) ON DELETE CASCADE,
+    evidence_type TEXT NOT NULL,
+    evidence_reference_id TEXT NOT NULL,
+    source_snapshot_hash TEXT NOT NULL,
+    attested_by TEXT NOT NULL,
+    attested_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    details TEXT
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_evidence_attestations_update
+BEFORE UPDATE ON legacy_evidence_attestations
+BEGIN
+    SELECT RAISE(FAIL, 'legacy_evidence_attestations records are append-only and cannot be updated.');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_evidence_attestations_delete
+BEFORE DELETE ON legacy_evidence_attestations
+BEGIN
+    SELECT RAISE(FAIL, 'legacy_evidence_attestations records are immutable and cannot be deleted.');
+END;
 
 -- ---------------------------------------------------------------------
 -- 15. DATABASE SCHEMA MIGRATION LEDGER (Phase 9.1.2.4 Migration Finality)
@@ -619,3 +648,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_jobs_company_title ON jobs(company_name CO
 CREATE INDEX IF NOT EXISTS idx_security_scans_lookup ON security_scans(user_id, source_type, source_id, source_version);
 CREATE INDEX IF NOT EXISTS idx_security_scans_hash ON security_scans(source_hash);
 CREATE INDEX IF NOT EXISTS idx_security_scan_overrides_lookup ON security_scan_overrides(user_id, scan_id);
+CREATE INDEX IF NOT EXISTS idx_legacy_evidence_attestations_lookup ON legacy_evidence_attestations(job_description_id, user_id);

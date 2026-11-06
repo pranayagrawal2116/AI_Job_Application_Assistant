@@ -339,6 +339,15 @@ class TestPhase9124MigrationAndAttachmentClosure(unittest.TestCase):
                 (self.user1_id, raw_text, c_hash, snap_hash),
             )
             jd_id = c.lastrowid
+            c.execute(
+                """
+                INSERT INTO legacy_evidence_attestations (
+                    user_id, job_description_id, evidence_type, evidence_reference_id,
+                    source_snapshot_hash, attested_by
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_2024_05_01_001', ?, 'system_migration')
+                """,
+                (self.user1_id, jd_id, snap_hash),
+            )
 
         with self.db.immediate_transaction() as conn:
             self.db._migrate_historical_job_description_integrity(conn.cursor())
@@ -443,6 +452,15 @@ class TestPhase9124MigrationAndAttachmentClosure(unittest.TestCase):
                 (self.user1_id, raw_text, c_hash, snap_hash),
             )
             jd_id = c.lastrowid
+            c.execute(
+                """
+                INSERT INTO legacy_evidence_attestations (
+                    user_id, job_description_id, evidence_type, evidence_reference_id,
+                    source_snapshot_hash, attested_by
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_ROLLBACK_001', ?, 'system_migration')
+                """,
+                (self.user1_id, jd_id, snap_hash),
+            )
 
         # Migration attempt must fail and rollback
         with self.assertRaises((sqlite3.OperationalError, sqlite3.IntegrityError)) as ctx:
@@ -499,6 +517,15 @@ class TestPhase9124MigrationAndAttachmentClosure(unittest.TestCase):
                 (self.user1_id, raw_text, c_hash, snap_hash),
             )
             jd_id = c.lastrowid
+            c.execute(
+                """
+                INSERT INTO legacy_evidence_attestations (
+                    user_id, job_description_id, evidence_type, evidence_reference_id,
+                    source_snapshot_hash, attested_by
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_ROLLBACK_002', ?, 'system_migration')
+                """,
+                (self.user1_id, jd_id, snap_hash),
+            )
 
         with self.assertRaises((sqlite3.OperationalError, sqlite3.IntegrityError)) as ctx:
             with self.db.immediate_transaction() as conn:
@@ -563,6 +590,15 @@ class TestPhase9124MigrationAndAttachmentClosure(unittest.TestCase):
                 (self.user1_id, raw_text, c_hash, snap_hash),
             )
             jd_id = c.lastrowid
+            c.execute(
+                """
+                INSERT INTO legacy_evidence_attestations (
+                    user_id, job_description_id, evidence_type, evidence_reference_id,
+                    source_snapshot_hash, attested_by
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_2024_05_01_002', ?, 'system_migration')
+                """,
+                (self.user1_id, jd_id, snap_hash),
+            )
 
         # Run migration successfully
         with self.db.immediate_transaction() as conn:

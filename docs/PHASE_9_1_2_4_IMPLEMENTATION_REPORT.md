@@ -5,7 +5,7 @@
 **Target Branch:** `main`  
 **Architecture:** v2.1.1  
 **Verified Baseline Commit:** `af236122cafcf235518966f0386e2153a5dfe8b1`  
-**Verified Final Commit:** `71e8a85b323c5cf0dbc5667a8cccd8ff1c90c52a`  
+**Verified Final Commit:** `76cc3677c71242056aa2c3d0fe289e54896fddd8`  
 **Date:** November 06, 2026  
 **Status:** Completed & Fully Verified  
 
@@ -68,6 +68,11 @@ Phase 9.1.2.4 completes the security-hardening objectives identified during the 
 ### 2.5 Silent Database Error Suppression
 - **Defect:** Legacy database upgrade routines in `db_manager.py` frequently caught `sqlite3.OperationalError` with `pass`, potentially swallowing fatal schema errors, missing columns, or transaction aborts.
 - **Remediation:** Removed silent exception suppression from `_migrate_historical_job_description_integrity()`. All database operations run within transactional blocks, ensuring any operational or integrity failure triggers an immediate rollback and propagates to the caller.
+
+### 2.6 Legacy Migration Evidence Limitations (Phase 9.1.2.5 Audit Finding)
+- **Defect:** While Phase 9.1.2.4 introduced the `schema_migrations` ledger to ensure one-time execution and prevent post-migration timestamp spoofing, subsequent security audit identified that the underlying migration candidate selection criteria (non-empty `created_at`, matching 9-field canonical snapshot hash, and NULL binary metadata) do not constitute independent historical proof.
+- **Analysis:** In architecture v2.1.1, the public `save_job_description_snapshot()` method computes the exact same 9-key canonical manifest schema for all job descriptions, meaning snapshot hash structure alone cannot prove whether a record was created prior to Phase 9.1.1. Furthermore, SQLite `created_at` timestamps are mutable strings without cryptographic attestation. Therefore, manifest structure and timestamps alone cannot establish historical provenance.
+- **Remediation Path (Phase 9.1.2.5):** True historical provenance requires independent, verifiable external evidence (such as an immutable historical import manifest or explicit administrator archival attestation). In the absence of such independent evidence, uploaded records with missing binary metadata must fail closed (`REQUIRED`) rather than being grandfathered into `LEGACY_TEXT_ONLY`.
 
 ---
 

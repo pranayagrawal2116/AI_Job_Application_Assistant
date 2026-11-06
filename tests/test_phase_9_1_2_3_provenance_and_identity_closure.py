@@ -208,6 +208,15 @@ class TestPhase9123ProvenanceAndIdentityClosure(unittest.TestCase):
                 (self.user1_id, raw_text, content_hash, snapshot_hash),
             )
             jd_id = c.lastrowid
+            c.execute(
+                """
+                INSERT INTO legacy_evidence_attestations (
+                    user_id, job_description_id, evidence_type, evidence_reference_id,
+                    source_snapshot_hash, attested_by
+                ) VALUES (?, ?, 'historical_import_manifest', 'MANIFEST_2025_06_01_001', ?, 'system_migration')
+                """,
+                (self.user1_id, jd_id, snapshot_hash),
+            )
 
         # Run database migration routine
         with self.db.immediate_transaction() as conn:

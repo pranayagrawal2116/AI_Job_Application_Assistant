@@ -163,6 +163,12 @@ class SecurityPreflightManager:
                         f"JobDescription #{jd_id} snapshot hash '{jd.snapshot_hash}' does not match grandfathered snapshot hash '{legacy_exc.source_snapshot_hash}'."
                     )
 
+                # Phase 9.1.2.5 Part C: Verify independent evidence provenance
+                if not getattr(legacy_exc, "evidence_type", None) or not getattr(legacy_exc, "evidence_reference_id", None):
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} legacy integrity exception lacks required independent evidence proof (evidence_type / evidence_reference_id missing)."
+                    )
+
                 has_binary_meta = False
                 logger.info("JobDescription #%d verified as auditable LEGACY_TEXT_ONLY record; proceeding with text scanning.", jd_id)
 
