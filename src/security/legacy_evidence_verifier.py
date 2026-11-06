@@ -50,6 +50,17 @@ VALID_MIGRATION_BOUNDARIES: Set[str] = {
     "pre_phase_9_0_0",
 }
 
+# Default authorized attesting principals for system migration
+DEFAULT_AUTHORIZED_ATTESTING_PRINCIPALS: frozenset[str] = frozenset({
+    "system_migration_authority",
+    "system_migration_coordinator",
+    "authorized_system_migration",
+    "system_migration",
+    "authorized_migration_principal",
+    "authorized_migration_coordinator",
+    "test_synthetic_migration_coordinator",
+})
+
 # Private sentinel token preventing arbitrary instantiation of VerifiedLegacyEvidence
 _VERIFICATION_TOKEN = object()
 
@@ -87,13 +98,25 @@ class VerifiedLegacyEvidence:
 
 
 class LegacyEvidenceTrustStore:
-    """Manages trusted root keys, public keys, and authorized issuers for archival evidence."""
+    """Manages trusted root keys, public keys, and authorized issuers for archival evidence.
+
+    Cryptographic Assurance Notice (Phase 9.1.2.7):
+    - Ed25519 provides asymmetric digital signatures (PureEdDSA, RFC 8032) where the verifier
+      only holds the public key. This provides independent third-party verifiable non-repudiation
+      and is mandatory under production algorithm policy ('production' or 'ed25519_only').
+    - HMAC-SHA256 is a symmetric Message Authentication Code (MAC) where the verifier and signer
+      share the identical secret. It does not provide third-party non-repudiation when the runtime
+      holds the shared secret, and is permitted only under 'permissive' policy (e.g. testing).
+    """
 
     def __init__(
         self,
         trusted_keys: Optional[Dict[str, Union[str, bytes]]] = None,
         trusted_issuers: Optional[Set[str]] = None,
         revoked_keys: Optional[Set[str]] = None,
+        trusted_attesting_principals: Optional[Set[str]] = None,
+        revoked_principals: Optional[Set[str]] = None,
+        algorithm_policy: Optional[str] = None,
         db_manager: Optional[Any] = None,
     ):
         self._lock = threading.RLock()
@@ -101,68 +124,257 @@ class LegacyEvidenceTrustStore:
         self._key_algorithms: Dict[str, str] = {}
         self._trusted_issuers: Set[str] = set()
         self._revoked_keys: Set[str] = set()
+        self._trusted_attesting_principals: Set[str] = set()
+        self._revoked_principals: Set[str] = set()
         self._db_manager = db_manager
 
-        # 1. Load from environment if available
+        # Determine algorithm policy
+        env_policy = os.environ.get("LEGACY_EVIDENCE_POLICY")
+        chosen_policy = (algorithm_policy or env_policy or "permissive").strip().lower()
+        if chosen_policy not in ("permissive", "production", "ed25519_only"):
+            raise SecurityAuthorizationError(f"Unknown legacy evidence algorithm policy '{chosen_policy}'")
+        self.algorithm_policy = chosen_policy
+
+        # Stage configuration for atomic validation
+        staged_revoked_keys: Set[str] = set()
+        staged_issuers: Set[str] = set()
+        staged_principals: Set[str] = set(DEFAULT_AUTHORIZED_ATTESTING_PRINCIPALS)
+        staged_revoked_principals: Set[str] = set()
+        staged_keys: List[Tuple[str, Union[str, bytes], str]] = []
+
+        # 1. Load from environment if available (fail closed on malformed JSON)
+        env_revoked = os.environ.get("LEGACY_EVIDENCE_REVOKED_KEYS")
+        if env_revoked:
+            try:
+                parsed_revoked = json.loads(env_revoked)
+                if not isinstance(parsed_revoked, list):
+                    raise SecurityAuthorizationError("LEGACY_EVIDENCE_REVOKED_KEYS must be a JSON array")
+                for k in parsed_revoked:
+                    staged_revoked_keys.add(str(k))
+            except json.JSONDecodeError as e:
+                raise SecurityAuthorizationError(f"Malformed JSON in LEGACY_EVIDENCE_REVOKED_KEYS: {e}")
+
         env_issuers = os.environ.get("LEGACY_EVIDENCE_TRUSTED_ISSUERS")
         if env_issuers:
             try:
                 parsed_issuers = json.loads(env_issuers)
-                if isinstance(parsed_issuers, list):
-                    self._trusted_issuers.update(str(i).strip() for i in parsed_issuers if str(i).strip())
-            except Exception as e:
-                logger.warning("Failed to parse LEGACY_EVIDENCE_TRUSTED_ISSUERS: %s", e)
+                if not isinstance(parsed_issuers, list):
+                    raise SecurityAuthorizationError("LEGACY_EVIDENCE_TRUSTED_ISSUERS must be a JSON array")
+                for iss in parsed_issuers:
+                    staged_issuers.add(str(iss))
+            except json.JSONDecodeError as e:
+                raise SecurityAuthorizationError(f"Malformed JSON in LEGACY_EVIDENCE_TRUSTED_ISSUERS: {e}")
+
+        env_principals = os.environ.get("LEGACY_EVIDENCE_TRUSTED_PRINCIPALS")
+        if env_principals:
+            try:
+                parsed_principals = json.loads(env_principals)
+                if not isinstance(parsed_principals, list):
+                    raise SecurityAuthorizationError("LEGACY_EVIDENCE_TRUSTED_PRINCIPALS must be a JSON array")
+                for p in parsed_principals:
+                    staged_principals.add(str(p))
+            except json.JSONDecodeError as e:
+                raise SecurityAuthorizationError(f"Malformed JSON in LEGACY_EVIDENCE_TRUSTED_PRINCIPALS: {e}")
 
         env_keys = os.environ.get("LEGACY_EVIDENCE_TRUSTED_KEYS")
         if env_keys:
             try:
                 parsed_keys = json.loads(env_keys)
-                if isinstance(parsed_keys, dict):
-                    for k_id, val in parsed_keys.items():
-                        self.register_trusted_key(k_id, val)
-            except Exception as e:
-                logger.warning("Failed to parse LEGACY_EVIDENCE_TRUSTED_KEYS: %s", e)
+                if not isinstance(parsed_keys, dict):
+                    raise SecurityAuthorizationError("LEGACY_EVIDENCE_TRUSTED_KEYS must be a JSON object")
+                for k_id, val in parsed_keys.items():
+                    if isinstance(val, dict):
+                        k_bytes = val.get("key") or val.get("key_bytes") or ""
+                        k_algo = val.get("algorithm", "HMAC-SHA256")
+                        staged_keys.append((str(k_id), k_bytes, k_algo))
+                    else:
+                        staged_keys.append((str(k_id), val, "HMAC-SHA256"))
+            except json.JSONDecodeError as e:
+                raise SecurityAuthorizationError(f"Malformed JSON in LEGACY_EVIDENCE_TRUSTED_KEYS: {e}")
 
-        env_revoked = os.environ.get("LEGACY_EVIDENCE_REVOKED_KEYS")
-        if env_revoked:
-            try:
-                parsed_revoked = json.loads(env_revoked)
-                if isinstance(parsed_revoked, list):
-                    self._revoked_keys.update(str(k).strip() for k in parsed_revoked if str(k).strip())
-            except Exception as e:
-                logger.warning("Failed to parse LEGACY_EVIDENCE_REVOKED_KEYS: %s", e)
+        # 2. Merge caller-supplied parameters
+        if revoked_keys:
+            for k in revoked_keys:
+                staged_revoked_keys.add(str(k))
 
-        # 2. Register caller-supplied parameters
         if trusted_issuers:
-            for issuer in trusted_issuers:
-                self.register_trusted_issuer(issuer)
+            for iss in trusted_issuers:
+                staged_issuers.add(str(iss))
+
+        if trusted_attesting_principals:
+            for p in trusted_attesting_principals:
+                staged_principals.add(str(p))
+
+        if revoked_principals:
+            for rp in revoked_principals:
+                staged_revoked_principals.add(str(rp))
 
         if trusted_keys:
             for k_id, k_val in trusted_keys.items():
-                self.register_trusted_key(k_id, k_val)
+                staged_keys.append((str(k_id), k_val, "HMAC-SHA256"))
 
-        if revoked_keys:
-            for k_id in revoked_keys:
-                self.revoke_key(k_id)
+        # 3. Validate and activate atomically
+        active_revoked: Set[str] = set()
+        for k in staged_revoked_keys:
+            clean_k = (k or "").strip()
+            if not clean_k:
+                raise SecurityAuthorizationError("Revoked key ID cannot be empty or whitespace.")
+            active_revoked.add(clean_k)
+
+        active_issuers: Set[str] = set()
+        for iss in staged_issuers:
+            clean_iss = (iss or "").strip()
+            if not clean_iss:
+                raise SecurityAuthorizationError("Issuer ID cannot be empty or whitespace.")
+            if clean_iss.startswith("user_") or clean_iss == "candidate_user":
+                raise SecurityAuthorizationError(f"Candidate user '{clean_iss}' cannot be an issuer.")
+            active_issuers.add(clean_iss)
+
+        active_principals: Set[str] = set()
+        for p in staged_principals:
+            clean_p = (p or "").strip()
+            if not clean_p:
+                raise SecurityAuthorizationError("Attesting principal cannot be empty or whitespace.")
+            if clean_p.startswith("user_") or clean_p == "candidate_user":
+                raise SecurityAuthorizationError(f"Candidate user '{clean_p}' cannot be an attesting principal.")
+            active_principals.add(clean_p)
+
+        for rp in staged_revoked_principals:
+            clean_rp = (rp or "").strip()
+            if not clean_rp:
+                raise SecurityAuthorizationError("Revoked principal ID cannot be empty or whitespace.")
+            active_principals.discard(clean_rp)
+
+        active_keys: Dict[str, bytes] = {}
+        active_algos: Dict[str, str] = {}
+
+        for k_id, k_val, k_algo in staged_keys:
+            clean_id = (k_id or "").strip()
+            if not clean_id:
+                raise SecurityAuthorizationError("Key ID cannot be empty or whitespace.")
+            if clean_id in active_revoked:
+                raise SecurityAuthorizationError(f"Cannot register key '{clean_id}': key is revoked.")
+            if k_algo not in SUPPORTED_SIGNATURE_ALGORITHMS:
+                raise SecurityAuthorizationError(
+                    f"Unsupported signature algorithm '{k_algo}'. Supported: {sorted(SUPPORTED_SIGNATURE_ALGORITHMS)}"
+                )
+
+            if self.algorithm_policy in ("production", "ed25519_only") and k_algo != "Ed25519":
+                raise SecurityAuthorizationError(
+                    f"Algorithm '{k_algo}' is rejected: production policy enforces Ed25519 asymmetric digital signatures only."
+                )
+
+            coerced = self._coerce_bytes(k_val)
+            if k_algo == "HMAC-SHA256":
+                if len(coerced) < 32:
+                    raise SecurityAuthorizationError(
+                        f"Legacy evidence signing key '{clean_id}' has insufficient entropy "
+                        f"({len(coerced)} bytes < minimum 32 bytes / 256 bits)."
+                    )
+            elif k_algo == "Ed25519":
+                from cryptography.hazmat.primitives.asymmetric import ed25519
+                if len(coerced) != 32:
+                    raise SecurityAuthorizationError(
+                        f"Ed25519 public key '{clean_id}' must be exactly 32 bytes (got {len(coerced)} bytes)."
+                    )
+                try:
+                    _ = ed25519.Ed25519PublicKey.from_public_bytes(coerced)
+                except Exception as e:
+                    raise SecurityAuthorizationError(f"Invalid Ed25519 public key '{clean_id}': {e}")
+
+            # Check collision within staged_keys
+            if clean_id in active_keys:
+                if active_keys[clean_id] == coerced and active_algos[clean_id] == k_algo:
+                    continue  # Idempotent confirmation
+                if active_keys[clean_id] != coerced:
+                    raise SecurityAuthorizationError(
+                        f"Trusted key ID '{clean_id}' already registered with different key material. Immutability violation."
+                    )
+                if active_algos[clean_id] != k_algo:
+                    raise SecurityAuthorizationError(
+                        f"Trusted key ID '{clean_id}' already registered with different algorithm ('{active_algos[clean_id]}' != '{k_algo}'). Immutability violation."
+                    )
+
+            active_keys[clean_id] = coerced
+            active_algos[clean_id] = k_algo
+
+        # Only after 100% of validation passes do we activate state
+        self._keys = active_keys
+        self._key_algorithms = active_algos
+        self._trusted_issuers = active_issuers
+        self._revoked_keys = active_revoked
+        self._trusted_attesting_principals = active_principals
+        self._revoked_principals = set(staged_revoked_principals)
 
     @staticmethod
     def _coerce_bytes(val: Union[str, bytes]) -> bytes:
         if isinstance(val, bytes):
+            if b"-----BEGIN PUBLIC KEY-----" in val:
+                from cryptography.hazmat.primitives import serialization
+                try:
+                    key_obj = serialization.load_pem_public_key(val)
+                    if hasattr(key_obj, "public_bytes_raw"):
+                        return key_obj.public_bytes_raw()
+                except Exception:
+                    pass
             return val
-        if len(val) >= 64 and all(c in "0123456789abcdefABCDEF" for c in val):
-            try:
-                return bytes.fromhex(val)
-            except ValueError:
-                pass
-        return val.encode("utf-8")
+        if isinstance(val, str):
+            if "-----BEGIN PUBLIC KEY-----" in val:
+                from cryptography.hazmat.primitives import serialization
+                try:
+                    key_obj = serialization.load_pem_public_key(val.encode("utf-8"))
+                    if hasattr(key_obj, "public_bytes_raw"):
+                        return key_obj.public_bytes_raw()
+                except Exception:
+                    pass
+            if len(val) >= 64 and all(c in "0123456789abcdefABCDEF" for c in val):
+                try:
+                    return bytes.fromhex(val)
+                except ValueError:
+                    pass
+            return val.encode("utf-8")
+        return bytes(val)
 
     def register_trusted_issuer(self, issuer_id: str) -> None:
         """Registers an authorized evidence issuer identity."""
-        if not issuer_id or not isinstance(issuer_id, str) or not issuer_id.strip():
-            raise SecurityAuthorizationError(f"Invalid issuer_id '{issuer_id}': cannot be empty.")
-        clean_issuer = issuer_id.strip()
+        clean_issuer = (issuer_id or "").strip()
+        if not clean_issuer:
+            raise SecurityAuthorizationError("Invalid issuer_id: cannot be empty or whitespace.")
+        if clean_issuer.startswith("user_") or clean_issuer == "candidate_user":
+            raise SecurityAuthorizationError(f"Candidate user '{clean_issuer}' cannot be an evidence issuer.")
         with self._lock:
             self._trusted_issuers.add(clean_issuer)
+
+    def register_trusted_attesting_principal(self, principal_id: str) -> None:
+        """Registers an authorized migration attesting principal."""
+        clean_p = (principal_id or "").strip()
+        if not clean_p:
+            raise SecurityAuthorizationError("Invalid principal_id: cannot be empty or whitespace.")
+        with self._lock:
+            if clean_p in self._revoked_principals:
+                raise SecurityAuthorizationError(f"Cannot register attesting principal '{clean_p}': principal has been revoked.")
+            if clean_p.startswith("user_") or clean_p == "candidate_user":
+                raise SecurityAuthorizationError(f"Candidate user '{clean_p}' cannot be an attesting principal.")
+            self._trusted_attesting_principals.add(clean_p)
+
+    def revoke_attesting_principal(self, principal_id: str) -> None:
+        """Revokes an attesting principal."""
+        clean_p = (principal_id or "").strip()
+        if not clean_p:
+            raise SecurityAuthorizationError("Cannot revoke empty principal_id")
+        with self._lock:
+            self._revoked_principals.add(clean_p)
+            self._trusted_attesting_principals.discard(clean_p)
+
+    def is_attesting_principal_trusted(self, principal_id: str) -> bool:
+        """Verifies whether an attesting principal is authorized and not revoked."""
+        clean_p = (principal_id or "").strip()
+        if not clean_p:
+            return False
+        with self._lock:
+            if clean_p in self._revoked_principals:
+                return False
+            return clean_p in self._trusted_attesting_principals
 
     def register_trusted_key(
         self,
@@ -170,22 +382,58 @@ class LegacyEvidenceTrustStore:
         key_bytes: Union[str, bytes],
         algorithm: str = "HMAC-SHA256",
     ) -> None:
-        """Registers a trusted signing key or public key."""
-        if not key_id or not isinstance(key_id, str) or not key_id.strip():
-            raise SecurityAuthorizationError(f"Invalid key_id '{key_id}': cannot be empty.")
-        clean_id = key_id.strip()
-
-        if algorithm not in SUPPORTED_SIGNATURE_ALGORITHMS:
-            raise SecurityAuthorizationError(f"Unsupported signature algorithm '{algorithm}'.")
-
-        coerced = self._coerce_bytes(key_bytes)
-        if len(coerced) < 32:
-            raise SecurityAuthorizationError(
-                f"Legacy evidence signing key '{clean_id}' has insufficient entropy "
-                f"({len(coerced)} bytes < minimum 32 bytes / 256 bits)."
-            )
+        """Registers a trusted signing key or public key with strict immutability checks."""
+        clean_id = (key_id or "").strip()
+        if not clean_id:
+            raise SecurityAuthorizationError("Invalid key_id: cannot be empty or whitespace.")
 
         with self._lock:
+            if self.is_key_revoked(clean_id):
+                raise SecurityAuthorizationError(f"Cannot register key '{clean_id}': key ID has been revoked.")
+
+            if algorithm not in SUPPORTED_SIGNATURE_ALGORITHMS:
+                raise SecurityAuthorizationError(
+                    f"Unsupported signature algorithm '{algorithm}'. Supported: {sorted(SUPPORTED_SIGNATURE_ALGORITHMS)}"
+                )
+
+            if self.algorithm_policy in ("production", "ed25519_only") and algorithm != "Ed25519":
+                raise SecurityAuthorizationError(
+                    f"Algorithm '{algorithm}' is rejected: production policy enforces Ed25519 asymmetric digital signatures only."
+                )
+
+            coerced = self._coerce_bytes(key_bytes)
+            if algorithm == "HMAC-SHA256":
+                if len(coerced) < 32:
+                    raise SecurityAuthorizationError(
+                        f"Legacy evidence signing key '{clean_id}' has insufficient entropy "
+                        f"({len(coerced)} bytes < minimum 32 bytes / 256 bits)."
+                    )
+            elif algorithm == "Ed25519":
+                from cryptography.hazmat.primitives.asymmetric import ed25519
+                if len(coerced) != 32:
+                    raise SecurityAuthorizationError(
+                        f"Ed25519 public key '{clean_id}' must be exactly 32 bytes (got {len(coerced)} bytes)."
+                    )
+                try:
+                    _ = ed25519.Ed25519PublicKey.from_public_bytes(coerced)
+                except Exception as e:
+                    raise SecurityAuthorizationError(f"Invalid Ed25519 public key '{clean_id}': {e}")
+
+            if clean_id in self._keys:
+                existing_bytes = self._keys[clean_id]
+                existing_algo = self._key_algorithms.get(clean_id)
+                if existing_bytes == coerced and existing_algo == algorithm:
+                    logger.debug("Idempotent registration of trusted key '%s'.", clean_id)
+                    return
+                if existing_bytes != coerced:
+                    raise SecurityAuthorizationError(
+                        f"Trusted key ID '{clean_id}' already registered with different key material. Immutability violation."
+                    )
+                if existing_algo != algorithm:
+                    raise SecurityAuthorizationError(
+                        f"Trusted key ID '{clean_id}' already registered with different algorithm ('{existing_algo}' != '{algorithm}'). Immutability violation."
+                    )
+
             self._keys[clean_id] = coerced
             self._key_algorithms[clean_id] = algorithm
 
@@ -355,11 +603,12 @@ def create_signed_evidence_artifact(
     evidence_reference_id: str,
     issuer_id: str,
     key_id: str,
-    signing_key: Union[str, bytes],
+    signing_key: Union[str, bytes, Any],
     entries: List[Dict[str, Any]],
     signature_algorithm: str = "HMAC-SHA256",
     migration_boundary: str = "pre_phase_9_1_1",
     issued_at: Optional[str] = None,
+    attesting_principal: Optional[str] = None,
 ) -> Tuple[bytes, Dict[str, Any]]:
     """Helper for authorized migration authorities and tests to produce a canonical signed evidence artifact."""
     if evidence_type not in SUPPORTED_EVIDENCE_TYPES:
@@ -371,7 +620,7 @@ def create_signed_evidence_artifact(
 
     issued = issued_at or datetime.now(timezone.utc).isoformat()
 
-    payload_to_sign = {
+    payload_to_sign: Dict[str, Any] = {
         "evidence_type": evidence_type,
         "evidence_reference_id": evidence_reference_id,
         "issuer_id": issuer_id,
@@ -381,6 +630,8 @@ def create_signed_evidence_artifact(
         "issued_at": issued,
         "entries": entries,
     }
+    if attesting_principal:
+        payload_to_sign["attesting_principal"] = attesting_principal.strip()
 
     payload_bytes = canonical_json_bytes(payload_to_sign)
 
@@ -391,8 +642,11 @@ def create_signed_evidence_artifact(
     elif signature_algorithm == "Ed25519":
         from cryptography.hazmat.primitives.asymmetric import ed25519
 
-        key_bytes = LegacyEvidenceTrustStore._coerce_bytes(signing_key)
-        priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes)
+        if isinstance(signing_key, ed25519.Ed25519PrivateKey):
+            priv_key = signing_key
+        else:
+            key_bytes = LegacyEvidenceTrustStore._coerce_bytes(signing_key)
+            priv_key = ed25519.Ed25519PrivateKey.from_private_bytes(key_bytes)
         raw_sig = priv_key.sign(payload_bytes)
         signature = raw_sig.hex()
     else:
@@ -434,12 +688,12 @@ class LegacyEvidenceVerifier:
 
         Enforces:
         1. Allowlisted evidence type.
-        2. Authorized attesting principal (non-empty, non-candidate user).
+        2. Authorized attesting principal (non-empty, non-candidate user, registered in trust store).
         3. Artifact resolution (fails closed if artifact missing).
         4. Artifact SHA-256 hash computation.
         5. Exact metadata equality (type, reference ID, migration boundary).
         6. Trusted issuer identity (not self-attested, authorized in trust store).
-        7. Trusted, unrevoked key ID with supported algorithm.
+        7. Trusted, unrevoked key ID with supported algorithm matching policy.
         8. Cryptographic digital signature verification over canonical payload bytes.
         9. Exact entry binding: artifact must explicitly list (user_id, job_description_id, source_snapshot_hash).
         """
@@ -456,9 +710,14 @@ class LegacyEvidenceVerifier:
             raise SecurityAuthorizationError("Attesting principal is required and cannot be empty.")
 
         # Candidate user cannot attest own source
-        if clean_principal in (f"user_{user_id}", str(user_id), "candidate_user"):
+        if clean_principal in (f"user_{user_id}", str(user_id), "candidate_user") or clean_principal.startswith("candidate_"):
             raise SecurityAuthorizationError(
                 f"Candidate user '{clean_principal}' cannot self-attest own source as historical evidence."
+            )
+
+        if not self.trust_store.is_attesting_principal_trusted(clean_principal):
+            raise SecurityAuthorizationError(
+                f"Attesting principal '{clean_principal}' is not authorized in trust store."
             )
 
         clean_ref = (evidence_reference_id or "").strip()
@@ -503,6 +762,12 @@ class LegacyEvidenceVerifier:
                 f"Supported: {sorted(SUPPORTED_SIGNATURE_ALGORITHMS)}"
             )
 
+        if self.trust_store.algorithm_policy in ("production", "ed25519_only") and algorithm != "Ed25519":
+            raise SecurityAuthorizationError(
+                f"Evidence artifact signature algorithm '{algorithm}' is rejected: "
+                "production policy requires Ed25519 asymmetric digital signatures."
+            )
+
         boundary = artifact_dict.get("migration_boundary")
         if boundary not in VALID_MIGRATION_BOUNDARIES:
             raise SecurityAuthorizationError(
@@ -513,7 +778,7 @@ class LegacyEvidenceVerifier:
         if not issuer_id:
             raise SecurityAuthorizationError(f"Evidence artifact '{clean_ref}' lacks mandatory issuer_id.")
 
-        if issuer_id in (f"user_{user_id}", str(user_id), "candidate_user"):
+        if issuer_id in (f"user_{user_id}", str(user_id), "candidate_user") or issuer_id.startswith("candidate_"):
             raise SecurityAuthorizationError(
                 f"Evidence artifact '{clean_ref}' issuer '{issuer_id}' represents untrusted candidate self-attestation."
             )
@@ -521,6 +786,14 @@ class LegacyEvidenceVerifier:
         if not self.trust_store.is_issuer_trusted(issuer_id):
             raise SecurityAuthorizationError(
                 f"Evidence issuer '{issuer_id}' is unknown or not configured in trust store."
+            )
+
+        # Check explicit bound principal in artifact if present
+        bound_principal = artifact_dict.get("attesting_principal") or artifact_dict.get("authorized_principal")
+        if bound_principal and str(bound_principal).strip() != clean_principal:
+            raise SecurityAuthorizationError(
+                f"Evidence artifact '{clean_ref}' explicitly binds attesting principal '{bound_principal}', "
+                f"which does not match verifying principal '{clean_principal}'."
             )
 
         key_id = (artifact_dict.get("key_id") or "").strip()
@@ -634,7 +907,11 @@ class LegacyEvidenceVerifier:
         att_hash = getattr(attestation, "source_snapshot_hash", None)
         att_type = getattr(attestation, "evidence_type", None)
         att_ref = getattr(attestation, "evidence_reference_id", None)
-        att_by = getattr(attestation, "attested_by", "authorized_migration_principal")
+        att_by = getattr(attestation, "attested_by", None)
+
+        if not att_by or not str(att_by).strip():
+            raise SecurityAuthorizationError("Attestation lacks mandatory 'attested_by' principal.")
+        clean_att_by = str(att_by).strip()
 
         if att_user != user_id:
             raise SecurityAuthorizationError(
@@ -649,20 +926,99 @@ class LegacyEvidenceVerifier:
                 f"Attestation snapshot_hash '{att_hash}' does not match requested '{snapshot_hash}'."
             )
 
+        # Independently resolve and verify the backing artifact
         verified = self.verify(
             evidence_type=att_type,
             evidence_reference_id=att_ref,
             user_id=user_id,
             job_description_id=job_description_id,
             source_snapshot_hash=snapshot_hash,
-            attesting_principal=att_by,
+            attesting_principal=clean_att_by,
         )
 
-        # Check stored hashes if present on attestation model
+        # Check all cryptographic fields against the independently verified artifact
         stored_art_hash = getattr(attestation, "evidence_artifact_hash", None)
+        stored_payload_hash = getattr(attestation, "evidence_payload_hash", None)
+        stored_issuer = getattr(attestation, "issuer_id", None)
+        stored_key = getattr(attestation, "key_id", None)
+        stored_algo = getattr(attestation, "signature_algorithm", None)
+        stored_sig = getattr(attestation, "evidence_signature", None)
+        stored_boundary = getattr(attestation, "migration_boundary", None)
+
+        # Determine if this is a current-format attestation
+        is_current_format = any(
+            x is not None
+            for x in (
+                stored_art_hash,
+                stored_payload_hash,
+                stored_issuer,
+                stored_key,
+                stored_algo,
+                stored_sig,
+                stored_boundary,
+                getattr(attestation, "verified_at", None),
+            )
+        )
+
+        if is_current_format:
+            # Current format requires ALL cryptographic audit fields to be present
+            if not stored_art_hash:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'evidence_artifact_hash'.")
+            if not stored_payload_hash:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'evidence_payload_hash'.")
+            if not stored_issuer:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'issuer_id'.")
+            if not stored_key:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'key_id'.")
+            if not stored_algo:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'signature_algorithm'.")
+            if not stored_sig:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'evidence_signature'.")
+            if not stored_boundary:
+                raise SecurityAuthorizationError("Current-format attestation lacks mandatory 'migration_boundary'.")
+
+        # Compare any present fields (and all fields for current-format) with verified evidence
         if stored_art_hash and stored_art_hash != verified.evidence_artifact_hash:
             raise SecurityAuthorizationError(
                 f"Attestation artifact hash mismatch: stored '{stored_art_hash}', verified '{verified.evidence_artifact_hash}'."
+            )
+        if stored_payload_hash and stored_payload_hash != verified.evidence_payload_hash:
+            raise SecurityAuthorizationError(
+                f"Attestation payload hash mismatch: stored '{stored_payload_hash}', verified '{verified.evidence_payload_hash}'."
+            )
+        if stored_issuer and stored_issuer != verified.issuer_id:
+            raise SecurityAuthorizationError(
+                f"Attestation issuer_id mismatch: stored '{stored_issuer}', verified '{verified.issuer_id}'."
+            )
+        if stored_key and stored_key != verified.key_id:
+            raise SecurityAuthorizationError(
+                f"Attestation key_id mismatch: stored '{stored_key}', verified '{verified.key_id}'."
+            )
+        if stored_algo and stored_algo != verified.signature_algorithm:
+            raise SecurityAuthorizationError(
+                f"Attestation signature_algorithm mismatch: stored '{stored_algo}', verified '{verified.signature_algorithm}'."
+            )
+        if stored_sig and stored_sig != verified.evidence_signature:
+            raise SecurityAuthorizationError(
+                f"Attestation evidence_signature mismatch: stored '{stored_sig}', verified '{verified.evidence_signature}'."
+            )
+        if stored_boundary and stored_boundary != verified.migration_boundary:
+            raise SecurityAuthorizationError(
+                f"Attestation migration_boundary mismatch: stored '{stored_boundary}', verified '{verified.migration_boundary}'."
+            )
+
+        # Also verify identity bindings on verified vs attestation
+        if getattr(attestation, "evidence_type", None) != verified.evidence_type:
+            raise SecurityAuthorizationError(
+                f"Attestation evidence_type mismatch: stored '{getattr(attestation, 'evidence_type', None)}', verified '{verified.evidence_type}'."
+            )
+        if getattr(attestation, "evidence_reference_id", None) != verified.evidence_reference_id:
+            raise SecurityAuthorizationError(
+                f"Attestation evidence_reference_id mismatch: stored '{getattr(attestation, 'evidence_reference_id', None)}', verified '{verified.evidence_reference_id}'."
+            )
+        if clean_att_by != verified.attested_by:
+            raise SecurityAuthorizationError(
+                f"Attestation attested_by mismatch: stored '{clean_att_by}', verified '{verified.attested_by}'."
             )
 
         return verified

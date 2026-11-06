@@ -28,6 +28,10 @@ from src.utils.logger import setup_logger
 logger = setup_logger("SecurityPreflightManager")
 
 
+# Authoritative legacy exception states accepted by security preflight (Phase 9.1.2.7 Part A)
+ACCEPTED_LEGACY_AUDIT_OUTCOMES: frozenset[str] = frozenset({"SUCCESS", "RECONCILED"})
+
+
 @dataclass(frozen=True)
 class PreflightCheckResult:
     """Result of security preflight evaluation."""
@@ -155,13 +159,41 @@ class SecurityPreflightManager:
                     )
 
                 legacy_exc = self.db.get_legacy_integrity_exception(job_description_id=jd_id, user_id=user_id)
-                if not legacy_exc or legacy_exc.outcome != "SUCCESS":
+                if not legacy_exc:
                     raise SecurityAuthorizationError(
                         f"JobDescription #{jd_id} has LEGACY_TEXT_ONLY state without an authoritative legacy integrity exception migration audit record."
                     )
 
+                # Authoritative legacy exception outcome check (Phase 9.1.2.7 Part A)
+                if legacy_exc.outcome == "REVERTED":
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} legacy integrity exception was REVERTED during reconciliation audit and cannot be accepted as LEGACY_TEXT_ONLY."
+                    )
+
+                if legacy_exc.outcome not in ACCEPTED_LEGACY_AUDIT_OUTCOMES:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} has unapproved legacy integrity exception outcome '{legacy_exc.outcome}'. "
+                        f"Accepted outcomes: {sorted(ACCEPTED_LEGACY_AUDIT_OUTCOMES)}."
+                    )
+
+                if legacy_exc.assigned_legacy_state != "LEGACY_TEXT_ONLY":
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} legacy integrity exception assigned state '{legacy_exc.assigned_legacy_state}' "
+                        "is inconsistent with expected 'LEGACY_TEXT_ONLY'."
+                    )
+
+                if legacy_exc.user_id != user_id:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} legacy integrity exception user_id {legacy_exc.user_id} does not match requested user_id {user_id}."
+                    )
+
+                if legacy_exc.job_description_id != jd_id:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} legacy integrity exception job_description_id {legacy_exc.job_description_id} does not match requested {jd_id}."
+                    )
+
                 # Verify snapshot hash binding
-                if legacy_exc.source_snapshot_hash and jd.snapshot_hash and legacy_exc.source_snapshot_hash != jd.snapshot_hash:
+                if not legacy_exc.source_snapshot_hash or (jd.snapshot_hash and legacy_exc.source_snapshot_hash != jd.snapshot_hash):
                     raise SecurityAuthorizationError(
                         f"JobDescription #{jd_id} snapshot hash '{jd.snapshot_hash}' does not match grandfathered snapshot hash '{legacy_exc.source_snapshot_hash}'."
                     )

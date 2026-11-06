@@ -812,6 +812,40 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,596 tests passing across 109 test suites (100% pass rate).
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_6_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.7: Reconciled Attestation Acceptance & Trust-Key Immutability Closure** (Complete)
+  - Reconciled Legacy Preflight Outcome Contract (Part A):
+    - Resolved preflight bug where `check_job_description_security()` rejected reconciled records (`outcome='RECONCILED'`).
+    - Formally established `ACCEPTED_LEGACY_AUDIT_OUTCOMES = frozenset({"SUCCESS", "RECONCILED"})`.
+    - Enforced latest-event semantics via `DatabaseManager.get_legacy_integrity_exception()`: explicitly rejects `REVERTED` audit records, unapproved outcomes, records without `LEGACY_TEXT_ONLY` state, user ID / job ID mismatches, and snapshot hash discrepancies.
+    - Re-verifies backing cryptographic evidence via `LegacyEvidenceVerifier.verify_attestation()` on preflight execution.
+  - Immutable Trust-Key Identity & Collision Prevention (Part B):
+    - Hardened `LegacyEvidenceTrustStore.register_trusted_key()` to enforce key identity immutability.
+    - Idempotent re-registration: exact same key bytes and algorithm succeed without error.
+    - Prohibited key overwrites: registering an existing key ID with different secret material or a different algorithm fails closed with `SecurityAuthorizationError`.
+    - Revocation permanence: revoked key IDs cannot be re-registered under any circumstances.
+    - Atomic configuration: `LegacyEvidenceTrustStore.__init__` stages all caller and environment entries into temporary structures, failing closed atomically on any invalid key, weak secret (<32 bytes for HMAC), duplicate ID, or malformed JSON without activating partial state.
+  - Authenticated Attesting Principal Authorization (Part C):
+    - Explicitly separated evidence issuer ID, authenticated attesting principal, and candidate user ID.
+    - Implemented principal management in `LegacyEvidenceTrustStore` (`register_trusted_attesting_principal`, `revoke_attesting_principal`, `is_attesting_principal_trusted`).
+    - Enforced authorized attesting principals in `LegacyEvidenceVerifier.verify()`, rejecting candidate self-attestation (`attested_by == str(user_id)`), unknown migration identities, revoked principals, and mismatched artifact bindings.
+    - Eliminated arbitrary fallback principal defaults (`"system_migration"`) from `verify_attestation()`, requiring explicit, non-empty, authenticated attesting principals.
+  - Complete Attestation Field Verification (Part D):
+    - Hardened `LegacyEvidenceVerifier.verify_attestation()` to strictly compare all 13 persisted attestation fields against the independently verified artifact (`user_id`, `job_description_id`, `source_snapshot_hash`, `evidence_type`, `evidence_reference_id`, `attested_by`, `evidence_artifact_hash`, `evidence_payload_hash`, `issuer_id`, `key_id`, `signature_algorithm`, `evidence_signature`, `migration_boundary`).
+    - Detects current-format attestations and enforces that no cryptographic audit fields are None or empty, failing closed immediately on field tampering or omission.
+  - Cryptographic Assurance & Production Algorithm Policy (Part E):
+    - Distinguished symmetric HMAC-SHA256 from asymmetric Ed25519 digital signatures.
+    - Introduced `algorithm_policy` configuration (`"permissive"`, `"production"`, `"ed25519_only"`).
+    - Under `"production"` or `"ed25519_only"`, symmetric HMAC keys and HMAC-signed evidence artifacts are rejected with `SecurityAuthorizationError`, guaranteeing non-repudiation via Ed25519 asymmetric signatures.
+  - Production No-Provider Boundary Invariant (Part F):
+    - Verified invariant: In production deployment without an external signed archival evidence provider, zero legacy exceptions are granted.
+    - Unverified records remain in `REQUIRED` binary integrity state, blocking unverified job descriptions from security-sensitive matching, tailored document generation, and packet preparation.
+    - Controlled recovery remains accessible via `recover_unverified_job_description()`.
+  - Verification & Regressions (Parts G, H, I & J):
+    - Authored 26 comprehensive test cases in `tests/test_phase_9_1_2_7_reconciled_preflight_and_trust_keys.py` (26/26 passing, 100%).
+    - 304/304 Phase 9 tests passing across all 12 test suites.
+    - Full repository regression pass: 1,622 tests passing across 110 test suites (100% pass rate).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_7_IMPLEMENTATION_REPORT.md`.
 
 ---
 
