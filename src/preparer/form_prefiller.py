@@ -3,7 +3,7 @@
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from src.database.models import Job
 from src.utils.logger import setup_logger
@@ -74,23 +74,46 @@ class FormPrefiller:
         resume_version_num: Optional[int] = None,
     ) -> FormFillPlan:
         """Constructs an executable form filling plan without executing forbidden actions."""
-        # Security preflight: Centralized HMAC enforcement and strict external agent gate (Phase 9.1.2.1 Part C)
+        # Security preflight: Centralized HMAC enforcement and strict external agent gate (Phase 9.1.2.1 Part C & Phase 9.1.2.2)
         from src.security.prompt_injection_detector import PromptInjectionDetector, ScanClassification
-        from src.database.exceptions import QuarantinedSourceError
+        from src.database.exceptions import (
+            CrossUserAccessError,
+            QuarantinedSourceError,
+            SecurityAuthorizationError,
+        )
         from src.security.security_preflight import SecurityPreflightManager
+        from src.security.resume_verifier import ResumeIntegrityVerifier
 
         target_action = "external_agent_execution"
 
-        # Resolve user_id
-        uid = (
-            user_id
-            or self.profile.get("user_id")
-            or (job.get("user_id") if isinstance(job, dict) else getattr(job, "user_id", None))
-        )
+        # Resolve authenticated user_id
+        uid = user_id or self.profile.get("user_id")
         job_id = job.get("id") if isinstance(job, dict) else getattr(job, "id", None)
 
         # 1. Authoritative Job Description Security Preflight
-        if self.db and uid and job_id:
+        is_persisted_job = False
+        if isinstance(job, Job):
+            is_persisted_job = True
+        elif hasattr(job, "source_type") or hasattr(job, "snapshot_hash") or hasattr(job, "raw_content"):
+            is_persisted_job = bool(job_id)
+        elif isinstance(job, dict):
+            if job.get("is_persisted") is True or job.get("source_type") in ("upload", "uploaded", "url", "pasted", "PASTE", "URL", "UPLOAD"):
+                is_persisted_job = True
+            elif job.get("id") and (job.get("user_id") or user_id or self.db):
+                is_persisted_job = True
+
+        if is_persisted_job:
+            if not self.db or not uid:
+                raise SecurityAuthorizationError(
+                    "Persisted job description verification requires authenticated user_id and database manager."
+                )
+            job_owner_id = job.get("user_id") if isinstance(job, dict) else getattr(job, "user_id", None)
+            if job_owner_id is not None and job_owner_id != uid:
+                raise CrossUserAccessError(
+                    user_id=uid,
+                    target_user_id=job_owner_id,
+                    resource=f"job_description #{job_id}",
+                )
             preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
             preflight.check_job_description_security(
                 user_id=uid,
@@ -147,24 +170,51 @@ class FormPrefiller:
                             risk_score=ans_scan.risk_score,
                         )
 
-        # 4. Authoritative Resume Security Preflight
-        if self.db and uid and resume_id:
+        # 4. Authoritative Resume Security Preflight & Attachment Validation (Phase 9.1.2.2 Part A)
+        resume_ready = False
+        verified_attachment_path: Optional[str] = None
+
+        if resume_id is not None:
+            if not self.db or not uid:
+                raise SecurityAuthorizationError(
+                    "Resume attachment verification requires authenticated user_id and database manager."
+                )
+            verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
+            v_res = verifier.verify_and_load_resume(
+                user_id=uid,
+                resume_id=resume_id,
+                version_num=resume_version_num,
+                fresh_parse=False,
+            )
             preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
             preflight.check_resume_security(
                 user_id=uid,
                 resume_id=resume_id,
                 version_num=resume_version_num,
+                verified_resume=v_res,
                 target_action=target_action,
+            )
+            if resume_file_path:
+                if Path(resume_file_path).resolve() != v_res.resolved_path.resolve():
+                    raise SecurityAuthorizationError(
+                        f"Provided resume_file_path '{resume_file_path}' does not match verified resume record '{v_res.resolved_path}'."
+                    )
+            verified_attachment_path = str(v_res.resolved_path)
+            resume_ready = True
+        elif resume_file_path is not None:
+            raise SecurityAuthorizationError(
+                "Unverified resume file path cannot bypass authoritative resume verification. "
+                "Resume attachment requires authenticated user_id and resume_id."
             )
 
         if isinstance(job, dict):
             job_id = job.get("id", 0)
             company_name = job.get("company_name", "Unknown")
-            job_url = job.get("job_url", "")
+            job_url = job.get("job_url", "") or job.get("source_url", "")
         else:
             job_id = job.id or 0
             company_name = job.company_name
-            job_url = job.job_url
+            job_url = getattr(job, "job_url", None) or getattr(job, "source_url", "") or ""
 
         personal = self.profile.get("personal", {})
         full_name = personal.get("full_name", "")
@@ -281,15 +331,13 @@ class FormPrefiller:
                 )
             )
 
-        resume_ready = False
-        if resume_file_path and Path(resume_file_path).exists():
-            resume_ready = True
+        if resume_ready and verified_attachment_path:
             fields.append(
                 FormFieldMapping(
                     field_name="Resume File Attachment",
                     target_selector="input[type='file'], input[name*='resume']",
                     field_type="file",
-                    intended_value=str(resume_file_path),
+                    intended_value=verified_attachment_path,
                     status="REQUIRES_AUTH",
                     is_sensitive=True,
                 )
@@ -301,8 +349,52 @@ class FormPrefiller:
             target_url=job_url,
             fields_to_fill=fields,
             resume_attachment_ready=resume_ready,
-            resume_file_path=resume_file_path,
+            resume_file_path=verified_attachment_path,
             anti_automation_detected=False,
             safety_message="Form fields prepared. Human review and explicit approval required prior to submission.",
         )
+
+    def ingest_and_prepare_attachment(
+        self,
+        user_id: int,
+        file_path: Union[str, Path],
+        label: str = "Prepared Attachment",
+    ) -> int:
+        """Explicit legacy compatibility helper: validates, sandboxes, persists, and scans an attachment before prefill.
+
+        Returns:
+            The authoritative resume_id to be used in build_form_payload.
+        """
+        from src.database.exceptions import SecurityAuthorizationError
+        if not self.db:
+            raise SecurityAuthorizationError("ingest_and_prepare_attachment requires configured DatabaseManager.")
+        from src.security.file_security import FileSecurityValidator
+        from src.security.security_preflight import SecurityPreflightManager
+        file_validator = self.file_validator or FileSecurityValidator()
+        f_path = Path(file_path).resolve()
+        if not f_path.exists():
+            raise FileNotFoundError(f"Resume file '{file_path}' not found.")
+
+        with open(f_path, "rb") as f:
+            file_bytes = f.read()
+
+        file_validator.validate_file(file_bytes, f_path.name)
+
+        rec = self.db.upload_user_resume(
+            user_id=user_id,
+            file_bytes=file_bytes,
+            original_filename=f_path.name,
+            label=label,
+            user_base_dir=getattr(file_validator, "base_storage_dir", None),
+        )
+        resume_id = rec["id"]
+
+        # Preflight and scan
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=file_validator)
+        preflight.check_resume_security(
+            user_id=user_id,
+            resume_id=resume_id,
+            target_action="external_agent_execution",
+        )
+        return resume_id
 

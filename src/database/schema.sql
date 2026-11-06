@@ -482,6 +482,10 @@ CREATE TABLE IF NOT EXISTS security_scans (
     threats_detected_json TEXT NOT NULL,
     key_id TEXT NOT NULL,
     hmac_signature TEXT NOT NULL,
+    source_binary_hash TEXT,
+    source_binary_size_bytes INTEGER,
+    source_binary_format TEXT,
+    manifest_version TEXT DEFAULT 'v1',
     scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 

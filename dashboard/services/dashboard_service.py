@@ -405,7 +405,7 @@ class DashboardService:
             detector = PromptInjectionDetector()
             scan_res = detector.scan(res_text)
 
-            # 4. Sign scan result
+            # 4. Sign scan result (Phase 9.1.2.2 manifest v2 with binary provenance)
             signer = SecurityScanSigner()
             manifest, sig, key_id = signer.sign_scan_result(
                 user_id=user_id,
@@ -415,6 +415,10 @@ class DashboardService:
                 source_hash=file_hash,
                 snapshot_hash=None,
                 scan_result=scan_res,
+                manifest_version="v2",
+                source_binary_hash=file_hash,
+                source_binary_size_bytes=len(file_bytes),
+                source_binary_format=fmt,
             )
 
             # 5. Persist scan
@@ -434,6 +438,10 @@ class DashboardService:
                 key_id=key_id,
                 hmac_signature=sig,
                 scanned_at=manifest["scanned_at"],
+                source_binary_hash=file_hash,
+                source_binary_size_bytes=len(file_bytes),
+                source_binary_format=fmt,
+                manifest_version="v2",
             )
 
             # 6. Verify persisted scan record HMAC and integrity
@@ -453,6 +461,10 @@ class DashboardService:
                 "key_id": saved_scan.key_id,
                 "hmac_signature": saved_scan.hmac_signature,
                 "scanned_at": saved_scan.scanned_at,
+                "source_binary_hash": saved_scan.source_binary_hash,
+                "source_binary_size_bytes": saved_scan.source_binary_size_bytes,
+                "source_binary_format": saved_scan.source_binary_format,
+                "manifest_version": saved_scan.manifest_version,
             }
             signer.verify_scan_record(
                 expected_user_id=user_id,
@@ -462,6 +474,9 @@ class DashboardService:
                 expected_source_hash=file_hash,
                 expected_snapshot_hash=None,
                 scan_row=scan_dict,
+                expected_source_binary_hash=file_hash,
+                expected_source_binary_size_bytes=len(file_bytes),
+                expected_source_binary_format=fmt,
             )
 
             return True, "Scan verified", scan_dict
@@ -2730,6 +2745,10 @@ class DashboardService:
                     source_hash=jd.content_hash,
                     snapshot_hash=jd.snapshot_hash,
                     scan_result=scan_res,
+                    manifest_version="v2",
+                    source_binary_hash=jd.file_hash,
+                    source_binary_size_bytes=jd.file_size_bytes,
+                    source_binary_format=jd.file_format,
                 )
                 self.db.save_security_scan(
                     user_id=user_id,
@@ -2746,6 +2765,10 @@ class DashboardService:
                     key_id=key_id,
                     hmac_signature=sig,
                     scanned_at=manifest["scanned_at"],
+                    source_binary_hash=jd.file_hash,
+                    source_binary_size_bytes=jd.file_size_bytes,
+                    source_binary_format=jd.file_format,
+                    manifest_version="v2",
                 )
             except Exception as scan_err:
                 self.logger.warning("Failed to persist security scan for JobDescription #%d: %s", jd.id, scan_err)
@@ -2784,6 +2807,10 @@ class DashboardService:
                     source_hash=jd.content_hash,
                     snapshot_hash=jd.snapshot_hash,
                     scan_result=scan_res,
+                    manifest_version="v2",
+                    source_binary_hash=jd.file_hash,
+                    source_binary_size_bytes=jd.file_size_bytes,
+                    source_binary_format=jd.file_format,
                 )
                 self.db.save_security_scan(
                     user_id=user_id,
@@ -2800,6 +2827,10 @@ class DashboardService:
                     key_id=key_id,
                     hmac_signature=sig,
                     scanned_at=manifest["scanned_at"],
+                    source_binary_hash=jd.file_hash,
+                    source_binary_size_bytes=jd.file_size_bytes,
+                    source_binary_format=jd.file_format,
+                    manifest_version="v2",
                 )
             except Exception as scan_err:
                 self.logger.warning("Failed to persist security scan for JobDescription #%d: %s", jd.id, scan_err)
@@ -2860,6 +2891,10 @@ class DashboardService:
                     source_hash=jd.content_hash,
                     snapshot_hash=jd.snapshot_hash,
                     scan_result=scan_res,
+                    manifest_version="v2",
+                    source_binary_hash=jd.file_hash,
+                    source_binary_size_bytes=jd.file_size_bytes,
+                    source_binary_format=jd.file_format,
                 )
                 self.db.save_security_scan(
                     user_id=user_id,
@@ -2876,6 +2911,10 @@ class DashboardService:
                     key_id=key_id,
                     hmac_signature=sig,
                     scanned_at=manifest["scanned_at"],
+                    source_binary_hash=jd.file_hash,
+                    source_binary_size_bytes=jd.file_size_bytes,
+                    source_binary_format=jd.file_format,
+                    manifest_version="v2",
                 )
             except Exception as scan_err:
                 self.logger.warning("Failed to persist security scan for JobDescription #%d: %s", jd.id, scan_err)

@@ -102,6 +102,8 @@ class ScanKeyManager:
                 try:
                     raw_rotation = json.loads(env_rot)
                 except Exception as e:
+                    if app_env == "production":
+                        raise SecurityAuthorizationError(f"Malformed SECURITY_SCAN_ROTATION_KEYS in production: {e}")
                     logger.warning("Failed to parse SECURITY_SCAN_ROTATION_KEYS JSON: %s", e)
 
         if raw_rotation and isinstance(raw_rotation, dict):
@@ -118,8 +120,11 @@ class ScanKeyManager:
                     raise SecurityAuthorizationError(
                         f"Rotation scan key '{clean_k_id}' cannot reuse ACTION_TICKET_SECRET_KEY or action ticket keys."
                     )
-                if len(coerced) >= 32:
-                    self._keys[clean_k_id] = coerced
+                if len(coerced) < 32:
+                    raise SecurityAuthorizationError(
+                        f"Rotation scan key '{clean_k_id}' must have at least 32 bytes (256 bits) of entropy."
+                    )
+                self._keys[clean_k_id] = coerced
 
     def _get_prohibited_action_ticket_keys(self) -> Set[bytes]:
         """Collects all configured action-ticket secret keys to enforce strict cryptographic domain separation."""
@@ -134,8 +139,10 @@ class ScanKeyManager:
                 if isinstance(rot_data, dict):
                     for v in rot_data.values():
                         prohibited.add(self._coerce_bytes(v))
-            except Exception:
-                pass
+            except Exception as e:
+                app_env = os.environ.get("APP_ENV", "development").lower()
+                if app_env == "production":
+                    raise SecurityAuthorizationError(f"Malformed ACTION_TICKET_ROTATION_KEYS in production: {e}")
         return prohibited
 
     @staticmethod
@@ -214,6 +221,15 @@ class ScanKeyManager:
             )
 
         with self._lock:
+            if clean_key_id in self._keys:
+                if self._keys[clean_key_id] != secret_bytes:
+                    raise SecurityAuthorizationError(
+                        f"Cannot reuse existing key ID '{clean_key_id}' with different secret material."
+                    )
+                self.active_key_id = clean_key_id
+                logger.info("Reaffirmed active security scan signing key '%s'.", clean_key_id)
+                return
+
             self._keys[clean_key_id] = secret_bytes
             self.active_key_id = clean_key_id
             logger.info("Rotated security scan signing key to active key '%s'.", clean_key_id)
@@ -255,8 +271,13 @@ class ScanKeyManager:
 class SecurityScanSigner:
     """Signs and verifies security scan records using RFC 8785 canonical JSON and HMAC-SHA256."""
 
-    def __init__(self, key_manager: Optional[ScanKeyManager] = None):
-        self.key_manager = key_manager or ScanKeyManager()
+    def __init__(self, key_manager: Optional[ScanKeyManager] = None, db_manager: Optional[Any] = None):
+        if key_manager:
+            self.key_manager = key_manager
+            if db_manager:
+                self.key_manager.register_db_manager(db_manager)
+        else:
+            self.key_manager = ScanKeyManager(db_manager=db_manager)
 
     def build_canonical_manifest(
         self,
@@ -273,36 +294,64 @@ class SecurityScanSigner:
         threats: List[ThreatRecord],
         scanned_at: str,
         key_id: str,
+        manifest_version: Optional[str] = None,
+        source_binary_hash: Optional[str] = None,
+        source_binary_size_bytes: Optional[int] = None,
+        source_binary_format: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Constructs the canonical scan manifest dictionary before signing."""
+        resolved_manifest_version = manifest_version or ("v2" if source_binary_hash is not None else "v1")
         sorted_threats = sorted(threats, key=lambda t: (t.start_offset, t.end_offset, t.rule_id))
+        serialized_threats = [
+            {
+                "category": t.category,
+                "confidence": round(float(t.confidence), 4),
+                "end_offset": t.end_offset,
+                "engine_id": t.engine_id,
+                "explanation": t.explanation or "",
+                "rule_id": t.rule_id,
+                "severity": t.severity,
+                "start_offset": t.start_offset,
+            }
+            for t in sorted_threats
+        ]
+        if resolved_manifest_version == "v1":
+            return {
+                "classification": classification,
+                "key_id": key_id,
+                "manifest_version": "v1",
+                "policy_version": policy_version,
+                "risk_score": round(float(risk_score), 4),
+                "scanned_at": scanned_at,
+                "scanner_version": scanner_version,
+                "snapshot_hash": snapshot_hash or "",
+                "source_hash": source_hash,
+                "source_id": int(source_id),
+                "source_type": source_type,
+                "source_version": int(source_version),
+                "threat_count": len(sorted_threats),
+                "threats": serialized_threats,
+                "user_id": int(user_id),
+            }
+
         return {
             "classification": classification,
             "key_id": key_id,
-            "manifest_version": "v1",
+            "manifest_version": "v2",
             "policy_version": policy_version,
             "risk_score": round(float(risk_score), 4),
             "scanned_at": scanned_at,
             "scanner_version": scanner_version,
             "snapshot_hash": snapshot_hash or "",
+            "source_binary_format": source_binary_format,
+            "source_binary_hash": source_binary_hash,
+            "source_binary_size_bytes": source_binary_size_bytes,
             "source_hash": source_hash,
             "source_id": int(source_id),
             "source_type": source_type,
             "source_version": int(source_version),
             "threat_count": len(sorted_threats),
-            "threats": [
-                {
-                    "category": t.category,
-                    "confidence": round(float(t.confidence), 4),
-                    "end_offset": t.end_offset,
-                    "engine_id": t.engine_id,
-                    "explanation": t.explanation or "",
-                    "rule_id": t.rule_id,
-                    "severity": t.severity,
-                    "start_offset": t.start_offset,
-                }
-                for t in sorted_threats
-            ],
+            "threats": serialized_threats,
             "user_id": int(user_id),
         }
 
@@ -316,6 +365,10 @@ class SecurityScanSigner:
         snapshot_hash: Optional[str],
         scan_result: PromptInjectionScanResult,
         scanned_at: Optional[str] = None,
+        manifest_version: Optional[str] = None,
+        source_binary_hash: Optional[str] = None,
+        source_binary_size_bytes: Optional[int] = None,
+        source_binary_format: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], str, str]:
         """Computes RFC 8785 canonical JSON bytes and signs with active HMAC-SHA256 key.
 
@@ -324,6 +377,8 @@ class SecurityScanSigner:
         """
         key_id, secret_bytes = self.key_manager.get_signing_key()
         timestamp = scanned_at or scan_result.scan_timestamp
+
+        resolved_manifest_version = manifest_version or ("v2" if source_binary_hash is not None else "v1")
 
         manifest = self.build_canonical_manifest(
             user_id=user_id,
@@ -339,6 +394,10 @@ class SecurityScanSigner:
             threats=scan_result.threats_detected,
             scanned_at=timestamp,
             key_id=key_id,
+            manifest_version=resolved_manifest_version,
+            source_binary_hash=source_binary_hash,
+            source_binary_size_bytes=source_binary_size_bytes,
+            source_binary_format=source_binary_format,
         )
 
         canonical_bytes = canonical_json_bytes(manifest)
@@ -354,6 +413,9 @@ class SecurityScanSigner:
         expected_source_hash: str,
         expected_snapshot_hash: Optional[str],
         scan_row: Dict[str, Any],
+        expected_source_binary_hash: Optional[str] = None,
+        expected_source_binary_size_bytes: Optional[int] = None,
+        expected_source_binary_format: Optional[str] = None,
     ) -> bool:
         """Verifies the HMAC signature and cryptographic consistency of a stored scan record.
 
@@ -361,6 +423,9 @@ class SecurityScanSigner:
             SecurityAuthorizationError: If signature is invalid, key is revoked, or hashes mismatch.
             CrossUserAccessError: If user_id does not match expected_user_id.
         """
+        if hasattr(scan_row, "to_dict"):
+            scan_row = scan_row.to_dict()
+
         row_user_id = scan_row.get("user_id")
         if row_user_id != expected_user_id:
             raise CrossUserAccessError(
@@ -396,6 +461,28 @@ class SecurityScanSigner:
                 raise SecurityAuthorizationError(
                     f"Snapshot hash discrepancy: current snapshot hash '{expected_snapshot_hash}' "
                     f"does not match scanned snapshot hash '{row_snap}'."
+                )
+
+        manifest_version = scan_row.get("manifest_version")
+        if not manifest_version:
+            manifest_version = "v2" if scan_row.get("source_binary_hash") is not None else "v1"
+
+        row_bin_hash = scan_row.get("source_binary_hash")
+        row_bin_size = scan_row.get("source_binary_size_bytes")
+        row_bin_fmt = scan_row.get("source_binary_format")
+
+        if manifest_version == "v2":
+            if expected_source_binary_hash is not None and row_bin_hash != expected_source_binary_hash:
+                raise SecurityAuthorizationError(
+                    f"Binary hash discrepancy: expected '{expected_source_binary_hash}', got '{row_bin_hash}'."
+                )
+            if expected_source_binary_size_bytes is not None and row_bin_size != expected_source_binary_size_bytes:
+                raise SecurityAuthorizationError(
+                    f"Binary size discrepancy: expected {expected_source_binary_size_bytes}, got {row_bin_size}."
+                )
+            if expected_source_binary_format is not None and row_bin_fmt != expected_source_binary_format:
+                raise SecurityAuthorizationError(
+                    f"Binary format discrepancy: expected '{expected_source_binary_format}', got '{row_bin_fmt}'."
                 )
 
         key_id = scan_row.get("key_id")
@@ -442,6 +529,10 @@ class SecurityScanSigner:
             threats=threat_objs,
             scanned_at=scan_row["scanned_at"],
             key_id=key_id,
+            manifest_version=manifest_version,
+            source_binary_hash=row_bin_hash,
+            source_binary_size_bytes=row_bin_size,
+            source_binary_format=row_bin_fmt,
         )
 
         canonical_bytes = canonical_json_bytes(manifest)
@@ -452,5 +543,7 @@ class SecurityScanSigner:
                 f"Cryptographic signature verification failed for scan record #{scan_row.get('id')}. "
                 "The scan record has been tampered with or modified."
             )
+
+        return True
 
         return True

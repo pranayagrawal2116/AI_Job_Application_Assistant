@@ -555,6 +555,40 @@ class UnicodeSanitizer:
                         break
 
                 if has_letter:
+                    # Verify ScriptExtensions compatibility between $L and $V (Phase 9.1.2.2 Part E)
+                    common_set = {"Common", "Inherited", "Unknown", "Zyyy", "Zinh", "Zzzz"}
+                    l_scx = self.db.get_script_extensions(cand_cp)
+                    v_scx = self.db.get_script_extensions(cps[virama_idx])
+                    l_non_common = l_scx - common_set
+                    v_non_common = v_scx - common_set
+
+                    if not l_non_common and v_non_common:
+                        shared_scripts = v_non_common
+                        compatible_script = True
+                    elif not v_non_common and l_non_common:
+                        shared_scripts = l_non_common
+                        compatible_script = True
+                    elif not l_non_common and not v_non_common:
+                        shared_scripts = {"Common"}
+                        compatible_script = True
+                    else:
+                        shared_scripts = l_non_common & v_non_common
+                        compatible_script = len(shared_scripts) > 0
+
+                    if not compatible_script:
+                        rule_name = "UTS39_CONDITION_A2_VIOLATION" if is_zwnj else "UTS39_CONDITION_B_VIOLATION"
+                        findings.append(JoiningControlFinding(
+                            codepoint=cp,
+                            char_name=name,
+                            offset=i,
+                            is_valid=False,
+                            rule=rule_name,
+                            explanation=f"Invalid {name}: letter ({self.db.get_script(cand_cp)}) and virama ({self.db.get_script(cps[virama_idx])}) belong to incompatible scripts.",
+                        ))
+                        continue
+
+                    script_label = sorted(list(shared_scripts))[0]
+
                     if is_zwnj:
                         # Condition A2 satisfied!
                         findings.append(JoiningControlFinding(
@@ -563,7 +597,7 @@ class UnicodeSanitizer:
                             offset=i,
                             is_valid=True,
                             rule="UTS39_CONDITION_A2",
-                            explanation="Valid ZWNJ in Indic conjunct context following Virama.",
+                            explanation=f"Valid ZWNJ in Indic conjunct context following Virama in {script_label} script.",
                         ))
                         continue
                     else:
@@ -582,7 +616,7 @@ class UnicodeSanitizer:
                                 offset=i,
                                 is_valid=True,
                                 rule="UTS39_CONDITION_B",
-                                explanation="Valid ZWJ in Indic conjunct context following Virama.",
+                                explanation=f"Valid ZWJ in Indic conjunct context following Virama in {script_label} script.",
                             ))
                             continue
                         else:
@@ -630,19 +664,42 @@ class UnicodeSanitizer:
                     is_next_rj = next_jt in ("D", "R")
                     
                     common_set = {"Common", "Inherited", "Unknown", "Zyyy", "Zinh", "Zzzz"}
-                    shared_scripts = (prev_scx & next_scx) - common_set
-                    same_script = len(shared_scripts) > 0
+                    prev_non_common = prev_scx - common_set
+                    next_non_common = next_scx - common_set
+                    if not prev_non_common and next_non_common:
+                        shared_scripts = next_non_common
+                        same_script = True
+                    elif not next_non_common and prev_non_common:
+                        shared_scripts = prev_non_common
+                        same_script = True
+                    elif not prev_non_common and not next_non_common:
+                        shared_scripts = {"Common"}
+                        same_script = True
+                    else:
+                        shared_scripts = prev_non_common & next_non_common
+                        same_script = len(shared_scripts) > 0
 
-                    if is_prev_lj and is_next_rj and same_script:
-                        findings.append(JoiningControlFinding(
-                            codepoint=cp,
-                            char_name=name,
-                            offset=i,
-                            is_valid=True,
-                            rule="UTS39_CONDITION_A1_REV34",
-                            explanation=f"Valid ZWNJ breaking cursive connection in {sorted(list(shared_scripts))[0]} script.",
-                        ))
-                        continue
+                    if is_prev_lj and is_next_rj:
+                        if same_script:
+                            findings.append(JoiningControlFinding(
+                                codepoint=cp,
+                                char_name=name,
+                                offset=i,
+                                is_valid=True,
+                                rule="UTS39_CONDITION_A1_REV34",
+                                explanation=f"Valid ZWNJ breaking cursive connection in {sorted(list(shared_scripts))[0]} script.",
+                            ))
+                            continue
+                        else:
+                            findings.append(JoiningControlFinding(
+                                codepoint=cp,
+                                char_name=name,
+                                offset=i,
+                                is_valid=False,
+                                rule="UTS39_CONDITION_A1_VIOLATION",
+                                explanation=f"Invalid ZWNJ breaking cursive connection across incompatible scripts ({self.db.get_script(prev_non_t)} and {self.db.get_script(next_non_t)}).",
+                            ))
+                            continue
 
             # If we reached here, the joining control is invalid/anomalous!
             findings.append(JoiningControlFinding(

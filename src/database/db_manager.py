@@ -324,6 +324,10 @@ class DatabaseManager:
         add_col_if_missing("application_approvals", "is_revoked", "INTEGER DEFAULT 0")
         add_col_if_missing("application_approvals", "revoked_at", "DATETIME")
         add_col_if_missing("application_approvals", "revocation_reason", "TEXT")
+        add_col_if_missing("security_scans", "source_binary_hash", "TEXT")
+        add_col_if_missing("security_scans", "source_binary_size_bytes", "INTEGER")
+        add_col_if_missing("security_scans", "source_binary_format", "TEXT")
+        add_col_if_missing("security_scans", "manifest_version", "TEXT DEFAULT 'v1'")
 
         try:
             cursor.execute("""
@@ -382,6 +386,10 @@ class DatabaseManager:
                     threats_detected_json TEXT NOT NULL,
                     key_id TEXT NOT NULL,
                     hmac_signature TEXT NOT NULL,
+                    source_binary_hash TEXT,
+                    source_binary_size_bytes INTEGER,
+                    source_binary_format TEXT,
+                    manifest_version TEXT DEFAULT 'v1',
                     scanned_at DATETIME DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -4571,6 +4579,31 @@ class DatabaseManager:
             cursor.execute(query, params)
             return [dict(row) for row in cursor.fetchall()]
 
+    @staticmethod
+    def _row_to_security_scan(row: sqlite3.Row) -> SecurityScan:
+        keys = row.keys()
+        return SecurityScan(
+            id=row["id"],
+            user_id=row["user_id"],
+            source_type=row["source_type"],
+            source_id=row["source_id"],
+            source_version=row["source_version"],
+            source_hash=row["source_hash"],
+            snapshot_hash=row["snapshot_hash"],
+            scanner_version=row["scanner_version"],
+            policy_version=row["policy_version"],
+            risk_score=row["risk_score"],
+            classification=row["classification"],
+            threats_detected_json=row["threats_detected_json"],
+            key_id=row["key_id"],
+            hmac_signature=row["hmac_signature"],
+            source_binary_hash=row["source_binary_hash"] if "source_binary_hash" in keys else None,
+            source_binary_size_bytes=row["source_binary_size_bytes"] if "source_binary_size_bytes" in keys else None,
+            source_binary_format=row["source_binary_format"] if "source_binary_format" in keys else None,
+            manifest_version=row["manifest_version"] if "manifest_version" in keys and row["manifest_version"] else "v1",
+            scanned_at=row["scanned_at"],
+        )
+
     def save_security_scan(
         self,
         user_id: int,
@@ -4587,8 +4620,13 @@ class DatabaseManager:
         key_id: str,
         hmac_signature: str,
         scanned_at: Optional[str] = None,
+        source_binary_hash: Optional[str] = None,
+        source_binary_size_bytes: Optional[int] = None,
+        source_binary_format: Optional[str] = None,
+        manifest_version: Optional[str] = None,
     ) -> SecurityScan:
         """Persists an authenticated, HMAC-signed security scan record."""
+        resolved_manifest_version = manifest_version or ("v2" if source_binary_hash is not None else "v1")
         threats_json = json.dumps(threats_detected)
         with self.transaction() as conn:
             cursor = conn.cursor()
@@ -4599,14 +4637,16 @@ class DatabaseManager:
                         user_id, source_type, source_id, source_version,
                         source_hash, snapshot_hash, scanner_version, policy_version,
                         risk_score, classification, threats_detected_json,
-                        key_id, hmac_signature, scanned_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        key_id, hmac_signature, scanned_at,
+                        source_binary_hash, source_binary_size_bytes, source_binary_format, manifest_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id, source_type, source_id, source_version,
                         source_hash, snapshot_hash, scanner_version, policy_version,
                         risk_score, classification, threats_json,
                         key_id, hmac_signature, scanned_at,
+                        source_binary_hash, source_binary_size_bytes, source_binary_format, resolved_manifest_version,
                     ),
                 )
             else:
@@ -4616,36 +4656,22 @@ class DatabaseManager:
                         user_id, source_type, source_id, source_version,
                         source_hash, snapshot_hash, scanner_version, policy_version,
                         risk_score, classification, threats_detected_json,
-                        key_id, hmac_signature
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        key_id, hmac_signature,
+                        source_binary_hash, source_binary_size_bytes, source_binary_format, manifest_version
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         user_id, source_type, source_id, source_version,
                         source_hash, snapshot_hash, scanner_version, policy_version,
                         risk_score, classification, threats_json,
                         key_id, hmac_signature,
+                        source_binary_hash, source_binary_size_bytes, source_binary_format, resolved_manifest_version,
                     ),
                 )
             scan_id = cursor.lastrowid
             cursor.execute("SELECT * FROM security_scans WHERE id = ?", (scan_id,))
             row = cursor.fetchone()
-            return SecurityScan(
-                id=row["id"],
-                user_id=row["user_id"],
-                source_type=row["source_type"],
-                source_id=row["source_id"],
-                source_version=row["source_version"],
-                source_hash=row["source_hash"],
-                snapshot_hash=row["snapshot_hash"],
-                scanner_version=row["scanner_version"],
-                policy_version=row["policy_version"],
-                risk_score=row["risk_score"],
-                classification=row["classification"],
-                threats_detected_json=row["threats_detected_json"],
-                key_id=row["key_id"],
-                hmac_signature=row["hmac_signature"],
-                scanned_at=row["scanned_at"],
-            )
+            return self._row_to_security_scan(row)
 
     def get_latest_security_scan(
         self,
@@ -4678,23 +4704,7 @@ class DatabaseManager:
             row = cursor.fetchone()
             if not row:
                 return None
-            return SecurityScan(
-                id=row["id"],
-                user_id=row["user_id"],
-                source_type=row["source_type"],
-                source_id=row["source_id"],
-                source_version=row["source_version"],
-                source_hash=row["source_hash"],
-                snapshot_hash=row["snapshot_hash"],
-                scanner_version=row["scanner_version"],
-                policy_version=row["policy_version"],
-                risk_score=row["risk_score"],
-                classification=row["classification"],
-                threats_detected_json=row["threats_detected_json"],
-                key_id=row["key_id"],
-                hmac_signature=row["hmac_signature"],
-                scanned_at=row["scanned_at"],
-            )
+            return self._row_to_security_scan(row)
 
     def list_security_scans(
         self,
@@ -4716,26 +4726,7 @@ class DatabaseManager:
             query += " ORDER BY id DESC"
             cursor.execute(query, params)
             rows = cursor.fetchall()
-            return [
-                SecurityScan(
-                    id=row["id"],
-                    user_id=row["user_id"],
-                    source_type=row["source_type"],
-                    source_id=row["source_id"],
-                    source_version=row["source_version"],
-                    source_hash=row["source_hash"],
-                    snapshot_hash=row["snapshot_hash"],
-                    scanner_version=row["scanner_version"],
-                    policy_version=row["policy_version"],
-                    risk_score=row["risk_score"],
-                    classification=row["classification"],
-                    threats_detected_json=row["threats_detected_json"],
-                    key_id=row["key_id"],
-                    hmac_signature=row["hmac_signature"],
-                    scanned_at=row["scanned_at"],
-                )
-                for row in rows
-            ]
+            return [self._row_to_security_scan(row) for row in rows]
 
     def record_security_scan_override(
         self,

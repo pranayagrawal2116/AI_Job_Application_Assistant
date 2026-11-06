@@ -109,23 +109,50 @@ class SecurityPreflightManager:
                 f"expected '{jd.snapshot_hash}', computed '{computed_snapshot_hash}'."
             )
 
-        # 3. Uploaded job-description physical binary integrity (Phase 9.1.2.1 Part D.2)
-        if jd.file_hash is not None and jd.storage_filename:
-            jd_dir = self.file_validator.get_user_job_descriptions_dir(user_id)
-            jd_file_path = jd_dir / jd.storage_filename
-            self.file_validator.resolve_and_verify_candidate_file(
-                user_id=user_id,
-                file_path=jd_file_path,
-                expected_hash=jd.file_hash,
-                expected_size=jd.file_size_bytes,
-                expected_format=jd.file_format,
-                is_mandatory=True,
-                resource_desc=f"Uploaded Job Description #{jd_id}",
-            )
-        elif jd.source_type == "uploaded" and jd.file_hash is None:
-            logger.info("JobDescription #%d has NULL binary metadata (historical record); proceeding with verified extracted text.", jd_id)
+        # 3. Uploaded job-description physical binary integrity (Phase 9.1.2.1 Part D.2 & Phase 9.1.2.2 Part C)
+        is_uploaded = (jd.source_type or "").lower() in ("uploaded", "upload")
+        has_binary_meta = False
+        if is_uploaded:
+            bin_fields = (jd.storage_filename, jd.file_hash, jd.file_size_bytes, jd.file_format)
+            non_null_count = sum(1 for f in bin_fields if f is not None and str(f).strip() != "")
+            if 0 < non_null_count < 4:
+                raise SecurityAuthorizationError(
+                    f"JobDescription #{jd_id} has partially populated binary metadata. "
+                    f"Complete metadata (storage_filename, file_hash, file_size_bytes, file_format) is mandatory for uploaded records."
+                )
+            if non_null_count == 4:
+                if (jd.file_format or "").lower() not in ("pdf", "docx"):
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} has unsupported file_format '{jd.file_format}'. Must be 'pdf' or 'docx'."
+                    )
+                jd_dir = self.file_validator.get_user_job_descriptions_dir(user_id)
+                jd_file_path = jd_dir / jd.storage_filename
+                self.file_validator.resolve_and_verify_candidate_file(
+                    user_id=user_id,
+                    file_path=jd_file_path,
+                    expected_hash=jd.file_hash,
+                    expected_size=jd.file_size_bytes,
+                    expected_format=jd.file_format,
+                    is_mandatory=True,
+                    resource_desc=f"Uploaded Job Description #{jd_id}",
+                )
+                has_binary_meta = True
+            else:
+                # non_null_count == 0
+                is_legacy = False
+                if parsed_data and isinstance(parsed_data, dict) and parsed_data.get("is_legacy_record") is True:
+                    is_legacy = True
+                elif getattr(jd, "created_at", None) and str(jd.created_at) < "2026-11-06T00:00:00":
+                    is_legacy = True
 
-        # 4. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E)
+                if not is_legacy:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} is an uploaded record missing required binary metadata. "
+                        "All-NULL binary metadata is permitted only for auditable historical legacy records."
+                    )
+                logger.info("JobDescription #%d has NULL binary metadata (auditable legacy record); proceeding with verified extracted text.", jd_id)
+
+        # 4. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E & Phase 9.1.2.2 Part B)
         scan = self.db.get_latest_security_scan(
             user_id=user_id,
             source_type="job_description",
@@ -141,11 +168,28 @@ class SecurityPreflightManager:
                     "Scan #%d for JobDescription #%d has stale version (scanner: %s vs %s, policy: %s vs %s). Triggering rescan.",
                     scan.id, jd_id, scan.scanner_version, self.detector.engine_version, scan.policy_version, self.detector.policy_version,
                 )
+            elif scan.classification != ScanClassification.QUARANTINED and has_binary_meta:
+                if (
+                    getattr(scan, "manifest_version", "v1") != "v2"
+                    or getattr(scan, "source_binary_hash", None) != jd.file_hash
+                    or getattr(scan, "source_binary_size_bytes", None) != jd.file_size_bytes
+                    or getattr(scan, "source_binary_format", None) != jd.file_format
+                ):
+                    is_stale = True
+                    logger.info(
+                        "Scan #%d for JobDescription #%d lacks current binary provenance binding. Triggering fresh v2 scan.",
+                        scan.id, jd_id,
+                    )
 
         if (not scan) or is_stale:
             # Execute fresh scan on authoritative raw content
             logger.info("Executing fresh security scan for JobDescription #%d (User #%d)...", jd_id, user_id)
             scan_result = self.detector.scan(jd.raw_content)
+            manifest_ver = "v2" if has_binary_meta else "v1"
+            bin_hash = jd.file_hash if has_binary_meta else None
+            bin_size = jd.file_size_bytes if has_binary_meta else None
+            bin_fmt = jd.file_format if has_binary_meta else None
+
             manifest, sig, key_id = self.signer.sign_scan_result(
                 user_id=user_id,
                 source_type="job_description",
@@ -154,6 +198,10 @@ class SecurityPreflightManager:
                 source_hash=jd.content_hash,
                 snapshot_hash=jd.snapshot_hash,
                 scan_result=scan_result,
+                manifest_version=manifest_ver,
+                source_binary_hash=bin_hash,
+                source_binary_size_bytes=bin_size,
+                source_binary_format=bin_fmt,
             )
             threats_dicts = [t.to_dict() for t in scan_result.threats_detected]
             scan = self.db.save_security_scan(
@@ -171,6 +219,10 @@ class SecurityPreflightManager:
                 key_id=key_id,
                 hmac_signature=sig,
                 scanned_at=manifest["scanned_at"],
+                source_binary_hash=bin_hash,
+                source_binary_size_bytes=bin_size,
+                source_binary_format=bin_fmt,
+                manifest_version=manifest_ver,
             )
 
         # 5. Verify scan record HMAC and integrity
@@ -190,6 +242,10 @@ class SecurityPreflightManager:
             "key_id": scan.key_id,
             "hmac_signature": scan.hmac_signature,
             "scanned_at": scan.scanned_at,
+            "source_binary_hash": getattr(scan, "source_binary_hash", None),
+            "source_binary_size_bytes": getattr(scan, "source_binary_size_bytes", None),
+            "source_binary_format": getattr(scan, "source_binary_format", None),
+            "manifest_version": getattr(scan, "manifest_version", "v1"),
         }
 
         self.signer.verify_scan_record(
@@ -200,6 +256,9 @@ class SecurityPreflightManager:
             expected_source_hash=jd.content_hash,
             expected_snapshot_hash=jd.snapshot_hash,
             scan_row=scan_dict,
+            expected_source_binary_hash=jd.file_hash if has_binary_meta else None,
+            expected_source_binary_size_bytes=jd.file_size_bytes if has_binary_meta else None,
+            expected_source_binary_format=jd.file_format if has_binary_meta else None,
         )
 
         # Check for candidate override (audit telemetry only)
@@ -326,8 +385,10 @@ class SecurityPreflightManager:
 
         target_ver = v_res.version_num
         target_hash = v_res.file_hash
+        res_size = v_res.file_size_bytes
+        res_format = v_res.file_format
 
-        # 2. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E)
+        # 2. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E & Phase 9.1.2.2 Part B)
         scan = self.db.get_latest_security_scan(
             user_id=user_id,
             source_type="resume",
@@ -343,6 +404,19 @@ class SecurityPreflightManager:
                     "Scan #%d for Resume #%d v%d has stale version (scanner: %s vs %s, policy: %s vs %s). Triggering rescan.",
                     scan.id, resume_id, target_ver, scan.scanner_version, self.detector.engine_version, scan.policy_version, self.detector.policy_version,
                 )
+            elif getattr(scan, "manifest_version", "v1") == "v2":
+                if (
+                    getattr(scan, "source_binary_hash", None) != target_hash
+                    or getattr(scan, "source_binary_size_bytes", None) != res_size
+                    or getattr(scan, "source_binary_format", None) != res_format
+                ):
+                    is_stale = True
+                    logger.info(
+                        "Scan #%d for Resume #%d v%d has binary metadata mismatch. Triggering fresh v2 scan.",
+                        scan.id, resume_id, target_ver,
+                    )
+            elif scan.source_hash != target_hash:
+                is_stale = True
 
         if (not scan) or is_stale:
             # Execute fresh scan on fresh in-memory parsed text / raw representation
@@ -386,6 +460,10 @@ class SecurityPreflightManager:
                 source_hash=target_hash,
                 snapshot_hash=None,
                 scan_result=scan_result,
+                manifest_version="v2",
+                source_binary_hash=target_hash,
+                source_binary_size_bytes=res_size,
+                source_binary_format=res_format,
             )
             threats_dicts = [t.to_dict() for t in scan_result.threats_detected]
             scan = self.db.save_security_scan(
@@ -403,6 +481,10 @@ class SecurityPreflightManager:
                 key_id=key_id,
                 hmac_signature=sig,
                 scanned_at=manifest["scanned_at"],
+                source_binary_hash=target_hash,
+                source_binary_size_bytes=res_size,
+                source_binary_format=res_format,
+                manifest_version="v2",
             )
 
         # 3. Verify scan record HMAC and integrity
@@ -422,6 +504,10 @@ class SecurityPreflightManager:
             "key_id": scan.key_id,
             "hmac_signature": scan.hmac_signature,
             "scanned_at": scan.scanned_at,
+            "source_binary_hash": getattr(scan, "source_binary_hash", None),
+            "source_binary_size_bytes": getattr(scan, "source_binary_size_bytes", None),
+            "source_binary_format": getattr(scan, "source_binary_format", None),
+            "manifest_version": getattr(scan, "manifest_version", "v1"),
         }
 
         self.signer.verify_scan_record(
@@ -432,6 +518,9 @@ class SecurityPreflightManager:
             expected_source_hash=target_hash,
             expected_snapshot_hash=None,
             scan_row=scan_dict,
+            expected_source_binary_hash=target_hash,
+            expected_source_binary_size_bytes=res_size,
+            expected_source_binary_format=res_format,
         )
 
         override = self.db.get_security_scan_override(user_id=user_id, scan_id=scan.id)

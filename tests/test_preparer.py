@@ -120,6 +120,14 @@ class TestApplicationPreparationEngine(unittest.TestCase):
             user_id=cls.user_id,
         )
 
+        cls.test_jd = cls.db.create_job_description(
+            user_id=cls.user_id,
+            company_name=cls.test_job.company_name,
+            job_title=cls.test_job.job_title,
+            raw_content=cls.test_job.job_description or "Looking for an AI Research Intern.",
+            source_type="pasted",
+        )
+
     @classmethod
     def tearDownClass(cls):
         cls.temp_dir.cleanup()
@@ -135,7 +143,14 @@ class TestApplicationPreparationEngine(unittest.TestCase):
             output_dir=Path(self.temp_dir.name) / "cover_letters",
         )
         self.answerer = QuestionAnswerer(candidate_profile=self.profile)
-        self.prefiller = FormPrefiller(candidate_profile=self.profile)
+        from src.security.file_security import FileSecurityValidator
+        self.file_validator = FileSecurityValidator(base_storage_dir=Path(self.temp_dir.name) / "users")
+        self.profile["user_id"] = self.user_id
+        self.prefiller = FormPrefiller(
+            candidate_profile=self.profile,
+            db_manager=self.db,
+            file_validator=self.file_validator,
+        )
         SessionManager.reset_instance()
         self.session_mgr = SessionManager()
         self.db._session_manager = self.session_mgr
@@ -282,10 +297,15 @@ class TestApplicationPreparationEngine(unittest.TestCase):
 
     # 8. Form Pre-filler & Safety Safeguards
     def test_form_prefiller(self):
+        resume_id = self.prefiller.ingest_and_prepare_attachment(
+            user_id=self.user_id,
+            file_path=self.sample_pdf,
+        )
         plan = self.prefiller.build_form_payload(
-            job=self.test_job,
+            job={"id": self.test_jd.id, "company_name": self.test_jd.company_name, "job_url": self.test_job.job_url, "raw_content": self.test_jd.raw_content, "user_id": self.user_id},
             cover_letter_text="Sample cover letter",
-            resume_file_path=str(self.sample_pdf),
+            resume_id=resume_id,
+            user_id=self.user_id,
         )
         self.assertTrue(len(plan.fields_to_fill) > 5)
         field_names = [f.field_name for f in plan.fields_to_fill]

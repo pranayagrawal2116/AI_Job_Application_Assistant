@@ -601,6 +601,10 @@ class SecurityScan:
     threats_detected_json: str
     key_id: str
     hmac_signature: str
+    source_binary_hash: Optional[str] = None
+    source_binary_size_bytes: Optional[int] = None
+    source_binary_format: Optional[str] = None
+    manifest_version: str = "v1"
     scanned_at: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:

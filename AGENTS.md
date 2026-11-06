@@ -687,6 +687,32 @@ When interacting with the browser via Playwright MCP:
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_1_REMEDIATION_REPORT.md`.
 
+- [x] **Architecture v2.1.1 Phase 9.1.2.2: Final Source Provenance, Form Attachment & Unicode Joining-Control Closure** (Complete)
+  - Form-Prefill Resume Attachment Trust Boundary (Part A):
+    - `FormPrefiller.build_form_payload()` enforces mandatory authenticated `user_id` and authoritative `resume_id` for resume attachments, strictly rejecting unverified caller-supplied file paths.
+    - Persisted job descriptions (`Job`, `JobDescription`, or persistent ID) require database manager and authenticated user ID, strictly validating `user_id == job.user_id` (`CrossUserAccessError`).
+    - Added `ingest_and_prepare_attachment(user_id, file_path, label)` for explicit, sandboxed legacy file ingestion.
+  - Cryptographic Binding of Uploaded Job-Description Binaries (Part B):
+    - Added `source_binary_hash`, `source_binary_size_bytes`, `source_binary_format`, and `manifest_version` to `security_scans` table and `SecurityScan` model with idempotent schema migrations.
+    - Updated `SecurityScanSigner.build_canonical_manifest()` and `sign_scan_result()` to support manifest `v2` binding binary metadata, while maintaining backward-compatible verification for historical `v1` records.
+    - Hardened `SecurityScanSigner.verify_scan_record()` to validate physical binary fields on `v2` records and accept both dataclasses and dictionary rows.
+  - Incomplete Binary Metadata Policy (Part C):
+    - `SecurityPreflightManager.check_job_description_security()` enforces an all-or-nothing check on `(storage_filename, file_hash, file_size_bytes, file_format)`, rejecting partial metadata with `SecurityAuthorizationError`.
+    - Documented and validated explicit auditable all-NULL binary metadata policy for historical legacy text records.
+  - Stable Scan Key Identity & Entropy (Part D):
+    - `ScanKeyManager.rotate_key()` rejects key ID reuse with different secret material, allowing idempotent re-affirmation with matching bytes.
+    - Enforced minimum 32 bytes (256 bits) of entropy for all rotation keys in both constructor and rotation methods.
+    - Production mode (`APP_ENV="production"`) fails closed on malformed rotation key JSON.
+  - Complete ScriptExtensions Joining-Control Context (Part E):
+    - `UnicodeSanitizer.validate_joining_controls()` evaluates `ScriptExtensions` compatibility between letter $L and virama $V for UTS #39 Condition A2 and Condition B, emitting `UTS39_CONDITION_A2_VIOLATION` or `UTS39_CONDITION_B_VIOLATION` on mixed-script sequences.
+    - Emits explicit `UTS39_CONDITION_A1_VIOLATION` when adjacent cursive characters have conflicting scripts.
+    - Validated non-destructive immutability across normalization and security analysis pipelines.
+  - Verification & Regressions (Parts F, G, H, I & J):
+    - Authored 17 dedicated tests in `tests/test_phase_9_1_2_2_provenance_closure.py` (17/17 passing, 100%).
+    - Full test suite regression pass: 1,468 tests passing across the entire repository (100% pass rate in 72.86s).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_2_IMPLEMENTATION_REPORT.md`.
+
 ---
 
 ## 7. Approval Requirement
