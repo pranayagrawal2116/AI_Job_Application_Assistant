@@ -11,6 +11,7 @@ cryptographically authentic, and strictly bound evidence artifact.
 """
 
 from abc import ABC, abstractmethod
+import base64
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import hashlib
@@ -20,6 +21,7 @@ import os
 from pathlib import Path
 import threading
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
+import uuid
 
 from src.database.exceptions import (
     KeyRevokedError,
@@ -53,63 +55,103 @@ VALID_MIGRATION_BOUNDARIES: Set[str] = {
 # Default authorized attesting principals for system migration (Phase 9.1.2.8 Part B: empty by default)
 DEFAULT_AUTHORIZED_ATTESTING_PRINCIPALS: frozenset[str] = frozenset()
 
-# Private sentinel token preventing arbitrary instantiation of VerifiedLegacyEvidence
+# Private sentinel tokens preventing arbitrary external instantiation
 _VERIFICATION_TOKEN = object()
+_AUTH_TOKEN = object()
+
+
+def resolve_app_env() -> str:
+    """Authoritatively resolves and validates the application execution environment.
+
+    Contract (Phase 9.1.2.9 Section 5.1):
+    - production / prod -> 'production' (Ed25519 asymmetric only)
+    - staging -> 'staging' (Ed25519 asymmetric only)
+    - qa -> 'qa' (Ed25519 asymmetric only)
+    - development / dev -> 'development' (Permissive policy permitted)
+    - test -> 'test' (Permissive policy permitted)
+    - missing / empty / whitespace / unknown -> raises SecurityAuthorizationError (fails closed)
+    """
+    raw_env = os.environ.get("APP_ENV")
+    if raw_env is None:
+        raise SecurityAuthorizationError(
+            "APP_ENV environment variable is missing. Application security policy fails closed."
+        )
+    clean_env = raw_env.strip()
+    if not clean_env:
+        raise SecurityAuthorizationError(
+            "APP_ENV environment variable is empty or whitespace. Application security policy fails closed."
+        )
+    normalized = clean_env.lower()
+    if normalized in ("production", "prod"):
+        return "production"
+    if normalized == "staging":
+        return "staging"
+    if normalized == "qa":
+        return "qa"
+    if normalized in ("development", "dev"):
+        return "development"
+    if normalized == "test":
+        return "test"
+    raise SecurityAuthorizationError(
+        f"Unrecognized or untrusted APP_ENV '{raw_env}'. Application security policy fails closed."
+    )
 
 
 @dataclass(frozen=True)
 class AuthenticatedMigrationPrincipal:
-    """Represents an authenticated service identity authorized to verify and attest historical legacy evidence.
+    """Represents a verified service identity authorized to verify and attest historical legacy evidence.
 
-    Security Boundary (Phase 9.1.2.8):
-    - Establishes principal identity, type, authentication source, authorization scope, and revocation status.
-    - An allowlisted string is merely an identifier; AuthenticatedMigrationPrincipal proves the caller
-      actually represents that authorized identity with verified credentials/context.
+    Security Invariant (Phase 9.1.2.9):
+    - Cannot be directly constructed by callers or manufactured with unverified Boolean flags.
+    - Can ONLY be issued by ServiceAuthenticationProvider after authenticating genuine credentials.
+    - Bound to 'legacy_migration' authorization scope.
     - Candidate users are strictly prohibited from holding this context.
     """
 
-    principal_id: str
+    _token: Any = None
+    principal_id: str = ""
+    issuer: str = "internal_service_authority"
+    audience: str = "legacy_migration"
+    scopes: Tuple[str, ...] = ("legacy_migration",)
+    issued_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+    credential_id: Optional[str] = None
     principal_type: str = "service"
-    authentication_source: str = "internal_service_credential"
-    authorization_scope: str = "legacy_migration"
-    is_authenticated: bool = True
-    is_revoked: bool = False
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
+        if self._token is not _AUTH_TOKEN:
+            raise SecurityAuthorizationError(
+                "AuthenticatedMigrationPrincipal cannot be directly instantiated or manufactured. "
+                "Identity must be verified through ServiceAuthenticationProvider."
+            )
         if not self.principal_id or not isinstance(self.principal_id, str) or not self.principal_id.strip():
             raise ValidationError("AuthenticatedMigrationPrincipal principal_id cannot be empty or whitespace.")
         clean_id = self.principal_id.strip()
         if clean_id in ("candidate_user",) or clean_id.startswith("user_") or clean_id.startswith("candidate_"):
             raise SecurityAuthorizationError(f"Candidate user '{clean_id}' cannot be an authenticated migration principal.")
-        if not self.is_authenticated:
-            raise SecurityAuthorizationError(f"Migration principal '{clean_id}' is not authenticated.")
-        if self.is_revoked:
-            raise SecurityAuthorizationError(f"Migration principal '{clean_id}' has been revoked.")
         if self.principal_type in ("candidate", "unauthenticated", "anonymous"):
             raise SecurityAuthorizationError(f"Invalid principal_type '{self.principal_type}' for migration principal.")
-        if self.authorization_scope not in ("legacy_migration", "system_migration", "all"):
+        if "legacy_migration" not in self.scopes and "all" not in self.scopes:
             raise SecurityAuthorizationError(f"Principal '{clean_id}' lacks legacy_migration authorization scope.")
+        if self.expires_at is not None:
+            now_utc = datetime.now(timezone.utc)
+            if self.expires_at <= now_utc:
+                raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' has expired.")
 
-    @classmethod
-    def create_authenticated_principal(
-        cls,
-        principal_id: str,
-        principal_type: str = "service",
-        authentication_source: str = "internal_service_credential",
-        authorization_scope: str = "legacy_migration",
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> "AuthenticatedMigrationPrincipal":
-        """Helper to create a validated AuthenticatedMigrationPrincipal instance."""
-        return cls(
-            principal_id=principal_id,
-            principal_type=principal_type,
-            authentication_source=authentication_source,
-            authorization_scope=authorization_scope,
-            is_authenticated=True,
-            is_revoked=False,
-            metadata=metadata or {},
-        )
+    @property
+    def is_authenticated(self) -> bool:
+        """Always True because instances can only be minted by ServiceAuthenticationProvider."""
+        return True
+
+    @property
+    def is_revoked(self) -> bool:
+        """State is checked at verification time by verifier and trust store."""
+        return False
+
+    @property
+    def authorization_scope(self) -> str:
+        return "legacy_migration"
 
 
 @dataclass(frozen=True)
@@ -144,6 +186,365 @@ class VerifiedLegacyEvidence:
             )
 
 
+class ServiceAuthenticationProvider:
+    """Authenticates internal service credentials and issues AuthenticatedMigrationPrincipal instances.
+
+    Security Boundary (Phase 9.1.2.9):
+    - Validates cryptographic signatures (Ed25519 or HMAC-SHA256 based on policy).
+    - In production, strictly enforces Ed25519 signatures and rejects HMAC.
+    - Validates trusted issuer, intended audience, principal identity, scopes, and expiration.
+    - Enforces revocation checks against DatabaseManager and trust store.
+    - Rejects candidate identities, expired credentials, invalid signatures, wrong scopes.
+    """
+
+    DEFAULT_AUDIENCE = "legacy_migration"
+
+    def __init__(
+        self,
+        trusted_keys: Optional[Dict[str, Union[str, bytes, Any]]] = None,
+        trusted_issuers: Optional[Set[str]] = None,
+        expected_audience: str = "legacy_migration",
+        db_manager: Optional[Any] = None,
+        trust_store: Optional[Any] = None,
+    ):
+        self.app_env = resolve_app_env()
+        self.expected_audience = expected_audience
+        self.db_manager = db_manager
+        self.trust_store = trust_store
+        self._lock = threading.RLock()
+        self._trusted_keys: Dict[str, Tuple[bytes, str]] = {}
+        self._trusted_issuers: Set[str] = set()
+
+        if self.app_env in ("production", "staging", "qa") and self.db_manager is None:
+            raise SecurityAuthorizationError(
+                f"Authoritative DatabaseManager is mandatory for ServiceAuthenticationProvider in '{self.app_env}'."
+            )
+
+        if trusted_issuers:
+            for iss in trusted_issuers:
+                clean_iss = (iss or "").strip()
+                if clean_iss:
+                    self._trusted_issuers.add(clean_iss)
+
+        if trusted_keys:
+            for k_id, k_val in trusted_keys.items():
+                self.register_trusted_key(k_id, k_val)
+
+    @staticmethod
+    def _coerce_bytes(val: Union[str, bytes]) -> bytes:
+        if isinstance(val, bytes):
+            return val
+        if len(val) >= 64 and all(c in "0123456789abcdefABCDEF" for c in val):
+            try:
+                return bytes.fromhex(val)
+            except ValueError:
+                pass
+        return val.encode("utf-8")
+
+    @staticmethod
+    def _b64url_decode(input_str: str) -> bytes:
+        rem = len(input_str) % 4
+        if rem > 0:
+            input_str += "=" * (4 - rem)
+        return base64.urlsafe_b64decode(input_str.encode("utf-8"))
+
+    def register_trusted_key(
+        self,
+        key_id: str,
+        key_data: Union[str, bytes, Any],
+        algorithm: Optional[str] = None,
+    ) -> None:
+        clean_id = (key_id or "").strip()
+        if not clean_id:
+            raise SecurityAuthorizationError("Service authentication key ID cannot be empty or whitespace.")
+
+        if isinstance(key_data, dict):
+            k_bytes = key_data.get("key") or key_data.get("key_bytes") or b""
+            k_algo = key_data.get("algorithm") or algorithm or "HMAC-SHA256"
+        else:
+            k_bytes = key_data
+            k_algo = algorithm or ("Ed25519" if len(self._coerce_bytes(key_data)) == 32 and self.app_env in ("production", "staging", "qa") else "HMAC-SHA256")
+
+        if k_algo not in ("Ed25519", "EdDSA", "HMAC-SHA256", "HS256"):
+            raise SecurityAuthorizationError(f"Unsupported service signing algorithm '{k_algo}'.")
+
+        if self.app_env in ("production", "staging", "qa") and k_algo in ("HMAC-SHA256", "HS256"):
+            raise SecurityAuthorizationError(
+                f"HMAC service signing keys are strictly prohibited in '{self.app_env}'. Production requires asymmetric Ed25519 keys."
+            )
+
+        coerced = self._coerce_bytes(k_bytes)
+        if k_algo in ("Ed25519", "EdDSA"):
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            if len(coerced) != 32:
+                raise SecurityAuthorizationError(f"Ed25519 public key must be exactly 32 bytes (got {len(coerced)} bytes).")
+            try:
+                _ = ed25519.Ed25519PublicKey.from_public_bytes(coerced)
+            except Exception as e:
+                raise SecurityAuthorizationError(f"Invalid Ed25519 public key '{clean_id}': {e}")
+            norm_algo = "Ed25519"
+        else:
+            if len(coerced) < 32:
+                raise SecurityAuthorizationError(f"HMAC secret must have at least 32 bytes of entropy (got {len(coerced)}).")
+            norm_algo = "HMAC-SHA256"
+
+        with self._lock:
+            self._trusted_keys[clean_id] = (coerced, norm_algo)
+
+    def authenticate(self, credential: Any) -> AuthenticatedMigrationPrincipal:
+        """Verifies a service credential token and returns an authentic AuthenticatedMigrationPrincipal."""
+        if credential is None or not credential:
+            raise SecurityAuthorizationError("Missing service credential: credential is required.")
+
+        if not isinstance(credential, str) or not credential.strip():
+            raise SecurityAuthorizationError("Invalid service credential: must be a non-empty string.")
+
+        parts = credential.strip().split(".")
+        if len(parts) != 3:
+            raise SecurityAuthorizationError(
+                f"Invalid service credential format: expected 3 dot-separated segments, got {len(parts)}."
+            )
+
+        header_b64, payload_b64, sig_b64 = parts
+
+        try:
+            header_json = self._b64url_decode(header_b64).decode("utf-8")
+            header = json.loads(header_json)
+        except Exception as e:
+            raise SecurityAuthorizationError(f"Invalid service credential header: {e}")
+
+        try:
+            payload_json = self._b64url_decode(payload_b64).decode("utf-8")
+            payload = json.loads(payload_json)
+        except Exception as e:
+            raise SecurityAuthorizationError(f"Invalid service credential payload: {e}")
+
+        try:
+            signature_bytes = self._b64url_decode(sig_b64)
+        except Exception as e:
+            raise SecurityAuthorizationError(f"Invalid service credential signature encoding: {e}")
+
+        alg = header.get("alg")
+        if not alg or alg == "none":
+            raise SecurityAuthorizationError("Unsigned service credentials (alg='none') are strictly prohibited.")
+
+        if self.app_env in ("production", "staging", "qa") and alg in ("HS256", "HMAC-SHA256"):
+            raise SecurityAuthorizationError(
+                f"HMAC service credentials are prohibited under '{self.app_env}' policy. Production requires EdDSA / Ed25519."
+            )
+
+        kid = header.get("kid")
+        if not kid or not str(kid).strip():
+            raise SecurityAuthorizationError("Service credential header missing mandatory 'kid'.")
+        clean_kid = str(kid).strip()
+
+        with self._lock:
+            if clean_kid not in self._trusted_keys:
+                raise SecurityAuthorizationError(f"Unknown service signing key ID '{clean_kid}'.")
+            key_bytes, key_algo = self._trusted_keys[clean_kid]
+
+        if self.db_manager and hasattr(self.db_manager, "is_key_revoked"):
+            if self.db_manager.is_key_revoked(clean_kid):
+                raise SecurityAuthorizationError(f"Service signing key '{clean_kid}' has been revoked.")
+
+        signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+
+        if alg in ("HS256", "HMAC-SHA256"):
+            expected_sig = hmac.new(key_bytes, signing_input, hashlib.sha256).digest()
+            if not hmac.compare_digest(expected_sig, signature_bytes):
+                raise SecurityAuthorizationError("Invalid service credential signature.")
+        elif alg in ("EdDSA", "Ed25519"):
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            try:
+                pub_key = ed25519.Ed25519PublicKey.from_public_bytes(key_bytes)
+                pub_key.verify(signature_bytes, signing_input)
+            except Exception:
+                raise SecurityAuthorizationError("Invalid service credential signature.")
+        else:
+            raise SecurityAuthorizationError(f"Unsupported credential algorithm '{alg}'.")
+
+        iss = payload.get("iss")
+        if not iss or not str(iss).strip():
+            raise SecurityAuthorizationError("Service credential payload missing mandatory 'iss' claim.")
+        clean_iss = str(iss).strip()
+        with self._lock:
+            if clean_iss not in self._trusted_issuers:
+                raise SecurityAuthorizationError(f"Untrusted service credential issuer '{clean_iss}'.")
+
+        aud = payload.get("aud")
+        if not aud:
+            raise SecurityAuthorizationError("Service credential payload missing mandatory 'aud' claim.")
+        aud_list = [aud] if isinstance(aud, str) else list(aud)
+        if self.expected_audience not in aud_list:
+            raise SecurityAuthorizationError(
+                f"Service credential audience '{aud}' does not match expected audience '{self.expected_audience}'."
+            )
+
+        sub = payload.get("sub") or payload.get("principal_id")
+        if not sub or not str(sub).strip():
+            raise SecurityAuthorizationError("Service credential payload missing mandatory 'sub' claim.")
+        clean_sub = str(sub).strip()
+
+        if clean_sub in ("candidate_user",) or clean_sub.startswith("user_") or clean_sub.startswith("candidate_"):
+            raise SecurityAuthorizationError(f"Candidate user '{clean_sub}' cannot be an authenticated service principal.")
+
+        ptype = payload.get("principal_type", "service")
+        if ptype in ("candidate", "unauthenticated", "anonymous"):
+            raise SecurityAuthorizationError(f"Invalid principal_type '{ptype}' in service credential.")
+
+        raw_scopes = payload.get("scope") or payload.get("scopes") or []
+        if isinstance(raw_scopes, str):
+            scopes = tuple(raw_scopes.split())
+        else:
+            scopes = tuple(raw_scopes)
+        if "legacy_migration" not in scopes and "all" not in scopes:
+            raise SecurityAuthorizationError("Service credential lacks mandatory 'legacy_migration' authorization scope.")
+
+        exp = payload.get("exp")
+        if exp is None:
+            raise SecurityAuthorizationError("Service credential payload missing mandatory 'exp' claim.")
+        try:
+            exp_float = float(exp)
+        except (ValueError, TypeError):
+            raise SecurityAuthorizationError("Invalid 'exp' timestamp in service credential.")
+
+        now_utc = datetime.now(timezone.utc)
+        if exp_float <= now_utc.timestamp():
+            raise SecurityAuthorizationError(f"Service credential has expired (exp={exp_float}).")
+
+        iat = payload.get("iat")
+        if iat is not None:
+            try:
+                iat_float = float(iat)
+                if iat_float > now_utc.timestamp() + 300:
+                    raise SecurityAuthorizationError("Service credential issued in the future.")
+                issued_at_dt = datetime.fromtimestamp(iat_float, tz=timezone.utc)
+            except (ValueError, TypeError):
+                issued_at_dt = now_utc
+        else:
+            issued_at_dt = now_utc
+
+        expires_at_dt = datetime.fromtimestamp(exp_float, tz=timezone.utc)
+
+        if self.db_manager and hasattr(self.db_manager, "is_principal_revoked"):
+            if self.db_manager.is_principal_revoked(clean_sub):
+                raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
+
+        if self.trust_store and hasattr(self.trust_store, "is_principal_revoked"):
+            if self.trust_store.is_principal_revoked(clean_sub):
+                raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
+
+        jti = payload.get("jti")
+
+        return AuthenticatedMigrationPrincipal(
+            _token=_AUTH_TOKEN,
+            principal_id=clean_sub,
+            issuer=clean_iss,
+            audience=self.expected_audience,
+            scopes=scopes,
+            issued_at=issued_at_dt,
+            expires_at=expires_at_dt,
+            credential_id=str(jti) if jti else None,
+            principal_type=ptype,
+        )
+
+    @classmethod
+    def mint_service_token(
+        cls,
+        principal_id: str,
+        signing_key: Union[str, bytes, Any],
+        key_id: str,
+        issuer: str,
+        audience: str = "legacy_migration",
+        scopes: Optional[List[str]] = None,
+        ttl_seconds: int = 3600,
+        algorithm: str = "EdDSA",
+        principal_type: str = "service",
+        jti: Optional[str] = None,
+    ) -> str:
+        clean_p = (principal_id or "").strip()
+        now_ts = int(datetime.now(timezone.utc).timestamp())
+        exp_ts = now_ts + ttl_seconds
+        scopes_list = scopes or ["legacy_migration"]
+        token_id = jti or str(uuid.uuid4())
+
+        header = {"alg": algorithm, "typ": "JWT", "kid": key_id}
+        payload = {
+            "iss": issuer,
+            "aud": audience,
+            "sub": clean_p,
+            "principal_type": principal_type,
+            "scope": scopes_list,
+            "iat": now_ts,
+            "exp": exp_ts,
+            "jti": token_id,
+        }
+
+        header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode("utf-8")).rstrip(b"=").decode("utf-8")
+        payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).rstrip(b"=").decode("utf-8")
+        signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+
+        if algorithm in ("HS256", "HMAC-SHA256"):
+            coerced_key = cls._coerce_bytes(signing_key)
+            sig_bytes = hmac.new(coerced_key, signing_input, hashlib.sha256).digest()
+        elif algorithm in ("EdDSA", "Ed25519"):
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            if isinstance(signing_key, ed25519.Ed25519PrivateKey):
+                priv = signing_key
+            else:
+                priv = ed25519.Ed25519PrivateKey.from_private_bytes(cls._coerce_bytes(signing_key))
+            sig_bytes = priv.sign(signing_input)
+        else:
+            raise ValueError(f"Unsupported algorithm '{algorithm}'")
+
+        sig_b64 = base64.urlsafe_b64encode(sig_bytes).rstrip(b"=").decode("utf-8")
+        return f"{header_b64}.{payload_b64}.{sig_b64}"
+
+
+def create_test_authenticated_principal(
+    principal_id: str,
+    issuer: str = "test_archival_authority",
+    audience: str = "legacy_migration",
+    scopes: Optional[List[str]] = None,
+    ttl_seconds: int = 3600,
+    db_manager: Optional[Any] = None,
+) -> AuthenticatedMigrationPrincipal:
+    """Explicitly isolated testing fixture to obtain a genuine AuthenticatedMigrationPrincipal for tests.
+
+    STRICT INVARIANT:
+    - CANNOT be used in production (APP_ENV=production fails closed).
+    - Mints a real ephemeral credential and verifies it through ServiceAuthenticationProvider.
+    """
+    app_env = resolve_app_env()
+    if app_env in ("production", "prod", "staging", "qa"):
+        raise SecurityAuthorizationError(
+            f"create_test_authenticated_principal is strictly prohibited in '{app_env}' environment."
+        )
+
+    from cryptography.hazmat.primitives.asymmetric import ed25519
+    priv = ed25519.Ed25519PrivateKey.generate()
+    pub = priv.public_key().public_bytes_raw()
+    key_id = f"test_key_{principal_id}"
+
+    provider = ServiceAuthenticationProvider(
+        trusted_keys={key_id: {"key": pub, "algorithm": "Ed25519"}},
+        trusted_issuers={issuer},
+        expected_audience=audience,
+        db_manager=db_manager,
+    )
+    token = provider.mint_service_token(
+        principal_id=principal_id,
+        signing_key=priv,
+        key_id=key_id,
+        issuer=issuer,
+        audience=audience,
+        scopes=scopes or ["legacy_migration"],
+        ttl_seconds=ttl_seconds,
+        algorithm="EdDSA",
+    )
+    return provider.authenticate(token)
+
+
 class LegacyEvidenceTrustStore:
     """Manages trusted root keys, public keys, and authorized issuers for archival evidence.
 
@@ -175,9 +576,8 @@ class LegacyEvidenceTrustStore:
         self._revoked_principals: Set[str] = set()
         self._db_manager = db_manager
 
-        # Determine algorithm policy with authoritative APP_ENV (Phase 9.1.2.8 Part A)
-        raw_app_env = os.environ.get("APP_ENV")
-        app_env = (raw_app_env or "development").strip().lower()
+        # Determine algorithm policy with authoritative APP_ENV (Phase 9.1.2.9 Section 5.1)
+        app_env = resolve_app_env()
 
         raw_env_policy = os.environ.get("LEGACY_EVIDENCE_POLICY")
         clean_env_policy = raw_env_policy.strip().lower() if raw_env_policy else None
@@ -188,7 +588,7 @@ class LegacyEvidenceTrustStore:
         if clean_arg_policy and clean_arg_policy not in ("permissive", "production", "ed25519_only"):
             raise SecurityAuthorizationError(f"Unknown legacy evidence algorithm policy '{algorithm_policy}'")
 
-        if app_env in ("production", "prod"):
+        if app_env == "production":
             # Production environment: require Ed25519-only verification; strictly reject permissive HMAC
             if clean_env_policy == "permissive":
                 raise SecurityAuthorizationError(
@@ -206,13 +606,12 @@ class LegacyEvidenceTrustStore:
                     f"Permissive HMAC policy is prohibited in '{app_env}' environment without approved testing configuration."
                 )
             chosen_policy = clean_arg_policy or clean_env_policy or "production"
-        elif app_env in ("development", "test", "dev"):
+        elif app_env in ("development", "test"):
             # Development and testing: permit permissive policy for synthetic HMAC fixtures
             chosen_policy = clean_arg_policy or clean_env_policy or "permissive"
         else:
-            # Unrecognized APP_ENV: fail closed
             raise SecurityAuthorizationError(
-                f"Unrecognized or untrusted APP_ENV '{raw_app_env}'. Legacy evidence trust store fails closed."
+                f"Unrecognized or untrusted APP_ENV '{app_env}'. Legacy evidence trust store fails closed."
             )
 
         self.algorithm_policy = chosen_policy
@@ -231,6 +630,10 @@ class LegacyEvidenceTrustStore:
                 if db_revoked:
                     staged_revoked_principals.update(db_revoked)
             except Exception as e:
+                if app_env in ("production", "staging", "qa"):
+                    raise SecurityAuthorizationError(
+                        f"Failed to query durable revoked principals from database in '{app_env}': {e}"
+                    ) from e
                 logger.warning("Failed to load persisted revoked principals from DB: %s", e)
 
         # 1. Load from environment if available (fail closed on malformed JSON)
@@ -475,11 +878,24 @@ class LegacyEvidenceTrustStore:
         with self._lock:
             if clean_p in self._revoked_principals:
                 return False
-            if self._db_manager and hasattr(self._db_manager, "is_principal_revoked"):
-                if self._db_manager.is_principal_revoked(clean_p):
-                    self._revoked_principals.add(clean_p)
-                    self._trusted_attesting_principals.discard(clean_p)
+            if self._db_manager:
+                try:
+                    if hasattr(self._db_manager, "is_principal_revoked"):
+                        if self._db_manager.is_principal_revoked(clean_p):
+                            self._revoked_principals.add(clean_p)
+                            self._trusted_attesting_principals.discard(clean_p)
+                            return False
+                except Exception as e:
+                    app_env = resolve_app_env()
+                    if app_env in ("production", "staging", "qa") or self.algorithm_policy in ("production", "ed25519_only"):
+                        raise SecurityAuthorizationError(
+                            f"Database revocation query failure for principal '{clean_p}' in '{app_env}': {e}"
+                        ) from e
+                    logger.error("Database revocation query failed: %s", e)
                     return False
+            elif self.algorithm_policy in ("production", "ed25519_only"):
+                raise SecurityAuthorizationError("Missing database revocation authority in production.")
+
             return clean_p in self._trusted_attesting_principals
 
     def register_trusted_key(
@@ -584,6 +1000,10 @@ class LegacyEvidenceTrustStore:
                 )
 
             return self._keys[clean_id], self._key_algorithms.get(clean_id, "HMAC-SHA256")
+
+    def get_key_bytes(self, key_id: str) -> bytes:
+        """Retrieves raw key bytes, raising error if revoked or unknown."""
+        return self.get_key(key_id)[0]
 
     def is_issuer_trusted(self, issuer_id: str) -> bool:
         """Verifies whether the issuer identity is authorized."""
@@ -777,21 +1197,145 @@ class LegacyEvidenceVerifier:
         resolver: Optional[LegacyEvidenceResolver] = None,
         db_manager: Optional[Any] = None,
         require_authenticated_context: Optional[bool] = None,
+        service_authenticator: Optional[Any] = None,
     ):
+        self.app_env = resolve_app_env()
         self.trust_store = trust_store or get_default_evidence_trust_store() or LegacyEvidenceTrustStore(db_manager=db_manager)
         self.resolver = resolver or get_default_evidence_resolver()
         self.db_manager = db_manager
-        app_env = os.environ.get("APP_ENV", "development").strip().lower()
-        if require_authenticated_context is not None:
+        self.service_authenticator = service_authenticator
+
+        is_production_like = (
+            self.app_env in ("production", "staging", "qa")
+            or self.trust_store.algorithm_policy in ("production", "ed25519_only")
+        )
+
+        if is_production_like:
+            if require_authenticated_context is False:
+                raise SecurityAuthorizationError(
+                    "Disabling authenticated context enforcement (require_authenticated_context=False) "
+                    f"is strictly prohibited in '{self.app_env}' environment."
+                )
+            self.require_authenticated_context = True
+        elif require_authenticated_context is not None:
             self.require_authenticated_context = require_authenticated_context
         else:
-            self.require_authenticated_context = (
-                self.trust_store.algorithm_policy in ("production", "ed25519_only")
-                or app_env in ("production", "prod", "staging", "qa")
-            )
+            self.require_authenticated_context = False
 
     def set_resolver(self, resolver: Optional[LegacyEvidenceResolver]) -> None:
         self.resolver = resolver
+
+    def _verify_artifact_for_audit(
+        self,
+        evidence_type: str,
+        evidence_reference_id: str,
+        user_id: int,
+        job_description_id: int,
+        source_snapshot_hash: str,
+        attesting_principal: str,
+    ) -> VerifiedLegacyEvidence:
+        """Internal helper for auditing stored attestations against backing artifacts without live credentials."""
+        clean_principal = attesting_principal.strip()
+        if not self.trust_store.is_attesting_principal_trusted(clean_principal):
+            raise SecurityAuthorizationError(
+                f"Attesting principal '{clean_principal}' is not authorized or has been revoked."
+            )
+
+        if self.resolver is None:
+            raise SecurityAuthorizationError("No evidence resolver configured; cannot verify attestation.")
+        resolved = self.resolver.resolve_artifact(evidence_type, evidence_reference_id)
+        if resolved is None:
+            raise SecurityAuthorizationError(
+                f"Referenced evidence artifact '{evidence_reference_id}' of type '{evidence_type}' could not be resolved or found."
+            )
+        raw_bytes, artifact_dict = resolved
+        artifact_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+        if not isinstance(artifact_dict, dict):
+            raise SecurityAuthorizationError("Evidence artifact is not a valid JSON dictionary.")
+
+        if artifact_dict.get("evidence_type") != evidence_type:
+            raise SecurityAuthorizationError("Evidence type mismatch in artifact.")
+        if artifact_dict.get("evidence_reference_id") != evidence_reference_id:
+            raise SecurityAuthorizationError("Evidence reference ID mismatch in artifact.")
+
+        bound_principal = (
+            artifact_dict.get("migration_attesting_principal")
+            or artifact_dict.get("attesting_principal")
+            or artifact_dict.get("authorized_principal")
+        )
+        if self.trust_store.algorithm_policy in ("production", "ed25519_only") and not bound_principal:
+            raise SecurityAuthorizationError(
+                f"Evidence artifact '{evidence_reference_id}' lacks mandatory attesting_principal binding required under production policy."
+            )
+        if bound_principal and str(bound_principal).strip() != clean_principal:
+            raise SecurityAuthorizationError(
+                f"Evidence artifact explicitly binds attesting principal '{bound_principal}', "
+                f"which does not match attestation principal '{clean_principal}'."
+            )
+
+        issuer_id = str(artifact_dict.get("issuer_id", "")).strip()
+        if not self.trust_store.is_issuer_trusted(issuer_id):
+            raise SecurityAuthorizationError(f"Evidence issuer '{issuer_id}' is untrusted.")
+
+        key_id = str(artifact_dict.get("key_id", "")).strip()
+        if self.trust_store.is_key_revoked(key_id):
+            raise KeyRevokedError(key_id)
+
+        sig_algo = str(artifact_dict.get("signature_algorithm", "")).strip()
+        if self.trust_store.algorithm_policy in ("production", "ed25519_only") and sig_algo != "Ed25519":
+            raise SecurityAuthorizationError("Signature algorithm rejected under Ed25519-only policy.")
+
+        stored_sig = str(artifact_dict.get("signature") or artifact_dict.get("evidence_signature", "")).strip()
+        payload_to_verify = {k: v for k, v in artifact_dict.items() if k not in ("signature", "evidence_signature")}
+        payload_bytes = canonical_json_bytes(payload_to_verify)
+        payload_hash = hashlib.sha256(payload_bytes).hexdigest()
+
+        if sig_algo == "Ed25519":
+            from cryptography.hazmat.primitives.asymmetric import ed25519
+            pub_key_bytes = self.trust_store.get_key_bytes(key_id)
+            pub_key = ed25519.Ed25519PublicKey.from_public_bytes(pub_key_bytes)
+            raw_sig = bytes.fromhex(stored_sig) if all(c in "0123456789abcdefABCDEF" for c in stored_sig) else stored_sig.encode("utf-8")
+            try:
+                pub_key.verify(raw_sig, payload_bytes)
+            except Exception:
+                raise SecurityAuthorizationError("Cryptographic digital signature verification failed on evidence artifact.")
+        elif sig_algo == "HMAC-SHA256":
+            secret = self.trust_store.get_key_bytes(key_id)
+            expected_sig = hmac.new(secret, payload_bytes, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(expected_sig.lower(), stored_sig.lower()):
+                raise SecurityAuthorizationError("Cryptographic HMAC signature verification failed on evidence artifact.")
+
+        entries = artifact_dict.get("entries", [])
+        matched = False
+        for entry in entries:
+            if (
+                entry.get("user_id") == user_id
+                and entry.get("job_description_id") == job_description_id
+                and entry.get("source_snapshot_hash") == source_snapshot_hash
+            ):
+                matched = True
+                break
+        if not matched:
+            raise SecurityAuthorizationError("Evidence artifact payload does not bind the specified job description.")
+
+        return VerifiedLegacyEvidence(
+            _token=_VERIFICATION_TOKEN,
+            evidence_type=evidence_type,
+            evidence_reference_id=evidence_reference_id,
+            evidence_artifact_hash=artifact_hash,
+            evidence_payload_hash=payload_hash,
+            user_id=user_id,
+            job_description_id=job_description_id,
+            source_snapshot_hash=source_snapshot_hash,
+            migration_boundary=artifact_dict.get("migration_boundary", "pre_phase_9_1_1"),
+            issuer_id=issuer_id,
+            key_id=key_id,
+            signature_algorithm=sig_algo,
+            evidence_signature=stored_sig,
+            verified_at=datetime.now(timezone.utc).isoformat(),
+            attested_by=clean_principal,
+        )
 
     def verify(
         self,
@@ -816,6 +1360,27 @@ class LegacyEvidenceVerifier:
         8. Cryptographic digital signature verification over canonical payload bytes.
         9. Exact entry binding: artifact must explicitly list (user_id, job_description_id, source_snapshot_hash).
         """
+        app_env = resolve_app_env()
+        is_production_like = (
+            app_env in ("production", "staging", "qa")
+            or self.trust_store.algorithm_policy in ("production", "ed25519_only")
+        )
+
+        if is_production_like and require_authenticated_context is False:
+            raise SecurityAuthorizationError(
+                "Method-level downgrade override (require_authenticated_context=False) "
+                f"is strictly prohibited in '{app_env}' environment."
+            )
+
+        if is_production_like and self.db_manager is None:
+            raise SecurityAuthorizationError(
+                f"Authoritative DatabaseManager is mandatory for LegacyEvidenceVerifier in '{app_env}'."
+            )
+
+        effective_require_context = self.require_authenticated_context
+        if require_authenticated_context is not None and not is_production_like:
+            effective_require_context = require_authenticated_context
+
         # 1. Evidence type allowlist
         clean_type = (evidence_type or "").strip()
         if clean_type not in SUPPORTED_EVIDENCE_TYPES:
@@ -823,33 +1388,39 @@ class LegacyEvidenceVerifier:
                 f"Evidence type '{clean_type}' is not on the supported allowlist: {sorted(SUPPORTED_EVIDENCE_TYPES)}"
             )
 
-        # 2. Attesting principal authorization & authenticated context verification (Phase 9.1.2.8 Part C)
+        # 2. Attesting principal authorization & authenticated context verification (Phase 9.1.2.9)
         if attesting_principal is None:
             raise SecurityAuthorizationError("Missing authenticated service context: attesting_principal is required.")
 
-        effective_require_context = require_authenticated_context
-        if effective_require_context is None:
-            effective_require_context = self.require_authenticated_context
-
         if isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
-            if not attesting_principal.is_authenticated:
-                raise SecurityAuthorizationError(f"Migration principal '{attesting_principal.principal_id}' is not authenticated.")
-            if attesting_principal.is_revoked:
-                raise SecurityAuthorizationError(f"Migration principal '{attesting_principal.principal_id}' has been revoked.")
+            if attesting_principal._token is not _AUTH_TOKEN:
+                raise SecurityAuthorizationError("Tampered or unverified AuthenticatedMigrationPrincipal context.")
             clean_principal = attesting_principal.principal_id.strip()
         elif isinstance(attesting_principal, str):
-            if effective_require_context:
+            clean_str = attesting_principal.strip()
+            if not clean_str:
+                raise SecurityAuthorizationError("Attesting principal is required and cannot be empty.")
+
+            if self.service_authenticator and "." in clean_str:
+                auth_p = self.service_authenticator.authenticate(clean_str)
+                clean_principal = auth_p.principal_id.strip()
+            elif is_production_like or effective_require_context:
                 raise SecurityAuthorizationError(
                     "Caller cannot authenticate by supplying an arbitrary allowed string. "
                     "An AuthenticatedMigrationPrincipal context is required."
                 )
-            clean_principal = attesting_principal.strip()
-            if not clean_principal:
-                raise SecurityAuthorizationError("Attesting principal is required and cannot be empty.")
+            else:
+                clean_principal = clean_str
         else:
             raise SecurityAuthorizationError(
                 f"Invalid attesting_principal type '{type(attesting_principal).__name__}'. "
                 "An AuthenticatedMigrationPrincipal context is required."
+            )
+
+        # In production, require service authenticator or genuine AuthenticatedMigrationPrincipal
+        if is_production_like and self.service_authenticator is None and not isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
+            raise SecurityAuthorizationError(
+                "Production service authentication provider is not configured. Production legacy attestation creation is disabled."
             )
 
         # Candidate user cannot attest own source
@@ -1073,20 +1644,20 @@ class LegacyEvidenceVerifier:
                 f"Attestation snapshot_hash '{att_hash}' does not match requested '{snapshot_hash}'."
             )
 
-        # Independently resolve and verify the backing artifact
-        auth_principal = AuthenticatedMigrationPrincipal(
-            principal_id=clean_att_by,
-            principal_type="service",
-            authentication_source="persisted_attestation_audit",
-            authorization_scope="legacy_migration",
-        )
-        verified = self.verify(
+        # Check that attesting principal is authorized and NOT revoked
+        if not self.trust_store.is_attesting_principal_trusted(clean_att_by):
+            raise SecurityAuthorizationError(
+                f"Attesting principal '{clean_att_by}' in stored attestation is revoked or not authorized in trust store."
+            )
+
+        # Independently resolve and verify the backing artifact for audit
+        verified = self._verify_artifact_for_audit(
             evidence_type=att_type,
             evidence_reference_id=att_ref,
             user_id=user_id,
             job_description_id=job_description_id,
             source_snapshot_hash=snapshot_hash,
-            attesting_principal=auth_principal,
+            attesting_principal=clean_att_by,
         )
 
         # Check all cryptographic fields against the independently verified artifact

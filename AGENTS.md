@@ -870,6 +870,28 @@ When interacting with the browser via Playwright MCP:
     - 0 pyflakes errors, 0 ruff errors.
     - Corrected invalid commit SHA in `docs/PHASE_9_1_2_7_IMPLEMENTATION_REPORT.md` (to `446c98ddf68154e0f2dec2ebc8a06dfaff33bde3`).
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_8_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.9: Genuine Service Identity Authentication & Environment Fail-Closed Closure** (Complete)
+  - Genuine Cryptographic Service Authentication Architecture:
+    - Implemented `ServiceAuthenticationProvider` supporting RFC 7519 / JWT-format service credentials (`header.payload.signature`) with Ed25519 (EdDSA) digital signatures, key revocation checks, trusted issuer sets, expected audience matching (`"legacy_migration"`), and expiration validation.
+    - Added sentinel-locked `AuthenticatedMigrationPrincipal` using a module-private token `_AUTH_TOKEN`, preventing direct caller construction, fake duck-typing, and arbitrary flag setting.
+    - Completely eliminated unverified identity creation helpers (`create_authenticated_principal`), replacing them with isolated, production-blocked test fixtures (`create_test_authenticated_principal`).
+  - Environment Fail-Closed Closure & Policy Hardening:
+    - Authoritative `resolve_app_env()` mandates non-empty `APP_ENV`; missing, empty, whitespace, or unknown `APP_ENV` fails closed immediately with `SecurityAuthorizationError`.
+    - Production, staging, and QA enforce Ed25519-only cryptographic verification; permissive HMAC policies are strictly prohibited outside development and test.
+    - Enforced non-overridable security checks: `require_authenticated_context=False` is rejected in constructors and verification methods under production policy.
+  - Durable Revocation & Database Integrity:
+    - Revocations in SQLite `revoked_attesting_principals` survive process restart; revoked principals cannot be authenticated or persisted.
+    - Database errors during revocation checks fail closed with `SecurityAuthorizationError`.
+    - Added `revoke_attesting_principal` alias on `DatabaseManager` for complete API compatibility.
+  - Production No-Provider Guarantee & Binary Recovery:
+    - Confirmed candidate authentication exists (`AuthManager`), but no production service authenticator or archival authority exists. Consequently, production legacy attestation creation fails closed and unverified records remain in `REQUIRED` state.
+    - Verified binary recovery workflow: candidates can provide original PDF/DOCX files to restore verified status and resume application preflight.
+  - Verification & Regressions:
+    - Authored 45 dedicated test cases in `tests/test_phase_9_1_2_9_real_service_authentication.py` (45/45 passing, 100%).
+    - Harmonized Phase 9.1.2.8 test suite (34/34 passing, 100%).
+    - Harmonized root-level test environment with `tests/conftest.py` setting `APP_ENV=test`.
+    - Updated `docs/PHASE_9_1_2_8_IMPLEMENTATION_REPORT.md` to clearly distinguish principal identifiers, authorized principals, caller contexts, and credential-verified identities.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_9_IMPLEMENTATION_REPORT.md`.
 
 ---
 

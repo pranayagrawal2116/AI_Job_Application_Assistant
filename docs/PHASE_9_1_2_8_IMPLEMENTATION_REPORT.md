@@ -131,6 +131,15 @@ CREATE TABLE IF NOT EXISTS revoked_attesting_principals (
 
 ## 6. Authenticated Service-Principal Context Architecture
 
+> [!NOTE] Architecture Note & Provenance Distinction (Updated in Phase 9.1.2.9)
+> In security and cryptographic audits, four distinct identity concepts must be clearly differentiated:
+> 1. **Principal Identifier:** A string naming an entity (e.g., `"migration_runner"`), which carries no proof of identity or authorization by itself.
+> 2. **Authorized Principal:** A configured identity allowlisted in the trust store or database policy.
+> 3. **Caller Context:** An unverified in-memory Python object claiming to represent an identity.
+> 4. **Credential-Verified Authenticated Identity:** An identity mathematically proven through valid cryptographic service credentials (e.g., Ed25519-signed JWT tokens verified against trusted keys, audience, scopes, and revocation lists).
+>
+> **Phase Scope Clarification:** Phase 9.1.2.8 introduced the architectural requirement for an authenticated context (prohibiting raw principal strings in production and establishing `AuthenticatedMigrationPrincipal`). However, Phase 9.1.2.8 retained an unverified construction helper (`create_authenticated_principal`). Phase 9.1.2.9 completed the security boundary by implementing genuine `ServiceAuthenticationProvider` cryptographic token verification, sentinel-locking `AuthenticatedMigrationPrincipal`, and completely eliminating synthetic manufacturing helpers.
+
 ### Replacement of Caller-Supplied Strings
 Previously, caller code supplied arbitrary strings (`attested_by="migration_coordinator"`). Any caller could forge identity simply by guessing or knowing an allowed principal name.
 

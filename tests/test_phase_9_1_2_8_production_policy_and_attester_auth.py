@@ -27,6 +27,7 @@ from src.security.legacy_evidence_verifier import (
     InMemoryEvidenceResolver,
     LegacyEvidenceTrustStore,
     LegacyEvidenceVerifier,
+    ServiceAuthenticationProvider,
     create_signed_evidence_artifact,
     set_default_evidence_resolver,
     set_default_evidence_trust_store,
@@ -102,6 +103,34 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             )
             return c.lastrowid
 
+    def _create_authenticated_principal(
+        self,
+        principal_id: str,
+        issuer: str = "archival_authority",
+        audience: str = "legacy_migration",
+    ) -> AuthenticatedMigrationPrincipal:
+        from cryptography.hazmat.primitives.asymmetric import ed25519
+        priv = ed25519.Ed25519PrivateKey.generate()
+        pub = priv.public_key().public_bytes_raw()
+        kid = f"key_{principal_id}"
+        provider = ServiceAuthenticationProvider(
+            trusted_keys={kid: {"key": pub, "algorithm": "Ed25519"}},
+            trusted_issuers={issuer},
+            expected_audience=audience,
+            db_manager=self.db,
+        )
+        token = provider.mint_service_token(
+            principal_id=principal_id,
+            signing_key=priv,
+            key_id=kid,
+            issuer=issuer,
+            audience=audience,
+            scopes=["legacy_migration"],
+            ttl_seconds=3600,
+            algorithm="EdDSA",
+        )
+        return provider.authenticate(token)
+
     # =========================================================================
     # PART 6.1 — ENVIRONMENT-POLICY TESTS (Tests 1 - 12)
     # =========================================================================
@@ -172,10 +201,11 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             store = LegacyEvidenceTrustStore(
                 trusted_issuers={"archival_authority"},
                 trusted_attesting_principals={"migration_svc"},
+                db_manager=self.db,
             )
             store.register_trusted_key("ed_k1", self.pub_bytes, algorithm="Ed25519")
             resolver = InMemoryEvidenceResolver()
-            verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver)
+            verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
 
             jd_id = self._create_sample_jd(self.user1_id)
             snap = self.db.get_job_description(jd_id, user_id=self.user1_id).snapshot_hash
@@ -193,7 +223,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "REF_ED_01", raw_bytes)
 
-            auth_p = AuthenticatedMigrationPrincipal(principal_id="migration_svc")
+            auth_p = self._create_authenticated_principal("migration_svc")
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="REF_ED_01",
@@ -327,9 +357,9 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
     def test_21_caller_cannot_authenticate_by_supplying_arbitrary_allowed_string(self) -> None:
         """TC-21: In production mode, passing a bare string is rejected: AuthenticatedMigrationPrincipal required."""
         with patch.dict(os.environ, {"APP_ENV": "production"}, clear=True):
-            store = LegacyEvidenceTrustStore(trusted_attesting_principals={"migration_svc"})
+            store = LegacyEvidenceTrustStore(trusted_attesting_principals={"migration_svc"}, db_manager=self.db)
             resolver = InMemoryEvidenceResolver()
-            verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver)
+            verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
 
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 verifier.verify(
@@ -402,10 +432,11 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             store = LegacyEvidenceTrustStore(
                 trusted_issuers={"archival_authority"},
                 trusted_attesting_principals={"migration_svc"},
+                db_manager=self.db,
             )
             store.register_trusted_key("ed_k", self.pub_bytes, algorithm="Ed25519")
             resolver = InMemoryEvidenceResolver()
-            verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver)
+            verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
 
             jd_id = self._create_sample_jd(self.user1_id)
             snap = self.db.get_job_description(jd_id, user_id=self.user1_id).snapshot_hash
@@ -424,7 +455,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "UNBOUND_REF", raw_bytes)
 
-            auth_p = AuthenticatedMigrationPrincipal(principal_id="migration_svc")
+            auth_p = self._create_authenticated_principal("migration_svc")
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 verifier.verify(
                     evidence_type="historical_import_manifest",
@@ -501,7 +532,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
         )
         resolver.register_artifact("historical_import_manifest", "PERS_REF_01", raw_bytes)
 
-        auth_p = AuthenticatedMigrationPrincipal(principal_id="auth_svc")
+        auth_p = self._create_authenticated_principal("auth_svc", issuer="auth_issuer")
         verified = verifier.verify(
             evidence_type="historical_import_manifest",
             evidence_reference_id="PERS_REF_01",
@@ -597,7 +628,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             attesting_principal="principal_one",
         )
 
-        auth_two = AuthenticatedMigrationPrincipal(principal_id="principal_two")
+        auth_two = self._create_authenticated_principal("principal_two", issuer="auth_issuer")
         with self.assertRaises(SecurityAuthorizationError) as ctx:
             self.db.record_legacy_evidence_attestation(
                 verified_evidence=verified,
@@ -608,9 +639,12 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
 
     def test_29_candidate_cannot_create_migration_attestation(self) -> None:
         """TC-29: Candidate identities are strictly rejected in record_legacy_evidence_attestation."""
-        # Attempt to create AuthenticatedMigrationPrincipal with candidate user ID fails immediately
+        # Direct instantiation is rejected
         with self.assertRaises(SecurityAuthorizationError):
             AuthenticatedMigrationPrincipal(principal_id=f"user_{self.user1_id}")
+        # Even attempting to authenticate a candidate identity through provider fails immediately
+        with self.assertRaises(SecurityAuthorizationError):
+            self._create_authenticated_principal(f"user_{self.user1_id}")
 
     def test_30_missing_verified_object_is_rejected(self) -> None:
         """TC-30: Direct insertion without a VerifiedLegacyEvidence instance fails closed."""
@@ -695,7 +729,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             resolver.register_artifact("historical_import_manifest", "PERM_REF_01", raw_bytes)
 
             verifier1 = LegacyEvidenceVerifier(trust_store=store1, resolver=resolver, db_manager=self.db)
-            auth_p = AuthenticatedMigrationPrincipal(principal_id="service_runner")
+            auth_p = self._create_authenticated_principal("service_runner", issuer="prod_authority")
             verified = verifier1.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="PERM_REF_01",
@@ -769,7 +803,7 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             resolver.register_artifact("historical_import_manifest", "REV_REF_01", raw_bytes)
 
             verifier = LegacyEvidenceVerifier(trust_store=store, resolver=resolver, db_manager=self.db)
-            auth_p = AuthenticatedMigrationPrincipal(principal_id="revokable_runner")
+            auth_p = self._create_authenticated_principal("revokable_runner", issuer="prod_authority")
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",
                 evidence_reference_id="REV_REF_01",
@@ -812,7 +846,9 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             # After revocation: preflight FAILS CLOSED
             with self.assertRaises(SecurityAuthorizationError) as ctx:
                 preflight.check_job_description_security(user_id=self.user1_id, jd_id=jd_id)
-            self.assertIn("not authorized in trust store", str(ctx.exception))
+            self.assertTrue(
+                "revoked" in str(ctx.exception).lower() or "not authorized" in str(ctx.exception).lower()
+            )
 
     # =========================================================================
     # PART 6.4 — END-TO-END PRODUCTION BEHAVIOR (Test 34)
@@ -862,11 +898,9 @@ class TestPhase9128ProductionPolicyAndAttesterAuth(unittest.TestCase):
             )
             resolver.register_artifact("historical_import_manifest", "E2E_PROD_MANIFEST_001", raw_bytes)
 
-            auth_principal = AuthenticatedMigrationPrincipal(
-                principal_id="prod_migration_coordinator",
-                principal_type="service",
-                authentication_source="deployment_token",
-                authorization_scope="legacy_migration",
+            auth_principal = self._create_authenticated_principal(
+                "prod_migration_coordinator",
+                issuer="authorized_archive_org",
             )
             verified = verifier.verify(
                 evidence_type="historical_import_manifest",

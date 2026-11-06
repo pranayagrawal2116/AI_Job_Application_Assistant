@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
@@ -3290,6 +3291,14 @@ class DatabaseManager:
             )
             logger.warning("Revoked attesting principal '%s' in SQLite (reason: %s)", clean_p, reason)
 
+    def revoke_attesting_principal(
+        self,
+        principal_id: str,
+        reason: str = "Principal Revoked",
+    ) -> None:
+        """Alias for record_principal_revocation."""
+        self.record_principal_revocation(principal_id, reason=reason)
+
     def is_principal_revoked(self, principal_id: str) -> bool:
         """Checks if an attesting principal has been revoked in SQLite."""
         if not principal_id or not isinstance(principal_id, str):
@@ -5805,6 +5814,12 @@ class DatabaseManager:
                     )
                 passed_principal = attesting_principal.principal_id.strip()
             elif isinstance(attesting_principal, str):
+                app_env = os.environ.get("APP_ENV", "development").strip().lower()
+                if app_env in ("production", "staging", "qa"):
+                    raise SecurityAuthorizationError(
+                        "Caller-supplied principal strings are rejected as authentication proof in production. "
+                        "An AuthenticatedMigrationPrincipal context is required."
+                    )
                 passed_principal = attesting_principal.strip()
             else:
                 raise SecurityAuthorizationError(
@@ -5825,7 +5840,14 @@ class DatabaseManager:
                     f"Attesting principal '{verified_principal}' is not authorized in trust store or has been revoked."
                 )
 
-        if self.is_principal_revoked(verified_principal):
+        try:
+            is_rev = self.is_principal_revoked(verified_principal)
+        except Exception as e:
+            raise SecurityAuthorizationError(
+                f"Database revocation query failure for principal '{verified_principal}': {e}"
+            ) from e
+
+        if is_rev:
             raise SecurityAuthorizationError(
                 f"Attesting principal '{verified_principal}' has been revoked in database."
             )
