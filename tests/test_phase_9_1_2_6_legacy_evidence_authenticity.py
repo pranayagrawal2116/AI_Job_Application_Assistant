@@ -79,6 +79,9 @@ class TestPhase9126LegacyEvidenceAuthenticity(unittest.TestCase):
         self.trust_store = LegacyEvidenceTrustStore(db_manager=self.db)
         self.trust_store.register_trusted_issuer(SYNTHETIC_TEST_ISSUER)
         self.trust_store.register_trusted_key(SYNTHETIC_TEST_KEY_ID, SYNTHETIC_TEST_SECRET)
+        self.trust_store.register_trusted_attesting_principal(SYNTHETIC_TEST_MIGRATION_PRINCIPAL)
+        self.trust_store.register_trusted_attesting_principal("system_migration_coordinator")
+        self.trust_store.register_trusted_attesting_principal("system_migration")
 
         # Synthetic in-memory evidence resolver
         self.resolver = InMemoryEvidenceResolver()

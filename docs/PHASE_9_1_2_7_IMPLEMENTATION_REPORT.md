@@ -27,7 +27,8 @@ Phase 9.1.2.7 resolves all six vulnerabilities, enforcing strict fail-closed def
 
 - **Verified Starting Baseline:** `aa29530e1e0afd2025d7b0076f5586d01edd3ea7`
 - **Target Branch:** `main`
-- **Final Commit:** `d2cb906b4df738eddcade270373322c6911d8ebd`
+- **Repository URL:** `https://github.com/pranayagrawal2116/AI_Job_Application_Assistant.git`
+- **Final Commit:** `446c98ddf68154e0f2dec2ebc8a06dfaff33bde3`
 
 ---
 

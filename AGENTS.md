@@ -846,6 +846,30 @@ When interacting with the browser via Playwright MCP:
     - Full repository regression pass: 1,622 tests passing across 110 test suites (100% pass rate).
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_7_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.8: Production Cryptographic Policy & Authenticated Attester Identity Closure** (Complete)
+  - Authoritative `APP_ENV` Cryptographic Policy (Part A):
+    - Derived algorithm policy directly from `APP_ENV`. In production (`APP_ENV=production`), strictly enforces `ed25519_only` cryptographic policy.
+    - Rejects HMAC key registration, HMAC-signed evidence artifacts, `LEGACY_EVIDENCE_POLICY=permissive`, and programmatic `algorithm_policy="permissive"` overrides with `SecurityAuthorizationError`.
+    - Fails closed on `staging`/`qa` (defaults to `ed25519_only`) and unrecognized `APP_ENV` environments. Documented all settings in `.env.example`.
+  - Empty Default Principal Allowlist & Durable Revocation Persistence (Part B):
+    - Completely emptied default principal configuration (`DEFAULT_AUTHORIZED_ATTESTING_PRINCIPALS = frozenset()`).
+    - An empty configuration grants zero migration principals; all migration attesting principals must be explicitly configured or authenticated.
+    - Implemented durable SQLite persistence for principal revocation via `revoked_attesting_principals` table and `DatabaseManager` methods (`record_principal_revocation`, `is_principal_revoked`, `get_revoked_principals`).
+  - Authenticated Attesting Principal Context (Part C):
+    - Replaced caller-controlled arbitrary string attesters with an authenticated `AuthenticatedMigrationPrincipal` dataclass.
+    - Validates `is_authenticated=True`, `is_revoked=False`, non-candidate identity, and authorized scope (`"legacy_migration"`).
+    - Under production policy, strictly enforces that signed evidence artifacts explicitly bind the migration attesting principal (`bound_principal == clean_principal`).
+  - Attestation Principal Binding & Override Prevention (Part D):
+    - In `DatabaseManager.record_legacy_evidence_attestation()`, strictly persists the principal bound in `verified_evidence.attested_by`.
+    - Enforces exact equality when caller passes `attesting_principal`, failing closed on discrepancies with `SecurityAuthorizationError`.
+    - Rejects candidate self-attestation and validates unrevoked status across trust store and SQLite database before persisting attestations.
+  - Verification & Regressions (Parts E, F, G, H & I):
+    - Authored 34 dedicated test cases in `tests/test_phase_9_1_2_8_production_policy_and_attester_auth.py` (34/34 passing, 100%).
+    - Harmonized synthetic test fixtures across Phase 9 suites (338/338 Phase 9 tests passing across 13 suites).
+    - Full repository regression pass: 1,656 tests passing across 111 test suites (100% pass rate).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Corrected invalid commit SHA in `docs/PHASE_9_1_2_7_IMPLEMENTATION_REPORT.md` (to `446c98ddf68154e0f2dec2ebc8a06dfaff33bde3`).
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_8_IMPLEMENTATION_REPORT.md`.
 
 ---
 

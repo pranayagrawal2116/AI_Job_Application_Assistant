@@ -395,6 +395,12 @@ CREATE TABLE IF NOT EXISTS revoked_signing_keys (
     reason TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS revoked_attesting_principals (
+    principal_id TEXT PRIMARY KEY,
+    revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    reason TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS consumed_action_nonces (
     nonce TEXT PRIMARY KEY,
     key_id TEXT NOT NULL,

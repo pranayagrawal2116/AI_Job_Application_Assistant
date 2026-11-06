@@ -71,6 +71,7 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
         self.trust_store = LegacyEvidenceTrustStore(db_manager=self.db)
         self.trust_store.register_trusted_issuer("system_migration_authority")
         self.trust_store.register_trusted_key("test_key_9122", b"test_secret_32_bytes_long_9122!!")
+        self.trust_store.register_trusted_attesting_principal("system_migration_coordinator")
         self.resolver = InMemoryEvidenceResolver()
         set_default_evidence_trust_store(self.trust_store)
         set_default_evidence_resolver(self.resolver)

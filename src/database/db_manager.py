@@ -6,7 +6,7 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Any, Dict, Generator, List, Optional, Tuple, Union
+from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
 import pandas as pd
 
@@ -338,6 +338,17 @@ class DatabaseManager:
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS revoked_signing_keys (
                     key_id TEXT PRIMARY KEY,
+                    revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    reason TEXT NOT NULL
+                )
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS revoked_attesting_principals (
+                    principal_id TEXT PRIMARY KEY,
                     revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     reason TEXT NOT NULL
                 )
@@ -3259,6 +3270,45 @@ class DatabaseManager:
             cursor.execute("SELECT 1 FROM revoked_signing_keys WHERE key_id = ?", (clean_key,))
             return cursor.fetchone() is not None
 
+    def record_principal_revocation(
+        self,
+        principal_id: str,
+        reason: str = "Principal Revoked",
+    ) -> None:
+        """Persists an attesting principal revocation durably in SQLite."""
+        if not principal_id or not isinstance(principal_id, str) or not principal_id.strip():
+            raise SecurityAuthorizationError(f"Invalid principal_id to revoke: '{principal_id}'")
+        clean_p = principal_id.strip()
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO revoked_attesting_principals (principal_id, revoked_at, reason)
+                VALUES (?, CURRENT_TIMESTAMP, ?)
+                """,
+                (clean_p, reason),
+            )
+            logger.warning("Revoked attesting principal '%s' in SQLite (reason: %s)", clean_p, reason)
+
+    def is_principal_revoked(self, principal_id: str) -> bool:
+        """Checks if an attesting principal has been revoked in SQLite."""
+        if not principal_id or not isinstance(principal_id, str):
+            return True
+        clean_p = principal_id.strip()
+        if not clean_p:
+            return True
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?", (clean_p,))
+            return cursor.fetchone() is not None
+
+    def get_revoked_principals(self) -> Set[str]:
+        """Returns all revoked attesting principal IDs from SQLite."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT principal_id FROM revoked_attesting_principals")
+            return {row[0] for row in cursor.fetchall()}
+
     def _record_packet_approval_internal(
         self,
         cursor: sqlite3.Cursor,
@@ -5703,18 +5753,24 @@ class DatabaseManager:
     def record_legacy_evidence_attestation(
         self,
         verified_evidence: Any,
-        attesting_principal: Optional[str] = None,
+        attesting_principal: Optional[Any] = None,
         details: Optional[str] = None,
         cursor: Optional[sqlite3.Cursor] = None,
         **kwargs: Any,
     ) -> int:
         """Records an authoritative independent evidence attestation for a historical job description.
 
-        Enforces Section 4:
+        Enforces Phase 9.1.2.8 Part D:
         - Requires a VerifiedLegacyEvidence instance produced by LegacyEvidenceVerifier.verify().
-        - Rejects arbitrary string calls, unverified references, and candidate self-attestation.
+        - Persists strictly the authenticated principal bound into verified_evidence.attested_by.
+        - If attesting_principal is passed, requires exact equality (attesting_principal == verified_evidence.attested_by).
+        - Rejects candidate identities, unverified references, and revoked principals.
         """
-        from src.security.legacy_evidence_verifier import VerifiedLegacyEvidence
+        from src.security.legacy_evidence_verifier import (
+            VerifiedLegacyEvidence,
+            AuthenticatedMigrationPrincipal,
+            get_default_evidence_trust_store,
+        )
 
         if not isinstance(verified_evidence, VerifiedLegacyEvidence):
             raise SecurityAuthorizationError(
@@ -5723,14 +5779,55 @@ class DatabaseManager:
                 "produced by LegacyEvidenceVerifier.verify()."
             )
 
-        principal = attesting_principal or verified_evidence.attested_by
-        if not principal or not isinstance(principal, str) or not principal.strip():
-            raise SecurityAuthorizationError("attesting_principal is required and cannot be empty.")
+        verified_principal = (verified_evidence.attested_by or "").strip()
+        if not verified_principal:
+            raise SecurityAuthorizationError("Verified evidence lacks mandatory attested_by principal.")
 
-        clean_principal = principal.strip()
-        if clean_principal in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user"):
+        # Candidate user cannot self-attest
+        if (
+            verified_principal in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user")
+            or verified_principal.startswith("candidate_")
+        ):
             raise SecurityAuthorizationError(
-                f"Candidate user '{clean_principal}' cannot self-attest own source as historical evidence."
+                f"Candidate user '{verified_principal}' cannot self-attest own source as historical evidence."
+            )
+
+        # Enforce exact equality if attesting_principal is provided
+        if attesting_principal is not None:
+            if isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
+                if not attesting_principal.is_authenticated:
+                    raise SecurityAuthorizationError(
+                        f"Migration principal '{attesting_principal.principal_id}' is not authenticated."
+                    )
+                if attesting_principal.is_revoked:
+                    raise SecurityAuthorizationError(
+                        f"Migration principal '{attesting_principal.principal_id}' has been revoked."
+                    )
+                passed_principal = attesting_principal.principal_id.strip()
+            elif isinstance(attesting_principal, str):
+                passed_principal = attesting_principal.strip()
+            else:
+                raise SecurityAuthorizationError(
+                    f"Invalid attesting_principal type '{type(attesting_principal).__name__}'."
+                )
+
+            if passed_principal != verified_principal:
+                raise SecurityAuthorizationError(
+                    f"Attesting principal mismatch: passed principal '{passed_principal}' does not match "
+                    f"verified evidence principal '{verified_principal}'. Attestation misattribution is strictly prohibited."
+                )
+
+        # Verify principal is authorized and unrevoked
+        trust_store = kwargs.get("trust_store") or get_default_evidence_trust_store()
+        if trust_store is not None:
+            if not trust_store.is_attesting_principal_trusted(verified_principal):
+                raise SecurityAuthorizationError(
+                    f"Attesting principal '{verified_principal}' is not authorized in trust store or has been revoked."
+                )
+
+        if self.is_principal_revoked(verified_principal):
+            raise SecurityAuthorizationError(
+                f"Attesting principal '{verified_principal}' has been revoked in database."
             )
 
         sql = """
@@ -5756,7 +5853,7 @@ class DatabaseManager:
             verified_evidence.signature_algorithm,
             verified_evidence.evidence_signature,
             verified_evidence.migration_boundary,
-            clean_principal,
+            verified_principal,
             verified_evidence.verified_at,
             details,
         )
