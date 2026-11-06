@@ -109,9 +109,13 @@ class SecurityPreflightManager:
                 f"expected '{jd.snapshot_hash}', computed '{computed_snapshot_hash}'."
             )
 
-        # 3. Uploaded job-description physical binary integrity (Phase 9.1.2.1 Part D.2 & Phase 9.1.2.2 Part C)
-        is_uploaded = (jd.source_type or "").lower() in ("uploaded", "upload")
+        # 3. Uploaded job-description physical binary integrity (Phase 9.1.2.1 Part D.2, Phase 9.1.2.2 Part C, Phase 9.1.2.3 Part A)
+        normalized_source_type = (jd.source_type or "").lower().strip()
+        is_uploaded = normalized_source_type in ("uploaded_document", "uploaded", "upload")
         has_binary_meta = False
+
+        binary_state = getattr(jd, "binary_integrity_state", None)
+
         if is_uploaded:
             bin_fields = (jd.storage_filename, jd.file_hash, jd.file_size_bytes, jd.file_format)
             non_null_count = sum(1 for f in bin_fields if f is not None and str(f).strip() != "")
@@ -120,7 +124,49 @@ class SecurityPreflightManager:
                     f"JobDescription #{jd_id} has partially populated binary metadata. "
                     f"Complete metadata (storage_filename, file_hash, file_size_bytes, file_format) is mandatory for uploaded records."
                 )
-            if non_null_count == 4:
+
+            if binary_state == "LEGACY_TEXT_ONLY":
+                if non_null_count != 0:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} claims LEGACY_TEXT_ONLY state but contains populated binary metadata."
+                    )
+
+                # Prior signed scan with binary hash cannot be bypassed by legacy state
+                if self.db:
+                    latest_scan = self.db.get_latest_security_scan(
+                        user_id=user_id,
+                        source_type="job_description",
+                        source_id=jd_id,
+                        source_version=1,
+                    )
+                    if latest_scan and getattr(latest_scan, "source_binary_hash", None) is not None:
+                        raise SecurityAuthorizationError(
+                            f"JobDescription #{jd_id} cannot be accepted as LEGACY_TEXT_ONLY because an authoritative signed scan "
+                            f"exists with binary provenance (hash: {latest_scan.source_binary_hash})."
+                        )
+
+                # Durable migration audit record is strictly mandatory for LEGACY_TEXT_ONLY
+                if not self.db or not hasattr(self.db, "get_legacy_integrity_exception"):
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} claims LEGACY_TEXT_ONLY state but no authoritative database manager is configured to verify migration audit record."
+                    )
+
+                legacy_exc = self.db.get_legacy_integrity_exception(job_description_id=jd_id, user_id=user_id)
+                if not legacy_exc or legacy_exc.outcome != "SUCCESS":
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} has LEGACY_TEXT_ONLY state without an authoritative legacy integrity exception migration audit record."
+                    )
+
+                # Verify snapshot hash binding
+                if legacy_exc.source_snapshot_hash and jd.snapshot_hash and legacy_exc.source_snapshot_hash != jd.snapshot_hash:
+                    raise SecurityAuthorizationError(
+                        f"JobDescription #{jd_id} snapshot hash '{jd.snapshot_hash}' does not match grandfathered snapshot hash '{legacy_exc.source_snapshot_hash}'."
+                    )
+
+                has_binary_meta = False
+                logger.info("JobDescription #%d verified as auditable LEGACY_TEXT_ONLY record; proceeding with text scanning.", jd_id)
+
+            elif non_null_count == 4:
                 if (jd.file_format or "").lower() not in ("pdf", "docx"):
                     raise SecurityAuthorizationError(
                         f"JobDescription #{jd_id} has unsupported file_format '{jd.file_format}'. Must be 'pdf' or 'docx'."
@@ -138,19 +184,19 @@ class SecurityPreflightManager:
                 )
                 has_binary_meta = True
             else:
-                # non_null_count == 0
-                is_legacy = False
-                if parsed_data and isinstance(parsed_data, dict) and parsed_data.get("is_legacy_record") is True:
-                    is_legacy = True
-                elif getattr(jd, "created_at", None) and str(jd.created_at) < "2026-11-06T00:00:00":
-                    is_legacy = True
-
-                if not is_legacy:
+                # non_null_count == 0 but NOT marked as LEGACY_TEXT_ONLY
+                raise SecurityAuthorizationError(
+                    f"JobDescription #{jd_id} is an uploaded record missing required binary metadata. "
+                    "All-NULL binary metadata is permitted only for auditable historical legacy records with verified migration audit records."
+                )
+        else:
+            # Non-uploaded record (pasted, url, etc.)
+            if binary_state not in ("NOT_APPLICABLE", None):
+                if binary_state == "LEGACY_TEXT_ONLY":
                     raise SecurityAuthorizationError(
-                        f"JobDescription #{jd_id} is an uploaded record missing required binary metadata. "
-                        "All-NULL binary metadata is permitted only for auditable historical legacy records."
+                        f"JobDescription #{jd_id} of source_type '{jd.source_type}' cannot have binary_integrity_state 'LEGACY_TEXT_ONLY'."
                     )
-                logger.info("JobDescription #%d has NULL binary metadata (auditable legacy record); proceeding with verified extracted text.", jd_id)
+            has_binary_meta = False
 
         # 4. Retrieve latest scan and verify version freshness (Phase 9.1.2.1 Part E & Phase 9.1.2.2 Part B)
         scan = self.db.get_latest_security_scan(
@@ -162,7 +208,10 @@ class SecurityPreflightManager:
 
         is_stale = False
         if scan:
-            if scan.scanner_version != self.detector.engine_version or scan.policy_version != self.detector.policy_version:
+            if scan.classification == ScanClassification.QUARANTINED:
+                # Quarantined scans remain permanently in quarantine
+                is_stale = False
+            elif scan.scanner_version != self.detector.engine_version or scan.policy_version != self.detector.policy_version:
                 is_stale = True
                 logger.info(
                     "Scan #%d for JobDescription #%d has stale version (scanner: %s vs %s, policy: %s vs %s). Triggering rescan.",
@@ -398,23 +447,31 @@ class SecurityPreflightManager:
 
         is_stale = False
         if scan:
-            if scan.scanner_version != self.detector.engine_version or scan.policy_version != self.detector.policy_version:
+            if scan.classification == ScanClassification.QUARANTINED:
+                # Quarantined scans remain permanently in quarantine
+                is_stale = False
+            elif scan.scanner_version != self.detector.engine_version or scan.policy_version != self.detector.policy_version:
                 is_stale = True
                 logger.info(
                     "Scan #%d for Resume #%d v%d has stale version (scanner: %s vs %s, policy: %s vs %s). Triggering rescan.",
                     scan.id, resume_id, target_ver, scan.scanner_version, self.detector.engine_version, scan.policy_version, self.detector.policy_version,
                 )
-            elif getattr(scan, "manifest_version", "v1") == "v2":
-                if (
-                    getattr(scan, "source_binary_hash", None) != target_hash
-                    or getattr(scan, "source_binary_size_bytes", None) != res_size
-                    or getattr(scan, "source_binary_format", None) != res_format
-                ):
-                    is_stale = True
-                    logger.info(
-                        "Scan #%d for Resume #%d v%d has binary metadata mismatch. Triggering fresh v2 scan.",
-                        scan.id, resume_id, target_ver,
-                    )
+            elif getattr(scan, "manifest_version", "v1") != "v2":
+                is_stale = True
+                logger.info(
+                    "Scan #%d for Resume #%d v%d is manifest version '%s' (not 'v2'). Upgrading to v2 with binary provenance.",
+                    scan.id, resume_id, target_ver, getattr(scan, "manifest_version", "v1"),
+                )
+            elif (
+                getattr(scan, "source_binary_hash", None) != target_hash
+                or getattr(scan, "source_binary_size_bytes", None) != res_size
+                or getattr(scan, "source_binary_format", None) != res_format
+            ):
+                is_stale = True
+                logger.info(
+                    "Scan #%d for Resume #%d v%d has binary metadata mismatch. Triggering fresh v2 scan.",
+                    scan.id, resume_id, target_ver,
+                )
             elif scan.source_hash != target_hash:
                 is_stale = True
 
@@ -510,6 +567,7 @@ class SecurityPreflightManager:
             "manifest_version": getattr(scan, "manifest_version", "v1"),
         }
 
+        require_bin = getattr(scan, "manifest_version", "v1") == "v2" or scan.classification != ScanClassification.QUARANTINED
         self.signer.verify_scan_record(
             expected_user_id=user_id,
             expected_source_type="resume",
@@ -518,9 +576,9 @@ class SecurityPreflightManager:
             expected_source_hash=target_hash,
             expected_snapshot_hash=None,
             scan_row=scan_dict,
-            expected_source_binary_hash=target_hash,
-            expected_source_binary_size_bytes=res_size,
-            expected_source_binary_format=res_format,
+            expected_source_binary_hash=target_hash if require_bin else None,
+            expected_source_binary_size_bytes=res_size if require_bin else None,
+            expected_source_binary_format=res_format if require_bin else None,
         )
 
         override = self.db.get_security_scan_override(user_id=user_id, scan_id=scan.id)

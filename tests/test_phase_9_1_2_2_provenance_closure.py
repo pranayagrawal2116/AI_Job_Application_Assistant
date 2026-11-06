@@ -491,7 +491,7 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
             user_base_dir=self.file_validator.get_user_job_descriptions_dir(self.user1_id),
         )
 
-        # Simulate legacy record: source_type='upload' but all binary metadata NULL
+        # Simulate legacy record: source_type='upload' but all binary metadata NULL with auditable migration exception
         with self.db.transaction() as conn:
             c = conn.cursor()
             c.execute(
@@ -500,11 +500,23 @@ class TestPhase9122ProvenanceClosure(unittest.TestCase):
                 SET storage_filename = NULL,
                     file_hash = NULL,
                     file_size_bytes = NULL,
-                    file_format = NULL
+                    file_format = NULL,
+                    binary_integrity_state = 'LEGACY_TEXT_ONLY'
                 WHERE id = ?
                 """,
                 (jd.id,),
             )
+        self.db.record_legacy_integrity_exception(
+            user_id=self.user1_id,
+            job_description_id=jd.id,
+            original_source_type=jd.source_type,
+            previous_binary_state="REQUIRED",
+            assigned_legacy_state="LEGACY_TEXT_ONLY",
+            source_snapshot_hash=jd.snapshot_hash,
+            migration_version="9.1.2.3",
+            migration_reason="Auditable legacy migration",
+            outcome="SUCCESS",
+        )
 
         # Preflight handles all-NULL as auditable legacy text record
         verified_res = self.preflight.check_job_description_security(

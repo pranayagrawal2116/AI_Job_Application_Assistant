@@ -54,6 +54,7 @@ from src.database.models import (
     VerifiedApprovalGrant,
     SecurityScan,
     SecurityScanOverride,
+    LegacyIntegrityException,
 )
 from src.database.url_normalizer import (
     generate_company_title_key,
@@ -282,6 +283,7 @@ class DatabaseManager:
         add_col_if_missing("job_descriptions", "file_hash", "TEXT")
         add_col_if_missing("job_descriptions", "file_size_bytes", "INTEGER")
         add_col_if_missing("job_descriptions", "file_format", "TEXT")
+        add_col_if_missing("job_descriptions", "binary_integrity_state", "TEXT DEFAULT 'REQUIRED'")
         add_col_if_missing("match_results", "resume_version_num", "INTEGER DEFAULT 1")
         add_col_if_missing("match_results", "resume_file_hash", "TEXT")
         add_col_if_missing("match_results", "candidate_profile_version", "INTEGER DEFAULT 1")
@@ -442,6 +444,43 @@ class DatabaseManager:
         except sqlite3.OperationalError:
             pass
 
+        # Legacy integrity exceptions table and triggers (Phase 9.1.2.3 Durable Migration Audit)
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS legacy_integrity_exceptions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    job_description_id INTEGER NOT NULL REFERENCES job_descriptions(id) ON DELETE RESTRICT,
+                    original_source_type TEXT NOT NULL,
+                    previous_binary_state TEXT,
+                    assigned_legacy_state TEXT NOT NULL,
+                    source_snapshot_hash TEXT,
+                    migration_version TEXT NOT NULL,
+                    migration_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    migration_reason TEXT NOT NULL,
+                    outcome TEXT NOT NULL
+                )
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_integrity_exceptions_update
+                BEFORE UPDATE ON legacy_integrity_exceptions
+                BEGIN
+                    SELECT RAISE(FAIL, 'legacy_integrity_exceptions records are append-only and cannot be updated.');
+                END
+            """)
+            cursor.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_integrity_exceptions_delete
+                BEFORE DELETE ON legacy_integrity_exceptions
+                BEGIN
+                    SELECT RAISE(FAIL, 'legacy_integrity_exceptions records are immutable and cannot be deleted.');
+                END
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_legacy_integrity_exceptions_lookup ON legacy_integrity_exceptions(user_id, job_description_id)")
+        except sqlite3.OperationalError:
+            pass
+
+        self._migrate_historical_job_description_integrity(cursor)
+
         # Composite indexes required to safely satisfy composite foreign keys in application_approvals
         try:
             cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_applications_id_user ON applications(id, user_id)")
@@ -452,6 +491,108 @@ class DatabaseManager:
                 ON job_descriptions(user_id, supersedes_job_description_id)
                 WHERE supersedes_job_description_id IS NOT NULL AND is_active = 1
             """)
+        except sqlite3.OperationalError:
+            pass
+
+    def _migrate_historical_job_description_integrity(self, cursor: sqlite3.Cursor) -> None:
+        """Migrates historical job descriptions to authoritative binary_integrity_state.
+
+        Grandfathers pre-Phase-9.1.1 uploaded records with all-NULL binary metadata into LEGACY_TEXT_ONLY
+        and records an immutable audit entry in legacy_integrity_exceptions.
+        """
+        try:
+            # 1. Non-uploaded records (pasted, url, etc.) -> NOT_APPLICABLE
+            cursor.execute(
+                """
+                UPDATE job_descriptions
+                SET binary_integrity_state = 'NOT_APPLICABLE'
+                WHERE (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
+                  AND lower(source_type) NOT IN ('uploaded_document', 'upload')
+                """
+            )
+
+            # 2. Uploaded records with all 4 binary fields populated -> VERIFIED
+            cursor.execute(
+                """
+                UPDATE job_descriptions
+                SET binary_integrity_state = 'VERIFIED'
+                WHERE (binary_integrity_state = 'REQUIRED' OR binary_integrity_state IS NULL)
+                  AND lower(source_type) IN ('uploaded_document', 'upload')
+                  AND storage_filename IS NOT NULL
+                  AND file_hash IS NOT NULL
+                  AND file_size_bytes IS NOT NULL
+                  AND file_format IS NOT NULL
+                """
+            )
+
+            # 3. Uploaded records with all 4 binary fields NULL created before 2026-11-06 00:00:00 -> LEGACY_TEXT_ONLY
+            cursor.execute(
+                """
+                SELECT id, user_id, source_type, snapshot_hash, created_at, binary_integrity_state
+                FROM job_descriptions
+                WHERE lower(source_type) IN ('uploaded_document', 'upload')
+                  AND storage_filename IS NULL
+                  AND file_hash IS NULL
+                  AND file_size_bytes IS NULL
+                  AND file_format IS NULL
+                  AND created_at IS NOT NULL
+                  AND datetime(replace(created_at, 'T', ' ')) < datetime('2026-11-06 00:00:00')
+                """
+            )
+            candidates = cursor.fetchall()
+            for cand in candidates:
+                jd_id = cand[0] if isinstance(cand, tuple) else cand["id"]
+                u_id = cand[1] if isinstance(cand, tuple) else cand["user_id"]
+                s_type = cand[2] if isinstance(cand, tuple) else cand["source_type"]
+                s_hash = cand[3] if isinstance(cand, tuple) else cand["snapshot_hash"]
+                prev_state = cand[5] if isinstance(cand, tuple) else cand["binary_integrity_state"]
+
+                # Ensure no scan exists with source_binary_hash IS NOT NULL
+                cursor.execute(
+                    """
+                    SELECT 1 FROM security_scans
+                    WHERE source_type = 'job_description'
+                      AND source_id = ?
+                      AND source_binary_hash IS NOT NULL
+                    LIMIT 1
+                    """,
+                    (jd_id,),
+                )
+                if cursor.fetchone():
+                    # Cannot grandfather if an existing signed scan contains binary provenance!
+                    continue
+
+                # Check if already recorded in legacy_integrity_exceptions
+                cursor.execute(
+                    """
+                    SELECT 1 FROM legacy_integrity_exceptions
+                    WHERE job_description_id = ? AND user_id = ?
+                    LIMIT 1
+                    """,
+                    (jd_id, u_id),
+                )
+                if not cursor.fetchone():
+                    cursor.execute(
+                        """
+                        INSERT INTO legacy_integrity_exceptions (
+                            user_id, job_description_id, original_source_type,
+                            previous_binary_state, assigned_legacy_state,
+                            source_snapshot_hash, migration_version,
+                            migration_reason, outcome
+                        ) VALUES (?, ?, ?, ?, 'LEGACY_TEXT_ONLY', ?, '9.1.2.3',
+                                  'Grandfathered pre-9.1.1 uploaded record with NULL binary metadata', 'SUCCESS')
+                        """,
+                        (u_id, jd_id, s_type, prev_state or "REQUIRED", s_hash),
+                    )
+
+                cursor.execute(
+                    """
+                    UPDATE job_descriptions
+                    SET binary_integrity_state = 'LEGACY_TEXT_ONLY'
+                    WHERE id = ?
+                    """,
+                    (jd_id,),
+                )
         except sqlite3.OperationalError:
             pass
 
@@ -3086,6 +3227,7 @@ class DatabaseManager:
         extraction_confidence: float = 1.0,
         supersedes_job_description_id: Optional[int] = None,
         is_active: bool = True,
+        binary_integrity_state: Optional[str] = None,
     ) -> JobDescription:
         """Saves an immutable job description snapshot enforcing deduplication and multi-user isolation."""
         if not company_name or not company_name.strip():
@@ -3128,6 +3270,26 @@ class DatabaseManager:
                 f"Supplied snapshot_hash '{snapshot_hash}' does not match computed canonical manifest hash '{computed_snapshot_hash}'."
             )
         snapshot_hash = computed_snapshot_hash
+
+        # Determine and validate binary_integrity_state
+        normalized_source_type = (source_type or "").lower().strip()
+        is_uploaded = normalized_source_type in ("uploaded_document", "upload")
+        has_all_binary = bool(storage_filename and file_hash and file_size_bytes is not None and file_format)
+
+        if binary_integrity_state is not None:
+            if binary_integrity_state == "LEGACY_TEXT_ONLY":
+                raise SecurityAuthorizationError(
+                    "LEGACY_TEXT_ONLY binary integrity state cannot be assigned via public API; "
+                    "it is reserved exclusively for historical database migrations."
+                )
+            if binary_integrity_state not in ("REQUIRED", "VERIFIED", "NOT_APPLICABLE"):
+                raise ValidationError(f"Invalid binary_integrity_state: '{binary_integrity_state}'.")
+            resolved_binary_state = binary_integrity_state
+        else:
+            if is_uploaded:
+                resolved_binary_state = "VERIFIED" if has_all_binary else "REQUIRED"
+            else:
+                resolved_binary_state = "NOT_APPLICABLE"
 
         parsed_json = json.dumps(parsed_data) if parsed_data else None
 
@@ -3193,8 +3355,8 @@ class DatabaseManager:
                 INSERT INTO job_descriptions (
                     user_id, source_type, company_name, job_title, raw_content, content_hash, snapshot_hash, parsed_data,
                     source_url, original_filename, storage_filename, file_hash, file_size_bytes, file_format,
-                    parser_version, extraction_confidence, supersedes_job_description_id, is_active
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    parser_version, extraction_confidence, supersedes_job_description_id, binary_integrity_state, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     user_id,
@@ -3214,6 +3376,7 @@ class DatabaseManager:
                     parser_version,
                     extraction_confidence,
                     supersedes_job_description_id,
+                    resolved_binary_state,
                     1 if is_active else 0,
                 ),
             )
@@ -3241,6 +3404,7 @@ class DatabaseManager:
         extraction_confidence: float = 1.0,
         supersedes_job_description_id: Optional[int] = None,
         is_active: bool = True,
+        binary_integrity_state: Optional[str] = None,
     ) -> JobDescription:
         """Creates a user-owned job description record (backward-compatible delegate to save_job_description_snapshot)."""
         return self.save_job_description_snapshot(
@@ -3262,6 +3426,7 @@ class DatabaseManager:
             extraction_confidence=extraction_confidence,
             supersedes_job_description_id=supersedes_job_description_id,
             is_active=is_active,
+            binary_integrity_state=binary_integrity_state,
         )
 
     def update_job_description_snapshot(
@@ -4800,6 +4965,87 @@ class DatabaseManager:
                 override_reason=row["override_reason"],
                 actor_type=row["actor_type"],
                 created_at=row["created_at"],
+            )
+
+    def record_legacy_integrity_exception(
+        self,
+        user_id: int,
+        job_description_id: int,
+        original_source_type: str,
+        previous_binary_state: Optional[str],
+        assigned_legacy_state: str,
+        source_snapshot_hash: Optional[str],
+        migration_version: str = "9.1.2.3",
+        migration_reason: str = "Grandfathered pre-9.1.1 uploaded record with NULL binary metadata",
+        outcome: str = "SUCCESS",
+    ) -> int:
+        """Records an immutable audit entry in legacy_integrity_exceptions."""
+        with self.immediate_transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO legacy_integrity_exceptions (
+                    user_id, job_description_id, original_source_type,
+                    previous_binary_state, assigned_legacy_state,
+                    source_snapshot_hash, migration_version,
+                    migration_reason, outcome
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    user_id,
+                    job_description_id,
+                    original_source_type,
+                    previous_binary_state,
+                    assigned_legacy_state,
+                    source_snapshot_hash,
+                    migration_version,
+                    migration_reason,
+                    outcome,
+                ),
+            )
+            return cursor.lastrowid
+
+    def get_legacy_integrity_exception(
+        self,
+        job_description_id: int,
+        user_id: Optional[int] = None,
+    ) -> Optional[LegacyIntegrityException]:
+        """Retrieves the legacy integrity exception record for a job description."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if user_id is not None:
+                cursor.execute(
+                    """
+                    SELECT * FROM legacy_integrity_exceptions
+                    WHERE job_description_id = ? AND user_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (job_description_id, user_id),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT * FROM legacy_integrity_exceptions
+                    WHERE job_description_id = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (job_description_id,),
+                )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return LegacyIntegrityException(
+                id=row["id"],
+                user_id=row["user_id"],
+                job_description_id=row["job_description_id"],
+                original_source_type=row["original_source_type"],
+                previous_binary_state=row["previous_binary_state"],
+                assigned_legacy_state=row["assigned_legacy_state"],
+                source_snapshot_hash=row["source_snapshot_hash"],
+                migration_version=row["migration_version"],
+                migration_timestamp=row["migration_timestamp"],
+                migration_reason=row["migration_reason"],
+                outcome=row["outcome"],
             )
 
     def delete_user_resume(

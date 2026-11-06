@@ -122,6 +122,7 @@ CREATE TABLE IF NOT EXISTS job_descriptions (
     parser_version TEXT DEFAULT '1.0.0',
     extraction_confidence REAL DEFAULT 1.0,
     supersedes_job_description_id INTEGER,
+    binary_integrity_state TEXT DEFAULT 'REQUIRED' CHECK(binary_integrity_state IN ('REQUIRED', 'LEGACY_TEXT_ONLY', 'VERIFIED', 'NOT_APPLICABLE')),
     is_active INTEGER DEFAULT 1,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(id, user_id),
@@ -528,6 +529,35 @@ BEFORE DELETE ON security_scan_overrides
 BEGIN
     SELECT RAISE(FAIL, 'security_scan_overrides records are immutable and cannot be deleted except via authorized privacy erasure.')
     WHERE verify_privacy_erasure_authorization(OLD.user_id) != 1;
+END;
+
+-- ---------------------------------------------------------------------
+-- 19. LEGACY INTEGRITY EXCEPTIONS (Phase 9.1.2.3 Durable Migration Audit)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS legacy_integrity_exceptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    job_description_id INTEGER NOT NULL REFERENCES job_descriptions(id) ON DELETE RESTRICT,
+    original_source_type TEXT NOT NULL,
+    previous_binary_state TEXT,
+    assigned_legacy_state TEXT NOT NULL,
+    source_snapshot_hash TEXT,
+    migration_version TEXT NOT NULL,
+    migration_timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    migration_reason TEXT NOT NULL,
+    outcome TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_integrity_exceptions_update
+BEFORE UPDATE ON legacy_integrity_exceptions
+BEGIN
+    SELECT RAISE(FAIL, 'legacy_integrity_exceptions records are append-only and cannot be updated.');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_prevent_legacy_integrity_exceptions_delete
+BEFORE DELETE ON legacy_integrity_exceptions
+BEGIN
+    SELECT RAISE(FAIL, 'legacy_integrity_exceptions records are immutable and cannot be deleted.');
 END;
 
 -- ---------------------------------------------------------------------

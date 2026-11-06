@@ -24,6 +24,9 @@ from src.utils.logger import setup_logger
 
 logger = setup_logger("ScanSigner")
 
+# Supported canonical manifest versions
+SUPPORTED_MANIFEST_VERSIONS = {"v1", "v2"}
+
 # Process-wide ephemeral key for development/testing when env secret is not set
 _PROCESS_EPHEMERAL_KEY: Optional[bytes] = None
 
@@ -53,12 +56,6 @@ class ScanKeyManager:
         resolved_key_id = resolved_key_id.strip()
         self.active_key_id = resolved_key_id
 
-        # Check if active key ID is already revoked in DB
-        if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
-            if self._db_manager.is_key_revoked(resolved_key_id):
-                self._revoked_keys.add(resolved_key_id)
-                raise SecurityAuthorizationError(f"Active scan key ID '{resolved_key_id}' is already revoked.")
-
         # 2. Resolve primary signing key
         resolved_secret: Optional[bytes] = None
         if signing_key:
@@ -68,20 +65,7 @@ class ScanKeyManager:
             if env_secret:
                 resolved_secret = self._coerce_bytes(env_secret)
 
-        prohibited = self._get_prohibited_action_ticket_keys()
-
-        if resolved_secret:
-            if resolved_secret in prohibited:
-                raise SecurityAuthorizationError(
-                    "Security scan key cannot reuse ACTION_TICKET_SECRET_KEY or action ticket rotation keys. "
-                    "Cryptographic key separation is strictly enforced."
-                )
-            if len(resolved_secret) < 32:
-                raise SecurityAuthorizationError(
-                    "Security scan signing secret must have at least 32 bytes (256 bits) of entropy."
-                )
-            self._keys[resolved_key_id] = resolved_secret
-        else:
+        if not resolved_secret:
             if app_env == "production":
                 raise SecurityAuthorizationError(
                     "Missing SECURITY_SCAN_SIGNING_KEY in production environment. "
@@ -92,7 +76,9 @@ class ScanKeyManager:
             if _PROCESS_EPHEMERAL_KEY is None:
                 _PROCESS_EPHEMERAL_KEY = secrets.token_bytes(32)
                 logger.warning("Generating process-wide ephemeral development/testing security scan key.")
-            self._keys[resolved_key_id] = _PROCESS_EPHEMERAL_KEY
+            resolved_secret = _PROCESS_EPHEMERAL_KEY
+
+        self._register_key(resolved_key_id, resolved_secret, is_active=True)
 
         # 3. Resolve historical / rotation keys
         raw_rotation = rotation_keys
@@ -106,25 +92,60 @@ class ScanKeyManager:
                         raise SecurityAuthorizationError(f"Malformed SECURITY_SCAN_ROTATION_KEYS in production: {e}")
                     logger.warning("Failed to parse SECURITY_SCAN_ROTATION_KEYS JSON: %s", e)
 
-        if raw_rotation and isinstance(raw_rotation, dict):
-            for k_id, sec in raw_rotation.items():
-                if not k_id or not isinstance(k_id, str) or not k_id.strip():
-                    raise SecurityAuthorizationError(f"Invalid rotation key ID '{k_id}': cannot be empty.")
-                clean_k_id = k_id.strip()
-                if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
-                    if self._db_manager.is_key_revoked(clean_k_id):
-                        self._revoked_keys.add(clean_k_id)
-                        continue
-                coerced = self._coerce_bytes(sec)
-                if coerced in prohibited:
+        if raw_rotation is not None:
+            if not isinstance(raw_rotation, dict):
+                if app_env == "production":
+                    raise SecurityAuthorizationError("SECURITY_SCAN_ROTATION_KEYS must be a JSON object / dictionary.")
+                logger.warning("SECURITY_SCAN_ROTATION_KEYS is not a dict.")
+            else:
+                for k_id, sec in raw_rotation.items():
+                    self._register_key(k_id, sec, is_active=False)
+
+    def _register_key(
+        self,
+        key_id: str,
+        secret: Union[str, bytes],
+        is_active: bool = False,
+    ) -> None:
+        """Registers a signing or verification key, enforcing strict entropy, non-reuse of action ticket keys, and key ID immutability."""
+        if not key_id or not isinstance(key_id, str) or not key_id.strip():
+            raise SecurityAuthorizationError(f"Invalid key ID '{key_id}': cannot be empty.")
+        clean_key_id = key_id.strip()
+
+        with self._lock:
+            if clean_key_id in self._revoked_keys:
+                raise SecurityAuthorizationError(f"Scan key ID '{clean_key_id}' is revoked.")
+
+            if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
+                if self._db_manager.is_key_revoked(clean_key_id):
+                    self._revoked_keys.add(clean_key_id)
+                    raise SecurityAuthorizationError(f"Scan key ID '{clean_key_id}' is revoked.")
+
+            secret_bytes = self._coerce_bytes(secret)
+            if len(secret_bytes) < 32:
+                raise SecurityAuthorizationError(
+                    f"Scan key '{clean_key_id}' must have at least 32 bytes (256 bits) of entropy."
+                )
+
+            prohibited = self._get_prohibited_action_ticket_keys()
+            if secret_bytes in prohibited:
+                raise SecurityAuthorizationError(
+                    f"Security scan key '{clean_key_id}' cannot reuse ACTION_TICKET_SECRET_KEY or action ticket keys. "
+                    "Cryptographic key separation is strictly enforced."
+                )
+
+            if clean_key_id in self._keys:
+                if self._keys[clean_key_id] != secret_bytes:
                     raise SecurityAuthorizationError(
-                        f"Rotation scan key '{clean_k_id}' cannot reuse ACTION_TICKET_SECRET_KEY or action ticket keys."
+                        f"Cannot reuse existing key ID '{clean_key_id}' with different secret material."
                     )
-                if len(coerced) < 32:
-                    raise SecurityAuthorizationError(
-                        f"Rotation scan key '{clean_k_id}' must have at least 32 bytes (256 bits) of entropy."
-                    )
-                self._keys[clean_k_id] = coerced
+                if is_active:
+                    self.active_key_id = clean_key_id
+                return
+
+            self._keys[clean_key_id] = secret_bytes
+            if is_active:
+                self.active_key_id = clean_key_id
 
     def _get_prohibited_action_ticket_keys(self) -> Set[bytes]:
         """Collects all configured action-ticket secret keys to enforce strict cryptographic domain separation."""
@@ -197,42 +218,9 @@ class ScanKeyManager:
 
     def rotate_key(self, new_key_id: str, new_secret: Union[str, bytes]) -> None:
         """Rotates the active scan signing key, retaining previous keys for historical verification."""
-        if not new_key_id or not isinstance(new_key_id, str) or not new_key_id.strip():
-            raise SecurityAuthorizationError(f"Invalid rotation key ID '{new_key_id}': cannot be empty.")
-        clean_key_id = new_key_id.strip()
-
         with self._lock:
-            if clean_key_id in self._revoked_keys:
-                raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_key_id}'.")
-            if self._db_manager and hasattr(self._db_manager, "is_key_revoked"):
-                if self._db_manager.is_key_revoked(clean_key_id):
-                    self._revoked_keys.add(clean_key_id)
-                    raise SecurityAuthorizationError(f"Cannot rotate to previously revoked key ID '{clean_key_id}'.")
-
-        secret_bytes = self._coerce_bytes(new_secret)
-        if len(secret_bytes) < 32:
-            raise SecurityAuthorizationError("New signing secret must have at least 32 bytes (256 bits) of entropy.")
-
-        prohibited = self._get_prohibited_action_ticket_keys()
-        if secret_bytes in prohibited:
-            raise SecurityAuthorizationError(
-                "Security scan key cannot reuse ACTION_TICKET_SECRET_KEY or configured action ticket keys. "
-                "Cryptographic key separation is strictly enforced."
-            )
-
-        with self._lock:
-            if clean_key_id in self._keys:
-                if self._keys[clean_key_id] != secret_bytes:
-                    raise SecurityAuthorizationError(
-                        f"Cannot reuse existing key ID '{clean_key_id}' with different secret material."
-                    )
-                self.active_key_id = clean_key_id
-                logger.info("Reaffirmed active security scan signing key '%s'.", clean_key_id)
-                return
-
-            self._keys[clean_key_id] = secret_bytes
-            self.active_key_id = clean_key_id
-            logger.info("Rotated security scan signing key to active key '%s'.", clean_key_id)
+            self._register_key(new_key_id, new_secret, is_active=True)
+            logger.info("Rotated security scan signing key to active key '%s'.", self.active_key_id)
 
     def revoke_key(self, key_id: str, reason: str = "Key Revoked") -> None:
         """Revokes a key ID immediately and durably in SQLite."""
@@ -300,7 +288,16 @@ class SecurityScanSigner:
         source_binary_format: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Constructs the canonical scan manifest dictionary before signing."""
-        resolved_manifest_version = manifest_version or ("v2" if source_binary_hash is not None else "v1")
+        if manifest_version is not None:
+            if not isinstance(manifest_version, str) or manifest_version.strip() not in SUPPORTED_MANIFEST_VERSIONS:
+                raise SecurityAuthorizationError(
+                    f"Unsupported or invalid manifest_version '{manifest_version}'. "
+                    f"Supported manifest versions: {sorted(SUPPORTED_MANIFEST_VERSIONS)}"
+                )
+            resolved_manifest_version = manifest_version.strip()
+        else:
+            resolved_manifest_version = "v2" if source_binary_hash is not None else "v1"
+
         sorted_threats = sorted(threats, key=lambda t: (t.start_offset, t.end_offset, t.rule_id))
         serialized_threats = [
             {
@@ -463,13 +460,28 @@ class SecurityScanSigner:
                     f"does not match scanned snapshot hash '{row_snap}'."
                 )
 
-        manifest_version = scan_row.get("manifest_version")
-        if not manifest_version:
+        raw_manifest_version = scan_row.get("manifest_version")
+        if not raw_manifest_version:
             manifest_version = "v2" if scan_row.get("source_binary_hash") is not None else "v1"
+        else:
+            if not isinstance(raw_manifest_version, str) or raw_manifest_version.strip() not in SUPPORTED_MANIFEST_VERSIONS:
+                raise SecurityAuthorizationError(
+                    f"Stored scan record #{scan_row.get('id')} has unsupported manifest_version '{raw_manifest_version}'. "
+                    f"Supported manifest versions: {sorted(SUPPORTED_MANIFEST_VERSIONS)}"
+                )
+            manifest_version = raw_manifest_version.strip()
 
         row_bin_hash = scan_row.get("source_binary_hash")
         row_bin_size = scan_row.get("source_binary_size_bytes")
         row_bin_fmt = scan_row.get("source_binary_format")
+
+        # Strict v2 enforcement: reject v1 records when expected binary provenance is supplied
+        if expected_source_binary_hash is not None:
+            if manifest_version == "v1":
+                raise SecurityAuthorizationError(
+                    f"Scan record #{scan_row.get('id')} has manifest version 'v1' lacking binary provenance, "
+                    f"but binary provenance is required for this source. A 'v2' rescan is required."
+                )
 
         if manifest_version == "v2":
             if expected_source_binary_hash is not None and row_bin_hash != expected_source_binary_hash:

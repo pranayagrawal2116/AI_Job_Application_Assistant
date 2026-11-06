@@ -22,6 +22,25 @@ class FormFieldMapping:
 
 
 @dataclass
+class VerifiedAttachmentRef:
+    """Authoritative cryptographic attachment reference binding physical file and persistent scan."""
+    user_id: int
+    resume_id: int
+    version_num: int
+    storage_filename: str
+    file_path: str
+    file_hash: str
+    file_size_bytes: int
+    file_format: str
+    scan_id: int
+    scan_signature: str
+    verified_at: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class FormFillPlan:
     job_id: int
     company_name: str
@@ -29,6 +48,7 @@ class FormFillPlan:
     fields_to_fill: List[FormFieldMapping] = field(default_factory=list)
     resume_attachment_ready: bool = False
     resume_file_path: Optional[str] = None
+    attachment_ref: Optional[VerifiedAttachmentRef] = None
     unmapped_fields: List[str] = field(default_factory=list)
     anti_automation_detected: bool = False
     safety_message: str = ""
@@ -170,9 +190,10 @@ class FormPrefiller:
                             risk_score=ans_scan.risk_score,
                         )
 
-        # 4. Authoritative Resume Security Preflight & Attachment Validation (Phase 9.1.2.2 Part A)
+        # 4. Authoritative Resume Security Preflight & Attachment Validation (Phase 9.1.2.2 Part A & Phase 9.1.2.3 Part D)
         resume_ready = False
         verified_attachment_path: Optional[str] = None
+        attachment_ref: Optional[VerifiedAttachmentRef] = None
 
         if resume_id is not None:
             if not self.db or not uid:
@@ -201,6 +222,28 @@ class FormPrefiller:
                     )
             verified_attachment_path = str(v_res.resolved_path)
             resume_ready = True
+
+            # Retrieve the latest security scan to construct authoritative VerifiedAttachmentRef
+            latest_scan = self.db.get_latest_security_scan(
+                user_id=uid,
+                source_type="resume",
+                source_id=resume_id,
+                source_version=v_res.version_num,
+            )
+            from datetime import datetime, timezone
+            attachment_ref = VerifiedAttachmentRef(
+                user_id=uid,
+                resume_id=resume_id,
+                version_num=v_res.version_num,
+                storage_filename=v_res.storage_filename,
+                file_path=str(v_res.resolved_path),
+                file_hash=v_res.file_hash,
+                file_size_bytes=v_res.file_size_bytes,
+                file_format=v_res.file_format,
+                scan_id=latest_scan.id if latest_scan else 0,
+                scan_signature=latest_scan.hmac_signature if latest_scan else "",
+                verified_at=datetime.now(timezone.utc).isoformat(),
+            )
         elif resume_file_path is not None:
             raise SecurityAuthorizationError(
                 "Unverified resume file path cannot bypass authoritative resume verification. "
@@ -350,9 +393,131 @@ class FormPrefiller:
             fields_to_fill=fields,
             resume_attachment_ready=resume_ready,
             resume_file_path=verified_attachment_path,
+            attachment_ref=attachment_ref,
             anti_automation_detected=False,
             safety_message="Form fields prepared. Human review and explicit approval required prior to submission.",
         )
+
+    def open_verified_attachment(
+        self,
+        plan_or_ref: Union[FormFillPlan, VerifiedAttachmentRef],
+        user_id: int,
+    ) -> bytes:
+        """Opens and verifies an authoritative attachment binary immediately before form upload (use-time TOCTOU defense).
+
+        Re-validates:
+        1. User ownership and identity binding
+        2. Physical file existence, symlink traversal prevention, and candidate directory containment
+        3. Exact SHA-256 hash matching attachment_ref
+        4. Exact file byte size matching attachment_ref
+        5. File format magic byte headers (%PDF- or PK\x03\x04)
+        6. Security scan record HMAC validity, key active/unrevoked status, and non-quarantine status
+
+        Returns:
+            bytes: The verified raw file binary.
+
+        Raises:
+            CrossUserAccessError: If user_id mismatches attachment_ref.user_id.
+            SecurityAuthorizationError: If any binary integrity, format, or cryptographic check fails.
+        """
+        import hashlib
+        from src.database.exceptions import CrossUserAccessError, SecurityAuthorizationError
+        from src.security.file_security import FileSecurityValidator
+        from src.security.scan_signer import SecurityScanSigner
+
+        if isinstance(plan_or_ref, FormFillPlan):
+            ref = plan_or_ref.attachment_ref
+            if not ref:
+                raise SecurityAuthorizationError("FormFillPlan does not contain an authoritative attachment_ref.")
+        elif isinstance(plan_or_ref, VerifiedAttachmentRef):
+            ref = plan_or_ref
+        else:
+            raise SecurityAuthorizationError(f"Invalid plan_or_ref of type {type(plan_or_ref)}.")
+
+        if ref.user_id != user_id:
+            raise CrossUserAccessError(
+                user_id=user_id,
+                target_user_id=ref.user_id,
+                resource=f"VerifiedAttachmentRef for Resume #{ref.resume_id}",
+            )
+
+        file_validator = self.file_validator or FileSecurityValidator()
+        res_dir = file_validator.get_user_resumes_dir(user_id)
+        path = Path(ref.file_path).resolve()
+
+        # Symlink / directory containment check
+        try:
+            path.relative_to(res_dir.resolve())
+        except ValueError:
+            raise SecurityAuthorizationError(
+                f"Attachment path '{ref.file_path}' traverses outside authorized candidate directory '{res_dir}'."
+            )
+
+        if not path.is_file():
+            raise SecurityAuthorizationError(f"Attachment file '{ref.file_path}' does not exist or is not a regular file.")
+
+        try:
+            with open(path, "rb") as f:
+                content_bytes = f.read()
+        except Exception as e:
+            raise SecurityAuthorizationError(f"Failed to read attachment file '{ref.file_path}': {e}") from e
+
+        # Use-time size check
+        if len(content_bytes) != ref.file_size_bytes:
+            raise SecurityAuthorizationError(
+                f"TOCTOU detection: Attachment file size altered. Expected {ref.file_size_bytes} bytes, got {len(content_bytes)} bytes."
+            )
+
+        # Use-time SHA-256 check
+        actual_hash = hashlib.sha256(content_bytes).hexdigest()
+        if actual_hash != ref.file_hash:
+            raise SecurityAuthorizationError(
+                f"TOCTOU detection: Attachment file hash altered. Expected '{ref.file_hash}', got '{actual_hash}'."
+            )
+
+        # Use-time format magic bytes check
+        fmt = (ref.file_format or "").lower().strip()
+        if fmt == "pdf":
+            if not content_bytes.startswith(b"%PDF-"):
+                raise SecurityAuthorizationError("Attachment file lacks valid PDF header magic bytes.")
+        elif fmt == "docx":
+            if not content_bytes.startswith(b"PK\x03\x04"):
+                raise SecurityAuthorizationError("Attachment file lacks valid DOCX (ZIP) header magic bytes.")
+        else:
+            raise SecurityAuthorizationError(f"Unsupported attachment file format '{fmt}'.")
+
+        # Reverity security scan in database
+        if self.db:
+            scan = self.db.get_latest_security_scan(
+                user_id=user_id,
+                source_type="resume",
+                source_id=ref.resume_id,
+                source_version=ref.version_num,
+            )
+            if not scan:
+                raise SecurityAuthorizationError(f"No security scan record found for Resume #{ref.resume_id} v{ref.version_num}.")
+            if scan.id != ref.scan_id:
+                raise SecurityAuthorizationError(
+                    f"Scan ID mismatch: attachment ref refers to scan #{ref.scan_id}, but latest scan is #{scan.id}."
+                )
+            if scan.classification == "QUARANTINED":
+                raise SecurityAuthorizationError(f"Attachment Resume #{ref.resume_id} is QUARANTINED and cannot be opened for form upload.")
+
+            signer = SecurityScanSigner(db_manager=self.db)
+            signer.verify_scan_record(
+                expected_user_id=user_id,
+                expected_source_type="resume",
+                expected_source_id=ref.resume_id,
+                expected_source_version=ref.version_num,
+                expected_source_hash=ref.file_hash,
+                expected_snapshot_hash=None,
+                scan_row=scan.to_dict() if hasattr(scan, "to_dict") else dict(scan),
+                expected_source_binary_hash=ref.file_hash,
+                expected_source_binary_size_bytes=ref.file_size_bytes,
+                expected_source_binary_format=ref.file_format,
+            )
+
+        return content_bytes
 
     def ingest_and_prepare_attachment(
         self,

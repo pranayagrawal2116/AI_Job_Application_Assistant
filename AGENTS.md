@@ -712,6 +712,30 @@ When interacting with the browser via Playwright MCP:
     - Full test suite regression pass: 1,468 tests passing across the entire repository (100% pass rate in 72.86s).
     - 0 pyflakes errors, 0 ruff errors.
     - Comprehensive implementation report published in `docs/PHASE_9_1_2_2_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.3: Legacy Provenance, Manifest-Version & Attachment Lifecycle Closure** (Complete)
+  - Explicit Legacy Binary-Integrity State & Migration Audit (Part A):
+    - Eliminated fragile timestamp string comparisons (`str(jd.created_at) < "2026-11-06T00:00:00"`) in `SecurityPreflightManager.check_job_description_security()`.
+    - Added `binary_integrity_state TEXT DEFAULT 'REQUIRED' CHECK(binary_integrity_state IN ('REQUIRED', 'LEGACY_TEXT_ONLY', 'VERIFIED', 'NOT_APPLICABLE'))` to `job_descriptions` schema.
+    - Created append-only `legacy_integrity_exceptions` table with triggers preventing update or deletion of historical exceptions.
+    - Added database migration `_migrate_historical_job_description_integrity()` grandfathering pre-Phase-9.1.1 uploaded records with NULL metadata, verifying no conflicting signed scan exists with binary provenance.
+    - Disallowed assigning `LEGACY_TEXT_ONLY` state via public snapshot creation APIs (`SecurityAuthorizationError`).
+  - Manifest-Version Validation & Enforcement (Part B):
+    - Enforced strict supported manifest versions (`{"v1", "v2"}`) in `SecurityScanSigner`.
+    - `SecurityScanSigner.verify_scan_record()` rejects `v1` records when expected binary provenance is supplied.
+    - `SecurityPreflightManager.check_resume_security()` forces append-only `v2` rescan of historical `v1` resume scans before accepting them in security-sensitive workflows.
+  - Signing-Key Identity Immutability (Part C):
+    - Unified key registration across constructor, rotation configs, and runtime `rotate_key()` through `ScanKeyManager._register_key()`.
+    - Enforced key ID immutability (same key ID with different secret raises `SecurityAuthorizationError`, same bytes succeeds idempotently).
+    - Enforced minimum 32-byte entropy on all keys and domain separation against action ticket keys.
+  - Verified Attachment Reference & TOCTOU Defense (Part D):
+    - Introduced typed `VerifiedAttachmentRef` dataclass binding user ID, resume ID, version, storage filename, path, SHA-256, size, format, scan ID, and signature.
+    - Extended `FormFillPlan` with `attachment_ref: Optional[VerifiedAttachmentRef] = None`.
+    - Implemented `FormPrefiller.open_verified_attachment()` performing use-time reverification of physical disk file, hash, size, format, directory containment, and persistent scan HMAC signature.
+  - Verification & Regressions (Parts E, F, G & H):
+    - Authored 16 dedicated tests in `tests/test_phase_9_1_2_3_provenance_and_identity_closure.py` (16/16 passing, 100%).
+    - Full test suite regression pass: 1,484 tests passing across the entire repository (100% pass rate in 79.82s).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Comprehensive implementation report published in `docs/PHASE_9_1_2_3_IMPLEMENTATION_REPORT.md`.
 
 ---
 

@@ -442,6 +442,7 @@ class JobDescription:
     parser_version: Optional[str] = "1.0.0"
     extraction_confidence: Optional[float] = 1.0
     supersedes_job_description_id: Optional[int] = None
+    binary_integrity_state: str = "REQUIRED"
     is_active: bool = True
     created_at: Optional[str] = None
 
@@ -632,6 +633,26 @@ class SecurityScanOverride:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class LegacyIntegrityException:
+    """Audit log of grandfathered legacy job description binary integrity exception."""
+    id: int
+    user_id: int
+    job_description_id: int
+    original_source_type: str
+    previous_binary_state: Optional[str]
+    assigned_legacy_state: str
+    source_snapshot_hash: Optional[str]
+    migration_version: str
+    migration_timestamp: str
+    migration_reason: str
+    outcome: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 
 
