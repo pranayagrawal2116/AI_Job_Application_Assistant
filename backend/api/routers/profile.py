@@ -1,5 +1,7 @@
 """Candidate profile and resume management endpoints."""
 
+import hashlib
+import logging
 from typing import Any, Dict, List
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from dashboard.services.dashboard_service import DashboardService
@@ -11,10 +13,13 @@ from backend.api.schemas.profile import (
     ResumeSyncResponse,
 )
 from src.database.exceptions import (
+    DuplicateResumeError,
     FileSecurityError,
     ResumeNotFoundError,
     ValidationError,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/profile", tags=["Profile & Resumes"])
 
@@ -137,7 +142,37 @@ async def upload_resume(
         )
     except FileSecurityError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"File validation failed: {str(e)}")
+    except DuplicateResumeError as e:
+        # User already uploaded this exact resume. Gracefully retrieve and return it!
+        file_hash = hashlib.sha256(contents).hexdigest()
+        with service.db.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM resumes WHERE user_id = ? AND file_hash = ?", (user_id, file_hash))
+            existing_row = cursor.fetchone()
+
+        if existing_row:
+            existing_dict = dict(existing_row)
+            if auto_sync_profile:
+                try:
+                    service.sync_user_profile_from_resume_id(user_id=user_id, resume_id=existing_dict["id"])
+                except Exception as sync_err:
+                    logger.warning("Profile re-sync non-fatal warning: %s", sync_err)
+
+            return ResumeResponse(
+                id=existing_dict["id"],
+                user_id=existing_dict["user_id"],
+                original_filename=existing_dict["original_filename"],
+                file_format=existing_dict["file_format"],
+                file_size_bytes=existing_dict["file_size_bytes"],
+                file_hash=existing_dict["file_hash"],
+                is_primary=bool(existing_dict.get("is_primary", False)),
+                upload_date=existing_dict.get("upload_date"),
+            )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Duplicate resume: {str(e)}")
+    except ValidationError as e:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception as e:
+        logger.exception("Resume upload failed unexpectedly for user %s: %s", user_id, e)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Resume upload failed: {str(e)}")
 
 

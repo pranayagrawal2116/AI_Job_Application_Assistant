@@ -5,6 +5,7 @@ import { JobItem } from '@/types';
 import { LoadingSpinner } from '@/components/common/LoadingSpinner';
 import { Badge } from '@/components/common/Badge';
 import { Modal } from '@/components/common/Modal';
+import { FileDropzone } from '@/components/common/FileDropzone';
 import { formatScore, getScoreColor } from '@/lib/utils';
 import {
   Search,
@@ -327,23 +328,14 @@ export const JobsPage: React.FC = () => {
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
                   Upload PDF or DOCX Job Posting *
                 </label>
-                <div className="border-2 border-dashed border-slate-200 hover:border-brand-400 rounded-2xl p-6 text-center transition-colors">
-                  <input
-                    type="file"
-                    id="jd-file-upload"
-                    accept=".pdf,.docx"
-                    onChange={(e) => setJdFile(e.target.files?.[0] || null)}
-                    className="hidden"
-                  />
-                  <label htmlFor="jd-file-upload" className="cursor-pointer block">
-                    <Upload size={24} className="mx-auto text-slate-400 mb-2" />
-                    {jdFile ? (
-                      <span className="text-xs font-bold text-slate-800">{jdFile.name}</span>
-                    ) : (
-                      <span className="text-xs text-slate-500">Select PDF or DOCX up to 10 MB</span>
-                    )}
-                  </label>
-                </div>
+                <FileDropzone
+                  id="jd-file-upload"
+                  onFileSelect={(file) => setJdFile(file)}
+                  selectedFile={jdFile}
+                  onClearFile={() => setJdFile(null)}
+                  title="Click to select or drop job description"
+                  subtitle="PDF or DOCX documents up to 10 MB"
+                />
               </div>
             )}
 

@@ -3,13 +3,13 @@ import { useSearchParams } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { CandidateProfile, ResumeItem } from '@/types';
 import { LoadingSpinner } from '@/components/common/LoadingSpinner';
+import { FileDropzone } from '@/components/common/FileDropzone';
 import {
   User,
   FileText,
   GraduationCap,
   Briefcase,
   Code2,
-  UploadCloud,
   CheckCircle2,
   Trash2,
   RefreshCw,
@@ -72,21 +72,22 @@ export const ProfilePage: React.FC = () => {
     }
   };
 
-  const handleResumeUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const file = e.target.files[0];
-      setUploadingResume(true);
-      setErrorMsg(null);
+  const handleResumeFileSelect = async (file: File) => {
+    setUploadingResume(true);
+    setErrorMsg(null);
+    try {
+      const uploaded = await api.uploadResume(file);
+      // Automatically sync profile with parsed resume
       try {
-        const uploaded = await api.uploadResume(file);
-        // Automatically sync
         await api.syncProfileWithResume(uploaded.id);
-        await loadData();
-      } catch (err: any) {
-        setErrorMsg(err.message || 'Resume upload failed.');
-      } finally {
-        setUploadingResume(false);
+      } catch (syncErr: any) {
+        console.warn('Profile sync non-fatal warning:', syncErr);
       }
+      await loadData();
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Resume upload failed.');
+    } finally {
+      setUploadingResume(false);
     }
   };
 
@@ -616,23 +617,15 @@ export const ProfilePage: React.FC = () => {
               Upload PDF or DOCX resume to extract verified candidate credentials and sync your profile.
             </p>
 
-            <div className="border-2 border-dashed border-slate-200 hover:border-brand-400 rounded-2xl p-6 text-center transition-colors bg-slate-50/50">
-              <input
-                type="file"
-                id="resume-lib-upload"
-                accept=".pdf,.docx"
-                onChange={handleResumeUpload}
-                disabled={uploadingResume}
-                className="hidden"
-              />
-              <label htmlFor="resume-lib-upload" className="cursor-pointer block">
-                <UploadCloud size={32} className="mx-auto text-brand-600 mb-2" />
-                <p className="text-xs font-bold text-slate-800">
-                  {uploadingResume ? 'Uploading & Parsing Resume...' : 'Click to upload PDF or DOCX'}
-                </p>
-                <p className="text-[11px] text-slate-400 mt-0.5">Maximum file size: 10 MB</p>
-              </label>
-            </div>
+            <FileDropzone
+              id="resume-lib-upload"
+              onFileSelect={handleResumeFileSelect}
+              onError={(err) => setErrorMsg(err)}
+              isLoading={uploadingResume}
+              loadingText="Uploading & Parsing Resume..."
+              title="Click to upload PDF or DOCX"
+              subtitle="Maximum file size: 10 MB"
+            />
           </div>
 
           {/* Resumes list */}

@@ -2,8 +2,9 @@ import React, { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '@/features/auth/AuthContext';
 import { api } from '@/lib/api';
-import { Sparkles, UploadCloud, CheckCircle2, ArrowRight, ArrowLeft, FileText, AlertCircle } from 'lucide-react';
+import { Sparkles, CheckCircle2, ArrowRight, ArrowLeft, FileText, AlertCircle } from 'lucide-react';
 import { LoadingSpinner } from '@/components/common/LoadingSpinner';
+import { FileDropzone } from '@/components/common/FileDropzone';
 
 export const OnboardingWizard: React.FC = () => {
   const { user } = useAuth();
@@ -14,18 +15,6 @@ export const OnboardingWizard: React.FC = () => {
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [uploadedResume, setUploadedResume] = useState<any>(null);
-
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    if (e.target.files && e.target.files[0]) {
-      const selected = e.target.files[0];
-      if (!selected.name.match(/\.(pdf|docx)$/i)) {
-        setError('Only PDF or DOCX files are supported.');
-        return;
-      }
-      setFile(selected);
-      setError(null);
-    }
-  };
 
   const handleUpload = async () => {
     if (!file) return;
@@ -115,38 +104,20 @@ export const OnboardingWizard: React.FC = () => {
                 </p>
               </div>
 
-              <div className="border-2 border-dashed border-slate-200 hover:border-brand-400 rounded-2xl p-8 text-center transition-colors bg-slate-50/50">
-                <input
-                  type="file"
-                  id="resume-file"
-                  accept=".pdf,.docx"
-                  onChange={handleFileChange}
-                  className="hidden"
-                />
-                <label
-                  htmlFor="resume-file"
-                  className="cursor-pointer flex flex-col items-center justify-center"
-                >
-                  <div className="w-14 h-14 rounded-2xl bg-white shadow-sm border border-slate-200 flex items-center justify-center text-brand-600 mb-3">
-                    <UploadCloud size={28} />
-                  </div>
-                  {file ? (
-                    <div>
-                      <p className="text-sm font-semibold text-slate-800">{file.name}</p>
-                      <p className="text-xs text-slate-400 mt-0.5">
-                        {(file.size / (1024 * 1024)).toFixed(2)} MB &middot; Ready to parse
-                      </p>
-                    </div>
-                  ) : (
-                    <div>
-                      <p className="text-sm font-semibold text-slate-700">
-                        Click to browse or drag and drop
-                      </p>
-                      <p className="text-xs text-slate-400 mt-1">PDF or DOCX documents up to 10 MB</p>
-                    </div>
-                  )}
-                </label>
-              </div>
+              <FileDropzone
+                id="onboarding-resume-upload"
+                onFileSelect={(selectedFile) => {
+                  setFile(selectedFile);
+                  setError(null);
+                }}
+                onError={(err) => setError(err)}
+                selectedFile={file}
+                onClearFile={() => setFile(null)}
+                isLoading={isUploading}
+                loadingText="Parsing resume..."
+                title="Click to browse or drag and drop"
+                subtitle="PDF or DOCX documents up to 10 MB"
+              />
 
               <div className="mt-8 flex items-center justify-between">
                 <button
