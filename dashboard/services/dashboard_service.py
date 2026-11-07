@@ -1135,6 +1135,7 @@ class DashboardService:
         session_id: str,
         company_name: str,
         job_title: str,
+        job_id: Optional[int] = None,
         job_description_id: Optional[int] = None,
         resume_id: Optional[int] = None,
         status: Optional[str] = None,
@@ -1176,6 +1177,17 @@ class DashboardService:
             if not res:
                 raise ValidationError(f"Resume #{resume_id} not found or unauthorized.")
 
+        # If job_id is provided, populate missing context from catalog
+        if job_id is not None:
+            catalog_job = self.db.get_job_by_id(job_id)
+            if catalog_job:
+                if not job_url and getattr(catalog_job, "job_url", None):
+                    job_url = catalog_job.job_url
+                if not location and getattr(catalog_job, "location", None):
+                    location = catalog_job.location
+                if not employment_type and getattr(catalog_job, "work_arrangement", None):
+                    employment_type = catalog_job.work_arrangement
+
         # Validate job_url if provided
         validated_job_url: Optional[str] = None
         if job_url:
@@ -1196,6 +1208,7 @@ class DashboardService:
             user_id=user_id,
             company_name=clean_company,
             job_title=clean_title,
+            job_id=job_id,
             status=initial_status,
             resume_id=resume_id,
             job_description_id=job_description_id,
@@ -3685,4 +3698,8 @@ class DashboardService:
             packet_version_hash=packet_version_hash,
             submission_notes=submission_notes,
         )
+
+    # Aliases for unified preparation interface
+    generate_universal_tailored_resume = generate_tailored_resume
+    generate_universal_application_documents = export_application_documents
 

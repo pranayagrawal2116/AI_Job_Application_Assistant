@@ -1423,6 +1423,54 @@ class DatabaseManager:
 
         logger.info("prepared_packets migration completed successfully.")
 
+    def _migrate_application_logs_job_id_nullable(self, conn: sqlite3.Connection) -> None:
+        """Migrates application_logs table to allow NULL job_id (aligning with schema.sql).
+
+        Candidate applications created from user job descriptions or custom roles may not have a catalog job_id.
+        """
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_logs'")
+        if not cursor.fetchone():
+            return
+
+        cursor.execute("PRAGMA table_info(application_logs)")
+        cols = cursor.fetchall()
+        job_id_not_null = False
+        for c in cols:
+            name = c[1]
+            notnull = c[3]
+            if name == "job_id" and notnull == 1:
+                job_id_not_null = True
+                break
+
+        if not job_id_not_null:
+            return
+
+        logger.info("Migrating application_logs to allow NULL job_id...")
+        cursor.execute("PRAGMA foreign_keys = OFF")
+        cursor.execute("DROP TABLE IF EXISTS application_logs_new")
+        cursor.execute("""
+            CREATE TABLE application_logs_new (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+                application_id INTEGER REFERENCES applications(id) ON DELETE SET NULL,
+                user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
+                anonymized_user_pseudonym TEXT,
+                action TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                details TEXT
+            )
+        """)
+
+        col_names = [c[1] for c in cols]
+        common = [col for col in ["id", "job_id", "application_id", "user_id", "anonymized_user_pseudonym", "action", "timestamp", "details"] if col in col_names]
+        cols_str = ", ".join(common)
+        cursor.execute(f"INSERT INTO application_logs_new ({cols_str}) SELECT {cols_str} FROM application_logs")
+        cursor.execute("DROP TABLE application_logs")
+        cursor.execute("ALTER TABLE application_logs_new RENAME TO application_logs")
+        cursor.execute("PRAGMA foreign_keys = ON")
+        logger.info("application_logs migration completed successfully.")
+
     def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
         """Migrates applications and lifecycle tables to Phase 7 universal architecture.
 
@@ -2134,6 +2182,8 @@ class DatabaseManager:
             self._migrate_match_results_foreign_keys(conn)
             conn.commit()
             self._migrate_prepared_packets_foreign_keys(conn)
+            conn.commit()
+            self._migrate_application_logs_job_id_nullable(conn)
             conn.commit()
             self._migrate_phase7_lifecycle_tables(conn)
             conn.commit()
@@ -3819,12 +3869,19 @@ class DatabaseManager:
         )
 
         # Also log to application_logs
+        app_job_id = None
+        cursor.execute("SELECT job_id FROM applications WHERE id = ?", (application_id,))
+        app_j = cursor.fetchone()
+        if app_j and app_j["job_id"]:
+            app_job_id = app_j["job_id"]
+
         cursor.execute(
             """
-            INSERT INTO application_logs (application_id, user_id, action, details)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO application_logs (job_id, application_id, user_id, action, details)
+            VALUES (?, ?, ?, ?, ?)
             """,
             (
+                app_job_id,
                 application_id,
                 user_id,
                 "HUMAN_APPROVAL_GRANTED",
@@ -4917,6 +4974,42 @@ class DatabaseManager:
 
             cursor.execute("SELECT * FROM applications WHERE id = ?", (app_id,))
             return Application(**dict(cursor.fetchone()))
+
+    def update_application_resume_and_job(
+        self,
+        application_id: int,
+        user_id: int,
+        resume_id: Optional[int] = None,
+        job_id: Optional[int] = None,
+    ) -> bool:
+        """Updates resume_id and/or job_id on a user-owned application with cross-user isolation."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT id, user_id FROM applications WHERE id = ?", (application_id,))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            if row["user_id"] != user_id:
+                raise CrossUserAccessError(
+                    user_id=user_id,
+                    target_user_id=row["user_id"],
+                    resource=f"Application #{application_id}",
+                )
+            updates = []
+            params: list = []
+            if resume_id is not None:
+                updates.append("resume_id = ?")
+                params.append(resume_id)
+            if job_id is not None:
+                updates.append("job_id = ?")
+                params.append(job_id)
+            if not updates:
+                return True
+            updates.append("updated_at = CURRENT_TIMESTAMP")
+            params.extend([application_id, user_id])
+            sql = f"UPDATE applications SET {', '.join(updates)} WHERE id = ? AND user_id = ?"
+            cursor.execute(sql, params)
+            return cursor.rowcount == 1
 
     def get_user_application(self, application_id: int, user_id: int) -> Optional[Application]:
         """Fetches an application owned by user. Enforces cross-user isolation."""

@@ -31,6 +31,11 @@ export const ApplicationPreparerPage: React.FC = () => {
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
 
+  // Resume Selection State
+  const [resumes, setResumes] = useState<any[]>([]);
+  const [selectedResumeId, setSelectedResumeId] = useState<number | null>(null);
+  const [customInstructions, setCustomInstructions] = useState('');
+
   // Preparation Data States
   const [tailoredResume, setTailoredResume] = useState<any>(null);
   const [isTailoringResume, setIsTailoringResume] = useState(false);
@@ -40,23 +45,8 @@ export const ApplicationPreparerPage: React.FC = () => {
   const [coverLetterClaims, setCoverLetterClaims] = useState<any[]>([]);
   const [isGeneratingCoverLetter, setIsGeneratingCoverLetter] = useState(false);
 
-  const [screeningQs, setScreeningQs] = useState<Array<{ q: string; a: string; needsInput: boolean }>>([
-    {
-      q: 'Why do you want to join this company and team?',
-      a: 'I am excited by the company mission and product engineering focus. My verified experience in software engineering and data systems aligns directly with the posted role requirements.',
-      needsInput: false,
-    },
-    {
-      q: 'What is your expected compensation?',
-      a: 'Competitive market rate / Open to discussion based on role scope.',
-      needsInput: true,
-    },
-    {
-      q: 'What is your earliest available start date?',
-      a: 'Immediate / 2 weeks notice.',
-      needsInput: true,
-    },
-  ]);
+  const [screeningQs, setScreeningQs] = useState<Array<{ q: string; a: string; needsInput: boolean }>>([]);
+  const [isGeneratingScreening, setIsGeneratingScreening] = useState(false);
 
   // Approval Gate State
   const [packetInfo, setPacketInfo] = useState<any>(null);
@@ -69,7 +59,7 @@ export const ApplicationPreparerPage: React.FC = () => {
 
   // Manual Submission Confirmation State
   const [candidateConfirmedSubmission, setCandidateConfirmedSubmission] = useState(false);
-  const [submissionChannel, setSubmissionChannel] = useState('EMPLOYER_PORTAL');
+  const [submissionChannel, setSubmissionChannel] = useState('COMPANY_PORTAL');
   const [confirmationRef, setConfirmationRef] = useState('');
   const [candidateNotes, setCandidateNotes] = useState('');
   const [isSubmittingConfirm, setIsSubmittingConfirm] = useState(false);
@@ -79,10 +69,49 @@ export const ApplicationPreparerPage: React.FC = () => {
     const loadAppData = async () => {
       setIsLoading(true);
       try {
-        const application = await api.getApplication(appId);
-        setApp(application);
+        const [application, userResumes, prepState] = await Promise.all([
+          api.getApplication(appId),
+          api.getResumes().catch(() => []),
+          api.getPreparationState(appId).catch(() => null),
+        ]);
 
-        // Check if already submitted or approved
+        setApp(application);
+        setResumes(userResumes || []);
+
+        // Resolve selected resume
+        let resolvedResId: number | null = null;
+        if (prepState?.selected_resume_id) {
+          resolvedResId = prepState.selected_resume_id;
+        } else if (application?.resume_id) {
+          resolvedResId = application.resume_id;
+        } else if (userResumes && userResumes.length > 0) {
+          const primary = userResumes.find((r: any) => r.is_primary);
+          resolvedResId = primary ? primary.id : (userResumes.length === 1 ? userResumes[0].id : null);
+        }
+        setSelectedResumeId(resolvedResId);
+
+        // Restore preparation artifacts if present
+        if (prepState?.tailored_resume) {
+          setTailoredResume(prepState.tailored_resume);
+        }
+        if (prepState?.cover_letter) {
+          setCoverLetterText(prepState.cover_letter.letter_text || '');
+          setCoverLetterClaims(prepState.cover_letter.provenance_claims || []);
+        }
+        if (prepState?.screening_qa && prepState.screening_qa.length > 0) {
+          setScreeningQs(prepState.screening_qa);
+        }
+        if (prepState?.has_packet && prepState.packet) {
+          setPacketInfo(prepState.packet);
+        }
+        if (prepState?.is_approved) {
+          setIsApproved(true);
+        }
+        if (prepState?.is_submitted) {
+          setIsSubmitted(true);
+        }
+
+        // Check if application is already submitted or approved
         if (['SUBMITTED', 'Applied', 'In Progress', 'IN_PROGRESS'].includes(application.status)) {
           setIsSubmitted(true);
           setIsApproved(true);
@@ -90,10 +119,12 @@ export const ApplicationPreparerPage: React.FC = () => {
           setIsApproved(true);
         }
 
-        // Check active packet
-        const packetRes = await api.getLatestPacket(appId);
-        if (packetRes?.has_packet) {
-          setPacketInfo(packetRes.packet);
+        // Active packet check fallback
+        if (!prepState?.packet) {
+          const packetRes = await api.getLatestPacket(appId).catch(() => null);
+          if (packetRes?.has_packet) {
+            setPacketInfo(packetRes.packet);
+          }
         }
       } catch (err: any) {
         setErrorMsg(err.message || 'Failed to load application workspace.');
@@ -105,11 +136,23 @@ export const ApplicationPreparerPage: React.FC = () => {
   }, [appId]);
 
   const handleTailorResume = async () => {
+    if (resumes.length === 0) {
+      setErrorMsg('No resumes available. Please upload a resume in My Profile first.');
+      return;
+    }
+    if (!selectedResumeId && resumes.length > 1) {
+      setErrorMsg('Please select a resume to use for tailoring.');
+      return;
+    }
     setIsTailoringResume(true);
     setErrorMsg(null);
     try {
-      const res = await api.tailorResume(appId);
+      const res = await api.tailorResume(appId, {
+        resume_id: selectedResumeId || undefined,
+        custom_instructions: customInstructions || undefined,
+      });
       setTailoredResume(res.tailored_resume);
+      setSuccessMsg('Tailored resume synthesized and saved!');
     } catch (err: any) {
       setErrorMsg(err.message || 'Resume tailoring failed.');
     } finally {
@@ -121,14 +164,34 @@ export const ApplicationPreparerPage: React.FC = () => {
     setIsGeneratingCoverLetter(true);
     setErrorMsg(null);
     try {
-      const res = await api.generateCoverLetter(appId, coverLetterTone);
+      const res = await api.generateCoverLetter(appId, {
+        tone: coverLetterTone,
+        resume_id: selectedResumeId || undefined,
+      });
       const cl = res.cover_letter;
       setCoverLetterText(cl.letter_text || '');
       setCoverLetterClaims(cl.provenance_claims || []);
+      setSuccessMsg('Tailored cover letter drafted and saved!');
     } catch (err: any) {
       setErrorMsg(err.message || 'Cover letter generation failed.');
     } finally {
       setIsGeneratingCoverLetter(false);
+    }
+  };
+
+  const handleGenerateScreening = async () => {
+    setIsGeneratingScreening(true);
+    setErrorMsg(null);
+    try {
+      const res = await api.answerScreeningQuestions(appId, {
+        resume_id: selectedResumeId || undefined,
+      });
+      setScreeningQs(res.screening_qa || []);
+      setSuccessMsg('Screening answers drafted from verified credentials!');
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Screening QA generation failed.');
+    } finally {
+      setIsGeneratingScreening(false);
     }
   };
 
@@ -152,8 +215,6 @@ export const ApplicationPreparerPage: React.FC = () => {
 
       setIsApproved(true);
       setSuccessMsg('Application packet cryptographically sealed and approved!');
-      // Transition application status to APPROVED
-      await api.updateApplicationStatus(appId, 'APPROVED');
       setCurrentStep(7);
     } catch (err: any) {
       setErrorMsg(err.message || 'Packet authorization failed.');
@@ -320,13 +381,32 @@ export const ApplicationPreparerPage: React.FC = () => {
       <div className="bg-white rounded-2xl p-4 border border-slate-200/80 shadow-sm overflow-x-auto">
         <div className="flex items-center justify-between min-w-[700px]">
           {steps.map((s, idx) => {
-            const isCompleted = currentStep > s.num || (s.num === 6 && isApproved) || (s.num === 7 && isSubmitted);
+            const isCompleted =
+              currentStep > s.num ||
+              (s.num === 2 && !!tailoredResume) ||
+              (s.num === 3 && !!coverLetterText) ||
+              (s.num === 4 && screeningQs.length > 0) ||
+              (s.num === 5 && !!packetInfo) ||
+              (s.num === 6 && isApproved) ||
+              (s.num === 7 && isSubmitted);
             const isCurrent = currentStep === s.num;
+            const canNavigate =
+              s.num === 1 ||
+              s.num === 2 ||
+              (s.num === 3 && !!tailoredResume) ||
+              (s.num === 4 && !!coverLetterText) ||
+              (s.num === 5 && screeningQs.length > 0) ||
+              (s.num === 6 && !!packetInfo) ||
+              (s.num === 7 && isApproved);
+
             return (
               <React.Fragment key={s.num}>
                 <button
-                  onClick={() => setCurrentStep(s.num)}
-                  className="flex items-center gap-2 text-xs font-bold transition-all focus:outline-none"
+                  onClick={() => {
+                    if (canNavigate) setCurrentStep(s.num);
+                  }}
+                  disabled={!canNavigate}
+                  className="flex items-center gap-2 text-xs font-bold transition-all focus:outline-none disabled:opacity-40 disabled:cursor-not-allowed"
                 >
                   <div
                     className={`w-7 h-7 rounded-full flex items-center justify-center text-xs transition-all ${
@@ -414,7 +494,7 @@ export const ApplicationPreparerPage: React.FC = () => {
             <div className="flex items-center gap-2">
               <button
                 onClick={handleTailorResume}
-                disabled={isTailoringResume}
+                disabled={isTailoringResume || resumes.length === 0}
                 className="px-4 py-2 rounded-xl border border-brand-200 bg-brand-50 hover:bg-brand-100 text-brand-700 font-semibold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
               >
                 <Sparkles size={14} />
@@ -422,11 +502,71 @@ export const ApplicationPreparerPage: React.FC = () => {
               </button>
               <button
                 onClick={() => setCurrentStep(3)}
-                className="px-5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all"
+                disabled={!tailoredResume}
+                className="px-5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <span>Next: Cover Letter</span>
                 <ArrowRight size={14} />
               </button>
+            </div>
+          </div>
+
+          {/* Resume Selection Box */}
+          <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <label className="text-xs font-bold text-slate-800 block">Source Resume</label>
+                <p className="text-[11px] text-slate-500">
+                  Select which verified resume version to base your tailoring on.
+                </p>
+              </div>
+              {resumes.length === 0 ? (
+                <Link
+                  to="/profile?tab=resumes"
+                  className="px-3.5 py-1.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white text-xs font-semibold inline-flex items-center gap-1.5 self-start"
+                >
+                  <span>Upload Resume</span>
+                  <ExternalLink size={12} />
+                </Link>
+              ) : (
+                <select
+                  value={selectedResumeId || ''}
+                  onChange={(e) => setSelectedResumeId(Number(e.target.value))}
+                  className="px-3 py-1.5 rounded-xl border border-slate-200 text-xs bg-white text-slate-800 font-medium focus:ring-2 focus:ring-brand-500 focus:outline-none"
+                >
+                  {resumes.map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.original_filename || `Resume #${r.id}`} {r.is_primary ? '(Primary)' : ''}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </div>
+
+            {resumes.length === 0 && (
+              <div className="p-3 rounded-xl bg-amber-50 border border-amber-200 text-amber-800 text-xs flex items-center gap-2">
+                <AlertTriangle size={15} className="shrink-0 text-amber-600" />
+                <span>
+                  No resumes found in your profile. Please upload a resume in{' '}
+                  <Link to="/profile" className="font-bold underline">
+                    My Profile
+                  </Link>{' '}
+                  before generating tailored applications.
+                </span>
+              </div>
+            )}
+
+            <div>
+              <label className="text-xs font-semibold text-slate-700 block mb-1">
+                Custom Tailoring Instructions (Optional)
+              </label>
+              <input
+                type="text"
+                placeholder="e.g. Highlight Python, machine learning workflows, and data pipelines..."
+                value={customInstructions}
+                onChange={(e) => setCustomInstructions(e.target.value)}
+                className="w-full px-3.5 py-2 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-brand-500 text-slate-700"
+              />
             </div>
           </div>
 
@@ -439,8 +579,8 @@ export const ApplicationPreparerPage: React.FC = () => {
               </p>
               <button
                 onClick={handleTailorResume}
-                disabled={isTailoringResume}
-                className="mt-4 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 inline-flex items-center gap-1.5 transition-all"
+                disabled={isTailoringResume || resumes.length === 0}
+                className="mt-4 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 inline-flex items-center gap-1.5 transition-all disabled:opacity-50"
               >
                 <Sparkles size={14} />
                 <span>{isTailoringResume ? 'Synthesizing...' : 'Generate Tailored Resume'}</span>
@@ -462,6 +602,22 @@ export const ApplicationPreparerPage: React.FC = () => {
                     'Candidate profile aligned with target engineering requirements.'}
                 </p>
               </div>
+
+              {tailoredResume.matching_skills && tailoredResume.matching_skills.length > 0 && (
+                <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2">
+                  <h4 className="text-xs font-bold text-slate-900">Aligned Technical Skills</h4>
+                  <div className="flex flex-wrap gap-1.5">
+                    {tailoredResume.matching_skills.map((skill: string, sIdx: number) => (
+                      <span
+                        key={sIdx}
+                        className="px-2.5 py-0.5 rounded-lg text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200"
+                      >
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {tailoredResume.experience_entries && (
                 <div className="space-y-3">
@@ -518,7 +674,8 @@ export const ApplicationPreparerPage: React.FC = () => {
               </button>
               <button
                 onClick={() => setCurrentStep(4)}
-                className="px-5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all"
+                disabled={!coverLetterText}
+                className="px-5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <span>Next: Screening QA</span>
                 <ArrowRight size={14} />
@@ -608,8 +765,17 @@ export const ApplicationPreparerPage: React.FC = () => {
                 Back
               </button>
               <button
+                onClick={handleGenerateScreening}
+                disabled={isGeneratingScreening}
+                className="px-4 py-2 rounded-xl border border-brand-200 bg-brand-50 hover:bg-brand-100 text-brand-700 font-semibold text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50"
+              >
+                <Sparkles size={13} />
+                <span>{isGeneratingScreening ? 'Drafting...' : 'Draft Screening Answers'}</span>
+              </button>
+              <button
                 onClick={() => setCurrentStep(5)}
-                className="px-5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all"
+                disabled={screeningQs.length === 0}
+                className="px-5 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <span>Next: Preview & Export</span>
                 <ArrowRight size={14} />
@@ -617,39 +783,57 @@ export const ApplicationPreparerPage: React.FC = () => {
             </div>
           </div>
 
-          <div className="space-y-4">
-            {screeningQs.map((qItem, idx) => (
-              <div
-                key={idx}
-                className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2.5"
+          {screeningQs.length === 0 ? (
+            <div className="text-center py-12 border-2 border-dashed border-slate-200 rounded-2xl">
+              <Edit3 size={36} className="mx-auto text-brand-500 mb-3" />
+              <p className="text-sm font-bold text-slate-800">No Screening Answers Drafted Yet</p>
+              <p className="text-xs text-slate-400 mt-1 max-w-sm mx-auto">
+                Generate role-specific screening answers based on your verified candidate credentials.
+              </p>
+              <button
+                onClick={handleGenerateScreening}
+                disabled={isGeneratingScreening}
+                className="mt-4 px-6 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 inline-flex items-center gap-1.5 transition-all disabled:opacity-50"
               >
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-900">
-                    Q{idx + 1}: {qItem.q}
-                  </span>
-                  {qItem.needsInput ? (
-                    <span className="text-[10px] font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
-                      Needs Candidate Input
+                <Sparkles size={14} />
+                <span>{isGeneratingScreening ? 'Drafting...' : 'Generate Screening Answers'}</span>
+              </button>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {screeningQs.map((qItem, idx) => (
+                <div
+                  key={idx}
+                  className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2.5"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-900">
+                      Q{idx + 1}: {qItem.q}
                     </span>
-                  ) : (
-                    <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
-                      Draft Ready
-                    </span>
-                  )}
+                    {qItem.needsInput ? (
+                      <span className="text-[10px] font-bold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+                        Needs Candidate Input
+                      </span>
+                    ) : (
+                      <span className="text-[10px] font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                        Draft Ready
+                      </span>
+                    )}
+                  </div>
+                  <textarea
+                    rows={2}
+                    value={qItem.a}
+                    onChange={(e) => {
+                      const updated = [...screeningQs];
+                      updated[idx].a = e.target.value;
+                      setScreeningQs(updated);
+                    }}
+                    className="w-full p-2.5 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-brand-500"
+                  />
                 </div>
-                <textarea
-                  rows={2}
-                  value={qItem.a}
-                  onChange={(e) => {
-                    const updated = [...screeningQs];
-                    updated[idx].a = e.target.value;
-                    setScreeningQs(updated);
-                  }}
-                  className="w-full p-2.5 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none focus:ring-2 focus:ring-brand-500"
-                />
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -680,7 +864,8 @@ export const ApplicationPreparerPage: React.FC = () => {
               </button>
               <button
                 onClick={() => setCurrentStep(6)}
-                className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all"
+                disabled={!packetInfo}
+                className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all disabled:opacity-40 disabled:cursor-not-allowed"
               >
                 <span>Next: Human Approval Gate</span>
                 <ArrowRight size={14} />
@@ -824,14 +1009,25 @@ export const ApplicationPreparerPage: React.FC = () => {
             >
               Back
             </button>
-            <button
-              onClick={handleAuthorizePacket}
-              disabled={isAuthorizing || isApproved}
-              className="px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs shadow-md shadow-emerald-600/20 flex items-center gap-2 transition-all disabled:opacity-50"
-            >
-              <Lock size={14} />
-              <span>{isApproved ? 'Packet Approved' : isAuthorizing ? 'Authorizing...' : 'Authorize Packet'}</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleAuthorizePacket}
+                disabled={isAuthorizing || isApproved}
+                className="px-6 py-2.5 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-semibold text-xs shadow-md shadow-emerald-600/20 flex items-center gap-2 transition-all disabled:opacity-50"
+              >
+                <Lock size={14} />
+                <span>{isApproved ? 'Packet Approved' : isAuthorizing ? 'Authorizing...' : 'Authorize Packet'}</span>
+              </button>
+              {isApproved && (
+                <button
+                  onClick={() => setCurrentStep(7)}
+                  className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all"
+                >
+                  <span>Next: Portal Submission</span>
+                  <ArrowRight size={14} />
+                </button>
+              )}
+            </div>
           </div>
         </div>
       )}
@@ -903,11 +1099,11 @@ export const ApplicationPreparerPage: React.FC = () => {
                   onChange={(e) => setSubmissionChannel(e.target.value)}
                   className="w-full px-3.5 py-2 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none"
                 >
-                  <option value="EMPLOYER_PORTAL">Employer Career Portal</option>
-                  <option value="LINKEDIN_EASY_APPLY">LinkedIn Easy Apply</option>
-                  <option value="INTERNSHALA">Internshala Portal</option>
+                  <option value="COMPANY_PORTAL">Employer Career Portal</option>
+                  <option value="LINKEDIN">LinkedIn Easy Apply</option>
                   <option value="INDEED">Indeed Apply</option>
                   <option value="EMAIL">Email Submission</option>
+                  <option value="OTHER">Other Career Portal</option>
                 </select>
               </div>
 

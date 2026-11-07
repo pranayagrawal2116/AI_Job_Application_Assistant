@@ -199,17 +199,51 @@ class ApiClient {
     });
   }
 
-  async tailorResume(id: number, customInstructions?: string, resumeId?: number): Promise<any> {
+  async getPreparationState(id: number): Promise<any> {
+    return this.request(`/applications/${id}/preparation-state`);
+  }
+
+  async tailorResume(
+    id: number,
+    dataOrInstructions?: string | { resume_id?: number; custom_instructions?: string; template?: string },
+    resumeId?: number
+  ): Promise<any> {
+    let body: any = {};
+    if (typeof dataOrInstructions === 'string') {
+      body = { custom_instructions: dataOrInstructions, resume_id: resumeId };
+    } else if (dataOrInstructions) {
+      body = dataOrInstructions;
+    }
     return this.request(`/applications/${id}/tailor-resume`, {
       method: 'POST',
-      body: JSON.stringify({ custom_instructions: customInstructions, resume_id: resumeId }),
+      body: JSON.stringify(body),
     });
   }
 
-  async generateCoverLetter(id: number, tone?: string): Promise<any> {
+  async generateCoverLetter(
+    id: number,
+    dataOrTone?: string | { tone?: string; custom_instructions?: string; resume_id?: number },
+    resumeId?: number
+  ): Promise<any> {
+    let body: any = {};
+    if (typeof dataOrTone === 'string') {
+      body = { tone: dataOrTone, resume_id: resumeId };
+    } else if (dataOrTone) {
+      body = dataOrTone;
+    }
     return this.request(`/applications/${id}/cover-letter`, {
       method: 'POST',
-      body: JSON.stringify({ tone }),
+      body: JSON.stringify(body),
+    });
+  }
+
+  async answerScreeningQuestions(
+    id: number,
+    data?: { questions?: any[]; resume_id?: number }
+  ): Promise<any> {
+    return this.request(`/applications/${id}/screening-qa`, {
+      method: 'POST',
+      body: JSON.stringify(data || {}),
     });
   }
 

@@ -39,16 +39,38 @@ class ApplicationStatusUpdateRequest(BaseModel):
 
 
 class TailorResumeRequest(BaseModel):
+    resume_id: Optional[int] = None
+    custom_instructions: Optional[str] = None
     template: Optional[str] = "modern"
+    resume_version_num: Optional[int] = None
 
 
 class CoverLetterRequest(BaseModel):
     tone: Optional[str] = "Professional & Direct"
     custom_notes: Optional[str] = None
+    custom_instructions: Optional[str] = None
+    resume_id: Optional[int] = None
 
 
 class ScreeningQuestionsRequest(BaseModel):
-    questions: List[Dict[str, Any]]
+    questions: Optional[List[Dict[str, Any]]] = None
+    custom_instructions: Optional[str] = None
+    resume_id: Optional[int] = None
+
+
+class PreparationStateResponse(BaseModel):
+    application_id: int
+    selected_resume_id: Optional[int] = None
+    company_name: str
+    job_title: str
+    status: str
+    tailored_resume: Optional[Dict[str, Any]] = None
+    cover_letter: Optional[Dict[str, Any]] = None
+    screening_qa: Optional[List[Dict[str, Any]]] = None
+    has_packet: bool = False
+    packet: Optional[Dict[str, Any]] = None
+    is_approved: bool = False
+    is_submitted: bool = False
 
 
 class PreparedPacketResponse(BaseModel):

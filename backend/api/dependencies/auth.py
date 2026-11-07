@@ -28,15 +28,19 @@ def get_current_user_and_session(
     Returns:
         (user_id: int, session: CandidateSession)
     """
-    is_cookie_session = bool(session_token and session_token.strip())
-    token = session_token
+    is_cookie_session = False
+    token = None
     
-    if not token and authorization:
+    if authorization and authorization.strip():
         parts = authorization.strip().split()
         if len(parts) == 2 and parts[0].lower() == "bearer":
             token = parts[1]
         elif len(parts) == 1:
             token = parts[0]
+
+    if not token and session_token and session_token.strip():
+        token = session_token
+        is_cookie_session = True
             
     if not token or not token.strip():
         raise HTTPException(
