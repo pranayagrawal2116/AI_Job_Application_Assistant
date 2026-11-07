@@ -151,10 +151,10 @@ export const ProfilePage: React.FC = () => {
 
     try {
       const res = await api.triggerDiscovery(roles, locs);
-      setDiscoverySuccess(res.message || 'Discovery started! Searching opportunities in background.');
+      setDiscoverySuccess(res.message || 'Discovery initiated in background. Redirecting to Find Jobs to track progress...');
       setTimeout(() => {
         navigate('/jobs');
-      }, 1500);
+      }, 1200);
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to trigger discovery.');
       setIsDiscovering(false);

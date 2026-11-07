@@ -103,8 +103,8 @@ export const JobsPage: React.FC = () => {
 
         if (run.status === 'COMPLETED') {
           setIsTriggeringDiscovery(false);
-          const found = run.jobs_found ?? 0;
-          const saved = run.jobs_saved ?? 0;
+          const found = run.total_discovered ?? run.jobs_found ?? ((run.new_jobs_saved ?? 0) + (run.duplicates_skipped ?? 0));
+          const saved = run.new_jobs_saved ?? run.jobs_saved ?? 0;
           const skipped = run.duplicates_skipped ?? 0;
           setDiscoveryNotification(
             `Discovery completed! Found ${found} opportunities (${saved} new saved, ${skipped} duplicates skipped).`
@@ -116,9 +116,11 @@ export const JobsPage: React.FC = () => {
 
         if (run.status === 'PARTIAL') {
           setIsTriggeringDiscovery(false);
-          const saved = run.jobs_saved ?? 0;
+          const found = run.total_discovered ?? run.jobs_found ?? ((run.new_jobs_saved ?? 0) + (run.duplicates_skipped ?? 0));
+          const saved = run.new_jobs_saved ?? run.jobs_saved ?? 0;
+          const skipped = run.duplicates_skipped ?? 0;
           setDiscoveryNotification(
-            `Discovery finished with partial results (${saved} saved). Some sources were restricted or rate-limited.`
+            `Discovery finished with partial results (${saved} saved of ${found} found, ${skipped} duplicates skipped). Some sources were restricted or rate-limited.`
           );
           await loadDiscoveryMeta();
           await fetchJobs();
@@ -236,7 +238,7 @@ export const JobsPage: React.FC = () => {
     setDiscoveryNotification('Initiating job discovery across supported platforms...');
     try {
       const res = await api.triggerDiscovery();
-      const runId = res.run_id;
+      const runId = res.run_id || res.id;
       if (runId) {
         setDiscoveryNotification(res.message || 'Discovery running in background...');
         pollDiscoveryRun(runId);

@@ -1,7 +1,6 @@
 """FastAPI application entrypoint for Universal AI Job Application Assistant."""
 
 from contextlib import asynccontextmanager
-import os
 from pathlib import Path
 
 from fastapi import FastAPI, Request
@@ -35,6 +34,17 @@ async def lifespan(app: FastAPI):
         base = Path(service.db.db_path).parent.parent
         for d in [base / "users", base / "exports", base / "storage" / "backups"]:
             d.mkdir(parents=True, exist_ok=True)
+
+    # Phase B.3.3: Startup recovery of interrupted PENDING/RUNNING discovery runs
+    try:
+        recovered = service.db.recover_interrupted_discovery_runs()
+        if recovered > 0:
+            logger.warning("Recovered %d interrupted discovery run(s) on server startup.", recovered)
+        else:
+            logger.info("Startup recovery: Zero interrupted discovery runs found.")
+    except Exception as e:
+        logger.error("Failed to recover interrupted discovery runs on startup: %s", e)
+
     yield
     logger.info("FastAPI application shutdown.")
 

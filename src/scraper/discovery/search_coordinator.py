@@ -2,14 +2,12 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from src.database.db_manager import DatabaseManager
-from src.database.models import ApplicationStatus, Job
+from src.database.models import Job
 from src.database.url_normalizer import URLNormalizer
 from src.matcher.job_matcher import EvaluationResult, JobMatcher
-from src.scraper.adapters.base_adapter import BaseAdapter
 from src.scraper.discovery.pagination_manager import PaginationManager
 from src.scraper.discovery.query_generator import QueryGenerator
 from src.scraper.discovery.source_registry import SourceRegistry
@@ -30,6 +28,8 @@ class DiscoverySummary:
     eligibility_breakdown: Dict[str, int] = field(default_factory=dict)
     score_tier_breakdown: Dict[str, int] = field(default_factory=dict)
     saved_jobs: List[Dict[str, Any]] = field(default_factory=list)
+    duplicate_job_ids: List[int] = field(default_factory=list)
+    relevant_job_ids: List[int] = field(default_factory=list)
     restricted_notices: List[Dict[str, Any]] = field(default_factory=list)
     start_time: str = ""
     end_time: str = ""
@@ -39,6 +39,8 @@ class DiscoverySummary:
             "total_discovered": self.total_discovered,
             "new_jobs_saved": self.new_jobs_saved,
             "duplicates_skipped": self.duplicates_skipped,
+            "duplicate_job_ids": self.duplicate_job_ids,
+            "relevant_job_ids": self.relevant_job_ids,
             "restricted_incidents": self.restricted_incidents,
             "platform_breakdown": self.platform_breakdown,
             "eligibility_breakdown": self.eligibility_breakdown,
@@ -167,6 +169,9 @@ class SearchCoordinator:
             )
             if is_dup:
                 summary.duplicates_skipped += 1
+                if existing_id:
+                    summary.duplicate_job_ids.append(existing_id)
+                    summary.relevant_job_ids.append(existing_id)
                 self.logger.debug("Skipping duplicate job: %s (Existing ID: %s)", dup_reason, existing_id)
                 continue
 
@@ -205,6 +210,7 @@ class SearchCoordinator:
             try:
                 saved_job = self.db.add_job(job)
                 summary.new_jobs_saved += 1
+                summary.relevant_job_ids.append(saved_job.id)
 
                 # Update platform tally
                 plat = clean_payload.platform

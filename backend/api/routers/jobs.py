@@ -542,27 +542,35 @@ def trigger_jobs_discovery(
                 max_results_per_source=5,
                 enable_evaluation=False,
             )
-            # Evaluate personalized scores for candidate strictly against newly saved jobs
+            # Evaluate personalized scores for candidate strictly against all unique jobs discovered (newly saved + existing duplicates)
             resumes = service.get_user_resumes(user_id)
             prim = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
-            if prim and summary.saved_jobs:
+            if prim:
+                relevant_ids = set()
                 for saved_item in summary.saved_jobs:
-                    job_id_to_eval = saved_item.get("id")
-                    if job_id_to_eval:
-                        try:
-                            service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job_id_to_eval)
-                        except Exception as eval_err:
-                            logger.warning("Personalized evaluation failed for newly discovered job %s: %s", job_id_to_eval, eval_err)
+                    if saved_item.get("id"):
+                        relevant_ids.add(saved_item["id"])
+                for dup_id in getattr(summary, "duplicate_job_ids", []):
+                    if dup_id:
+                        relevant_ids.add(dup_id)
 
-            final_status = "PARTIAL" if summary.restricted_incidents > 0 and summary.new_jobs_saved > 0 else (
-                "COMPLETED" if summary.new_jobs_saved > 0 or summary.restricted_incidents == 0 else "PARTIAL"
+                for job_id_to_eval in relevant_ids:
+                    try:
+                        service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job_id_to_eval)
+                    except Exception as eval_err:
+                        logger.warning("Personalized evaluation failed for discovered job %s: %s", job_id_to_eval, eval_err)
+
+            final_status = "PARTIAL" if summary.restricted_incidents > 0 and (summary.new_jobs_saved > 0 or summary.duplicates_skipped > 0) else (
+                "COMPLETED" if (summary.new_jobs_saved > 0 or summary.duplicates_skipped > 0 or summary.restricted_incidents == 0) else "PARTIAL"
             )
             service.db.update_discovery_run(
                 run_id=run_id,
                 status=final_status,
-                new_jobs_count=summary.new_jobs_saved,
+                total_discovered=summary.total_discovered,
+                new_jobs_saved=summary.new_jobs_saved,
                 duplicates_skipped=summary.duplicates_skipped,
                 restricted_count=summary.restricted_incidents,
+                source_outcomes=summary.platform_breakdown,
             )
         except Exception as exc:
             logger.exception("Discovery background task failed: %s", exc)
@@ -577,6 +585,7 @@ def trigger_jobs_discovery(
 
     return {
         "run_id": run_id,
+        "id": run_id,
         "status": "RUNNING",
         "message": "Discovery initiated. Searching permitted sources and computing personalized matches.",
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -591,7 +600,7 @@ def get_latest_discovery_run_status(auth_ctx=Depends(get_current_user_and_sessio
     latest = service.db.get_latest_discovery_run(user_id)
     if not latest:
         return {"has_run": False, "run": None}
-    return {"has_run": True, "run": dict(latest)}
+    return {"has_run": True, "run": latest}
 
 
 @router.get("/discovery/{run_id}")
@@ -600,12 +609,8 @@ def get_jobs_discovery_status(run_id: int, auth_ctx=Depends(get_current_user_and
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
 
-    with service.db.connection() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM discovery_runs WHERE id = ? AND user_id = ?", (run_id, user_id))
-        row = cursor.fetchone()
-
-    if not row:
+    run = service.db.get_discovery_run(run_id, user_id=user_id)
+    if not run:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discovery run not found.")
 
-    return dict(row)
+    return run

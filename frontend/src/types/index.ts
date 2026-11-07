@@ -174,20 +174,26 @@ export interface InferredRole {
 
 export interface DiscoveryRun {
   id: number;
+  run_id?: number;
   user_id: number;
   status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'PARTIAL';
   triggered_by?: string;
   target_roles?: string[];
   target_locations?: string[];
+  total_discovered?: number;
+  new_jobs_saved?: number;
   jobs_discovered?: number;
   jobs_evaluated?: number;
   jobs_found?: number;
   jobs_saved?: number;
   duplicates_skipped?: number;
+  restricted_count?: number;
+  source_outcomes?: Record<string, any>;
   errors_count?: number;
   error_message?: string;
   log_summary?: string;
-  created_at: string;
+  started_at?: string;
+  created_at?: string;
   completed_at?: string;
 }
 

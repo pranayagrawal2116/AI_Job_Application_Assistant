@@ -2,6 +2,7 @@ import {
   AuthResponse,
   CandidateProfile,
   DashboardSummary,
+  DiscoveryRun,
   DiscoveryStatus,
   InferredRole,
   JobItem,
@@ -160,26 +161,23 @@ class ApiClient {
   }
 
   // Candidate Discovery & Recommendations
-  async triggerDiscovery(roles?: string[], locations?: string[]): Promise<{ status: string; message: string; run_id?: number }> {
-    return this.request('/discovery/trigger', {
-      method: 'POST',
-      body: JSON.stringify({ roles, locations }),
-    });
-  }
-
-  async triggerJobsDiscovery(roles?: string[], locations?: string[]): Promise<{ run_id: number; status: string; message: string; started_at?: string }> {
+  async triggerDiscovery(roles?: string[], locations?: string[]): Promise<{ run_id: number; id?: number; status: string; message: string; started_at?: string }> {
     return this.request('/jobs/discovery', {
       method: 'POST',
       body: JSON.stringify({ roles, locations }),
     });
   }
 
-  async getDiscoveryRun(runId: number): Promise<any> {
-    return this.request(`/jobs/discovery/${runId}`);
+  async triggerJobsDiscovery(roles?: string[], locations?: string[]): Promise<{ run_id: number; id?: number; status: string; message: string; started_at?: string }> {
+    return this.triggerDiscovery(roles, locations);
   }
 
-  async getLatestDiscoveryRun(): Promise<{ has_run: boolean; run: any }> {
-    return this.request('/jobs/discovery/latest');
+  async getDiscoveryRun(runId: number): Promise<DiscoveryRun> {
+    return this.request<DiscoveryRun>(`/jobs/discovery/${runId}`);
+  }
+
+  async getLatestDiscoveryRun(): Promise<{ has_run: boolean; run: DiscoveryRun | null }> {
+    return this.request<{ has_run: boolean; run: DiscoveryRun | null }>('/jobs/discovery/latest');
   }
 
   async getDiscoveryStatus(): Promise<DiscoveryStatus> {

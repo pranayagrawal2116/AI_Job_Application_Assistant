@@ -1481,10 +1481,11 @@ class DatabaseManager:
                 status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL')),
                 target_roles_json TEXT NOT NULL DEFAULT '[]',
                 target_locations_json TEXT NOT NULL DEFAULT '[]',
-                query_count INTEGER DEFAULT 0,
+                total_discovered INTEGER DEFAULT 0,
                 new_jobs_count INTEGER DEFAULT 0,
                 duplicates_skipped INTEGER DEFAULT 0,
                 restricted_count INTEGER DEFAULT 0,
+                query_count INTEGER DEFAULT 0,
                 source_outcomes_json TEXT NOT NULL DEFAULT '{}',
                 error_message TEXT,
                 started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -1498,12 +1499,11 @@ class DatabaseManager:
             ON discovery_runs(user_id) 
             WHERE status IN ('PENDING', 'RUNNING')
         """)
-        # Cleanly mark stale in-memory or interrupted runs from prior server process as FAILED
-        cursor.execute("""
-            UPDATE discovery_runs 
-            SET status = 'FAILED', error_message = 'Interrupted by server restart. You can safely retry discovery.' 
-            WHERE status IN ('PENDING', 'RUNNING')
-        """)
+        # Safe additive migration for existing databases
+        cursor.execute("PRAGMA table_info(discovery_runs)")
+        disc_cols = {r["name"]: dict(r) for r in cursor.fetchall()}
+        if "total_discovered" not in disc_cols:
+            cursor.execute("ALTER TABLE discovery_runs ADD COLUMN total_discovered INTEGER DEFAULT 0")
         logger.info("discovery_runs migration checked successfully.")
 
     def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
@@ -7542,7 +7542,7 @@ class DatabaseManager:
                 )
                 run_id = cursor.lastrowid
                 cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
-                return dict(cursor.fetchone())
+                return self.serialize_discovery_run(dict(cursor.fetchone()))
             except sqlite3.IntegrityError:
                 cursor.execute(
                     "SELECT id FROM discovery_runs WHERE user_id = ? AND status IN ('PENDING', 'RUNNING')",
@@ -7558,11 +7558,60 @@ class DatabaseManager:
             cursor.execute(
                 """
                 UPDATE discovery_runs
-                SET status = 'FAILED', error_message = 'Interrupted by server restart. You can safely retry discovery.'
+                SET status = 'FAILED', 
+                    error_message = 'Interrupted by server restart. You can safely retry discovery.',
+                    completed_at = CURRENT_TIMESTAMP
                 WHERE status IN ('PENDING', 'RUNNING')
                 """
             )
             return cursor.rowcount
+
+    @staticmethod
+    def serialize_discovery_run(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Authoritatively serializes a discovery run record into the unified API & domain schema."""
+        if not row:
+            return None
+
+        # Parse target roles & locations
+        roles_raw = row.get("target_roles_json")
+        roles = json.loads(roles_raw) if isinstance(roles_raw, str) else (roles_raw or [])
+        locs_raw = row.get("target_locations_json")
+        locs = json.loads(locs_raw) if isinstance(locs_raw, str) else (locs_raw or [])
+
+        # Parse source outcomes
+        outcomes_raw = row.get("source_outcomes_json")
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else (outcomes_raw or {})
+
+        new_jobs = row.get("new_jobs_count", 0) or 0
+        duplicates = row.get("duplicates_skipped", 0) or 0
+        total_disc = row.get("total_discovered")
+        if total_disc is None or total_disc == 0:
+            total_disc = new_jobs + duplicates
+
+        return {
+            "id": row.get("id"),
+            "run_id": row.get("id"),
+            "user_id": row.get("user_id"),
+            "status": row.get("status"),
+            "target_roles": roles,
+            "target_locations": locs,
+            "target_roles_json": roles_raw if isinstance(roles_raw, str) else json.dumps(roles_raw or []),
+            "target_locations_json": locs_raw if isinstance(locs_raw, str) else json.dumps(locs_raw or []),
+            "total_discovered": total_disc,
+            "jobs_found": total_disc,
+            "new_jobs_saved": new_jobs,
+            "jobs_saved": new_jobs,
+            "new_jobs_count": new_jobs,
+            "duplicates_skipped": duplicates,
+            "restricted_count": row.get("restricted_count", 0) or 0,
+            "query_count": row.get("query_count", 0) or 0,
+            "source_outcomes": outcomes,
+            "source_outcomes_json": outcomes_raw if isinstance(outcomes_raw, str) else json.dumps(outcomes_raw or {}),
+            "error_message": row.get("error_message"),
+            "started_at": row.get("started_at"),
+            "completed_at": row.get("completed_at"),
+            "created_at": row.get("created_at"),
+        }
 
     def get_active_discovery_run(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Returns currently active PENDING or RUNNING discovery run for the user."""
@@ -7577,7 +7626,7 @@ class DatabaseManager:
                 (user_id,),
             )
             row = cursor.fetchone()
-            return dict(row) if row else None
+            return self.serialize_discovery_run(dict(row)) if row else None
 
     def get_discovery_run(self, run_id: int, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
         """Retrieves a discovery run by ID, optionally scoped to a user."""
@@ -7588,7 +7637,7 @@ class DatabaseManager:
             else:
                 cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
             row = cursor.fetchone()
-            return dict(row) if row else None
+            return self.serialize_discovery_run(dict(row)) if row else None
 
     def get_latest_discovery_run(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Returns the most recent discovery run for the user."""
@@ -7603,12 +7652,14 @@ class DatabaseManager:
                 (user_id,),
             )
             row = cursor.fetchone()
-            return dict(row) if row else None
+            return self.serialize_discovery_run(dict(row)) if row else None
 
     def update_discovery_run(
         self,
         run_id: int,
         status: str,
+        total_discovered: Optional[int] = None,
+        new_jobs_saved: Optional[int] = None,
         query_count: Optional[int] = None,
         new_jobs_count: Optional[int] = None,
         duplicates_skipped: Optional[int] = None,
@@ -7621,12 +7672,16 @@ class DatabaseManager:
             cursor = conn.cursor()
             updates = ["status = ?"]
             params: list = [status]
+            if total_discovered is not None:
+                updates.append("total_discovered = ?")
+                params.append(total_discovered)
+            jobs_saved = new_jobs_saved if new_jobs_saved is not None else new_jobs_count
+            if jobs_saved is not None:
+                updates.append("new_jobs_count = ?")
+                params.append(jobs_saved)
             if query_count is not None:
                 updates.append("query_count = ?")
                 params.append(query_count)
-            if new_jobs_count is not None:
-                updates.append("new_jobs_count = ?")
-                params.append(new_jobs_count)
             if duplicates_skipped is not None:
                 updates.append("duplicates_skipped = ?")
                 params.append(duplicates_skipped)

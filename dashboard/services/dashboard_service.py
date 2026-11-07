@@ -385,30 +385,38 @@ class DashboardService:
                 enable_evaluation=False,
             )
 
-            # 5. Personalized Matching against candidate's primary resume
+            # 5. Personalized Matching against candidate's primary resume for run-associated jobs
             newly_scored = 0
             if primary_resume:
-                all_catalog_jobs = self.db.get_all_jobs()
-                for job in all_catalog_jobs[:30]:
+                relevant_ids = set()
+                for saved_item in summary.saved_jobs:
+                    if saved_item.get("id"):
+                        relevant_ids.add(saved_item["id"])
+                for dup_id in getattr(summary, "duplicate_job_ids", []):
+                    if dup_id:
+                        relevant_ids.add(dup_id)
+
+                for job_id in relevant_ids:
                     try:
                         self.run_match_evaluation(
                             user_id=user_id,
                             resume_id=primary_resume["id"],
-                            job_id=job.id,
+                            job_id=job_id,
                         )
                         newly_scored += 1
                     except Exception as match_err:
-                        logger.debug("Personalized match evaluation skipped for job %s: %s", job.id, match_err)
+                        logger.debug("Personalized match evaluation skipped for job %s: %s", job_id, match_err)
 
-            status = "PARTIAL" if summary.restricted_incidents > 0 and summary.new_jobs_saved > 0 else (
-                "COMPLETED" if summary.new_jobs_saved > 0 or summary.restricted_incidents == 0 else "PARTIAL"
+            status = "PARTIAL" if summary.restricted_incidents > 0 and (summary.new_jobs_saved > 0 or summary.duplicates_skipped > 0) else (
+                "COMPLETED" if (summary.new_jobs_saved > 0 or summary.duplicates_skipped > 0 or summary.restricted_incidents == 0) else "PARTIAL"
             )
 
             self.db.update_discovery_run(
                 run_id=run_id,
                 status=status,
+                total_discovered=summary.total_discovered,
+                new_jobs_saved=summary.new_jobs_saved,
                 query_count=len(target_roles) * len(target_locations),
-                new_jobs_count=summary.new_jobs_saved,
                 duplicates_skipped=summary.duplicates_skipped,
                 restricted_count=summary.restricted_incidents,
                 source_outcomes=summary.platform_breakdown,
@@ -417,6 +425,8 @@ class DashboardService:
             return {
                 "status": status,
                 "run_id": run_id,
+                "total_discovered": summary.total_discovered,
+                "new_jobs_saved": summary.new_jobs_saved,
                 "new_jobs_found": summary.new_jobs_saved,
                 "duplicates_skipped": summary.duplicates_skipped,
                 "restricted_sources": summary.restricted_incidents,
@@ -431,6 +441,10 @@ class DashboardService:
                 error_message=str(exc),
             )
             return {"status": "FAILED", "run_id": run_id, "error": str(exc)}
+
+    def recover_interrupted_discovery_runs(self) -> int:
+        """Recovers lingering interrupted discovery runs across all candidates on startup."""
+        return self.db.recover_interrupted_discovery_runs()
 
     def export_jobs_to_csv(self, file_path: Optional[str] = None, job_ids: Optional[List[int]] = None) -> Path:
         """Exports jobs to CSV, optionally filtered by job_ids."""
