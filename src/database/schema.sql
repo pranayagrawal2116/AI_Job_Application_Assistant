@@ -212,6 +212,27 @@ CREATE TABLE IF NOT EXISTS match_results (
 );
 
 -- ---------------------------------------------------------------------
+-- 7.1 DISCOVERY RUNS (Candidate-Scoped Search & Discovery Lifecycle)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS discovery_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL')),
+    target_roles_json TEXT NOT NULL DEFAULT '[]',
+    target_locations_json TEXT NOT NULL DEFAULT '[]',
+    query_count INTEGER DEFAULT 0,
+    new_jobs_count INTEGER DEFAULT 0,
+    duplicates_skipped INTEGER DEFAULT 0,
+    restricted_count INTEGER DEFAULT 0,
+    source_outcomes_json TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_discovery_runs_user_status ON discovery_runs(user_id, status);
+
+-- ---------------------------------------------------------------------
 -- 8. APPLICATIONS (Multi-User & Composite Ownership)
 -- ---------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS applications (

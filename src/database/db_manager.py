@@ -1471,6 +1471,32 @@ class DatabaseManager:
         cursor.execute("PRAGMA foreign_keys = ON")
         logger.info("application_logs migration completed successfully.")
 
+    def _migrate_discovery_runs_table(self, conn: sqlite3.Connection) -> None:
+        """Creates or updates the discovery_runs table for persistent candidate-scoped discovery runs."""
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS discovery_runs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL')),
+                target_roles_json TEXT NOT NULL DEFAULT '[]',
+                target_locations_json TEXT NOT NULL DEFAULT '[]',
+                query_count INTEGER DEFAULT 0,
+                new_jobs_count INTEGER DEFAULT 0,
+                duplicates_skipped INTEGER DEFAULT 0,
+                restricted_count INTEGER DEFAULT 0,
+                source_outcomes_json TEXT NOT NULL DEFAULT '{}',
+                error_message TEXT,
+                started_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                completed_at DATETIME,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_discovery_runs_user_status ON discovery_runs(user_id, status)")
+        # Cleanly mark stale in-memory runs from prior server process as FAILED
+        cursor.execute("UPDATE discovery_runs SET status = 'FAILED', error_message = 'Interrupted by server restart' WHERE status = 'RUNNING'")
+        logger.info("discovery_runs migration checked successfully.")
+
     def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
         """Migrates applications and lifecycle tables to Phase 7 universal architecture.
 
@@ -2184,6 +2210,8 @@ class DatabaseManager:
             self._migrate_prepared_packets_foreign_keys(conn)
             conn.commit()
             self._migrate_application_logs_job_id_nullable(conn)
+            conn.commit()
+            self._migrate_discovery_runs_table(conn)
             conn.commit()
             self._migrate_phase7_lifecycle_tables(conn)
             conn.commit()
@@ -7421,6 +7449,139 @@ class DatabaseManager:
             details_json=row["details_json"] if "details_json" in keys else None,
             evaluated_at=row["evaluated_at"],
         )
+
+    def get_user_match_results_for_jobs(
+        self,
+        user_id: int,
+        job_ids: List[int],
+    ) -> Dict[int, MatchResult]:
+        """Fetches the latest match result for each job_id for the user."""
+        if not job_ids:
+            return {}
+        q_marks = ",".join("?" for _ in job_ids)
+        query = f"""
+            SELECT * FROM match_results
+            WHERE user_id = ? AND job_id IN ({q_marks})
+            ORDER BY evaluated_at DESC, id DESC
+        """
+        params: List[Any] = [user_id] + list(job_ids)
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            results: Dict[int, MatchResult] = {}
+            for row in cursor.fetchall():
+                mr = self._row_to_match_result(row)
+                if mr.job_id is not None and mr.job_id not in results:
+                    results[mr.job_id] = mr
+            return results
+
+    # -------------------------------------------------------------------------
+    # DISCOVERY RUNS PERSISTENCE & LIFECYCLE
+    # -------------------------------------------------------------------------
+
+    def create_discovery_run(
+        self,
+        user_id: int,
+        target_roles: List[str],
+        target_locations: List[str],
+    ) -> Dict[str, Any]:
+        """Creates a new PENDING discovery run record for a candidate."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO discovery_runs (user_id, status, target_roles_json, target_locations_json, started_at)
+                VALUES (?, 'PENDING', ?, ?, CURRENT_TIMESTAMP)
+                """,
+                (user_id, json.dumps(target_roles), json.dumps(target_locations)),
+            )
+            run_id = cursor.lastrowid
+            cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
+            return dict(cursor.fetchone())
+
+    def get_active_discovery_run(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Returns currently active PENDING or RUNNING discovery run for the user."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM discovery_runs
+                WHERE user_id = ? AND status IN ('PENDING', 'RUNNING')
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_latest_discovery_run(self, user_id: int) -> Optional[Dict[str, Any]]:
+        """Returns the most recent discovery run for the user."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM discovery_runs
+                WHERE user_id = ?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id,),
+            )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def update_discovery_run(
+        self,
+        run_id: int,
+        status: str,
+        query_count: Optional[int] = None,
+        new_jobs_count: Optional[int] = None,
+        duplicates_skipped: Optional[int] = None,
+        restricted_count: Optional[int] = None,
+        source_outcomes: Optional[Dict[str, Any]] = None,
+        error_message: Optional[str] = None,
+    ) -> bool:
+        """Updates metrics and completion status of a discovery run."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            updates = ["status = ?"]
+            params: list = [status]
+            if query_count is not None:
+                updates.append("query_count = ?")
+                params.append(query_count)
+            if new_jobs_count is not None:
+                updates.append("new_jobs_count = ?")
+                params.append(new_jobs_count)
+            if duplicates_skipped is not None:
+                updates.append("duplicates_skipped = ?")
+                params.append(duplicates_skipped)
+            if restricted_count is not None:
+                updates.append("restricted_count = ?")
+                params.append(restricted_count)
+            if source_outcomes is not None:
+                updates.append("source_outcomes_json = ?")
+                params.append(json.dumps(source_outcomes))
+            if error_message is not None:
+                updates.append("error_message = ?")
+                params.append(error_message)
+            if status in ("COMPLETED", "FAILED", "PARTIAL"):
+                updates.append("completed_at = CURRENT_TIMESTAMP")
+            params.append(run_id)
+            cursor.execute(f"UPDATE discovery_runs SET {', '.join(updates)} WHERE id = ?", params)
+            return cursor.rowcount == 1
+
+    def list_user_discovery_runs(self, user_id: int, limit: int = 10) -> List[Dict[str, Any]]:
+        """Lists discovery runs for a user, newest first."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM discovery_runs
+                WHERE user_id = ?
+                ORDER BY id DESC LIMIT ?
+                """,
+                (user_id, limit),
+            )
+            return [dict(r) for r in cursor.fetchall()]
 
     # -------------------------------------------------------------------------
     # PHASE 7: APPLICATION LIFECYCLE, EVENTS, SUBMISSION CONFIRMATION & FOLLOW-UPS

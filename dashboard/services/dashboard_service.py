@@ -315,6 +315,114 @@ class DashboardService:
         )
         return summary
 
+    def run_candidate_discovery(
+        self,
+        user_id: int,
+        roles: Optional[List[str]] = None,
+        locations: Optional[List[str]] = None,
+        max_queries: int = 5,
+        max_results_per_source: int = 5,
+    ) -> Dict[str, Any]:
+        """Runs candidate-scoped job discovery, saves jobs, and automatically scores against primary resume."""
+        # 1. Resolve search preferences
+        prof_rec = self.db.get_user_candidate_profile(user_id)
+        prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
+        prefs = prof_data.get("search_preferences", {}) or prof_data.get("preferences", {})
+
+        target_roles = list(roles) if roles and len(roles) > 0 else list(prefs.get("target_roles", []))
+        target_locations = list(locations) if locations and len(locations) > 0 else list(prefs.get("target_locations", []))
+
+        # If still empty, infer dynamically from primary resume
+        resumes = self.get_user_resumes(user_id)
+        primary_resume = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
+
+        if (not target_roles or not target_locations) and primary_resume:
+            from src.preparer.career_role_inferencer import CareerRoleInferencer
+            inferencer = CareerRoleInferencer()
+            parsed_data = primary_resume.get("parsed_data")
+            if isinstance(parsed_data, str):
+                try:
+                    parsed_data = json.loads(parsed_data)
+                except Exception:
+                    parsed_data = {}
+            if not target_roles:
+                inferred = inferencer.infer_roles(parsed_data or prof_data)
+                target_roles = [r.role_title for r in inferred[:5]]
+            if not target_locations:
+                target_locations = inferencer.infer_locations(parsed_data or prof_data)
+
+        if not target_roles:
+            target_roles = ["Software Engineer Intern", "Developer Intern"]
+        if not target_locations:
+            target_locations = ["Remote", "India"]
+
+        # 2. Check for active run
+        active_run = self.db.get_active_discovery_run(user_id)
+        if active_run:
+            return {"status": "ALREADY_RUNNING", "run_id": active_run["id"]}
+
+        # 3. Create run record
+        run_rec = self.db.create_discovery_run(user_id, target_roles, target_locations)
+        run_id = run_rec["id"]
+        self.db.update_discovery_run(run_id, status="RUNNING")
+
+        try:
+            # 4. Run discovery coordinator
+            summary = self.coordinator.run_discovery(
+                roles=target_roles,
+                locations=target_locations,
+                max_queries=max_queries,
+                max_results_per_source=max_results_per_source,
+                enable_evaluation=False,
+            )
+
+            # 5. Personalized Matching against candidate's primary resume
+            newly_scored = 0
+            if primary_resume:
+                all_catalog_jobs = self.db.get_all_jobs()
+                for job in all_catalog_jobs[:30]:
+                    try:
+                        self.run_match_evaluation(
+                            user_id=user_id,
+                            resume_id=primary_resume["id"],
+                            job_id=job.id,
+                        )
+                        newly_scored += 1
+                    except Exception as match_err:
+                        logger.debug("Personalized match evaluation skipped for job %s: %s", job.id, match_err)
+
+            status = "PARTIAL" if summary.restricted_incidents > 0 and summary.new_jobs_saved > 0 else (
+                "COMPLETED" if summary.new_jobs_saved > 0 or summary.restricted_incidents == 0 else "PARTIAL"
+            )
+
+            self.db.update_discovery_run(
+                run_id=run_id,
+                status=status,
+                query_count=len(target_roles) * len(target_locations),
+                new_jobs_count=summary.new_jobs_saved,
+                duplicates_skipped=summary.duplicates_skipped,
+                restricted_count=summary.restricted_incidents,
+                source_outcomes=summary.platform_breakdown,
+            )
+
+            return {
+                "status": status,
+                "run_id": run_id,
+                "new_jobs_found": summary.new_jobs_saved,
+                "duplicates_skipped": summary.duplicates_skipped,
+                "restricted_sources": summary.restricted_incidents,
+                "personalized_scores_computed": newly_scored,
+            }
+
+        except Exception as exc:
+            logger.exception("Discovery run %d failed: %s", run_id, exc)
+            self.db.update_discovery_run(
+                run_id=run_id,
+                status="FAILED",
+                error_message=str(exc),
+            )
+            return {"status": "FAILED", "run_id": run_id, "error": str(exc)}
+
     def export_jobs_to_csv(self, file_path: Optional[str] = None, job_ids: Optional[List[int]] = None) -> Path:
         """Exports jobs to CSV, optionally filtered by job_ids."""
         target_path = file_path or str(self.db.exports_dir / f"jobs_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
@@ -3099,7 +3207,8 @@ class DashboardService:
         self,
         user_id: int,
         resume_id: int,
-        job_description_id: int,
+        job_description_id: Optional[int] = None,
+        job_id: Optional[int] = None,
         scoring_profile_id: Optional[str] = None,
     ) -> UniversalMatchResult:
         """Executes full universal match evaluation incorporating authenticated user profile and stores immutable record."""
@@ -3139,6 +3248,7 @@ class DashboardService:
             candidate_profile_version=candidate_profile_version,
             candidate_profile_hash=candidate_profile_hash,
             job_description_id=job_description_id,
+            job_id=job_id,
             scoring_profile_id=scoring_profile_id,
             persist=True,
             enforce_resume_verification=True,

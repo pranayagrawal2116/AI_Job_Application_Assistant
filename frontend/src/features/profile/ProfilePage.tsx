@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useSearchParams, useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
-import { CandidateProfile, ResumeItem } from '@/types';
+import { CandidateProfile, InferredRole, ResumeItem } from '@/types';
 import { LoadingSpinner } from '@/components/common/LoadingSpinner';
 import { FileDropzone } from '@/components/common/FileDropzone';
 import {
@@ -17,35 +17,51 @@ import {
   Plus,
   Save,
   AlertCircle,
+  Compass,
+  FolderGit2,
+  Check,
+  Sparkles,
+  X,
+  ShieldCheck,
 } from 'lucide-react';
 
 export const ProfilePage: React.FC = () => {
   const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
   const initialTab = searchParams.get('tab') === 'resumes' ? 'resumes' : 'personal';
 
-  const [activeTab, setActiveTab] = useState<'personal' | 'education' | 'experience' | 'skills' | 'resumes'>(
-    initialTab as any
-  );
+  const [activeTab, setActiveTab] = useState<
+    'personal' | 'education' | 'experience' | 'projects' | 'skills' | 'preferences' | 'resumes'
+  >(initialTab as any);
 
   const [profile, setProfile] = useState<CandidateProfile>({});
   const [resumes, setResumes] = useState<ResumeItem[]>([]);
+  const [suggestedRoles, setSuggestedRoles] = useState<InferredRole[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [isDiscovering, setIsDiscovering] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
+  const [discoverySuccess, setDiscoverySuccess] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Resume upload state
   const [uploadingResume, setUploadingResume] = useState(false);
 
+  // Input states for Preferences
+  const [newRoleInput, setNewRoleInput] = useState('');
+  const [newLocInput, setNewLocInput] = useState('');
+
   const loadData = async () => {
     setIsLoading(true);
     try {
-      const [profData, resList] = await Promise.all([
+      const [profData, resList, rolesRes] = await Promise.all([
         api.getProfile(),
         api.getResumes(),
+        api.getSuggestedRoles().catch(() => ({ suggested_roles: [], suggested_locations: [] })),
       ]);
       setProfile(profData.profile_data || {});
       setResumes(resList);
+      setSuggestedRoles(rolesRes.suggested_roles || []);
     } catch (err: any) {
       setErrorMsg(err.message || 'Failed to load candidate profile.');
     } finally {
@@ -121,6 +137,92 @@ export const ProfilePage: React.FC = () => {
     }
   };
 
+  const handleTriggerDiscovery = async () => {
+    setIsDiscovering(true);
+    setDiscoverySuccess(null);
+    setErrorMsg(null);
+
+    const searchPrefs = profile.search_preferences || profile.preferences || {};
+    const roles = searchPrefs.target_roles || [];
+    const locs = searchPrefs.target_locations || ['Remote', 'India'];
+
+    try {
+      const res = await api.triggerDiscovery(roles, locs);
+      setDiscoverySuccess(res.message || 'Discovery started! Searching opportunities in background.');
+      setTimeout(() => {
+        navigate('/jobs');
+      }, 1500);
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to trigger discovery.');
+      setIsDiscovering(false);
+    }
+  };
+
+  // Safe personal details accessor
+  const personal = profile.personal || profile.personal_info || {};
+
+  const updatePersonalField = (field: string, value: string) => {
+    const updated = { ...personal, [field]: value };
+    setProfile({
+      ...profile,
+      personal: updated,
+      personal_info: updated,
+    });
+  };
+
+  // Preferences accessors
+  const currentPrefs = profile.search_preferences || profile.preferences || {
+    target_roles: [],
+    target_locations: ['Remote', 'India'],
+    auto_discover_enabled: true,
+  };
+  const targetRoles: string[] = currentPrefs.target_roles || [];
+  const targetLocations: string[] = currentPrefs.target_locations || ['Remote', 'India'];
+
+  const updatePreferences = (newPrefs: any) => {
+    setProfile({
+      ...profile,
+      search_preferences: newPrefs,
+      preferences: newPrefs,
+    });
+  };
+
+  const handleAddTargetRole = (role: string) => {
+    const trimmed = role.trim();
+    if (trimmed && !targetRoles.includes(trimmed)) {
+      updatePreferences({
+        ...currentPrefs,
+        target_roles: [...targetRoles, trimmed],
+      });
+      setNewRoleInput('');
+    }
+  };
+
+  const handleRemoveTargetRole = (role: string) => {
+    updatePreferences({
+      ...currentPrefs,
+      target_roles: targetRoles.filter((r) => r !== role),
+    });
+  };
+
+  const handleAddLocation = (loc: string) => {
+    const trimmed = loc.trim();
+    if (trimmed && !targetLocations.includes(trimmed)) {
+      updatePreferences({
+        ...currentPrefs,
+        target_locations: [...targetLocations, trimmed],
+      });
+      setNewLocInput('');
+    }
+  };
+
+  const handleRemoveLocation = (loc: string) => {
+    updatePreferences({
+      ...currentPrefs,
+      target_locations: targetLocations.filter((l) => l !== loc),
+    });
+  };
+
   if (isLoading) {
     return (
       <div className="py-20 flex justify-center">
@@ -138,23 +240,40 @@ export const ProfilePage: React.FC = () => {
             Candidate Profile & Credentials
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Grounded in verifiable facts. Used to calculate match scores and tailor application documents.
+            Grounded in verifiable facts. Used to calculate personalized match scores and tailor applications.
           </p>
         </div>
 
         {activeTab !== 'resumes' && (
-          <button
-            onClick={handleSaveProfile}
-            disabled={isSaving}
-            className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-2 self-start sm:self-center transition-all disabled:opacity-50"
-          >
-            {isSaving ? (
-              <LoadingSpinner size={14} className="text-white" />
-            ) : (
-              <Save size={15} />
+          <div className="flex items-center gap-2 self-start sm:self-center">
+            {activeTab === 'preferences' && (
+              <button
+                onClick={handleTriggerDiscovery}
+                disabled={isDiscovering}
+                className="px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs shadow-md flex items-center gap-1.5 transition-all disabled:opacity-50"
+              >
+                {isDiscovering ? (
+                  <LoadingSpinner size={14} className="text-white" />
+                ) : (
+                  <Sparkles size={14} className="text-amber-400" />
+                )}
+                <span>{isDiscovering ? 'Searching...' : 'Discover Jobs Now'}</span>
+              </button>
             )}
-            <span>{isSaving ? 'Saving...' : 'Save Profile Changes'}</span>
-          </button>
+
+            <button
+              onClick={handleSaveProfile}
+              disabled={isSaving}
+              className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-2 transition-all disabled:opacity-50"
+            >
+              {isSaving ? (
+                <LoadingSpinner size={14} className="text-white" />
+              ) : (
+                <Save size={15} />
+              )}
+              <span>{isSaving ? 'Saving...' : 'Save Profile Changes'}</span>
+            </button>
+          </div>
         )}
       </div>
 
@@ -172,13 +291,22 @@ export const ProfilePage: React.FC = () => {
         </div>
       )}
 
+      {discoverySuccess && (
+        <div className="p-4 rounded-xl bg-blue-50 border border-blue-200 text-blue-700 text-xs flex items-center gap-2">
+          <Sparkles size={16} className="text-blue-600" />
+          <span>{discoverySuccess}</span>
+        </div>
+      )}
+
       {/* Main Tabs Navigation */}
       <div className="flex items-center gap-2 border-b border-slate-200 overflow-x-auto pb-px">
         {[
           { id: 'personal', label: 'Personal Details', icon: User },
           { id: 'education', label: 'Education', icon: GraduationCap },
           { id: 'experience', label: 'Work Experience', icon: Briefcase },
+          { id: 'projects', label: 'Projects', icon: FolderGit2, badge: (profile.projects || []).length },
           { id: 'skills', label: 'Skills & Tech', icon: Code2 },
+          { id: 'preferences', label: 'Career Preferences', icon: Compass },
           { id: 'resumes', label: 'Resume Library', icon: FileText, badge: resumes.length },
         ].map((tab) => {
           const Icon = tab.icon;
@@ -195,7 +323,7 @@ export const ProfilePage: React.FC = () => {
             >
               <Icon size={16} />
               <span>{tab.label}</span>
-              {tab.badge !== undefined && (
+              {tab.badge !== undefined && tab.badge > 0 && (
                 <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-slate-100 text-slate-700">
                   {tab.badge}
                 </span>
@@ -208,6 +336,17 @@ export const ProfilePage: React.FC = () => {
       {/* TAB 1: PERSONAL DETAILS */}
       {activeTab === 'personal' && (
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
+          <div className="flex items-center justify-between pb-3 border-b border-slate-100">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Personal & Contact Information</h3>
+              <p className="text-xs text-slate-500">Verified credentials from your primary uploaded resume.</p>
+            </div>
+            <span className="px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200/60 flex items-center gap-1.5">
+              <ShieldCheck size={13} />
+              <span>Verified Facts Only</span>
+            </span>
+          </div>
+
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-5">
             <div>
               <label className="block text-xs font-semibold text-slate-700 mb-1.5">
@@ -215,14 +354,9 @@ export const ProfilePage: React.FC = () => {
               </label>
               <input
                 type="text"
-                value={profile.personal_info?.full_name || ''}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    personal_info: { ...profile.personal_info, full_name: e.target.value },
-                  })
-                }
-                placeholder="e.g. Pranay Agrawal"
+                value={personal.full_name || ''}
+                onChange={(e) => updatePersonalField('full_name', e.target.value)}
+                placeholder="e.g. Alex Candidate"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
               />
             </div>
@@ -233,13 +367,8 @@ export const ProfilePage: React.FC = () => {
               </label>
               <input
                 type="email"
-                value={profile.personal_info?.email || ''}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    personal_info: { ...profile.personal_info, email: e.target.value },
-                  })
-                }
+                value={personal.email || ''}
+                onChange={(e) => updatePersonalField('email', e.target.value)}
                 placeholder="you@example.com"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
               />
@@ -251,13 +380,8 @@ export const ProfilePage: React.FC = () => {
               </label>
               <input
                 type="tel"
-                value={profile.personal_info?.phone || ''}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    personal_info: { ...profile.personal_info, phone: e.target.value },
-                  })
-                }
+                value={personal.phone || ''}
+                onChange={(e) => updatePersonalField('phone', e.target.value)}
                 placeholder="+91 98765 43210"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
               />
@@ -269,14 +393,9 @@ export const ProfilePage: React.FC = () => {
               </label>
               <input
                 type="text"
-                value={profile.personal_info?.location || ''}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    personal_info: { ...profile.personal_info, location: e.target.value },
-                  })
-                }
-                placeholder="Pune, India"
+                value={personal.location || ''}
+                onChange={(e) => updatePersonalField('location', e.target.value)}
+                placeholder="e.g. Bengaluru, India"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
               />
             </div>
@@ -287,13 +406,8 @@ export const ProfilePage: React.FC = () => {
               </label>
               <input
                 type="url"
-                value={profile.personal_info?.linkedin || ''}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    personal_info: { ...profile.personal_info, linkedin: e.target.value },
-                  })
-                }
+                value={personal.linkedin || ''}
+                onChange={(e) => updatePersonalField('linkedin', e.target.value)}
                 placeholder="https://linkedin.com/in/username"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
               />
@@ -305,13 +419,8 @@ export const ProfilePage: React.FC = () => {
               </label>
               <input
                 type="url"
-                value={profile.personal_info?.github || ''}
-                onChange={(e) =>
-                  setProfile({
-                    ...profile,
-                    personal_info: { ...profile.personal_info, github: e.target.value },
-                  })
-                }
+                value={personal.github || ''}
+                onChange={(e) => updatePersonalField('github', e.target.value)}
                 placeholder="https://github.com/username"
                 className="w-full px-3.5 py-2.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
               />
@@ -324,7 +433,10 @@ export const ProfilePage: React.FC = () => {
       {activeTab === 'education' && (
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-slate-900">Academic Background</h3>
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Academic Background</h3>
+              <p className="text-xs text-slate-500">Degree, institution, graduation timeline, and grades.</p>
+            </div>
             <button
               onClick={() => {
                 const eduList = profile.education || [];
@@ -435,7 +547,10 @@ export const ProfilePage: React.FC = () => {
       {activeTab === 'experience' && (
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
           <div className="flex items-center justify-between">
-            <h3 className="text-sm font-bold text-slate-900">Work Experience</h3>
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Work Experience</h3>
+              <p className="text-xs text-slate-500">Professional internships and full-time positions.</p>
+            </div>
             <button
               onClick={() => {
                 const expList = profile.work_experience || [];
@@ -463,9 +578,37 @@ export const ProfilePage: React.FC = () => {
           </div>
 
           {(profile.work_experience || []).length === 0 ? (
-            <div className="text-center py-8 text-slate-400">
-              <Briefcase size={32} className="mx-auto mb-2 text-slate-300" />
-              <p className="text-xs">No work experience records added yet.</p>
+            <div className="text-center py-12 px-6 rounded-2xl bg-slate-50 border border-dashed border-slate-200">
+              <div className="w-12 h-12 rounded-2xl bg-brand-50 text-brand-600 flex items-center justify-center mx-auto mb-3">
+                <Briefcase size={22} />
+              </div>
+              <h4 className="text-sm font-bold text-slate-800">No Employment Experience Identified</h4>
+              <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+                No employment experience was identified in your resume. If you are a student, recent graduate, or fresher, your academic projects and verified technical skills are used for matching.
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setProfile({
+                    ...profile,
+                    work_experience: [
+                      {
+                        employer: '',
+                        job_title: '',
+                        start_date: '',
+                        end_date: '',
+                        duration: '',
+                        responsibilities: [],
+                        provenance: 'USER_CONFIRMED',
+                      },
+                    ],
+                  });
+                }}
+                className="mt-4 px-4 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold text-xs inline-flex items-center gap-1.5 shadow-2xs"
+              >
+                <Plus size={14} />
+                <span>Add Work Experience Manually</span>
+              </button>
             </div>
           ) : (
             <div className="space-y-4">
@@ -575,7 +718,119 @@ export const ProfilePage: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 4: SKILLS */}
+      {/* TAB 4: PROJECTS */}
+      {activeTab === 'projects' && (
+        <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
+          <div className="flex items-center justify-between">
+            <div>
+              <h3 className="text-sm font-bold text-slate-900">Academic & Personal Projects</h3>
+              <p className="text-xs text-slate-500">Crucial for student/fresher matching and demonstrating real technical capabilities.</p>
+            </div>
+            <button
+              onClick={() => {
+                const projList = profile.projects || [];
+                setProfile({
+                  ...profile,
+                  projects: [
+                    ...projList,
+                    {
+                      name: '',
+                      description: '',
+                      technologies: [],
+                      provenance: 'USER_CONFIRMED',
+                    },
+                  ],
+                });
+              }}
+              className="px-3 py-1.5 rounded-xl bg-brand-50 text-brand-700 font-semibold text-xs border border-brand-200 flex items-center gap-1"
+            >
+              <Plus size={14} />
+              <span>Add Project</span>
+            </button>
+          </div>
+
+          {(profile.projects || []).length === 0 ? (
+            <div className="text-center py-12 px-6 rounded-2xl bg-slate-50 border border-dashed border-slate-200">
+              <FolderGit2 size={32} className="mx-auto mb-2 text-slate-300" />
+              <h4 className="text-sm font-bold text-slate-800">No Projects Added Yet</h4>
+              <p className="text-xs text-slate-500 mt-1 max-w-sm mx-auto">
+                Add key engineering, research, or academic projects to significantly boost your match scores for technical positions.
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {profile.projects?.map((proj, idx) => (
+                <div
+                  key={idx}
+                  className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-3"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-slate-800">Project #{idx + 1}</span>
+                    <button
+                      onClick={() => {
+                        const updated = [...(profile.projects || [])];
+                        updated.splice(idx, 1);
+                        setProfile({ ...profile, projects: updated });
+                      }}
+                      className="text-rose-600 hover:text-rose-700"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <input
+                      type="text"
+                      placeholder="Project Name (e.g. Medical Chatbot)"
+                      value={proj.name || proj.title || ''}
+                      onChange={(e) => {
+                        const updated = [...(profile.projects || [])];
+                        updated[idx].name = e.target.value;
+                        updated[idx].title = e.target.value;
+                        setProfile({ ...profile, projects: updated });
+                      }}
+                      className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Technologies (comma separated, e.g. Python, PyTorch, FastAPI)"
+                      value={(proj.technologies || []).join(', ')}
+                      onChange={(e) => {
+                        const updated = [...(profile.projects || [])];
+                        updated[idx].technologies = e.target.value
+                          .split(',')
+                          .map((t) => t.trim())
+                          .filter((t) => t.length > 0);
+                        setProfile({ ...profile, projects: updated });
+                      }}
+                      className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                      Project Description & Deliverables
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={proj.description || ''}
+                      onChange={(e) => {
+                        const updated = [...(profile.projects || [])];
+                        updated[idx].description = e.target.value;
+                        setProfile({ ...profile, projects: updated });
+                      }}
+                      placeholder="Implemented NLP symptom classification pipeline resulting in 92% diagnostic accuracy..."
+                      className="w-full p-2.5 rounded-xl border border-slate-200 text-xs bg-white"
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* TAB 5: SKILLS */}
       {activeTab === 'skills' && (
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
           <div>
@@ -607,7 +862,170 @@ export const ProfilePage: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 5: RESUME LIBRARY */}
+      {/* TAB 6: CAREER PREFERENCES */}
+      {activeTab === 'preferences' && (
+        <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
+          <div>
+            <h3 className="text-sm font-bold text-slate-900 mb-1">Career & Discovery Preferences</h3>
+            <p className="text-xs text-slate-500 mb-4">
+              Configure target job roles and locations used by the automated discovery scraper.
+            </p>
+          </div>
+
+          {/* Suggested Roles from Resume */}
+          {suggestedRoles.length > 0 && (
+            <div className="p-4 rounded-2xl bg-brand-50/50 border border-brand-100 space-y-3">
+              <div className="flex items-center gap-2">
+                <Compass size={16} className="text-brand-600" />
+                <h4 className="text-xs font-bold text-brand-900">Suggested Roles (Inferred from your Resume)</h4>
+              </div>
+              <p className="text-[11px] text-slate-600">
+                Click any suggested role to add it to your active target search roles:
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {suggestedRoles.map((role, idx) => {
+                  const isAdded = targetRoles.includes(role.role_title);
+                  return (
+                    <button
+                      key={idx}
+                      type="button"
+                      onClick={() => handleAddTargetRole(role.role_title)}
+                      className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all ${
+                        isAdded
+                          ? 'bg-brand-600 text-white shadow-2xs'
+                          : 'bg-white border border-brand-200 text-brand-800 hover:bg-brand-100/60'
+                      }`}
+                    >
+                      <span>{role.role_title}</span>
+                      <span className="text-[10px] opacity-75">({Math.round(role.confidence * 100)}%)</span>
+                      {isAdded ? <Check size={12} /> : <Plus size={12} />}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Active Target Roles */}
+          <div className="space-y-3">
+            <label className="block text-xs font-semibold text-slate-800">
+              Active Target Roles ({targetRoles.length})
+            </label>
+            <div className="flex flex-wrap gap-2">
+              {targetRoles.map((role, idx) => (
+                <span
+                  key={idx}
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 text-slate-800 border border-slate-200 flex items-center gap-1.5"
+                >
+                  <span>{role}</span>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveTargetRole(role)}
+                    className="text-slate-400 hover:text-rose-600"
+                  >
+                    <X size={13} />
+                  </button>
+                </span>
+              ))}
+            </div>
+
+            <div className="flex gap-2 max-w-md">
+              <input
+                type="text"
+                value={newRoleInput}
+                onChange={(e) => setNewRoleInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleAddTargetRole(newRoleInput);
+                  }
+                }}
+                placeholder="Add custom target role (e.g. AI Engineer)..."
+                className="flex-1 px-3.5 py-2 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => handleAddTargetRole(newRoleInput)}
+                disabled={!newRoleInput.trim()}
+                className="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs disabled:opacity-50"
+              >
+                Add Role
+              </button>
+            </div>
+          </div>
+
+          {/* Target Locations */}
+          <div className="space-y-3 pt-3 border-t border-slate-100">
+            <label className="block text-xs font-semibold text-slate-800">
+              Target Locations ({targetLocations.length})
+            </label>
+            <div className="flex flex-wrap gap-2">
+              {targetLocations.map((loc, idx) => (
+                <span
+                  key={idx}
+                  className="px-3 py-1.5 rounded-xl text-xs font-semibold bg-slate-100 text-slate-800 border border-slate-200 flex items-center gap-1.5"
+                >
+                  <span>{loc}</span>
+                  <button
+                    type="button"
+                    onClick={() => handleRemoveLocation(loc)}
+                    className="text-slate-400 hover:text-rose-600"
+                  >
+                    <X size={13} />
+                  </button>
+                </span>
+              ))}
+            </div>
+
+            <div className="flex gap-2 max-w-md">
+              <input
+                type="text"
+                value={newLocInput}
+                onChange={(e) => setNewLocInput(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    handleAddLocation(newLocInput);
+                  }
+                }}
+                placeholder="Add location (e.g. Pune, Bengaluru, Hybrid)..."
+                className="flex-1 px-3.5 py-2 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
+              />
+              <button
+                type="button"
+                onClick={() => handleAddLocation(newLocInput)}
+                disabled={!newLocInput.trim()}
+                className="px-4 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs disabled:opacity-50"
+              >
+                Add Location
+              </button>
+            </div>
+          </div>
+
+          {/* Auto-discovery setting */}
+          <div className="pt-3 border-t border-slate-100 flex items-center justify-between">
+            <div>
+              <h4 className="text-xs font-bold text-slate-900">Background Automatic Discovery</h4>
+              <p className="text-[11px] text-slate-500">
+                Periodically scrape and evaluate job postings matching your resume qualifications.
+              </p>
+            </div>
+            <input
+              type="checkbox"
+              checked={Boolean(currentPrefs.auto_discover_enabled)}
+              onChange={(e) =>
+                updatePreferences({
+                  ...currentPrefs,
+                  auto_discover_enabled: e.target.checked,
+                })
+              }
+              className="w-4 h-4 text-brand-600 rounded border-slate-300 focus:ring-brand-500"
+            />
+          </div>
+        </div>
+      )}
+
+      {/* TAB 7: RESUME LIBRARY */}
       {activeTab === 'resumes' && (
         <div className="space-y-6">
           {/* Upload card */}
@@ -650,19 +1068,18 @@ export const ProfilePage: React.FC = () => {
                       </div>
                       <div>
                         <div className="flex items-center gap-2">
-                          <p className="text-xs font-bold text-slate-900">{res.original_filename}</p>
+                          <span className="text-xs font-bold text-slate-800">
+                            {res.original_filename}
+                          </span>
                           {res.is_primary && (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                              Primary
+                            <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-emerald-100 text-emerald-800 flex items-center gap-1">
+                              <Star size={10} className="fill-emerald-800" />
+                              <span>Primary</span>
                             </span>
                           )}
                         </div>
                         <p className="text-[11px] text-slate-400 mt-0.5">
-                          Format: {res.file_format.toUpperCase()} &middot; Size:{' '}
-                          {(res.file_size_bytes / 1024).toFixed(1)} KB &middot; Hash:{' '}
-                          <code className="text-[10px] bg-slate-100 px-1 rounded">
-                            {res.file_hash.slice(0, 10)}...
-                          </code>
+                          {res.file_format.toUpperCase()} &middot; {(res.file_size_bytes / 1024).toFixed(1)} KB &middot; SHA-256 verified
                         </p>
                       </div>
                     </div>
@@ -671,22 +1088,23 @@ export const ProfilePage: React.FC = () => {
                       {!res.is_primary && (
                         <button
                           onClick={() => handleSetPrimary(res.id)}
-                          className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 font-semibold text-xs flex items-center gap-1 transition-colors"
+                          className="px-3 py-1.5 rounded-xl border border-slate-200 hover:bg-slate-50 text-slate-700 text-xs font-medium flex items-center gap-1"
                         >
                           <Star size={13} />
-                          <span>Make Primary</span>
+                          <span>Set Primary</span>
                         </button>
                       )}
                       <button
                         onClick={() => handleSyncResume(res.id)}
-                        className="px-3 py-1.5 rounded-xl bg-brand-50 hover:bg-brand-100 text-brand-700 font-semibold text-xs border border-brand-200 flex items-center gap-1 transition-colors"
+                        title="Re-extract verified candidate profile"
+                        className="px-3 py-1.5 rounded-xl bg-brand-50 hover:bg-brand-100 text-brand-700 text-xs font-medium flex items-center gap-1"
                       >
                         <RefreshCw size={13} />
-                        <span>Sync Profile</span>
+                        <span>Re-Sync</span>
                       </button>
                       <button
                         onClick={() => handleDeleteResume(res.id)}
-                        className="p-1.5 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                        className="p-1.5 rounded-xl text-slate-400 hover:text-rose-600 hover:bg-rose-50"
                       >
                         <Trash2 size={16} />
                       </button>

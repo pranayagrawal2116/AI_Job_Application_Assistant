@@ -51,6 +51,10 @@ export interface JobItem {
   internship_duration: string;
   is_shortlisted: boolean;
   source: string;
+  matching_skills?: string[];
+  missing_skills?: string[];
+  match_explanation?: string;
+  score_breakdown?: Record<string, any>;
 }
 
 export interface ResumeItem {
@@ -74,6 +78,17 @@ export interface CandidateProfile {
     linkedin?: string;
     github?: string;
     portfolio?: string;
+    summary?: string;
+  };
+  personal?: {
+    full_name?: string;
+    email?: string;
+    phone?: string;
+    location?: string;
+    linkedin?: string;
+    github?: string;
+    portfolio?: string;
+    summary?: string;
   };
   education?: Array<{
     institution: string;
@@ -102,10 +117,71 @@ export interface CandidateProfile {
     provenance?: string;
   }>;
   projects?: Array<{
-    name: string;
+    title?: string;
+    name?: string;
     description?: string;
     technologies?: string[];
+    deliverables?: string[];
+    provenance?: string;
   }>;
+  search_preferences?: {
+    target_roles?: string[];
+    target_locations?: string[];
+    auto_discover_enabled?: boolean;
+    suggested_roles?: InferredRole[];
+  };
+  preferences?: {
+    target_roles?: string[];
+    target_locations?: string[];
+    auto_discover_enabled?: boolean;
+  };
+}
+
+export interface InferredRole {
+  role_title: string;
+  evidence_sources: string[];
+  supporting_skills: string[];
+  confidence: number;
+  is_candidate_selected?: boolean;
+}
+
+export interface DiscoveryRun {
+  id: number;
+  user_id: number;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'PARTIAL';
+  triggered_by?: string;
+  target_roles?: string[];
+  target_locations?: string[];
+  jobs_discovered: number;
+  jobs_evaluated: number;
+  errors_count: number;
+  log_summary?: string;
+  created_at: string;
+  completed_at?: string;
+}
+
+export interface DiscoveryStatus {
+  is_running: boolean;
+  active_run?: DiscoveryRun | null;
+  latest_run?: DiscoveryRun | null;
+  suggested_roles: InferredRole[];
+  target_roles: string[];
+  target_locations: string[];
+  auto_discover_enabled: boolean;
+}
+
+export interface JobMatchExplanation {
+  job_id: number;
+  company_name: string;
+  job_title: string;
+  match_score: number;
+  match_classification: string;
+  is_eligible: boolean;
+  score_breakdown: Record<string, any>;
+  matching_skills: string[];
+  missing_skills: string[];
+  explanation: string;
+  disqualification_reasons: string[];
 }
 
 export interface ApplicationItem {

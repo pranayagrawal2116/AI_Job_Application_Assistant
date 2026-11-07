@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
-import { JobItem } from '@/types';
+import { DiscoveryStatus, InferredRole, JobItem, JobMatchExplanation } from '@/types';
 import { LoadingSpinner } from '@/components/common/LoadingSpinner';
 import { Badge } from '@/components/common/Badge';
 import { Modal } from '@/components/common/Modal';
@@ -24,6 +24,12 @@ import {
   Link as LinkIcon,
   Upload,
   Sparkles,
+  Compass,
+  RefreshCw,
+  X,
+  Info,
+  Check,
+  AlertTriangle,
 } from 'lucide-react';
 
 export const JobsPage: React.FC = () => {
@@ -33,6 +39,13 @@ export const JobsPage: React.FC = () => {
   const [jobs, setJobs] = useState<JobItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
 
+  // Discovery engine state & suggested career paths
+  const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus | null>(null);
+  const [suggestedRoles, setSuggestedRoles] = useState<InferredRole[]>([]);
+  const [selectedRoleFilter, setSelectedRoleFilter] = useState<string | null>(null);
+  const [isTriggeringDiscovery, setIsTriggeringDiscovery] = useState(false);
+  const [discoveryNotification, setDiscoveryNotification] = useState<string | null>(null);
+
   // Filters
   const [searchTerm, setSearchTerm] = useState('');
   const [arrangement, setArrangement] = useState('');
@@ -40,14 +53,10 @@ export const JobsPage: React.FC = () => {
   const [onlyEligible, setOnlyEligible] = useState(false);
   const [minScore, setMinScore] = useState<number>(0);
 
-  // Selected job for detail modal
+  // Selected job for detail / match explanation modal
   const [selectedJob, setSelectedJob] = useState<JobItem | null>(null);
-  const [candidateResumes, setCandidateResumes] = useState<any[]>([]);
-  const [evaluatingResumeId, setEvaluatingResumeId] = useState<number | null>(null);
-  const [evaluatingProfile, setEvaluatingProfile] = useState<string>('student_intern');
-  const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
-  const [matchEvaluation, setMatchEvaluation] = useState<any | null>(null);
-  const [evalError, setEvalError] = useState<string | null>(null);
+  const [matchExplanation, setMatchExplanation] = useState<JobMatchExplanation | null>(null);
+  const [isLoadingExplanation, setIsLoadingExplanation] = useState(false);
 
   // Add Job Manually modal/tab state
   const [manualMode, setManualMode] = useState<'text' | 'file' | 'url'>('text');
@@ -64,12 +73,13 @@ export const JobsPage: React.FC = () => {
     setIsLoading(true);
     try {
       const data = await api.getJobs({
-        search: searchTerm || undefined,
+        search: (selectedRoleFilter || searchTerm) || undefined,
         arrangement: arrangement || undefined,
         platform: platform || undefined,
         only_eligible: onlyEligible || undefined,
         min_score: minScore > 0 ? minScore : undefined,
         saved_only: activeTab === 'saved',
+        recommended_only: true,
       });
       setJobs(data);
     } catch (e) {
@@ -79,41 +89,31 @@ export const JobsPage: React.FC = () => {
     }
   };
 
+  const loadDiscoveryMeta = async () => {
+    try {
+      const statusRes = await api.getDiscoveryStatus();
+      setDiscoveryStatus(statusRes);
+      if (statusRes.suggested_roles && statusRes.suggested_roles.length > 0) {
+        setSuggestedRoles(statusRes.suggested_roles);
+      }
+    } catch (e) {
+      // Fallback
+    }
+  };
+
   useEffect(() => {
     if (activeTab !== 'add') {
       fetchJobs();
     }
-  }, [activeTab, arrangement, platform, onlyEligible, minScore]);
+  }, [activeTab, arrangement, platform, onlyEligible, minScore, selectedRoleFilter]);
 
   useEffect(() => {
-    api.getResumes().then((res) => {
-      setCandidateResumes(res);
-      if (res && res.length > 0) {
-        setEvaluatingResumeId(res[0].id);
-      }
-    }).catch(() => {});
+    loadDiscoveryMeta();
   }, []);
-
-  const handleRunEvaluation = async () => {
-    if (!selectedJob || !evaluatingResumeId) return;
-    setIsEvaluating(true);
-    setEvalError(null);
-    try {
-      const res = await api.evaluateMatch({
-        resume_id: evaluatingResumeId,
-        job_id: selectedJob.id,
-        scoring_profile: evaluatingProfile,
-      });
-      setMatchEvaluation(res);
-    } catch (err: any) {
-      setEvalError(err.message || 'Match evaluation failed.');
-    } finally {
-      setIsEvaluating(false);
-    }
-  };
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    setSelectedRoleFilter(null);
     fetchJobs();
   };
 
@@ -144,6 +144,37 @@ export const JobsPage: React.FC = () => {
     }
   };
 
+  const handleOpenExplanation = async (job: JobItem) => {
+    setSelectedJob(job);
+    setIsLoadingExplanation(true);
+    setMatchExplanation(null);
+    try {
+      const exp = await api.getJobMatchExplanation(job.id);
+      setMatchExplanation(exp);
+    } catch (err) {
+      console.warn('Could not load detailed explanation:', err);
+    } finally {
+      setIsLoadingExplanation(false);
+    }
+  };
+
+  const handleTriggerDiscovery = async () => {
+    setIsTriggeringDiscovery(true);
+    setDiscoveryNotification(null);
+    try {
+      const res = await api.triggerDiscovery();
+      setDiscoveryNotification(res.message || 'Discovery started. Searching opportunities...');
+      await loadDiscoveryMeta();
+      setTimeout(() => {
+        fetchJobs();
+        setIsTriggeringDiscovery(false);
+      }, 2500);
+    } catch (err: any) {
+      setDiscoveryNotification(err.message || 'Failed to trigger discovery.');
+      setIsTriggeringDiscovery(false);
+    }
+  };
+
   const handleManualIngest = async (e: React.FormEvent) => {
     e.preventDefault();
     setIsSubmittingJd(true);
@@ -167,7 +198,6 @@ export const JobsPage: React.FC = () => {
 
       setJdSuccess('Job parsed successfully! Creating application workspace...');
       setTimeout(async () => {
-        // Create application for this new job description
         const app = await api.createApplication({
           company_name: res.company_name || hintCompany || 'Company',
           job_title: res.job_title || hintTitle || 'Target Role',
@@ -190,14 +220,17 @@ export const JobsPage: React.FC = () => {
             Find Opportunities
           </h1>
           <p className="text-xs text-slate-500 mt-1">
-            Discover verified jobs scored by relevance to your profile.
+            Personalized job matches scored dynamically against your verified qualifications.
           </p>
         </div>
 
         {/* Tab Switcher */}
         <div className="flex items-center gap-1.5 p-1 rounded-2xl bg-slate-200/60 self-start sm:self-center">
           <button
-            onClick={() => setActiveTab('all')}
+            onClick={() => {
+              setActiveTab('all');
+              setSelectedRoleFilter(null);
+            }}
             className={`px-4 py-1.5 rounded-xl text-xs font-bold transition-all ${
               activeTab === 'all'
                 ? 'bg-white text-slate-900 shadow-sm'
@@ -229,6 +262,106 @@ export const JobsPage: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* DISCOVERY STATUS BANNER */}
+      {activeTab !== 'add' && (
+        <div className="p-4 rounded-2xl bg-white border border-slate-200/80 shadow-2xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <div className={`w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ${
+              discoveryStatus?.is_running || isTriggeringDiscovery
+                ? 'bg-amber-100 text-amber-700 animate-pulse'
+                : 'bg-brand-50 text-brand-600'
+            }`}>
+              <Sparkles size={16} />
+            </div>
+            <div>
+              <p className="text-xs font-bold text-slate-900">
+                {discoveryStatus?.is_running || isTriggeringDiscovery
+                  ? 'Discovery Scraper Running'
+                  : 'Automated Discovery Engine'}
+              </p>
+              <p className="text-[11px] text-slate-500">
+                {discoveryStatus?.is_running || isTriggeringDiscovery
+                  ? 'Scanning LinkedIn, Internshala, Indeed & Careers feeds for your verified roles...'
+                  : `Personalized ranking active · ${jobs.length} relevant opportunities available.`}
+              </p>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2 self-start sm:self-center">
+            {discoveryNotification && (
+              <span className="text-[11px] font-semibold text-brand-700 bg-brand-50 px-2.5 py-1 rounded-lg border border-brand-100">
+                {discoveryNotification}
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={handleTriggerDiscovery}
+              disabled={isTriggeringDiscovery || Boolean(discoveryStatus?.is_running)}
+              className="px-3.5 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs flex items-center gap-1.5 shadow-2xs transition-all disabled:opacity-50"
+            >
+              {isTriggeringDiscovery || discoveryStatus?.is_running ? (
+                <LoadingSpinner size={12} className="text-white" />
+              ) : (
+                <RefreshCw size={12} />
+              )}
+              <span>{isTriggeringDiscovery ? 'Searching...' : 'Refresh Matches'}</span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* SUGGESTED CAREER PATHS CHIPS */}
+      {activeTab !== 'add' && suggestedRoles.length > 0 && (
+        <div className="space-y-1.5">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-1.5 text-xs font-bold text-slate-700">
+              <Compass size={14} className="text-brand-600" />
+              <span>Suggested Career Paths:</span>
+            </div>
+            {selectedRoleFilter && (
+              <button
+                type="button"
+                onClick={() => setSelectedRoleFilter(null)}
+                className="text-[11px] text-brand-600 hover:text-brand-700 font-semibold flex items-center gap-1"
+              >
+                <span>Clear role filter</span>
+                <X size={12} />
+              </button>
+            )}
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {suggestedRoles.map((role, idx) => {
+              const isSelected = selectedRoleFilter === role.role_title;
+              return (
+                <button
+                  key={idx}
+                  type="button"
+                  onClick={() => {
+                    setSelectedRoleFilter(isSelected ? null : role.role_title);
+                  }}
+                  className={`px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all ${
+                    isSelected
+                      ? 'bg-brand-600 text-white shadow-2xs'
+                      : 'bg-white border border-slate-200/80 text-slate-700 hover:bg-slate-50'
+                  }`}
+                >
+                  <span>{role.role_title}</span>
+                  <span
+                    className={`px-1.5 py-0.2 rounded-md text-[9px] font-bold ${
+                      isSelected ? 'bg-brand-700 text-brand-100' : 'bg-slate-100 text-slate-600'
+                    }`}
+                  >
+                    {Math.round(role.confidence * 100)}%
+                  </span>
+                  {isSelected && <X size={12} className="ml-0.5" />}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* TAB CONTENT: ADD JOB MANUALLY */}
       {activeTab === 'add' ? (
@@ -545,39 +678,65 @@ export const JobsPage: React.FC = () => {
                       )}
                     </div>
 
-                    {/* Skills pills */}
-                    {job.required_skills && job.required_skills.length > 0 && (
-                      <div className="mt-4 flex flex-wrap gap-1.5">
-                        {job.required_skills.slice(0, 4).map((skill, idx) => (
-                          <span
-                            key={idx}
-                            className="text-[10px] font-medium bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md"
-                          >
-                            {skill}
-                          </span>
-                        ))}
-                        {job.required_skills.length > 4 && (
-                          <span className="text-[10px] text-slate-400 py-0.5 px-1">
-                            +{job.required_skills.length - 4} more
-                          </span>
-                        )}
+                    {/* Candidate-specific Matching Skills Pills */}
+                    {job.matching_skills && job.matching_skills.length > 0 && (
+                      <div className="mt-3">
+                        <span className="text-[10px] font-bold text-emerald-800 uppercase tracking-wider block mb-1">
+                          Matching Qualifications:
+                        </span>
+                        <div className="flex flex-wrap gap-1">
+                          {job.matching_skills.slice(0, 4).map((skill, idx) => (
+                            <span
+                              key={idx}
+                              className="text-[10px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200/80 px-2 py-0.5 rounded-md flex items-center gap-1"
+                            >
+                              <Check size={10} />
+                              <span>{skill}</span>
+                            </span>
+                          ))}
+                          {job.matching_skills.length > 4 && (
+                            <span className="text-[10px] text-emerald-600 self-center">
+                              +{job.matching_skills.length - 4} more
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Candidate-specific Missing Skills Pills */}
+                    {job.missing_skills && job.missing_skills.length > 0 && (
+                      <div className="mt-2">
+                        <span className="text-[10px] font-bold text-amber-800 uppercase tracking-wider block mb-1">
+                          Missing Skills:
+                        </span>
+                        <div className="flex flex-wrap gap-1">
+                          {job.missing_skills.slice(0, 3).map((skill, idx) => (
+                            <span
+                              key={idx}
+                              className="text-[10px] font-medium bg-amber-50 text-amber-700 border border-amber-200/80 px-2 py-0.5 rounded-md"
+                            >
+                              ! {skill}
+                            </span>
+                          ))}
+                        </div>
                       </div>
                     )}
                   </div>
 
                   {/* Card Bottom CTA */}
-                  <div className="mt-6 pt-3 border-t border-slate-100 flex items-center gap-2">
+                  <div className="mt-5 pt-3 border-t border-slate-100 flex items-center gap-2">
                     <button
-                      onClick={() => setSelectedJob(job)}
-                      className="flex-1 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs transition-colors"
+                      onClick={() => handleOpenExplanation(job)}
+                      className="flex-1 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs transition-colors flex items-center justify-center gap-1"
                     >
-                      View Details
+                      <Info size={13} />
+                      <span>Match Breakdown</span>
                     </button>
                     <button
                       onClick={() => handleStartApplication(job)}
                       className="flex-1 py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-sm shadow-brand-500/20 transition-colors"
                     >
-                      Start Application
+                      Prepare Application
                     </button>
                   </div>
                 </div>
@@ -587,22 +746,25 @@ export const JobsPage: React.FC = () => {
         </>
       )}
 
-      {/* JOB DETAIL MODAL */}
+      {/* JOB MATCH EXPLANATION & DETAIL MODAL */}
       {selectedJob && (
         <Modal
           isOpen={!!selectedJob}
-          onClose={() => setSelectedJob(null)}
+          onClose={() => {
+            setSelectedJob(null);
+            setMatchExplanation(null);
+          }}
           title={selectedJob.job_title}
           description={`${selectedJob.company_name} • ${selectedJob.location} (${selectedJob.work_arrangement})`}
           maxWidth="2xl"
         >
           <div className="space-y-5 text-xs text-slate-700">
-            {/* Match evaluation banner */}
+            {/* Score header */}
             <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 flex items-center justify-between">
               <div>
-                <span className="text-xs font-bold text-slate-900">Universal Match Score</span>
+                <span className="text-xs font-bold text-slate-900">Personalized Match Score</span>
                 <p className="text-[11px] text-slate-500">
-                  Scored across domain relevance, technical skills, and candidate profile
+                  Computed by Universal Matching Engine against your verified credentials.
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -611,7 +773,7 @@ export const JobsPage: React.FC = () => {
                     selectedJob.match_score
                   )}`}
                 >
-                  {formatScore(selectedJob.match_score)}
+                  {formatScore(selectedJob.match_score)} ({selectedJob.match_classification})
                 </span>
                 {selectedJob.is_eligible ? (
                   <Badge variant="success">Eligible</Badge>
@@ -621,139 +783,102 @@ export const JobsPage: React.FC = () => {
               </div>
             </div>
 
-            {/* Description */}
-            <div>
-              <h4 className="font-bold text-slate-900 mb-1">Job Description & Overview</h4>
-              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 leading-relaxed whitespace-pre-wrap max-h-60 overflow-y-auto">
-                {selectedJob.job_description || 'No detailed description provided.'}
+            {/* Explanation details */}
+            {isLoadingExplanation ? (
+              <div className="py-8 flex justify-center">
+                <LoadingSpinner size={24} />
               </div>
-            </div>
+            ) : matchExplanation ? (
+              <div className="space-y-4">
+                {/* 100-pt Dimension Breakdown */}
+                {matchExplanation.score_breakdown && Object.keys(matchExplanation.score_breakdown).length > 0 && (
+                  <div className="p-4 rounded-2xl bg-white border border-slate-200/80 space-y-3">
+                    <h4 className="font-bold text-slate-900 text-xs">100-Point Scoring Dimensions</h4>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                      {Object.entries(matchExplanation.score_breakdown).map(([dim, data]: [string, any], i) => (
+                        <div key={i} className="p-2.5 rounded-xl bg-slate-50 border border-slate-100">
+                          <p className="text-[10px] text-slate-400 capitalize">{dim.replace('_', ' ')}</p>
+                          <p className="text-xs font-bold text-slate-800 mt-0.5">
+                            {typeof data === 'object' && data !== null
+                              ? `${data.score || 0} / ${data.weight || 0} pts`
+                              : `${data} pts`}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
-            {/* Required Skills */}
-            {selectedJob.required_skills && selectedJob.required_skills.length > 0 && (
-              <div>
-                <h4 className="font-bold text-slate-900 mb-1.5">Required Skills</h4>
-                <div className="flex flex-wrap gap-1.5">
-                  {selectedJob.required_skills.map((skill, idx) => (
-                    <span
-                      key={idx}
-                      className="bg-brand-50 text-brand-700 border border-brand-200 px-2.5 py-1 rounded-lg text-xs font-medium"
-                    >
-                      {skill}
-                    </span>
-                  ))}
-                </div>
-              </div>
-            )}
+                {/* Matching Skills */}
+                {matchExplanation.matching_skills && matchExplanation.matching_skills.length > 0 && (
+                  <div>
+                    <h4 className="font-bold text-emerald-800 text-xs mb-1.5 flex items-center gap-1.5">
+                      <CheckCircle2 size={13} className="text-emerald-600" />
+                      <span>Verified Matching Skills ({matchExplanation.matching_skills.length})</span>
+                    </h4>
+                    <div className="flex flex-wrap gap-1.5">
+                      {matchExplanation.matching_skills.map((s, idx) => (
+                        <span
+                          key={idx}
+                          className="bg-emerald-50 text-emerald-800 border border-emerald-200 px-2.5 py-1 rounded-lg text-xs font-semibold"
+                        >
+                          ✓ {s}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
 
-            {/* Interactive Match Evaluation Section */}
-            <div className="p-4 rounded-2xl border border-brand-100 bg-brand-50/40 space-y-3">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
-                  <Sparkles size={16} className="text-brand-600" />
-                  <h4 className="font-bold text-slate-900 text-xs">Evaluate Match Against My Resume</h4>
-                </div>
-                {candidateResumes.length === 0 && (
-                  <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">
-                    Upload resume in Profile first
-                  </span>
+                {/* Missing Skills */}
+                {matchExplanation.missing_skills && matchExplanation.missing_skills.length > 0 && (
+                  <div>
+                    <h4 className="font-bold text-amber-800 text-xs mb-1.5 flex items-center gap-1.5">
+                      <AlertTriangle size={13} className="text-amber-600" />
+                      <span>Missing Skills or Desired Qualifications ({matchExplanation.missing_skills.length})</span>
+                    </h4>
+                    <div className="flex flex-wrap gap-1.5">
+                      {matchExplanation.missing_skills.map((s, idx) => (
+                        <span
+                          key={idx}
+                          className="bg-amber-50 text-amber-800 border border-amber-200 px-2.5 py-1 rounded-lg text-xs font-medium"
+                        >
+                          ! {s}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* Explanation text */}
+                {matchExplanation.explanation && (
+                  <div>
+                    <h4 className="font-bold text-slate-900 text-xs mb-1">Evaluation Summary</h4>
+                    <p className="p-3 rounded-xl bg-slate-50 text-slate-600 leading-relaxed text-xs">
+                      {matchExplanation.explanation}
+                    </p>
+                  </div>
+                )}
+
+                {/* Disqualification reasons */}
+                {matchExplanation.disqualification_reasons && matchExplanation.disqualification_reasons.length > 0 && (
+                  <div className="p-3 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs">
+                    <p className="font-bold mb-1">Disqualification Factors:</p>
+                    <ul className="list-disc pl-4 space-y-0.5">
+                      {matchExplanation.disqualification_reasons.map((r, i) => (
+                        <li key={i}>{r}</li>
+                      ))}
+                    </ul>
+                  </div>
                 )}
               </div>
+            ) : null}
 
-              {candidateResumes.length > 0 && (
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Select Resume</label>
-                    <select
-                      value={evaluatingResumeId || ''}
-                      onChange={(e) => setEvaluatingResumeId(Number(e.target.value))}
-                      className="w-full px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white text-xs"
-                    >
-                      {candidateResumes.map((r) => (
-                        <option key={r.id} value={r.id}>
-                          {r.original_filename} ({r.label || 'General'})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Scoring Profile</label>
-                    <select
-                      value={evaluatingProfile}
-                      onChange={(e) => setEvaluatingProfile(e.target.value)}
-                      className="w-full px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white text-xs"
-                    >
-                      <option value="student_intern">Student / Intern (Heavy Academics & Projects)</option>
-                      <option value="mid_career">Mid-Career (Experience & Domain)</option>
-                      <option value="executive">Executive / Leadership</option>
-                      <option value="career_changer">Career Changer (Transferable Skills)</option>
-                    </select>
-                  </div>
-                </div>
-              )}
-
-              {candidateResumes.length > 0 && (
-                <button
-                  onClick={handleRunEvaluation}
-                  disabled={isEvaluating || !evaluatingResumeId}
-                  className="w-full py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50"
-                >
-                  {isEvaluating ? <LoadingSpinner size={13} /> : <Sparkles size={14} />}
-                  <span>{isEvaluating ? 'Evaluating Multi-Dimensional Match...' : 'Run Personalized Match Analysis'}</span>
-                </button>
-              )}
-
-              {evalError && (
-                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-[11px]">
-                  {evalError}
-                </div>
-              )}
-
-              {matchEvaluation && (
-                <div className="p-3.5 rounded-xl bg-white border border-brand-200 space-y-2.5">
-                  <div className="flex items-center justify-between">
-                    <span className="font-bold text-slate-800 text-xs">Analysis Result:</span>
-                    <div className="flex items-center gap-2">
-                      <span className={`px-2.5 py-0.5 rounded-full text-xs font-extrabold border ${getScoreColor(matchEvaluation.match_score)}`}>
-                        {formatScore(matchEvaluation.match_score)} ({matchEvaluation.match_classification})
-                      </span>
-                      <Badge variant={matchEvaluation.eligibility_status === 'ELIGIBLE' ? 'success' : 'danger'}>
-                        {matchEvaluation.eligibility_status}
-                      </Badge>
-                    </div>
-                  </div>
-
-                  {matchEvaluation.matching_skills && matchEvaluation.matching_skills.length > 0 && (
-                    <div>
-                      <span className="text-[11px] font-semibold text-emerald-700 block mb-1">
-                        Matching Skills ({matchEvaluation.matching_skills.length}):
-                      </span>
-                      <div className="flex flex-wrap gap-1">
-                        {matchEvaluation.matching_skills.map((s: string, i: number) => (
-                          <span key={i} className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md text-[10px] font-medium">
-                            ✓ {s}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
-                  {matchEvaluation.missing_skills && matchEvaluation.missing_skills.length > 0 && (
-                    <div>
-                      <span className="text-[11px] font-semibold text-amber-700 block mb-1">
-                        Skill Gaps ({matchEvaluation.missing_skills.length}):
-                      </span>
-                      <div className="flex flex-wrap gap-1">
-                        {matchEvaluation.missing_skills.map((s: string, i: number) => (
-                          <span key={i} className="px-2 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-md text-[10px] font-medium">
-                            ✗ {s}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
-              )}
+            {/* Description */}
+            <div>
+              <h4 className="font-bold text-slate-900 mb-1">Job Description & Requirements</h4>
+              <div className="p-3.5 rounded-xl bg-slate-50 border border-slate-100 leading-relaxed whitespace-pre-wrap max-h-48 overflow-y-auto">
+                {selectedJob.job_description || 'No detailed description provided.'}
+              </div>
             </div>
 
             {/* Actions */}

@@ -2,7 +2,10 @@ import {
   AuthResponse,
   CandidateProfile,
   DashboardSummary,
+  DiscoveryStatus,
+  InferredRole,
   JobItem,
+  JobMatchExplanation,
   ResumeItem,
   ApplicationItem,
   FollowUpItem,
@@ -129,6 +132,7 @@ class ApiClient {
     min_score?: number;
     only_eligible?: boolean;
     saved_only?: boolean;
+    recommended_only?: boolean;
   }): Promise<JobItem[]> {
     const q = new URLSearchParams();
     if (params?.search) q.set('search', params.search);
@@ -137,6 +141,7 @@ class ApiClient {
     if (params?.min_score !== undefined) q.set('min_score', params.min_score.toString());
     if (params?.only_eligible !== undefined) q.set('only_eligible', params.only_eligible.toString());
     if (params?.saved_only) q.set('saved_only', 'true');
+    if (params?.recommended_only) q.set('recommended_only', 'true');
 
     const queryStr = q.toString() ? `?${q.toString()}` : '';
     return this.request<JobItem[]>(`/jobs${queryStr}`);
@@ -146,8 +151,39 @@ class ApiClient {
     return this.request<JobItem>(`/jobs/${id}`);
   }
 
+  async getJobMatchExplanation(jobId: number): Promise<JobMatchExplanation> {
+    return this.request<JobMatchExplanation>(`/jobs/${jobId}/match-explanation`);
+  }
+
   async toggleShortlist(jobId: number): Promise<{ status: string; is_shortlisted: boolean; message: string }> {
     return this.request(`/jobs/${jobId}/shortlist`, { method: 'POST' });
+  }
+
+  // Candidate Discovery & Recommendations
+  async triggerDiscovery(roles?: string[], locations?: string[]): Promise<{ status: string; message: string; run_id?: number }> {
+    return this.request('/discovery/trigger', {
+      method: 'POST',
+      body: JSON.stringify({ roles, locations }),
+    });
+  }
+
+  async getDiscoveryStatus(): Promise<DiscoveryStatus> {
+    return this.request<DiscoveryStatus>('/discovery/status');
+  }
+
+  async getSuggestedRoles(): Promise<{ suggested_roles: InferredRole[]; suggested_locations: string[] }> {
+    return this.request('/discovery/suggested-roles');
+  }
+
+  async updateSearchPreferences(prefs: {
+    target_roles: string[];
+    target_locations: string[];
+    auto_discover_enabled?: boolean;
+  }): Promise<{ message: string; preferences: any }> {
+    return this.request('/discovery/preferences', {
+      method: 'POST',
+      body: JSON.stringify(prefs),
+    });
   }
 
   async ingestJobText(data: { raw_text: string; hint_title?: string; hint_company?: string; hint_location?: string }): Promise<any> {

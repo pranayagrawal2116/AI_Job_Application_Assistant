@@ -1,6 +1,7 @@
 """Job discovery, exploration, and manual ingestion endpoints."""
 
 import json
+import logging
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from dashboard.services.dashboard_service import DashboardService
@@ -12,7 +13,51 @@ from backend.api.schemas.jobs import (
     JobItemResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/jobs", tags=["Jobs"])
+
+
+def _normalize_skill_list(raw: Any) -> List[str]:
+    """Safely normalizes raw skill data (str, JSON str, list of dicts) into a list of strings."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                raw = parsed
+            else:
+                return [s.strip() for s in raw.split(",") if s.strip()]
+        except Exception:
+            return [s.strip() for s in raw.split(",") if s.strip()]
+    if isinstance(raw, list):
+        out = []
+        for item in raw:
+            if isinstance(item, dict):
+                name = item.get("job_skill") or item.get("name") or item.get("candidate_skill") or ""
+                if name:
+                    out.append(str(name))
+            elif isinstance(item, str) and item.strip():
+                out.append(item.strip())
+        return out
+    return []
+
+
+def _normalize_dict(raw: Any) -> Dict[str, Any]:
+    """Safely normalizes raw dict data (dict or JSON str) into a dictionary."""
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+    return {}
 
 
 @router.get("", response_model=List[JobItemResponse])
@@ -23,9 +68,10 @@ def list_jobs(
     min_score: Optional[float] = Query(None),
     only_eligible: Optional[bool] = Query(None),
     saved_only: Optional[bool] = Query(False),
+    recommended_only: Optional[bool] = Query(False),
     auth_ctx=Depends(get_current_user_and_session),
 ):
-    """Lists catalog job opportunities with multi-dimensional filtering."""
+    """Lists catalog job opportunities with multi-dimensional filtering and candidate-personalized matching."""
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
     
@@ -36,6 +82,10 @@ def list_jobs(
     # Get user's saved/shortlisted jobs
     user_apps = service.list_candidate_applications(session_id=session.session_id, client_user_id=user_id, limit=None)
     saved_job_ids = {a.job_id for a in user_apps if a.job_id is not None}
+
+    # Fetch candidate-scoped personalized match results for catalog jobs
+    all_job_ids = [int(r["id"]) for _, r in df.iterrows()]
+    user_matches = service.db.get_user_match_results_for_jobs(user_id=user_id, job_ids=all_job_ids)
     
     items: List[JobItemResponse] = []
     for _, row in df.iterrows():
@@ -47,19 +97,27 @@ def list_jobs(
             
         # Parse skills
         raw_skills = row.get("required_skills", "")
-        skills_list = []
-        if isinstance(raw_skills, str) and raw_skills.strip():
-            try:
-                parsed = json.loads(raw_skills)
-                if isinstance(parsed, list):
-                    skills_list = parsed
-            except Exception:
-                skills_list = [s.strip() for s in raw_skills.split(",") if s.strip()]
-        elif isinstance(raw_skills, list):
-            skills_list = raw_skills
-            
-        score = float(row.get("match_score", 0.0) or 0.0)
-        eligible = bool(row.get("is_eligible", 1))
+        skills_list = _normalize_skill_list(raw_skills)
+
+        # Candidate-specific match overlay
+        user_match = user_matches.get(jid)
+        if user_match:
+            score = float(user_match.match_score)
+            eligible = (user_match.eligibility_status != "INELIGIBLE")
+            match_classification = user_match.match_classification
+            matching_skills = _normalize_skill_list(user_match.matching_skills)
+            missing_skills = _normalize_skill_list(user_match.missing_skills)
+            explanation = user_match.explanation or ""
+            breakdown = _normalize_dict(user_match.score_breakdown)
+        else:
+            score = float(row.get("match_score", 0.0) or 0.0)
+            eligible = bool(row.get("is_eligible", 1))
+            match_classification = str(row.get("match_classification", "") or "Moderate")
+            matching_skills = []
+            missing_skills = []
+            explanation = ""
+            breakdown = {}
+
         work_arr = str(row.get("work_arrangement", "Onsite") or "Onsite")
         plat = str(row.get("platform", "Manual") or "Manual")
         
@@ -93,16 +151,24 @@ def list_jobs(
                 eligibility_criteria=str(row.get("eligibility_criteria", "") or ""),
                 application_deadline=str(row.get("application_deadline", "") or ""),
                 match_score=score,
-                match_classification=str(row.get("match_classification", "") or "Moderate"),
+                match_classification=match_classification,
                 is_eligible=eligible,
                 platform=plat,
                 work_arrangement=work_arr,
                 internship_duration=str(row.get("internship_duration", "") or "Flexible"),
                 is_shortlisted=is_saved,
                 source="catalog",
+                matching_skills=matching_skills,
+                missing_skills=missing_skills,
+                match_explanation=explanation,
+                score_breakdown=breakdown,
             )
         )
         
+    # Sort by match_score descending if recommended_only or default sorting
+    if recommended_only:
+        items.sort(key=lambda j: j.match_score, reverse=True)
+
     return items
 
 
@@ -152,6 +218,65 @@ def get_job(job_id: int, auth_ctx=Depends(get_current_user_and_session)):
         is_shortlisted=is_saved,
         source="catalog",
     )
+
+
+@router.get("/{job_id}/match-explanation")
+def get_job_match_explanation(job_id: int, auth_ctx=Depends(get_current_user_and_session)):
+    """Retrieves deep 100-point personalized match breakdown and explanation for the candidate."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+
+    job = service.get_job_detail(job_id)
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Job #{job_id} not found")
+
+    match_rec = service.db.get_latest_match_result(user_id=user_id, job_id=job_id)
+
+    # If no match yet, compute on the fly if user has primary resume
+    if not match_rec:
+        resumes = service.get_user_resumes(user_id)
+        primary_res = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
+        if primary_res:
+            try:
+                service.run_match_evaluation(
+                    user_id=user_id,
+                    resume_id=primary_res["id"],
+                    job_id=job_id,
+                )
+                match_rec = service.db.get_latest_match_result(user_id=user_id, job_id=job_id)
+            except Exception as e:
+                logger.warning("On-the-fly match evaluation failed for job %s: %s", job_id, e)
+
+    if match_rec:
+        return {
+            "job_id": job_id,
+            "match_score": float(match_rec.match_score),
+            "match_classification": match_rec.match_classification,
+            "eligibility_status": match_rec.eligibility_status,
+            "is_eligible": match_rec.eligibility_status != "INELIGIBLE",
+            "score_breakdown": _normalize_dict(match_rec.score_breakdown),
+            "explanation": match_rec.explanation,
+            "matching_skills": _normalize_skill_list(match_rec.matching_skills),
+            "missing_skills": _normalize_skill_list(match_rec.missing_skills),
+            "education_analysis": match_rec.education_analysis,
+            "experience_analysis": match_rec.experience_analysis,
+            "eligibility_reasons": match_rec.eligibility_reasons,
+            "recommendations": match_rec.recommendations,
+            "evaluated_at": match_rec.evaluated_at,
+        }
+
+    return {
+        "job_id": job_id,
+        "match_score": float(job.match_score or 0.0),
+        "match_classification": job.match_classification or "Moderate",
+        "eligibility_status": "ELIGIBLE" if job.is_eligible else "INELIGIBLE",
+        "is_eligible": bool(job.is_eligible),
+        "score_breakdown": _normalize_dict(job.score_breakdown),
+        "explanation": "Calculated based on general catalog scoring criteria.",
+        "matching_skills": [],
+        "missing_skills": [],
+        "evaluated_at": job.discovery_date,
+    }
 
 
 @router.post("/{job_id}/shortlist")

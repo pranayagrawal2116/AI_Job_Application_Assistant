@@ -138,19 +138,54 @@ class ProfileUpdater:
             "linkedin_url": existing_inputs.get("linkedin_url") or resume.linkedin_url or "",
         }
 
+        # Personal info
+        personal_dict = {
+            "full_name": resume.full_name or "",
+            "email": resume.email or "",
+            "phone": resume.phone or "",
+            "location": resume.location or "",
+            "headline": resume.professional_headline or "",
+            "github": candidate_inputs["github_url"],
+            "linkedin": candidate_inputs["linkedin_url"],
+            "portfolio": resume.portfolio_url or "",
+            "websites": resume.websites,
+            "summary": resume.about_me,
+        }
+
+        # Dynamic Career Role & Search Preference Inference (Zero Hardcoded Universal Roles)
+        from src.preparer.career_role_inferencer import CareerRoleInferencer
+        inferencer = CareerRoleInferencer()
+        inferred_roles = inferencer.infer_roles(resume)
+        inferred_locations = inferencer.infer_locations(resume)
+
+        # Preserve existing user-configured search preferences if present
+        existing_prefs = {}
+        if self.profile_path.exists():
+            try:
+                with open(self.profile_path, "r", encoding="utf-8") as pf:
+                    existing_data = json.load(pf)
+                    existing_prefs = existing_data.get("search_preferences", {}) or existing_data.get("preferences", {})
+            except Exception:
+                pass
+
+        saved_roles = existing_prefs.get("target_roles")
+        saved_locs = existing_prefs.get("target_locations")
+        auto_disc = existing_prefs.get("auto_discover_enabled", True)
+
+        target_roles = saved_roles if saved_roles and isinstance(saved_roles, list) and len(saved_roles) > 0 else [r.role_title for r in inferred_roles[:5]]
+        target_locations = saved_locs if saved_locs and isinstance(saved_locs, list) and len(saved_locs) > 0 else inferred_locations
+
+        search_preferences = {
+            "target_roles": target_roles,
+            "suggested_roles": [r.to_dict() for r in inferred_roles],
+            "target_locations": target_locations,
+            "auto_discover_enabled": bool(auto_disc),
+            "experience_level": existing_prefs.get("experience_level") or ("Student / Fresher" if inferencer._is_student_or_fresher(resume.to_dict()) else "Professional"),
+        }
+
         profile_data = {
-            "personal": {
-                "full_name": resume.full_name or "",
-                "email": resume.email or "",
-                "phone": resume.phone or "",
-                "location": resume.location or "",
-                "headline": resume.professional_headline or "",
-                "github": candidate_inputs["github_url"],
-                "linkedin": candidate_inputs["linkedin_url"],
-                "portfolio": resume.portfolio_url or "",
-                "websites": resume.websites,
-                "summary": resume.about_me,
-            },
+            "personal": personal_dict,
+            "personal_info": copy.deepcopy(personal_dict),  # Compatibility mapping for frontend
             "education": edu_list,
             "work_experience": exp_list,
             "technical_skills": {
@@ -167,20 +202,8 @@ class ProfileUpdater:
             "projects": proj_list,
             "certifications": cert_list,
             "candidate_inputs": candidate_inputs,
-            "preferences": {
-                "target_roles": [
-                    "AI Intern",
-                    "Machine Learning Intern",
-                    "Data Science Intern",
-                    "Python Developer Intern",
-                    "Deep Learning Intern",
-                    "Generative AI Intern",
-                    "NLP Intern",
-                    "Computer Vision Intern",
-                ],
-                "target_locations": ["India", "Remote", "Work from Home", "Pune", "Bengaluru"],
-                "experience_level": "Student / Fresher",
-            },
+            "preferences": search_preferences,
+            "search_preferences": search_preferences,
             "languages": resume.languages,
             "areas_of_interest": resume.areas_of_interest,
             "core_strengths": resume.core_strengths,
@@ -454,6 +477,14 @@ class ProfileUpdater:
         for aux in ["languages", "awards", "publications", "custom_sections"]:
             if new_prof.get(aux):
                 updated[aux] = new_prof[aux]
+
+        # Always maintain personal_info synchronization for frontend
+        if "personal" in updated:
+            updated["personal_info"] = copy.deepcopy(updated["personal"])
+        if "preferences" not in updated or not updated["preferences"]:
+            updated["preferences"] = new_prof.get("preferences", {})
+        if "search_preferences" not in updated or not updated["search_preferences"]:
+            updated["search_preferences"] = new_prof.get("search_preferences", {})
 
         # Update metadata
         updated["resume_metadata"] = new_prof["resume_metadata"]

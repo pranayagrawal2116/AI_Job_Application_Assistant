@@ -804,9 +804,9 @@ class JobRequirementNormalizer:
         reqs.company_name = j_dict.get("company_name", "")
         reqs.industry = j_dict.get("industry") or j_dict.get("department") or ""
         reqs.location = j_dict.get("location")
-        reqs.work_arrangement = j_dict.get("work_arrangement", "Unknown")
+        reqs.work_arrangement = j_dict.get("work_arrangement") or "Unknown"
         reqs.is_remote = bool(
-            reqs.work_arrangement.lower() in ("remote", "work from home")
+            (reqs.work_arrangement and reqs.work_arrangement.lower() in ("remote", "work from home"))
             or (reqs.location and "remote" in reqs.location.lower())
         )
         reqs.is_internship = bool(

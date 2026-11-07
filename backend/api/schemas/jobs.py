@@ -36,6 +36,10 @@ class JobItemResponse(BaseModel):
     internship_duration: Optional[str] = None
     is_shortlisted: bool = False
     source: str = "catalog"
+    matching_skills: List[str] = []
+    missing_skills: List[str] = []
+    match_explanation: Optional[str] = None
+    score_breakdown: Optional[Dict[str, Any]] = None
 
 
 class JobDescriptionResponse(BaseModel):

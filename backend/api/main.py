@@ -13,6 +13,7 @@ from backend.api.routers import (
     applications,
     auth,
     dashboard,
+    discovery,
     jobs,
     matching,
     profile,
@@ -66,6 +67,7 @@ app.add_middleware(
 # Include Routers
 app.include_router(auth.router)
 app.include_router(dashboard.router)
+app.include_router(discovery.router)
 app.include_router(profile.router)
 app.include_router(jobs.router)
 app.include_router(matching.router)
