@@ -53,7 +53,7 @@ def render_settings():
         st.markdown("### 🔄 Restore Database from Backup")
         st.warning("Restoring will replace current database tables with the backup snapshot.")
 
-        backup_dir = Path("data/storage/backups")
+        backup_dir = getattr(service.db, "backup_dir", Path("data/storage/backups"))
         available_backups = []
         if backup_dir.exists():
             available_backups = sorted(list(backup_dir.glob("*.db")), reverse=True)

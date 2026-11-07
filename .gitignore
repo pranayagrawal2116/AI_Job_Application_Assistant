@@ -47,6 +47,8 @@ data/users/*
 # Database Backups & Snapshots
 data/backups/*
 !data/backups/README.md
+data/storage/backups/*
+!data/storage/backups/README.md
 *.bak
 *.backup
 

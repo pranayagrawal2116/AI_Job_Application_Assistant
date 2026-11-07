@@ -1,0 +1,38 @@
+# Streamlit Production Configuration for Universal AI Job Application Assistant
+# Architecture: v2.1.1
+# Windows Server 2016 + IIS 10 Reverse-Proxy Ready
+
+[server]
+# Run in non-interactive server mode without launching local browser
+headless = true
+
+# Bind strictly to local loopback interface for security behind IIS reverse proxy
+address = "127.0.0.1"
+
+# Standard internal listening port (proxied via IIS 10 ARR)
+port = 8501
+
+# Enforce browser security protections across reverse-proxy boundaries
+enableCORS = true
+enableXsrfProtection = true
+
+# Upload ceiling in megabytes for multi-page PDF/DOCX resumes and documents
+maxUploadSize = 25
+
+# Graceful timeout for static assets and WebSocket requests
+enableWebsocketCompression = true
+
+[browser]
+# Disable telemetry and usage statistics reporting
+gatherUsageStats = false
+
+[client]
+# Minimal toolbar display for clean professional dashboard UX
+toolbarMode = "minimal"
+
+[theme]
+primaryColor = "#2563EB"
+backgroundColor = "#FFFFFF"
+secondaryBackgroundColor = "#F8FAFC"
+textColor = "#0F172A"
+font = "sans serif"

@@ -42,7 +42,12 @@ logger = setup_logger("FileSecurity")
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_UNCOMPRESSED_DOCX_BYTES = 50 * 1024 * 1024  # 50 MB zip decompression ceiling
 MAX_CONFIRMATION_IMAGE_PIXELS = 25_000_000  # 25 megapixels safe decompression ceiling
-DEFAULT_USER_STORAGE_BASE = Path(__file__).resolve().parent.parent.parent / "data" / "users"
+_env_user_storage = os.environ.get("USER_STORAGE_BASE") or os.environ.get("USER_DATA_DIR")
+DEFAULT_USER_STORAGE_BASE = (
+    Path(_env_user_storage).resolve()
+    if _env_user_storage
+    else (Path(__file__).resolve().parent.parent.parent / "data" / "users")
+)
 
 PDF_MAGIC = b"%PDF-"
 DOCX_MAGIC = b"PK\x03\x04"

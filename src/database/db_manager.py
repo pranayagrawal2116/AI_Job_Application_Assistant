@@ -69,8 +69,24 @@ from src.utils.logger import setup_logger
 logger = setup_logger("DatabaseManager")
 
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "job_assistant.db"
-DEFAULT_EXPORTS_DIR = Path(__file__).resolve().parent.parent.parent / "data" / "exports"
+_env_db_path = os.environ.get("DATABASE_PATH") or os.environ.get("SQLITE_DB_PATH")
+DEFAULT_DB_PATH = (
+    Path(_env_db_path).resolve()
+    if _env_db_path
+    else (Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "job_assistant.db")
+)
+_env_exports_dir = os.environ.get("EXPORTS_DIR")
+DEFAULT_EXPORTS_DIR = (
+    Path(_env_exports_dir).resolve()
+    if _env_exports_dir
+    else (Path(__file__).resolve().parent.parent.parent / "data" / "exports")
+)
+_env_backup_dir = os.environ.get("BACKUP_DIR")
+DEFAULT_BACKUP_DIR = (
+    Path(_env_backup_dir).resolve()
+    if _env_backup_dir
+    else (Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "backups")
+)
 
 
 ALLOWED_TRANSITIONS: Dict[str, List[str]] = {
@@ -211,6 +227,8 @@ class DatabaseManager:
     ):
         self.db_path = str(db_path)
         self.schema_path = Path(schema_path)
+        self.exports_dir = Path(DEFAULT_EXPORTS_DIR)
+        self.backup_dir = Path(DEFAULT_BACKUP_DIR)
         self._service_authenticator: Optional[Any] = None
         if service_authenticator is not None:
             self.set_service_authenticator(service_authenticator)
@@ -225,9 +243,11 @@ class DatabaseManager:
                 session_manager.register_db_manager(self)
         self._session_manager = session_manager
 
-        # Ensure parent directory exists for file-based DB
+        # Ensure parent directory exists for file-based DB and exports/backups
         if self.db_path != ":memory:":
             Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            self.exports_dir.mkdir(parents=True, exist_ok=True)
 
         self._init_db()
 
@@ -3147,9 +3167,9 @@ class DatabaseManager:
     ) -> Path:
         """Exports jobs, companies, and application statuses to a clean CSV file."""
         if output_path is None:
-            DEFAULT_EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+            self.exports_dir.mkdir(parents=True, exist_ok=True)
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_path = DEFAULT_EXPORTS_DIR / f"applications_export_{timestamp}.csv"
+            output_path = self.exports_dir / f"applications_export_{timestamp}.csv"
         else:
             output_path = Path(output_path)
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -3202,7 +3222,8 @@ class DatabaseManager:
 
         if backup_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = Path(self.db_path).parent / f"backup_job_assistant_{timestamp}.db"
+            self.backup_dir.mkdir(parents=True, exist_ok=True)
+            backup_path = self.backup_dir / f"backup_job_assistant_{timestamp}.db"
         else:
             backup_path = Path(backup_path)
             backup_path.parent.mkdir(parents=True, exist_ok=True)
@@ -5263,7 +5284,7 @@ class DatabaseManager:
             else:
                 base_dir = user_base_dir / str(user_id) / "resumes"
         else:
-            base_dir = Path("data/users") / str(user_id) / "resumes"
+            base_dir = validator.get_user_resumes_dir(user_id)
         dest_path = base_dir / storage_filename
         validator.save_file(file_bytes, dest_path, user_id=user_id)
 
@@ -5375,7 +5396,7 @@ class DatabaseManager:
             next_version = (max_row["max_v"] or 1) + 1
 
         storage_filename = validator.generate_storage_filename(original_filename)
-        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        base_dir = user_base_dir or validator.get_user_resumes_dir(user_id)
         dest_path = base_dir / storage_filename
         validator.save_file(file_bytes, dest_path, user_id=user_id)
 
@@ -5515,7 +5536,20 @@ class DatabaseManager:
             else:
                 storage_filename = row["storage_filename"]
 
-        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        validator = FileSecurityValidator()
+        if user_base_dir:
+            base_dir = user_base_dir
+        elif hasattr(self, "db_path") and self.db_path and self.db_path != ":memory:":
+            cand_users = Path(self.db_path).parent / "users"
+            cand_users_parent = Path(self.db_path).parent.parent / "users"
+            if (cand_users / str(user_id) / "resumes").is_dir():
+                base_dir = cand_users / str(user_id) / "resumes"
+            elif (cand_users_parent / str(user_id) / "resumes").is_dir():
+                base_dir = cand_users_parent / str(user_id) / "resumes"
+            else:
+                base_dir = validator.get_user_resumes_dir(user_id)
+        else:
+            base_dir = validator.get_user_resumes_dir(user_id)
         target_path = base_dir / storage_filename
         FileSecurityValidator.validate_path_containment(target_path, base_dir)
 
@@ -6414,7 +6448,21 @@ class DatabaseManager:
 
             was_primary = bool(row["is_primary"])
 
-        base_dir = user_base_dir or (Path("data/users") / str(user_id) / "resumes")
+        from src.security.file_security import FileSecurityValidator
+        validator = FileSecurityValidator()
+        if user_base_dir:
+            base_dir = user_base_dir
+        elif hasattr(self, "db_path") and self.db_path and self.db_path != ":memory:":
+            cand_users = Path(self.db_path).parent / "users"
+            cand_users_parent = Path(self.db_path).parent.parent / "users"
+            if (cand_users / str(user_id) / "resumes").is_dir():
+                base_dir = cand_users / str(user_id) / "resumes"
+            elif (cand_users_parent / str(user_id) / "resumes").is_dir():
+                base_dir = cand_users_parent / str(user_id) / "resumes"
+            else:
+                base_dir = validator.get_user_resumes_dir(user_id)
+        else:
+            base_dir = validator.get_user_resumes_dir(user_id)
 
         if linked_packets > 0 or linked_matches > 0:
             # Soft-delete / Archive resume to protect historical prepared packets, match records and audit integrity

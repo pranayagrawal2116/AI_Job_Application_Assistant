@@ -317,7 +317,7 @@ class DashboardService:
 
     def export_jobs_to_csv(self, file_path: Optional[str] = None, job_ids: Optional[List[int]] = None) -> Path:
         """Exports jobs to CSV, optionally filtered by job_ids."""
-        target_path = file_path or f"data/exports/jobs_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        target_path = file_path or str(self.db.exports_dir / f"jobs_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
         if job_ids:
             df = self.get_all_jobs_df()
             if not df.empty:
@@ -395,10 +395,13 @@ class DashboardService:
             parsed_res = parser.parse_bytes(file_bytes, fmt)
             res_text = parsed_res.raw_text if hasattr(parsed_res, "raw_text") and parsed_res.raw_text else ""
             if not res_text:
+                summary_val = getattr(parsed_res, "summary", "") or ""
+                skills_val = getattr(parsed_res, "skills", []) or []
+                exp_val = getattr(parsed_res, "work_experience", []) or []
                 res_text = " ".join([
-                    parsed_res.summary or "",
-                    " ".join(parsed_res.skills or []),
-                    " ".join(exp.get("description", "") for exp in (parsed_res.work_experience or [])),
+                    summary_val,
+                    " ".join(skills_val) if isinstance(skills_val, list) else str(skills_val),
+                    " ".join(exp.get("description", "") for exp in exp_val if isinstance(exp, dict)),
                 ])
 
             # 3. Scan freshly extracted text
@@ -813,6 +816,49 @@ class DashboardService:
             )
 
         return sess
+
+    @property
+    def auth_manager(self) -> Any:
+        """Lazily instantiates the AuthManager bound to the active DatabaseManager."""
+        if not hasattr(self, "_auth_manager") or self._auth_manager is None:
+            from src.security.auth import AuthManager
+            self._auth_manager = AuthManager(db_manager=self.db)
+        return self._auth_manager
+
+    def register_candidate(
+        self,
+        email: str,
+        password: str,
+        full_name: str,
+        profession_industry: Optional[str] = None,
+        career_level: Optional[str] = None,
+    ) -> Any:
+        """Registers a new candidate with Argon2id password hashing and audit logging."""
+        return self.auth_manager.register(
+            email=email,
+            password=password,
+            full_name=full_name,
+            profession_industry=profession_industry,
+            career_level=career_level,
+        )
+
+    def login_candidate(
+        self,
+        email: str,
+        password: str,
+        client_ip: Optional[str] = None,
+    ) -> Tuple[Any, Any]:
+        """Authenticates candidate with Argon2id and issues a secure server-side session."""
+        user = self.auth_manager.login(email, password, client_ip=client_ip)
+        from src.security.session_manager import SessionManager
+        session_mgr = SessionManager.get_instance()
+        sess = session_mgr.authenticate_candidate(
+            candidate_id=f"user_{user.id}",
+            candidate_name=user.full_name,
+            user_id=user.id,
+            email=user.email,
+        )
+        return user, sess
 
     def logout_candidate(self, session_id: str) -> bool:
         """Logs out candidate by explicitly revoking active session and purging active grants."""
@@ -3489,35 +3535,7 @@ class DashboardService:
             UniversalDocumentGenerator,
         )
         generator = UniversalDocumentGenerator()
-        app_dir = Path(f"data/users/{user_id}/applications/{application_id}")
-        app_dir.mkdir(parents=True, exist_ok=True)
-        selected_template = template or DocumentTemplate.MODERN
-
-        docs: Dict[str, Any] = {}
-        # 1. Resume PDF & DOCX
-        docs["resume_pdf"] = generator.generate_resume_pdf(resume, app_dir, selected_template)
-        docs["resume_docx"] = generator.generate_resume_docx(resume, app_dir, selected_template)
-
-        # 2. Cover Letter PDF & DOCX
-        docs["cover_letter_pdf"] = generator.generate_cover_letter_pdf(cover_letter, app_dir, selected_template)
-        docs["cover_letter_docx"] = generator.generate_cover_letter_docx(cover_letter, app_dir, selected_template)
-
-        # 3. Screening QA PDF & DOCX
-        docs["screening_qa_pdf"] = generator.generate_screening_qa_pdf(qa_packet, app_dir)
-        docs["screening_qa_docx"] = generator.generate_screening_qa_docx(qa_packet, app_dir)
-
-        # 4. Consolidated Application Packet PDF & DOCX
-        docs["packet_pdf"] = generator.generate_application_packet_pdf(resume, cover_letter, qa_packet, app_dir, selected_template)
-        docs["packet_docx"] = generator.generate_application_packet_docx(resume, cover_letter, qa_packet, app_dir, selected_template)
-
-        return docs
-
-        from src.preparer.document_generator import (
-            DocumentTemplate,
-            UniversalDocumentGenerator,
-        )
-        generator = UniversalDocumentGenerator()
-        app_dir = Path(f"data/users/{user_id}/applications/{application_id}")
+        app_dir = self.file_validator.get_candidate_storage_root(user_id) / "applications" / str(application_id)
         app_dir.mkdir(parents=True, exist_ok=True)
         selected_template = template or DocumentTemplate.MODERN
 
@@ -3646,4 +3664,25 @@ class DashboardService:
     def list_application_packets(self, application_id: int, user_id: int):
         """Lists historical revisions of prepared packets for an application."""
         return self.db.list_prepared_packets(application_id=application_id, user_id=user_id)
+
+    def confirm_universal_manual_submission(
+        self,
+        application_id: int,
+        approver_name: str,
+        session_id: str,
+        submission_ticket: str,
+        packet_version_hash: str,
+        submission_notes: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Records confirmed manual application submission by candidate."""
+        from src.preparer.approval_gate import HumanApprovalGate
+        gate = HumanApprovalGate(db_manager=self.db)
+        return gate.record_manual_submission(
+            application_id=application_id,
+            approver_name=approver_name,
+            session_id=session_id,
+            submission_ticket=submission_ticket,
+            packet_version_hash=packet_version_hash,
+            submission_notes=submission_notes,
+        )
 

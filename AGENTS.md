@@ -1036,6 +1036,25 @@ When interacting with the browser via Playwright MCP:
     - 0 pyflakes errors, 0 ruff errors across `dashboard/`, `src/`, and `tests/`.
     - Published comprehensive implementation report in `docs/PHASE_9_1_2_14_IMPLEMENTATION_REPORT.md`.
 
+- [x] **Release Milestone: AI Job Application Assistant MVP Completion & Windows Server 2016 + IIS 10 Deployment Package** (Complete)
+  - Full End-to-End User Journey & Functional UI:
+    - Dedicated authentication interface in `dashboard/views/auth_view.py` with Sign In and Registration tabs using Argon2id password hashing.
+    - Server-side session management via `SessionManager` and sidebar candidate identity card with secure sign out.
+    - Candidate profile isolation ensuring newly created accounts start with empty profiles and zero leakage across candidates.
+    - PDF/DOCX resume uploading, parsing, candidate profile synchronizing, job text pasting and file upload, deduplication, 100-point job matching with 3-state eligibility, tailored resume & cover letter generation, screening question drafting, ATS export, strict human-in-the-loop review packet approval gate, and application status tracking.
+  - Windows Server 2016 + IIS 10 Production Deployment:
+    - Production Streamlit configuration in `.streamlit/config.toml` (headless, localhost binding, CORS/XSRF protection enabled).
+    - IIS 10 ARR reverse proxy and WebSocket streaming configuration in `deploy/iis/web.config`.
+    - Automated NSSM Windows Service installer (`deploy/windows/service_install.ps1`) and uninstaller (`deploy/windows/service_uninstall.ps1`).
+    - Interactive pre-deployment testing launcher (`deploy/windows/run_app.ps1`).
+    - Automated online SQLite database backup script for Windows Task Scheduler (`deploy/windows/backup_database.ps1`) with 30-day retention cleanup.
+    - Complete enterprise deployment runbook and architecture guide in `docs/DEPLOYMENT_WINDOWS_SERVER_2016_IIS.md`.
+    - Production environment variable template in `.env.production.example`.
+  - Comprehensive Verification & Acceptance Suite:
+    - Authored 5 dedicated acceptance tests in `tests/test_mvp_acceptance_workflow.py` validating the entire 17-step user journey, DOCX resume handling, JD deduplication, ineligible candidate disqualification, and storage auto-initialization.
+    - Verified all acceptance and regression test suites pass with 100% pass rate.
+    - 0 pyflakes errors, 0 ruff errors.
+
 ---
 
 ## 7. Approval Requirement

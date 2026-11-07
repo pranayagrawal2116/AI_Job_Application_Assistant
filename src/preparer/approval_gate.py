@@ -126,8 +126,11 @@ class HumanApprovalGate:
         base_dir = None
         if hasattr(self.db, "db_path") and self.db.db_path and self.db.db_path != ":memory:":
             cand_users = Path(self.db.db_path).parent / "users"
+            cand_users_parent = Path(self.db.db_path).parent.parent / "users"
             if cand_users.is_dir():
                 base_dir = cand_users
+            elif cand_users_parent.is_dir():
+                base_dir = cand_users_parent
         return FileSecurityValidator(base_storage_dir=base_dir)
 
     @file_validator.setter

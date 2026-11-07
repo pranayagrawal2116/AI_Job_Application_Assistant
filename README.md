@@ -166,6 +166,15 @@ python tests/test_playwright_mcp.py
 streamlit run dashboard/app.py
 ```
 
+### 4. Windows Server 2016 + IIS 10 Deployment
+For hosting in enterprise Windows environments:
+- Comprehensive step-by-step documentation: [`docs/DEPLOYMENT_WINDOWS_SERVER_2016_IIS.md`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/docs/DEPLOYMENT_WINDOWS_SERVER_2016_IIS.md)
+- Production Streamlit configuration: [`.streamlit/config.toml`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/.streamlit/config.toml)
+- IIS 10 Application Request Routing & WebSocket rules: [`deploy/iis/web.config`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/deploy/iis/web.config)
+- Windows Service installer / uninstaller (NSSM): [`deploy/windows/service_install.ps1`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/deploy/windows/service_install.ps1) & [`deploy/windows/service_uninstall.ps1`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/deploy/windows/service_uninstall.ps1)
+- Automated database backups: [`deploy/windows/backup_database.ps1`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/deploy/windows/backup_database.ps1)
+- Production environment template: [`.env.production.example`](file:///Users/pranay/Documents/AI_Job_Application_Assistant/.env.production.example)
+
 ---
 
 ## 🗺️ Roadmap
@@ -177,4 +186,8 @@ streamlit run dashboard/app.py
 - [x] **Phase 5:** Modular job discovery adapters (LinkedIn, Internshala, Indeed, Naukri, Company Careers ATS feeds) with anti-automation defense handling, automated deduplication, real-time matching, and SQLite persistence.
 - [x] **Phase 6:** Full Streamlit interactive dashboard with 8 dedicated views (Overview, Explore Jobs, Shortlisted Jobs, Application Tracker, Job Matching Analytics, Discovery Management, Candidate Profile, Settings), real-time SQLite metrics, interactive Plotly visualizations, skill gap analysis, state machine lifecycle management, human approval safeguards, live atomic database backup, and CSV export.
 - [x] **Phase 7:** End-to-end Application Preparation Engine: zero-hallucination PDF/DOCX resume parsing, candidate profile synchronizer with immutable SQLite snapshots, resume-job alignment, personalized cover letter generator, screening question answer drafter with `NEEDS CANDIDATE INPUT` tagging, Playwright form pre-filling payload planner, and strict human-in-the-loop review packet & approval gate.
+- [x] **Release Milestone: AI Job Application Assistant MVP Completion & Windows Server 2016 + IIS 10 Deployment Package**
+  - Full end-to-end user workflow: registration, login, profile management, resume upload, JD ingestion, matching, document tailoring, packet review & approval gate, and manual application tracking.
+  - Multi-tenant candidate isolation: Argon2id password hashing, SessionManager server-side session tokens, per-user resume/profile/packet sandboxing, zero profile leakage.
+  - Production Windows deployment: NSSM Windows service wrapper, IIS 10 reverse proxy with WebSocket stream rewriting, online SQLite hot-backup scheduled tasks, and configurable directory overrides (`DATABASE_PATH`, `USER_STORAGE_BASE`, `EXPORTS_DIR`, `BACKUP_DIR`).
 
