@@ -3457,7 +3457,7 @@ class DatabaseManager:
         """Alias for record_principal_revocation."""
         self.record_principal_revocation(principal_id, reason=reason)
 
-    def is_principal_revoked(self, principal_id: str) -> bool:
+    def is_principal_revoked(self, principal_id: str, cursor: Optional[sqlite3.Cursor] = None) -> bool:
         """Checks if an attesting principal has been revoked in SQLite."""
         if not principal_id or not isinstance(principal_id, str):
             return True
@@ -3465,10 +3465,13 @@ class DatabaseManager:
         if not clean_p:
             return True
         try:
-            with self.connection() as conn:
-                cursor = conn.cursor()
+            if cursor is not None:
                 cursor.execute("SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?", (clean_p,))
                 return cursor.fetchone() is not None
+            with self.connection() as conn:
+                cur = conn.cursor()
+                cur.execute("SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?", (clean_p,))
+                return cur.fetchone() is not None
         except Exception as e:
             raise SecurityAuthorizationError(f"Database revocation query failure checking revoked principal '{clean_p}': {e}") from e
 
@@ -6108,13 +6111,8 @@ class DatabaseManager:
                 f"Invalid attesting_principal type '{type(attesting_principal).__name__}'."
             )
 
-        # Trust store authorization check
+        # Trust store instance resolution
         trust_store = kwargs.get("trust_store") or get_default_evidence_trust_store()
-        if trust_store is not None:
-            if not trust_store.is_attesting_principal_trusted(clean_p_id):
-                raise SecurityAuthorizationError(
-                    f"Attesting principal '{clean_p_id}' is not authorized in trust store or has been revoked."
-                )
 
         sql = """
             INSERT INTO legacy_evidence_attestations (
@@ -6200,7 +6198,14 @@ class DatabaseManager:
                             f"Database revocation query failure for key '{clean_key}': {e}"
                         ) from e
 
-            # 3. Insert attestation on write cursor
+            # 3. Atomic trust store authorization check directly on write cursor
+            if trust_store is not None:
+                if not trust_store.is_attesting_principal_trusted(clean_p_id, cursor=cur):
+                    raise SecurityAuthorizationError(
+                        f"Attesting principal '{clean_p_id}' is not authorized in trust store or has been revoked."
+                    )
+
+            # 4. Insert attestation on write cursor
             cur.execute(sql, params)
             return cur.lastrowid
 
@@ -6228,7 +6233,8 @@ class DatabaseManager:
                 raise SecurityAuthorizationError(f"Invalid cursor: connection is closed or in invalid state: {conn_err}") from conn_err
             return _execute_atomic_attestation(cursor)
         else:
-            with self.immediate_transaction() as conn:
+            timeout = kwargs.get("timeout")
+            with self.immediate_transaction(timeout=timeout) as conn:
                 cur = conn.cursor()
                 return _execute_atomic_attestation(cur)
 

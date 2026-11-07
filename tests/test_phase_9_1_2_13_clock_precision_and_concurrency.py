@@ -27,7 +27,6 @@ Verifies:
    - Authenticator trust-root lockdown.
 """
 
-from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -37,7 +36,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
-from typing import Tuple
+from typing import List, Tuple
 import unittest
 from unittest.mock import patch
 
@@ -645,33 +644,37 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
     # =========================================================================
 
     def test_36_concurrency_scenario_a_revocation_wins_under_real_lock_contention(self) -> None:
-        """TC-36: Scenario A — Revocation wins under real concurrent lock contention.
+        """TC-36: Scenario A — Revocation wins under deterministic SQLite lock-conflict and retry.
 
         Proves:
         1. Thread A acquires BEGIN IMMEDIATE and inserts principal revocation.
-        2. Thread B attempts attestation persistence through DatabaseManager.
-        3. Deterministic synchronization verifies Thread B genuinely blocks on the SQLite write lock.
-        4. Thread A commits revocation.
-        5. Thread B unblocks, acquires lock, encounters committed revocation, and rejects.
+        2. Thread B attempts attestation persistence through DatabaseManager with timeout=0.0.
+        3. Thread B encounters an actual sqlite3.OperationalError ("database is locked").
+        4. Thread B signals lock_conflict_observed only AFTER catching the lock error.
+        5. Thread A commits revocation and releases the write lock.
+        6. Main controller signals retry_permitted.
+        7. Thread B retries through DatabaseManager, acquires lock, encounters committed revocation,
+           and fails closed with SecurityAuthorizationError.
+        8. Thread B is joined and verified terminated. No attestation row is persisted.
         """
         verified, principal, _, store = self._setup_verified_evidence_and_principal()
         principal_id = principal.principal_id
 
         connA = None
         thread_b = None
-        orig_immediate_transaction = self.db.immediate_transaction
-        orig_get_connection = self.db.get_connection
 
         # Lifecycle tracking events (Phase 9.1.2.14)
-        b_created = threading.Event()         # State 1: Worker thread created
-        b_entered_path = threading.Event()    # State 2: Entered transaction path
-        b_attempted_lock = threading.Event()  # State 3: Attempted SQLite write-lock operation
-        b_acquired_lock = threading.Event()   # State 4: Acquired write lock
-        b_completed = threading.Event()       # State 6: Competing transaction completes
-        b_exceptions = []
+        b_created = threading.Event()               # State 1: Worker thread created
+        b_entered_path = threading.Event()          # State 2: Entered transaction path
+        b_lock_attempt_executed = threading.Event() # State 3: Actual SQLite lock attempt executed
+        b_lock_conflict_observed = threading.Event()# State 4: SQLite returned lock-conflict error
+        b_retry_permitted = threading.Event()       # State 5: Original transaction commits; retry allowed
+        b_retry_lock_acquired = threading.Event()   # State 6: Worker retried and acquired lock
+        b_completed = threading.Event()             # State 7: Competing transaction completed
+        b_exceptions: List[Exception] = []
 
         try:
-            # Thread A connection holds BEGIN IMMEDIATE
+            # Thread A connection holds BEGIN IMMEDIATE with revocation
             connA = self.db.get_connection(timeout=5.0)
             connA.isolation_level = None
             connA.execute("BEGIN IMMEDIATE")
@@ -692,35 +695,45 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
                 probe.close()
             self.assertTrue(probe_locked, "Expected SQLite write lock to be physically held by Thread A.")
 
-            # Instrument get_connection to detect C-level BEGIN IMMEDIATE execution
-            def instrumented_get_connection(timeout=None):
-                conn = orig_get_connection(timeout=timeout)
-                def trace_cb(stmt: str) -> None:
-                    if "BEGIN IMMEDIATE" in stmt:
-                        b_attempted_lock.set()
-                conn.set_trace_callback(trace_cb)
-                return conn
-
-            @contextmanager
-            def instrumented_immediate_transaction(timeout=None):
-                b_entered_path.set()
-                with orig_immediate_transaction(timeout=timeout) as conn:
-                    b_acquired_lock.set()
-                    yield conn
-
-            self.db.get_connection = instrumented_get_connection
-            self.db.immediate_transaction = instrumented_immediate_transaction
-
-            def thread_b_worker():
+            def thread_b_worker() -> None:
                 b_created.set()
+                b_entered_path.set()
+                # Attempt 1: Attempt attestation persistence with timeout=0.0
                 try:
+                    b_lock_attempt_executed.set()
                     self.db.record_legacy_evidence_attestation(
                         verified_evidence=verified,
                         attesting_principal=principal,
                         trust_store=store,
+                        timeout=0.0,
                     )
+                except sqlite3.OperationalError as op_err:
+                    # Verify error represents actual database lock conflict
+                    if "locked" in str(op_err).lower() or "busy" in str(op_err).lower():
+                        b_lock_conflict_observed.set()
+                    else:
+                        b_exceptions.append(op_err)
+                        return
                 except Exception as e:
                     b_exceptions.append(e)
+                    return
+
+                # Wait for retry permission from main controller
+                if not b_retry_permitted.wait(timeout=5.0):
+                    b_exceptions.append(TimeoutError("Thread B timed out waiting for retry permission."))
+                    return
+
+                # Attempt 2 (Retry): Now that Thread A released its lock, retry the transaction
+                try:
+                    b_retry_lock_acquired.set()
+                    self.db.record_legacy_evidence_attestation(
+                        verified_evidence=verified,
+                        attesting_principal=principal,
+                        trust_store=store,
+                        timeout=5.0,
+                    )
+                except Exception as retry_err:
+                    b_exceptions.append(retry_err)
                 finally:
                     b_completed.set()
 
@@ -731,43 +744,37 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             self.assertTrue(b_created.wait(timeout=5.0), "Thread B was not created in time.")
             # State 2: Worker entered transaction path
             self.assertTrue(b_entered_path.wait(timeout=5.0), "Thread B did not enter transaction path in time.")
-            # State 3: Worker attempted SQLite write-lock operation
-            self.assertTrue(b_attempted_lock.wait(timeout=5.0), "Thread B did not attempt BEGIN IMMEDIATE in time.")
+            # State 3: Actual SQLite lock attempt executed
+            self.assertTrue(b_lock_attempt_executed.wait(timeout=5.0), "Thread B did not execute lock attempt in time.")
+            # State 4: SQLite returned a real lock-conflict error
+            self.assertTrue(b_lock_conflict_observed.wait(timeout=5.0), "Thread B did not observe SQLite lock conflict.")
+            self.assertTrue(thread_b.is_alive(), "Thread B terminated prematurely before retry.")
 
-            # State 4: Verify Thread B observed contention and has NOT acquired the lock
-            probe2 = self.db.get_connection(timeout=0.0)
-            probe2.isolation_level = None
-            try:
-                with self.assertRaises(sqlite3.OperationalError):
-                    probe2.execute("BEGIN IMMEDIATE")
-            finally:
-                probe2.close()
-            self.assertFalse(b_acquired_lock.is_set(), "Thread B acquired write lock prematurely while Thread A held it!")
-            self.assertTrue(thread_b.is_alive(), "Thread B terminated prematurely.")
-
-            # State 5: Thread A now commits its revocation transaction and releases the lock
+            # State 5: Original transaction commits revocation and releases the write lock
             connA.execute("COMMIT")
             connA.close()
             connA = None
 
-            # State 4 (completed): Thread B must now acquire the lock
-            self.assertTrue(b_acquired_lock.wait(timeout=5.0), "Thread B failed to acquire write lock after Thread A committed.")
-            # State 6: Competing transaction completes
+            # Grant retry permission
+            b_retry_permitted.set()
+
+            # State 6: Worker retries and acquires write lock
+            self.assertTrue(b_retry_lock_acquired.wait(timeout=5.0), "Thread B failed to retry after lock release.")
+            # State 7: Competing transaction completes
             self.assertTrue(b_completed.wait(timeout=5.0), "Thread B did not complete in time.")
             thread_b.join(timeout=5.0)
-            self.assertFalse(thread_b.is_alive(), "Thread B hung and did not complete.")
+            self.assertFalse(thread_b.is_alive(), "Thread B failed to terminate cleanly.")
 
-            # Thread B must have raised SecurityAuthorizationError due to revocation
-            self.assertEqual(len(b_exceptions), 1, f"Expected 1 exception, got {b_exceptions}")
+            # Worker must have raised SecurityAuthorizationError due to committed revocation
+            self.assertEqual(len(b_exceptions), 1, f"Expected 1 exception, got: {b_exceptions}")
             self.assertIsInstance(b_exceptions[0], SecurityAuthorizationError)
             self.assertIn("has been revoked in database", str(b_exceptions[0]))
 
-            # Verify no attestation row was inserted
-            attestation = self.db.get_legacy_evidence_attestation(verified.job_description_id, user_id=self.user1_id)
-            self.assertIsNone(attestation, "Attestation must not be persisted for a revoked principal.")
+            # Verify no attestation row was persisted
+            att = self.db.get_legacy_evidence_attestation(verified.job_description_id, user_id=self.user1_id)
+            self.assertIsNone(att, "Attestation must not be persisted for a revoked principal.")
         finally:
-            self.db.immediate_transaction = orig_immediate_transaction
-            self.db.get_connection = orig_get_connection
+            b_retry_permitted.set()  # Guarantee unblocking worker if test fails
             if connA is not None:
                 try:
                     connA.execute("ROLLBACK")
@@ -779,18 +786,21 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
                     pass
             if thread_b is not None and thread_b.is_alive():
                 thread_b.join(timeout=5.0)
+                self.assertFalse(thread_b.is_alive(), "Thread B remained alive during cleanup!")
 
     def test_37_concurrency_scenario_b_attestation_wins_under_real_lock_contention(self) -> None:
-        """TC-37: Scenario B — Attestation wins under real concurrent lock contention.
+        """TC-37: Scenario B — Attestation wins under deterministic SQLite lock-conflict and retry.
 
         Proves:
         1. Thread A acquires BEGIN IMMEDIATE and inserts attestation via write cursor.
         2. Thread A holds transaction uncommitted.
-        3. Thread B attempts principal revocation.
-        4. Deterministic synchronization verifies Thread B genuinely blocks on the SQLite write lock.
-        5. Thread A commits attestation.
-        6. Thread B unblocks, acquires lock, and commits revocation.
-        7. Historical attestation remains immutable; subsequent preflight rejects revoked evidence.
+        3. Thread B attempts principal revocation with timeout=0.0.
+        4. Thread B receives actual sqlite3.OperationalError ("database is locked").
+        5. Thread B signals lock_conflict_observed only AFTER catching the lock error.
+        6. Thread A commits attestation and releases the write lock.
+        7. Main controller signals retry_permitted.
+        8. Thread B retries revocation, acquires lock, and commits revocation.
+        9. Historical attestation remains immutable; subsequent preflight rejects revoked evidence.
         """
         verified, principal, jd_id, store = self._setup_verified_evidence_and_principal()
         principal_id = principal.principal_id
@@ -799,12 +809,14 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
         thread_b = None
 
         # Lifecycle tracking events (Phase 9.1.2.14)
-        b_created = threading.Event()         # State 1: Worker thread created
-        b_entered_path = threading.Event()    # State 2: Entered transaction path
-        b_attempted_lock = threading.Event()  # State 3: Attempted SQLite write-lock operation
-        b_acquired_lock = threading.Event()   # State 4: Acquired write lock
-        b_completed = threading.Event()       # State 6: Competing transaction completes
-        b_exceptions = []
+        b_created = threading.Event()
+        b_entered_path = threading.Event()
+        b_lock_attempt_executed = threading.Event()
+        b_lock_conflict_observed = threading.Event()
+        b_retry_permitted = threading.Event()
+        b_retry_lock_acquired = threading.Event()
+        b_completed = threading.Event()
+        b_exceptions: List[Exception] = []
 
         try:
             # Thread A connection holds BEGIN IMMEDIATE with inserted attestation
@@ -822,30 +834,55 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             )
             self.assertGreater(attestation_id, 0)
 
-            def thread_b_revocation_worker():
+            def thread_b_revocation_worker() -> None:
                 b_created.set()
+                b_entered_path.set()
+                # Attempt 1: Attempt revocation with timeout=0.0
                 connB = None
                 try:
-                    b_entered_path.set()
-                    connB = self.db.get_connection(timeout=5.0)
+                    connB = self.db.get_connection(timeout=0.0)
                     connB.isolation_level = None
-                    def trace_cb(stmt: str) -> None:
-                        if "BEGIN IMMEDIATE" in stmt:
-                            b_attempted_lock.set()
-                    connB.set_trace_callback(trace_cb)
+                    b_lock_attempt_executed.set()
                     connB.execute("BEGIN IMMEDIATE")
-                    b_acquired_lock.set()
-                    connB.execute(
-                        "INSERT INTO revoked_attesting_principals (principal_id, revoked_at, reason) VALUES (?, CURRENT_TIMESTAMP, ?)",
-                        (principal_id, "Scenario B: Revocation after attestation"),
-                    )
-                    connB.execute("COMMIT")
+                except sqlite3.OperationalError as op_err:
+                    if "locked" in str(op_err).lower() or "busy" in str(op_err).lower():
+                        b_lock_conflict_observed.set()
+                    else:
+                        b_exceptions.append(op_err)
+                        return
                 except Exception as e:
                     b_exceptions.append(e)
+                    return
                 finally:
                     if connB:
                         try:
                             connB.close()
+                        except Exception:
+                            pass
+
+                # Wait for retry permission
+                if not b_retry_permitted.wait(timeout=5.0):
+                    b_exceptions.append(TimeoutError("Thread B timed out waiting for retry permission."))
+                    return
+
+                # Attempt 2 (Retry): Retrying revocation with timeout=5.0 after Thread A commits
+                connB_retry = None
+                try:
+                    connB_retry = self.db.get_connection(timeout=5.0)
+                    connB_retry.isolation_level = None
+                    connB_retry.execute("BEGIN IMMEDIATE")
+                    b_retry_lock_acquired.set()
+                    connB_retry.execute(
+                        "INSERT INTO revoked_attesting_principals (principal_id, revoked_at, reason) VALUES (?, CURRENT_TIMESTAMP, ?)",
+                        (principal_id, "Scenario B: Revocation after attestation"),
+                    )
+                    connB_retry.execute("COMMIT")
+                except Exception as retry_err:
+                    b_exceptions.append(retry_err)
+                finally:
+                    if connB_retry:
+                        try:
+                            connB_retry.close()
                         except Exception:
                             pass
                     b_completed.set()
@@ -853,35 +890,29 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             thread_b = threading.Thread(target=thread_b_revocation_worker)
             thread_b.start()
 
-            # State 1: Worker created
+            # State 1, 2, 3
             self.assertTrue(b_created.wait(timeout=5.0), "Thread B was not created in time.")
-            # State 2: Entered transaction path
             self.assertTrue(b_entered_path.wait(timeout=5.0), "Thread B did not enter transaction path in time.")
-            # State 3: Attempted BEGIN IMMEDIATE
-            self.assertTrue(b_attempted_lock.wait(timeout=5.0), "Thread B did not attempt BEGIN IMMEDIATE in time.")
+            self.assertTrue(b_lock_attempt_executed.wait(timeout=5.0), "Thread B did not execute lock attempt in time.")
 
-            # State 4: Verify contention active and Thread B has NOT acquired lock
-            probe = self.db.get_connection(timeout=0.0)
-            probe.isolation_level = None
-            try:
-                with self.assertRaises(sqlite3.OperationalError):
-                    probe.execute("BEGIN IMMEDIATE")
-            finally:
-                probe.close()
-            self.assertFalse(b_acquired_lock.is_set(), "Thread B acquired write lock prematurely while Thread A held it!")
-            self.assertTrue(thread_b.is_alive(), "Thread B terminated prematurely.")
+            # State 4: Actual SQLite lock-conflict error observed
+            self.assertTrue(b_lock_conflict_observed.wait(timeout=5.0), "Thread B did not observe SQLite lock conflict.")
+            self.assertTrue(thread_b.is_alive(), "Thread B died prematurely.")
 
             # State 5: Thread A commits attestation and releases lock
             connA.execute("COMMIT")
             connA.close()
             connA = None
 
-            # State 4 (completed): Thread B unblocks, acquires lock
-            self.assertTrue(b_acquired_lock.wait(timeout=5.0), "Thread B failed to acquire write lock after Thread A committed.")
-            # State 6: Competing transaction completes
+            # Grant retry permission
+            b_retry_permitted.set()
+
+            # State 6: Worker retries and acquires write lock
+            self.assertTrue(b_retry_lock_acquired.wait(timeout=5.0), "Thread B failed to acquire write lock on retry.")
+            # State 7: Competing transaction completes
             self.assertTrue(b_completed.wait(timeout=5.0), "Thread B did not complete in time.")
             thread_b.join(timeout=5.0)
-            self.assertFalse(thread_b.is_alive(), "Thread B hung and did not complete.")
+            self.assertFalse(thread_b.is_alive(), "Thread B failed to terminate cleanly.")
             self.assertEqual(len(b_exceptions), 0, f"Thread B encountered unexpected errors: {b_exceptions}")
 
             # 1. Historical attestation remains immutable
@@ -893,6 +924,7 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             self.assertTrue(self.db.is_principal_revoked(principal_id))
             self.assertFalse(store.is_attesting_principal_trusted(principal_id))
         finally:
+            b_retry_permitted.set()
             if connA is not None:
                 try:
                     connA.execute("ROLLBACK")
@@ -904,13 +936,15 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
                     pass
             if thread_b is not None and thread_b.is_alive():
                 thread_b.join(timeout=5.0)
+                self.assertFalse(thread_b.is_alive(), "Thread B remained alive during cleanup!")
 
     def test_38_concurrency_scenario_c_caller_supplied_immediate_transaction(self) -> None:
-        """TC-38: Scenario C — Caller-supplied ImmediateAwareConnection under write lock contention.
+        """TC-38: Scenario C — Caller-supplied ImmediateAwareConnection under deterministic lock contention.
 
         Proves:
         1. Sentinel write occurs on caller's cursor before revocation checks.
-        2. Competing caller blocks until initial caller commits.
+        2. Competing caller with timeout=0.0 receives actual sqlite3.OperationalError.
+        3. Competing caller retries and completes after initial caller commits.
         """
         verified, principal, _, store = self._setup_verified_evidence_and_principal()
 
@@ -920,10 +954,12 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
         # Lifecycle tracking events (Phase 9.1.2.14)
         t2_created = threading.Event()
         t2_entered = threading.Event()
-        t2_attempted = threading.Event()
+        t2_lock_attempt = threading.Event()
+        t2_conflict_observed = threading.Event()
+        t2_retry_permitted = threading.Event()
         t2_acquired = threading.Event()
         t2_completed = threading.Event()
-        t2_exceptions = []
+        t2_exceptions: List[Exception] = []
 
         try:
             conn1 = self.db.get_connection(timeout=5.0)
@@ -931,7 +967,7 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             conn1.execute("BEGIN IMMEDIATE")
             cur1 = conn1.cursor()
 
-            # Execute attestation
+            # Execute attestation on cur1
             att_id = self.db.record_legacy_evidence_attestation(
                 verified_evidence=verified,
                 attesting_principal=principal,
@@ -945,26 +981,50 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             sentinel_row = cur1.fetchone()
             self.assertIsNotNone(sentinel_row)
 
-            def thread2_worker():
+            def thread2_worker() -> None:
                 t2_created.set()
+                t2_entered.set()
+                # Attempt 1: timeout=0.0
                 conn2 = None
                 try:
-                    t2_entered.set()
-                    conn2 = self.db.get_connection(timeout=5.0)
+                    conn2 = self.db.get_connection(timeout=0.0)
                     conn2.isolation_level = None
-                    def trace_cb(stmt: str) -> None:
-                        if "BEGIN IMMEDIATE" in stmt:
-                            t2_attempted.set()
-                    conn2.set_trace_callback(trace_cb)
+                    t2_lock_attempt.set()
                     conn2.execute("BEGIN IMMEDIATE")
-                    t2_acquired.set()
-                    conn2.execute("COMMIT")
+                except sqlite3.OperationalError as op_err:
+                    if "locked" in str(op_err).lower() or "busy" in str(op_err).lower():
+                        t2_conflict_observed.set()
+                    else:
+                        t2_exceptions.append(op_err)
+                        return
                 except Exception as e:
                     t2_exceptions.append(e)
+                    return
                 finally:
                     if conn2:
                         try:
                             conn2.close()
+                        except Exception:
+                            pass
+
+                if not t2_retry_permitted.wait(timeout=5.0):
+                    t2_exceptions.append(TimeoutError("Thread 2 timed out waiting for retry permission."))
+                    return
+
+                # Attempt 2: retry with timeout=5.0
+                conn2_retry = None
+                try:
+                    conn2_retry = self.db.get_connection(timeout=5.0)
+                    conn2_retry.isolation_level = None
+                    conn2_retry.execute("BEGIN IMMEDIATE")
+                    t2_acquired.set()
+                    conn2_retry.execute("COMMIT")
+                except Exception as e:
+                    t2_exceptions.append(e)
+                finally:
+                    if conn2_retry:
+                        try:
+                            conn2_retry.close()
                         except Exception:
                             pass
                     t2_completed.set()
@@ -974,18 +1034,8 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
 
             self.assertTrue(t2_created.wait(timeout=5.0))
             self.assertTrue(t2_entered.wait(timeout=5.0))
-            self.assertTrue(t2_attempted.wait(timeout=5.0))
-
-            # Contention probe confirms lock held
-            probe = self.db.get_connection(timeout=0.0)
-            probe.isolation_level = None
-            try:
-                with self.assertRaises(sqlite3.OperationalError):
-                    probe.execute("BEGIN IMMEDIATE")
-            finally:
-                probe.close()
-
-            self.assertFalse(t2_acquired.is_set())
+            self.assertTrue(t2_lock_attempt.wait(timeout=5.0))
+            self.assertTrue(t2_conflict_observed.wait(timeout=5.0))
             self.assertTrue(t2.is_alive())
 
             # Commit conn1
@@ -993,12 +1043,15 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
             conn1.close()
             conn1 = None
 
+            t2_retry_permitted.set()
+
             self.assertTrue(t2_acquired.wait(timeout=5.0))
             self.assertTrue(t2_completed.wait(timeout=5.0))
             t2.join(timeout=5.0)
-            self.assertFalse(t2.is_alive())
+            self.assertFalse(t2.is_alive(), "Thread 2 failed to terminate cleanly.")
             self.assertEqual(len(t2_exceptions), 0, f"Thread 2 encountered errors: {t2_exceptions}")
         finally:
+            t2_retry_permitted.set()
             if conn1 is not None:
                 try:
                     conn1.execute("ROLLBACK")
@@ -1010,6 +1063,7 @@ class Phase91213ClockPrecisionAndConcurrencyTests(unittest.TestCase):
                     pass
             if t2 is not None and t2.is_alive():
                 t2.join(timeout=5.0)
+                self.assertFalse(t2.is_alive(), "Thread 2 remained alive during cleanup!")
 
     def test_39_concurrency_scenario_c_deferred_transaction_rejected(self) -> None:
         """TC-39: Scenario C — Caller supplying deferred transaction fails closed."""

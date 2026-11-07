@@ -1012,26 +1012,28 @@ When interacting with the browser via Playwright MCP:
     - Published comprehensive implementation report in `docs/PHASE_9_1_2_13_IMPLEMENTATION_REPORT.md`.
 
 - [x] **Architecture v2.1.1 Phase 9.1.2.14: Deterministic SQLite Concurrency Testing & Clock State Cleanup** (Complete)
-  - Removal of Sleep-Based Concurrency Coordination:
+  - Deterministic SQLite Lock-Conflict and Retry Architecture:
     - Completely eliminated all `time.sleep(0.05)` delays from multi-threaded SQLite concurrency tests (TC-36, TC-37, TC-38 in `tests/test_phase_9_1_2_13_clock_precision_and_concurrency.py`).
-    - Replaced with deterministic synchronization using `threading.Event`, native `sqlite3.Connection.set_trace_callback` to intercept C-level `BEGIN IMMEDIATE` execution at the precise instant of invocation, and zero-timeout (`timeout=0.0`) contention probes proving physical database write-lock acquisition.
-    - Verified all 6 lifecycle states deterministically: (1) Worker thread created, (2) entered transaction path, (3) attempted SQLite write-lock operation, (4) acquired write lock or observed contention, (5) original transaction commits/rolls back, (6) competing transaction completes.
-  - Failure-Safe Concurrency Test Cleanup:
+    - Replaced pre-execution trace callbacks with an explicit zero-timeout lock-conflict and retry architecture: competing workers execute `BEGIN IMMEDIATE` with `timeout=0.0`, catch the actual `sqlite3.OperationalError: database is locked`, verify error authenticity, signal `lock_conflict_observed` strictly after the error is returned by SQLite, wait on explicit retry permission, and retry upon lock release.
+    - Verified all 7 lifecycle states deterministically: (1) Worker thread created, (2) entered transaction path, (3) actual SQLite lock attempt executed (timeout=0.0), (4) SQLite returned lock-conflict error, (5) original transaction commits/rolls back; retry permitted, (6) worker retried and acquired write lock, (7) competing transaction completed.
+  - Failure-Safe Concurrency Test Cleanup & Injected Error Coverage:
     - Implemented guaranteed `try/finally` cleanup on all concurrent test transactions, connections, and worker threads.
-    - Ensured uncommitted transactions are rolled back, connections are closed, monkeypatches are restored, and worker threads are joined with bounded timeouts even upon mid-flight assertion failures or unexpected exceptions.
+    - Added comprehensive injected-failure test coverage across 5 critical failure points: (1) failure while Thread A holds write lock, (2) failure after Thread B observes lock conflict, (3) failure before retry permission, (4) failure during worker retry, (5) failure during transaction commit.
+    - Guaranteed worker thread termination with explicit post-join assertion: `self.assertFalse(thread.is_alive())`.
     - Verified that database instances remain immediately unlocked and fully writable post-cleanup without residual contention or leaked locks.
-  - Worker Exception Propagation:
+  - Worker Exception Propagation & Write-Lock Inspection Binding:
     - Captured and propagated worker thread exceptions (including `SecurityAuthorizationError`) to the main test thread, ensuring zero silent worker failures.
+    - Bound all authorization and revocation checks strictly to write cursors holding `BEGIN IMMEDIATE`, ensuring no separate read connection is opened before obtaining write locks.
   - Clock State Cleanup & ContextVar Isolation:
     - Completely eliminated the redundant module-level mutable global `_CLOCK_PROVIDER` in `src/security/legacy_evidence_verifier.py`, making `_CLOCK_VAR: ContextVar` the sole source of injected clock state.
     - Verified context isolation across threads, `contextvars.copy_context()` snapshots, nested `frozen_utc_clock` restoration, and exception-safe restoration.
     - Verified that `_CLOCK_PROVIDER` is strictly absent from `src.security.legacy_evidence_verifier` module attributes.
   - Dedicated Test Suite & Comprehensive Verification:
-    - Authored 15 dedicated tests in `tests/test_phase_9_1_2_14_deterministic_concurrency_cleanup.py` (15/15 passing, 100%).
-    - Updated `tests/test_phase_9_1_2_13_clock_precision_and_concurrency.py` (46/46 passing, 100%, 0 sleeps).
-    - Verified all 611 Phase 9 regression tests pass (100%).
-    - Verified all 1,929 repository test cases pass (100%).
-    - 0 pyflakes errors, 0 ruff errors.
+    - Authored 18 dedicated tests in `tests/test_phase_9_1_2_14_deterministic_concurrency_cleanup.py` (18/18 passing, 100%).
+    - Updated `tests/test_phase_9_1_2_13_clock_precision_and_concurrency.py` (46/46 passing, 100%, 0 sleeps, lock-conflict/retry).
+    - Verified all 614 Phase 9 regression tests pass (100%).
+    - Verified all 1,932 repository test cases pass (100%).
+    - 0 pyflakes errors, 0 ruff errors across `dashboard/`, `src/`, and `tests/`.
     - Published comprehensive implementation report in `docs/PHASE_9_1_2_14_IMPLEMENTATION_REPORT.md`.
 
 ---

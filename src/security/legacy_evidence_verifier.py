@@ -23,6 +23,7 @@ import math
 import os
 from pathlib import Path
 import secrets
+import sqlite3
 import threading
 import types
 from typing import Any, Callable, Dict, Generator, List, Optional, Set, Tuple, Union
@@ -1387,7 +1388,7 @@ class LegacyEvidenceTrustStore:
                     logger.error("Failed to persist principal revocation in DB: %s", e)
                     raise SecurityAuthorizationError(f"Durable principal revocation failed for '{clean_p}': {e}") from e
 
-    def is_attesting_principal_trusted(self, principal_id: str) -> bool:
+    def is_attesting_principal_trusted(self, principal_id: str, cursor: Optional[sqlite3.Cursor] = None) -> bool:
         """Verifies whether an attesting principal is authorized and not revoked."""
         clean_p = (principal_id or "").strip()
         if not clean_p:
@@ -1398,7 +1399,7 @@ class LegacyEvidenceTrustStore:
             if self._db_manager:
                 try:
                     if hasattr(self._db_manager, "is_principal_revoked"):
-                        if self._db_manager.is_principal_revoked(clean_p):
+                        if self._db_manager.is_principal_revoked(clean_p, cursor=cursor):
                             self._revoked_principals.add(clean_p)
                             self._trusted_attesting_principals.discard(clean_p)
                             return False
