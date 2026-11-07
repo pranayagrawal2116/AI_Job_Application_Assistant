@@ -953,6 +953,35 @@ When interacting with the browser via Playwright MCP:
     - Verified all 1,825 repository test cases pass (100%).
     - 0 pyflakes errors, 0 ruff errors.
     - Published comprehensive implementation report in `docs/PHASE_9_1_2_11_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.12: Authenticator Trust-Root Lockdown, Immutable Registry & Deterministic CI Closure** (Complete)
+  - Mandatory Signature Algorithm & Unconditional Claim Revalidation:
+    - `AuthenticatedMigrationPrincipal` requires non-empty `signature_algorithm` (`Ed25519`, `EdDSA`, `HS256`, `HMAC-SHA256`) in `__post_init__`, strictly rejecting HMAC schemes in production/staging/qa.
+    - `ServiceAuthenticationProvider.validate_principal()` unconditionally validates all 11 claims including `signature_algorithm` against the authoritative issuance record, failing closed on mismatch.
+  - Genuinely Immutable Issuance Registry:
+    - Replaced mutable dictionary issuance entries with `@dataclass(frozen=True) _IssuedCredentialRecord` enforcing strict immutability under `self._lock`.
+    - Implemented backward-compatible dictionary subscripting (`__getitem__`) and `.get()` supporting legacy test access patterns.
+  - Configured Authenticator Trust-Root Lockdown:
+    - `DatabaseManager.set_service_authenticator()` locks the initial configured provider instance, enforcing idempotency on same instance and raising `SecurityAuthorizationError` on replacement attempts with differing instances or `None` in production.
+    - Enforced strict type validation (`isinstance(authenticator, ServiceAuthenticationProvider)`) and environment consistency (`auth_env` vs `app_env`).
+    - Eliminated implicit authenticator auto-registration in `ServiceAuthenticationProvider.__init__`.
+    - `LegacyEvidenceVerifier` enforces shared provider instance identity with `DatabaseManager`.
+  - Complete Verified-Evidence Provenance Binding:
+    - `DatabaseManager.record_legacy_evidence_attestation()` unconditionally validates all 9 provenance fields between `VerifiedLegacyEvidence` and `AuthenticatedMigrationPrincipal` (`attesting_principal_id`, `provider_instance_id`, `credential_id`, `credential_key_id`, `issuer`, `audience`, `scopes`, `issued_at`, `expires_at`).
+    - `_normalize_datetime()` enforces UTC normalization and strictly rejects timezone-naive timestamps.
+    - Production requires all 9 provenance fields on `VerifiedLegacyEvidence`, preventing audit-only evidence from becoming new production attestations.
+  - SQLite Write-Lock Guarantee for Caller Cursors:
+    - Subclassed `ImmediateAwareConnection(sqlite3.Connection)` and `ImmediateAwareCursor` tracking `_tx_is_immediate` state upon `BEGIN IMMEDIATE`.
+    - `record_legacy_evidence_attestation()` validates caller cursors have `isolation_level is None`, `in_transaction is True`, and `_tx_is_immediate is True`, rejecting unsupported deferred transactions.
+    - Added `_sqlite_write_lock_sentinel` table and executes a physical sentinel write check prior to revocation inspection queries, guaranteeing physical RESERVED lock acquisition before read checks.
+  - Deterministic UTC Clock Injection & CI Stability:
+    - Central injectable UTC clock (`get_current_utc_time()`, `set_test_clock()`, `frozen_utc_clock()`) in `src/security/legacy_evidence_verifier.py`, failing closed if attempted in production.
+    - Replaced all non-deterministic `time.sleep` calls with deterministic clock advancement in `tests/test_phase_9_1_2_10_provider_binding_and_credential_lifecycle.py`, permanently resolving Python 3.11 GitHub Actions CI timing failures.
+  - Dedicated Test Suite & Comprehensive Verification:
+    - Authored 43 dedicated unit and integration tests in `tests/test_phase_9_1_2_12_authenticator_lockdown_and_deterministic_ci.py` across 5 requirement categories (43/43 passing, 100%).
+    - Verified all 550 Phase 9 test cases pass (100%).
+    - Verified all 1,868 repository test cases pass (100%).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Published comprehensive implementation report in `docs/PHASE_9_1_2_12_IMPLEMENTATION_REPORT.md`.
 
 ---
 

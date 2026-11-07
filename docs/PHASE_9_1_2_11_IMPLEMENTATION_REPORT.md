@@ -12,6 +12,15 @@
 
 ## 1. Executive Summary
 
+> [!NOTE]
+> **Post-Implementation Review & Phase 9.1.2.12 Hardening Note:**  
+> While Phase 9.1.2.11 established the core registry and atomic attestation architecture, independent source review and GitHub Actions CI run `42343980325` identified four residual integrity gaps and a timing issue in CI on Python 3.11:  
+> 1. Registry records were stored in mutable Python dictionaries rather than frozen objects. Hardened in Phase 9.1.2.12 via the `@dataclass(frozen=True) _IssuedCredentialRecord`.  
+> 2. `signature_algorithm` validation in `validate_principal` was conditional. Hardened in Phase 9.1.2.12 to be mandatory and unconditional.  
+> 3. `DatabaseManager.service_authenticator` could be overwritten by new provider instances. Hardened in Phase 9.1.2.12 to be locked upon configuration with replacement rejection.  
+> 4. Caller cursors in `record_legacy_evidence_attestation` were not validated for `BEGIN IMMEDIATE` locks. Hardened in Phase 9.1.2.12 via `ImmediateAwareConnection` and sentinel write verification.  
+> 5. Python 3.11 CI timing flakiness in `test_14` was resolved in Phase 9.1.2.12 by replacing `time.sleep` with deterministic clock injection (`set_test_clock`).
+
 Phase 9.1.2.11 provides the definitive cryptographic closure for the service-identity and legacy-evidence subsystem of the Universal AI Job Application Assistant. Building upon the provider-bound credential foundations introduced in Phase 9.1.2.10, this phase eliminates in-memory tampering windows, prevents credential identifier collisions, guarantees authoritative multi-claim issuance tracking, enforces provider-bound caller context during attestation persistence, and completely eliminates the Time-Of-Check-To-Time-Of-Use (TOCTOU) race window between principal/key revocation verification and attestation database writes.
 
 All 72 dedicated tests in `tests/test_phase_9_1_2_11_credential_registry_and_atomic_attestation.py` passed with 100% success rate. The entire Phase 9 regression suite (507 tests) and full repository suite (1,825 tests) passed with 100% success rate, 0 pyflakes errors, and 0 ruff errors.

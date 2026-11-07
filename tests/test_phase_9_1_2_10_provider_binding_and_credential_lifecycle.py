@@ -19,7 +19,6 @@ from pathlib import Path
 import shutil
 import sqlite3
 import tempfile
-import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -41,6 +40,7 @@ from src.security.legacy_evidence_verifier import (
     create_signed_evidence_artifact,
     set_default_evidence_resolver,
     set_default_evidence_trust_store,
+    set_test_clock,
 )
 from src.security.prompt_injection_detector import PromptInjectionDetector
 from src.security.security_preflight import SecurityPreflightManager
@@ -85,6 +85,7 @@ class TestPhase91210ProviderBindingAndCredentialLifecycle(unittest.TestCase):
             self.user2_id = c.lastrowid
 
     def tearDown(self) -> None:
+        set_test_clock(None)
         set_default_evidence_trust_store(None)
         set_default_evidence_resolver(None)
         shutil.rmtree(self.temp_dir, ignore_errors=True)
@@ -471,91 +472,108 @@ class TestPhase91210ProviderBindingAndCredentialLifecycle(unittest.TestCase):
 
     def test_14_validate_principal_rejects_expired_credential(self) -> None:
         """TC-14: Credential expiring during application lifetime is rejected upon validate_principal."""
-        provider = self._create_provider()
-        token = provider.mint_service_token(
-            principal_id="ephemeral_svc",
-            signing_key=self.service_priv_key,
-            key_id="k_svc_01",
-            issuer="archival_authority",
-            ttl_seconds=1,
-        )
-        principal = provider.authenticate(token)
+        base_time = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+        set_test_clock(lambda: base_time)
+        try:
+            provider = self._create_provider()
+            token = provider.mint_service_token(
+                principal_id="ephemeral_svc",
+                signing_key=self.service_priv_key,
+                key_id="k_svc_01",
+                issuer="archival_authority",
+                ttl_seconds=60,
+            )
+            principal = provider.authenticate(token)
 
-        # Fast forward time or sleep 1.1s
-        time.sleep(1.2)
+            # Deterministically advance clock past expiration timestamp (60s ttl)
+            set_test_clock(lambda: base_time + timedelta(seconds=120))
 
-        with self.assertRaises(SecurityAuthorizationError) as ctx:
-            provider.validate_principal(principal)
-        self.assertIn("has expired", str(ctx.exception))
+            with self.assertRaises(SecurityAuthorizationError) as ctx:
+                provider.validate_principal(principal)
+            self.assertIn("has expired", str(ctx.exception))
+        finally:
+            set_test_clock(None)
 
     def test_15_legacy_evidence_verifier_rejects_expired_principal(self) -> None:
         """TC-15: Verifier.verify() rejects expired principal during execution."""
-        provider = self._create_provider()
-        token = provider.mint_service_token(
-            principal_id="exp_runner",
-            signing_key=self.service_priv_key,
-            key_id="k_svc_01",
-            issuer="archival_authority",
-            ttl_seconds=1,
-        )
-        principal = provider.authenticate(token)
-
-        store = LegacyEvidenceTrustStore(
-            trusted_issuers={"archival_authority"},
-            trusted_attesting_principals={"exp_runner"},
-            db_manager=self.db,
-        )
-        store.register_trusted_key("k_ed", self.pub_bytes, algorithm="Ed25519")
-        verifier = LegacyEvidenceVerifier(
-            trust_store=store,
-            resolver=InMemoryEvidenceResolver(),
-            service_authenticator=provider,
-            db_manager=self.db,
-        )
-
-        time.sleep(1.2)
-
-        with self.assertRaises(SecurityAuthorizationError) as ctx:
-            verifier.verify(
-                evidence_type="historical_import_manifest",
-                evidence_reference_id="EXP_REF",
-                user_id=self.user1_id,
-                job_description_id=1,
-                source_snapshot_hash="hash",
-                attesting_principal=principal,
+        base_time = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+        set_test_clock(lambda: base_time)
+        try:
+            provider = self._create_provider()
+            token = provider.mint_service_token(
+                principal_id="exp_runner",
+                signing_key=self.service_priv_key,
+                key_id="k_svc_01",
+                issuer="archival_authority",
+                ttl_seconds=60,
             )
-        self.assertIn("has expired", str(ctx.exception))
+            principal = provider.authenticate(token)
+
+            store = LegacyEvidenceTrustStore(
+                trusted_issuers={"archival_authority"},
+                trusted_attesting_principals={"exp_runner"},
+                db_manager=self.db,
+            )
+            store.register_trusted_key("k_ed", self.pub_bytes, algorithm="Ed25519")
+            verifier = LegacyEvidenceVerifier(
+                trust_store=store,
+                resolver=InMemoryEvidenceResolver(),
+                service_authenticator=provider,
+                db_manager=self.db,
+            )
+
+            # Deterministically advance clock past expiration timestamp (60s ttl)
+            set_test_clock(lambda: base_time + timedelta(seconds=120))
+
+            with self.assertRaises(SecurityAuthorizationError) as ctx:
+                verifier.verify(
+                    evidence_type="historical_import_manifest",
+                    evidence_reference_id="EXP_REF",
+                    user_id=self.user1_id,
+                    job_description_id=1,
+                    source_snapshot_hash="hash",
+                    attesting_principal=principal,
+                )
+            self.assertIn("has expired", str(ctx.exception))
+        finally:
+            set_test_clock(None)
 
     def test_16_database_manager_records_attestation_rejects_expired_principal(self) -> None:
         """TC-16: DatabaseManager.record_legacy_evidence_attestation rejects expired principal."""
-        provider = self._create_provider()
-        token = provider.mint_service_token(
-            principal_id="exp_db_runner",
-            signing_key=self.service_priv_key,
-            key_id="k_svc_01",
-            issuer="archival_authority",
-            ttl_seconds=1,
-        )
-        principal = provider.authenticate(token)
-
-        # Create a mock verified evidence object
-        verified_evidence = MagicMock()
-        verified_evidence.attested_by = "exp_db_runner"
-        verified_evidence.user_id = self.user1_id
-        from src.security.legacy_evidence_verifier import VerifiedLegacyEvidence
-        verified_mock = object.__new__(VerifiedLegacyEvidence)
-        object.__setattr__(verified_mock, "_token", None)
-        object.__setattr__(verified_mock, "attested_by", "exp_db_runner")
-        object.__setattr__(verified_mock, "user_id", self.user1_id)
-
-        time.sleep(1.2)
-
-        with self.assertRaises(SecurityAuthorizationError) as ctx:
-            self.db.record_legacy_evidence_attestation(
-                verified_evidence=verified_mock,
-                attesting_principal=principal,
+        base_time = datetime(2026, 11, 7, 12, 0, 0, tzinfo=timezone.utc)
+        set_test_clock(lambda: base_time)
+        try:
+            provider = self._create_provider()
+            token = provider.mint_service_token(
+                principal_id="exp_db_runner",
+                signing_key=self.service_priv_key,
+                key_id="k_svc_01",
+                issuer="archival_authority",
+                ttl_seconds=60,
             )
-        self.assertIn("has expired", str(ctx.exception))
+            principal = provider.authenticate(token)
+
+            # Create a mock verified evidence object
+            verified_evidence = MagicMock()
+            verified_evidence.attested_by = "exp_db_runner"
+            verified_evidence.user_id = self.user1_id
+            from src.security.legacy_evidence_verifier import VerifiedLegacyEvidence
+            verified_mock = object.__new__(VerifiedLegacyEvidence)
+            object.__setattr__(verified_mock, "_token", None)
+            object.__setattr__(verified_mock, "attested_by", "exp_db_runner")
+            object.__setattr__(verified_mock, "user_id", self.user1_id)
+
+            # Deterministically advance clock past expiration timestamp (60s ttl)
+            set_test_clock(lambda: base_time + timedelta(seconds=120))
+
+            with self.assertRaises(SecurityAuthorizationError) as ctx:
+                self.db.record_legacy_evidence_attestation(
+                    verified_evidence=verified_mock,
+                    attesting_principal=principal,
+                )
+            self.assertIn("has expired", str(ctx.exception))
+        finally:
+            set_test_clock(None)
 
     # =========================================================================
     # PART 3: ALGORITHM & KEY BINDING (Tests 17 - 25)

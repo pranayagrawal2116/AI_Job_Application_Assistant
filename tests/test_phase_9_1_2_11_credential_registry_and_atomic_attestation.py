@@ -197,6 +197,7 @@ class TestPhase91211CredentialRegistryAndAtomicAttestation(unittest.TestCase):
             expires_at=now + timedelta(seconds=3600),
             credential_id="UNKNOWN_CRED_ID",
             credential_key_id="k_svc_01",
+            signature_algorithm="Ed25519",
         )
         with self.assertRaises(SecurityAuthorizationError) as ctx:
             provider.validate_principal(principal)

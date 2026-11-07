@@ -401,6 +401,11 @@ CREATE TABLE IF NOT EXISTS revoked_attesting_principals (
     reason TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS _sqlite_write_lock_sentinel (
+    id INTEGER PRIMARY KEY,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS consumed_action_nonces (
     nonce TEXT PRIMARY KEY,
     key_id TEXT NOT NULL,

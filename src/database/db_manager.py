@@ -123,6 +123,82 @@ ALLOWED_TRANSITIONS: Dict[str, List[str]] = {
 }
 
 
+class ImmediateAwareCursor(sqlite3.Cursor):
+    """SQLite cursor subclass that notifies its ImmediateAwareConnection on BEGIN IMMEDIATE."""
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        clean_sql = sql.strip().upper() if isinstance(sql, str) else ""
+        conn = self.connection
+        if conn is not None and hasattr(conn, "_tx_is_immediate"):
+            if clean_sql.startswith("BEGIN IMMEDIATE"):
+                conn._tx_is_immediate = True
+            elif clean_sql.startswith("BEGIN") and not clean_sql.startswith("BEGIN IMMEDIATE"):
+                conn._tx_is_immediate = False
+            elif clean_sql.startswith("COMMIT") or clean_sql.startswith("ROLLBACK"):
+                conn._tx_is_immediate = False
+        return super().execute(sql, *args, **kwargs)
+
+
+class ImmediateAwareConnection(sqlite3.Connection):
+    """SQLite connection subclass that explicitly tracks whether an IMMEDIATE transaction write-lock is held."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._tx_is_immediate: bool = False
+
+    def cursor(self, factory: Any = ImmediateAwareCursor) -> sqlite3.Cursor:
+        return super().cursor(factory=factory)
+
+    def execute(self, sql: str, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+        clean_sql = sql.strip().upper() if isinstance(sql, str) else ""
+        if clean_sql.startswith("BEGIN IMMEDIATE"):
+            self._tx_is_immediate = True
+        elif clean_sql.startswith("BEGIN") and not clean_sql.startswith("BEGIN IMMEDIATE"):
+            self._tx_is_immediate = False
+        elif clean_sql.startswith("COMMIT") or clean_sql.startswith("ROLLBACK"):
+            self._tx_is_immediate = False
+        return super().execute(sql, *args, **kwargs)
+
+    def commit(self) -> None:
+        self._tx_is_immediate = False
+        super().commit()
+
+    def rollback(self) -> None:
+        self._tx_is_immediate = False
+        super().rollback()
+
+
+def _normalize_datetime(dt_val: Any) -> datetime:
+    """Normalizes a timestamp string or datetime object to a UTC-aware datetime.
+
+    Strictly rejects timezone-naive timestamps and non-datetime values.
+    """
+    if dt_val is None:
+        raise SecurityAuthorizationError("Timestamp value cannot be None.")
+    if isinstance(dt_val, bool):
+        raise SecurityAuthorizationError("Timestamp value cannot be boolean.")
+    if isinstance(dt_val, datetime):
+        if dt_val.tzinfo is None:
+            raise SecurityAuthorizationError("Timezone-naive datetime is strictly prohibited.")
+        return dt_val.astimezone(timezone.utc)
+    if isinstance(dt_val, str):
+        clean_str = dt_val.strip()
+        if not clean_str:
+            raise SecurityAuthorizationError("Timestamp string cannot be empty.")
+        try:
+            if clean_str.endswith("Z") or clean_str.endswith("z"):
+                clean_str = clean_str[:-1] + "+00:00"
+            parsed = datetime.fromisoformat(clean_str)
+            if parsed.tzinfo is None:
+                raise SecurityAuthorizationError(f"Timezone-naive timestamp string '{dt_val}' is strictly prohibited.")
+            return parsed.astimezone(timezone.utc)
+        except Exception as e:
+            if isinstance(e, SecurityAuthorizationError):
+                raise
+            raise SecurityAuthorizationError(f"Invalid timestamp format '{dt_val}': {e}") from e
+    raise SecurityAuthorizationError(f"Unsupported timestamp type '{type(dt_val).__name__}'.")
+
+
 class DatabaseManager:
     """Manages SQLite database connections, transactions, and CRUD operations."""
 
@@ -135,7 +211,9 @@ class DatabaseManager:
     ):
         self.db_path = str(db_path)
         self.schema_path = Path(schema_path)
-        self.service_authenticator = service_authenticator
+        self._service_authenticator: Optional[Any] = None
+        if service_authenticator is not None:
+            self.set_service_authenticator(service_authenticator)
 
         from src.security.session_manager import SessionManager
         if session_manager is not None:
@@ -166,13 +244,65 @@ class DatabaseManager:
         return sm
 
     def set_service_authenticator(self, authenticator: Optional[Any]) -> None:
-        """Configures the authoritative ServiceAuthenticationProvider for attestation persistence."""
-        self.service_authenticator = authenticator
+        """Configures the authoritative ServiceAuthenticationProvider for attestation persistence.
+
+        Invariants:
+        - Must be an instance of ServiceAuthenticationProvider (or None in dev/test only).
+        - Cannot replace an already configured authenticator with a different provider instance.
+        - Re-registering the identical provider instance is idempotent.
+        - Cannot replace with None in production/staging/qa once configured.
+        - Provider configured for development/test cannot be attached in production-like environments.
+        """
+        from src.security.legacy_evidence_verifier import ServiceAuthenticationProvider
+        app_env = getattr(self, "app_env", None) or os.environ.get("APP_ENV", "development").strip().lower()
+        is_production_like = app_env in ("production", "staging", "qa")
+
+        if authenticator is None:
+            if is_production_like and self._service_authenticator is not None:
+                raise SecurityAuthorizationError(
+                    f"Cannot remove configured service authenticator in '{app_env}' environment."
+                )
+            self._service_authenticator = None
+            return
+
+        if not isinstance(authenticator, ServiceAuthenticationProvider):
+            raise SecurityAuthorizationError(
+                f"Invalid service authenticator: must be an instance of ServiceAuthenticationProvider, got {type(authenticator).__name__}."
+            )
+
+        auth_env = getattr(authenticator, "app_env", None)
+        if is_production_like and auth_env not in ("production", "staging", "qa"):
+            raise SecurityAuthorizationError(
+                f"ServiceAuthenticationProvider configured for '{auth_env}' cannot be used in production-like environment '{app_env}'."
+            )
+
+        if self._service_authenticator is not None:
+            if authenticator is not self._service_authenticator:
+                raise SecurityAuthorizationError(
+                    "DatabaseManager service authenticator is already configured and locked. "
+                    "Replacing configured authenticator with a different instance is strictly prohibited."
+                )
+            return
+
+        self._service_authenticator = authenticator
+
+    @property
+    def service_authenticator(self) -> Optional[Any]:
+        return self._service_authenticator
+
+    @service_authenticator.setter
+    def service_authenticator(self, authenticator: Optional[Any]) -> None:
+        self.set_service_authenticator(authenticator)
 
     def get_connection(self, timeout: Optional[float] = None) -> sqlite3.Connection:
         """Creates and configures a new SQLite connection."""
         timeout_val = timeout if timeout is not None else 5.0
-        conn = sqlite3.connect(self.db_path, check_same_thread=False, timeout=timeout_val)
+        conn = sqlite3.connect(
+            self.db_path,
+            check_same_thread=False,
+            timeout=timeout_val,
+            factory=ImmediateAwareConnection,
+        )
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON;")
         if self.db_path != ":memory:":
@@ -359,6 +489,16 @@ class DatabaseManager:
                     principal_id TEXT PRIMARY KEY,
                     revoked_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                     reason TEXT NOT NULL
+                )
+            """)
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS _sqlite_write_lock_sentinel (
+                    id INTEGER PRIMARY KEY,
+                    updated_at TEXT NOT NULL
                 )
             """)
         except sqlite3.OperationalError:
@@ -5802,6 +5942,7 @@ class DatabaseManager:
             VerifiedLegacyEvidence,
             AuthenticatedMigrationPrincipal,
             get_default_evidence_trust_store,
+            get_current_utc_time,
             _AUTH_TOKEN,
         )
 
@@ -5847,7 +5988,7 @@ class DatabaseManager:
                 raise SecurityAuthorizationError("Tampered or unverified AuthenticatedMigrationPrincipal context.")
 
             # Check expiry
-            now_utc = datetime.now(timezone.utc)
+            now_utc = get_current_utc_time()
             if attesting_principal.expires_at is not None and attesting_principal.expires_at <= now_utc:
                 raise SecurityAuthorizationError(
                     f"Principal credential for '{attesting_principal.principal_id}' has expired."
@@ -5879,18 +6020,54 @@ class DatabaseManager:
                     f"verified evidence principal '{verified_principal}'. Attestation misattribution is strictly prohibited."
                 )
 
+            # In production, require complete provenance fields on verified_evidence
+            if is_production_like:
+                req_provenance = [
+                    ("attesting_principal_id", getattr(verified_evidence, "attesting_principal_id", "")),
+                    ("provider_instance_id", getattr(verified_evidence, "provider_instance_id", "")),
+                    ("credential_id", getattr(verified_evidence, "credential_id", "")),
+                    ("credential_key_id", getattr(verified_evidence, "credential_key_id", "")),
+                    ("issuer", getattr(verified_evidence, "issuer", "")),
+                    ("audience", getattr(verified_evidence, "audience", "")),
+                    ("scopes", getattr(verified_evidence, "scopes", ())),
+                    ("issued_at", getattr(verified_evidence, "issued_at", "")),
+                    ("expires_at", getattr(verified_evidence, "expires_at", "")),
+                ]
+                for fname, fval in req_provenance:
+                    if not fval or (isinstance(fval, str) and not fval.strip()) or (isinstance(fval, (tuple, list)) and len(fval) == 0):
+                        raise SecurityAuthorizationError(
+                            f"Old verified evidence without current authentication provenance ({fname}) cannot be persisted in production."
+                        )
+
             # Context provenance comparison against verified_evidence
-            if hasattr(verified_evidence, "attesting_principal_id") and verified_evidence.attesting_principal_id:
-                if clean_p_id != verified_evidence.attesting_principal_id.strip():
+            if is_production_like or getattr(verified_evidence, "provider_instance_id", ""):
+                ve_pid = getattr(verified_evidence, "attesting_principal_id", "").strip()
+                if clean_p_id != ve_pid:
+                    raise SecurityAuthorizationError(
+                        f"Provenance mismatch: attesting_principal_id '{ve_pid}' does not match principal ID '{clean_p_id}'."
+                    )
+                if getattr(verified_evidence, "provider_instance_id", "") != attesting_principal._provider_instance_id:
                     raise SecurityAuthorizationError("Evidence created by one provider cannot be persisted under another provider's context.")
-            if hasattr(verified_evidence, "provider_instance_id") and verified_evidence.provider_instance_id:
-                if verified_evidence.provider_instance_id != attesting_principal._provider_instance_id:
-                    raise SecurityAuthorizationError("Evidence created by one provider cannot be persisted under another provider's context.")
-            if hasattr(verified_evidence, "credential_id") and verified_evidence.credential_id:
-                if verified_evidence.credential_id != attesting_principal.credential_id:
+                if getattr(verified_evidence, "credential_id", "") != attesting_principal.credential_id:
                     raise SecurityAuthorizationError("Verified evidence credential_id does not match attesting principal context.")
-            if is_production_like and (not getattr(verified_evidence, "provider_instance_id", None) or not getattr(verified_evidence, "credential_id", None)):
-                raise SecurityAuthorizationError("Old verified evidence without current authentication provenance cannot be persisted in production.")
+                if getattr(verified_evidence, "credential_key_id", "") != attesting_principal.credential_key_id:
+                    raise SecurityAuthorizationError("Verified evidence credential_key_id does not match attesting principal context.")
+                if getattr(verified_evidence, "issuer", "") != attesting_principal.issuer:
+                    raise SecurityAuthorizationError("Verified evidence issuer does not match attesting principal context.")
+                if getattr(verified_evidence, "audience", "") != attesting_principal.audience:
+                    raise SecurityAuthorizationError("Verified evidence audience does not match attesting principal context.")
+                if tuple(getattr(verified_evidence, "scopes", ())) != tuple(attesting_principal.scopes):
+                    raise SecurityAuthorizationError("Verified evidence scopes do not match attesting principal context.")
+
+                ve_iat = _normalize_datetime(getattr(verified_evidence, "issued_at", None))
+                ap_iat = _normalize_datetime(attesting_principal.issued_at)
+                if abs((ve_iat - ap_iat).total_seconds()) > 0.001:
+                    raise SecurityAuthorizationError("Verified evidence issued_at timestamp does not match attesting principal context.")
+
+                ve_exp = _normalize_datetime(getattr(verified_evidence, "expires_at", None))
+                ap_exp = _normalize_datetime(attesting_principal.expires_at)
+                if abs((ve_exp - ap_exp).total_seconds()) > 0.001:
+                    raise SecurityAuthorizationError("Verified evidence expires_at timestamp does not match attesting principal context.")
 
         elif isinstance(attesting_principal, str):
             if is_production_like:
@@ -5968,6 +6145,17 @@ class DatabaseManager:
         )
 
         def _execute_atomic_attestation(cur: sqlite3.Cursor) -> int:
+            # -1. Physical write lock verification before any inspection queries
+            try:
+                cur.execute(
+                    "INSERT OR REPLACE INTO _sqlite_write_lock_sentinel (id, updated_at) VALUES (1, ?)",
+                    (get_current_utc_time().isoformat(),),
+                )
+            except sqlite3.OperationalError as op_err:
+                raise SecurityAuthorizationError(
+                    f"Failed to acquire physical write lock on cursor: {op_err}"
+                ) from op_err
+
             # 0. Atomic revalidation via configured service authenticator directly on this write cursor
             if self.service_authenticator is not None and isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
                 self.service_authenticator.validate_principal(attesting_principal, cursor=cur)
@@ -6016,7 +6204,23 @@ class DatabaseManager:
             cur.execute(sql, params)
             return cur.lastrowid
 
-        if cursor:
+        if cursor is not None:
+            if not isinstance(cursor, sqlite3.Cursor):
+                raise SecurityAuthorizationError(f"Invalid cursor: expected sqlite3.Cursor, got {type(cursor).__name__}.")
+            cur_conn = cursor.connection
+            if cur_conn is None:
+                raise SecurityAuthorizationError("Invalid cursor: cursor connection is closed or None.")
+            if cur_conn.isolation_level is not None:
+                raise SecurityAuthorizationError(
+                    "Caller transaction must have isolation_level=None (autocommit mode) with explicit BEGIN IMMEDIATE."
+                )
+            if not cur_conn.in_transaction:
+                raise SecurityAuthorizationError("Caller cursor must be inside an active transaction.")
+            if not getattr(cur_conn, "_tx_is_immediate", False):
+                raise SecurityAuthorizationError(
+                    "Caller transaction must hold an immediate write lock (BEGIN IMMEDIATE). "
+                    "Deferred transactions are strictly prohibited for legacy attestation persistence."
+                )
             return _execute_atomic_attestation(cursor)
         else:
             with self.immediate_transaction() as conn:
