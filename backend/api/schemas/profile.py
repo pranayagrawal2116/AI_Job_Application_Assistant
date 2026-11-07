@@ -25,6 +25,8 @@ class ResumeResponse(BaseModel):
     is_primary: bool
     upload_date: Optional[str] = None
     created_at: Optional[str] = None
+    sync_status: Optional[str] = "SYNCED"
+    sync_error: Optional[str] = None
 
 
 class ResumeSyncResponse(BaseModel):

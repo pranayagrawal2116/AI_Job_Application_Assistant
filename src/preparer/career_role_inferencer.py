@@ -87,6 +87,41 @@ class CareerRoleInferencer:
             "min_matches": 2,
         },
         # Business, Finance & Accounting
+        "UK Tax Associate": {
+            "keywords": ["uk tax", "uk taxation", "sa100", "making tax digital", "tax computations", "tax compliance", "digita"],
+            "category": "Taxation",
+            "min_matches": 1,
+        },
+        "Tax Compliance Associate": {
+            "keywords": ["tax compliance", "tax computations", "taxation", "sa100", "direct tax", "indirect tax"],
+            "category": "Taxation",
+            "min_matches": 1,
+        },
+        "Accounts Associate": {
+            "keywords": ["accounts payable", "reconciliation", "supplier payment", "working capital", "xero", "approvalmax", "general ledger"],
+            "category": "Accounting",
+            "min_matches": 2,
+        },
+        "Accounts Payable Associate": {
+            "keywords": ["accounts payable", "supplier payment", "vendor reconciliation", "invoice processing", "approvalmax"],
+            "category": "Accounting",
+            "min_matches": 1,
+        },
+        "Audit Associate": {
+            "keywords": ["audit", "internal audit", "stock audit", "receivables audit", "internal controls", "statutory audit"],
+            "category": "Audit",
+            "min_matches": 1,
+        },
+        "Internal Audit Associate": {
+            "keywords": ["internal audit", "internal controls", "receivables audit", "risk assessment", "compliance audit"],
+            "category": "Audit",
+            "min_matches": 1,
+        },
+        "Financial Reporting Associate": {
+            "keywords": ["financial reporting", "working capital analysis", "financial statements", "management reporting", "balance sheet"],
+            "category": "Finance",
+            "min_matches": 1,
+        },
         "Financial Analyst": {
             "keywords": ["financial analysis", "financial modeling", "accounting", "valuation", "balance sheet", "excel", "cfa"],
             "category": "Finance",
@@ -101,6 +136,12 @@ class CareerRoleInferencer:
             "keywords": ["business analysis", "requirements gathering", "agile", "scrum", "uml", "user stories", "stakeholder"],
             "category": "Business",
             "min_matches": 2,
+        },
+        # Tech: Healthcare & Specialized Software
+        "Healthcare Software Developer": {
+            "keywords": ["abdm", "medical chatbot", "healthcare", "patient registration", "clinical software"],
+            "category": "Software Engineering",
+            "min_matches": 1,
         },
         # Design
         "UI/UX Designer": {
@@ -202,6 +243,33 @@ class CareerRoleInferencer:
                         if is_student_or_fresher and "intern" not in r.lower():
                             self._add_or_update_role(inferred, f"{r} Intern", evidence, conf)
 
+        # 2b. Evidence from Certifications & Professional Qualifications
+        certs = resume_dict.get("certifications", []) + resume_dict.get("professional_qualifications", [])
+        for cert in certs:
+            c_name = str(cert.get("name", "")).lower() if isinstance(cert, dict) else str(cert).lower()
+            if "acca" in c_name or "chartered" in c_name:
+                self._add_or_update_role(inferred, "UK Tax Associate", "ACCA qualification / membership", 0.95)
+                self._add_or_update_role(inferred, "Tax Compliance Associate", "ACCA qualification / membership", 0.95)
+                self._add_or_update_role(inferred, "Accounts Associate", "ACCA qualification / membership", 0.95)
+                self._add_or_update_role(inferred, "Accounts Payable Associate", "ACCA qualification / membership", 0.90)
+                self._add_or_update_role(inferred, "Audit Associate", "ACCA qualification / membership", 0.95)
+                self._add_or_update_role(inferred, "Internal Audit Associate", "ACCA qualification / membership", 0.90)
+                self._add_or_update_role(inferred, "Financial Reporting Associate", "ACCA qualification / membership", 0.90)
+            elif "cpa" in c_name:
+                self._add_or_update_role(inferred, "Certified Public Accountant", "CPA credential", 0.95)
+                self._add_or_update_role(inferred, "Audit Associate", "CPA credential", 0.90)
+            elif "cfa" in c_name:
+                self._add_or_update_role(inferred, "Financial Analyst", "CFA credential", 0.95)
+                self._add_or_update_role(inferred, "Investment Associate", "CFA credential", 0.90)
+
+        # 2c. Evidence from Supervised Experience (ACCA PER)
+        for per in resume_dict.get("per_experience", []):
+            p_title = per.get("job_title") or per.get("role_name") or ""
+            if p_title:
+                clean_title = self._clean_role_title(p_title)
+                evidence = f"ACCA Practical Experience Requirement: {p_title}"
+                self._add_or_update_role(inferred, clean_title, evidence, 0.90)
+
         # 3. Evidence from Technical & Professional Skills
         all_skills: List[str] = []
         raw_tech = resume_dict.get("technical_skills", [])
@@ -264,11 +332,23 @@ class CareerRoleInferencer:
         personal = resume_dict.get("personal", {}) or resume_dict.get("personal_info", {})
         headline = personal.get("headline", "") or resume_dict.get("professional_headline", "")
         if headline:
-            for part in re.split(r"\||&|,|\-", headline):
-                part_clean = part.strip()
-                if len(part_clean) > 3 and not any(w in part_clean.lower() for w in ["aspiring", "enthusiast", "student", "seeking"]):
-                    evidence = f"Professional headline: {headline}"
-                    self._add_or_update_role(inferred, part_clean, evidence, 0.90)
+            # Split only on major title delimiters: pipe, bullet, forward-slash, or em/en dash with spaces
+            for part in re.split(r"\||•|—|\s[–-]\s|/", headline):
+                part_clean = self._clean_role_title(part.strip())
+                part_lower = part_clean.lower()
+                # A headline phrase is only a role if it contains a recognized job role indicator
+                if (
+                    3 < len(part_clean) <= 45
+                    and not any(w in part_lower for w in ["aspiring", "enthusiast", "student", "seeking", "experience in", "hands-on", "specializing"])
+                ):
+                    has_role_kw = any(kw in part_lower for kw in [
+                        "engineer", "developer", "analyst", "associate", "manager", "auditor",
+                        "accountant", "specialist", "scientist", "consultant", "officer", "executive",
+                        "intern", "lead", "director", "architect", "fellow",
+                    ])
+                    if has_role_kw:
+                        evidence = f"Professional headline: {headline}"
+                        self._add_or_update_role(inferred, part_clean, evidence, 0.90)
 
         # Fallback if no specific role identified
         if not inferred:

@@ -2,7 +2,7 @@
 
 import hashlib
 import logging
-from typing import Any, Dict, List
+from typing import List
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
@@ -120,15 +120,19 @@ async def upload_resume(
             original_filename=file.filename or "resume.pdf",
         )
         
-        # Optionally synchronize parsed details with profile
+        # Authoritative Single-Pass Profile Synchronization
+        sync_status = "SYNCED"
+        sync_error = None
         if auto_sync_profile:
             try:
                 service.sync_user_profile_from_resume_id(
                     user_id=user_id,
                     resume_id=resume_rec["id"],
                 )
-            except Exception:
-                pass  # Non-fatal sync
+            except Exception as sync_err:
+                logger.error("Profile synchronization error on resume upload: %s", sync_err)
+                sync_status = "FAILED"
+                sync_error = str(sync_err)
                 
         return ResumeResponse(
             id=resume_rec["id"],
@@ -139,6 +143,8 @@ async def upload_resume(
             file_hash=resume_rec["file_hash"],
             is_primary=bool(resume_rec.get("is_primary", False)),
             upload_date=resume_rec.get("upload_date"),
+            sync_status=sync_status,
+            sync_error=sync_error,
         )
     except FileSecurityError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"File validation failed: {str(e)}")
@@ -152,11 +158,15 @@ async def upload_resume(
 
         if existing_row:
             existing_dict = dict(existing_row)
+            sync_status = "SYNCED"
+            sync_error = None
             if auto_sync_profile:
                 try:
                     service.sync_user_profile_from_resume_id(user_id=user_id, resume_id=existing_dict["id"])
                 except Exception as sync_err:
-                    logger.warning("Profile re-sync non-fatal warning: %s", sync_err)
+                    logger.warning("Profile re-sync error on duplicate upload: %s", sync_err)
+                    sync_status = "FAILED"
+                    sync_error = str(sync_err)
 
             return ResumeResponse(
                 id=existing_dict["id"],
@@ -167,6 +177,8 @@ async def upload_resume(
                 file_hash=existing_dict["file_hash"],
                 is_primary=bool(existing_dict.get("is_primary", False)),
                 upload_date=existing_dict.get("upload_date"),
+                sync_status=sync_status,
+                sync_error=sync_error,
             )
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=f"Duplicate resume: {str(e)}")
     except ValidationError as e:

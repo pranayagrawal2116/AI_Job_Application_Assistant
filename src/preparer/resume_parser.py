@@ -16,6 +16,14 @@ from docx import Document
 from pypdf import PdfReader
 from pypdf.errors import PdfReadError
 
+try:
+    import pymupdf
+except ImportError:
+    try:
+        import fitz as pymupdf
+    except ImportError:
+        pymupdf = None
+
 from src.database.exceptions import (
     CorruptedFileError,
     EncryptedFileError,
@@ -153,12 +161,14 @@ class ParsedResume:
     # Sections
     education: List[EducationEntry] = field(default_factory=list)
     work_experience: List[ExperienceEntry] = field(default_factory=list)
+    per_experience: List[ExperienceEntry] = field(default_factory=list)
     technical_skills: List[str] = field(default_factory=list)
     professional_skills: List[str] = field(default_factory=list)
     soft_skills: List[str] = field(default_factory=list)
     tools_and_software: List[str] = field(default_factory=list)
     projects: List[ProjectEntry] = field(default_factory=list)
     certifications: List[CertificationEntry] = field(default_factory=list)
+    professional_qualifications: List[CertificationEntry] = field(default_factory=list)
     languages: List[str] = field(default_factory=list)
     areas_of_interest: List[str] = field(default_factory=list)
     core_strengths: List[str] = field(default_factory=list)
@@ -225,7 +235,11 @@ SECTION_PATTERNS = {
         re.IGNORECASE,
     ),
     "EDUCATION": re.compile(
-        r"^(?:education|academic\s+background|academic\s+credentials|qualifications|academic\s+qualifications|educational\s+background|degrees|medical\s+education|law\s+school|training)\b",
+        r"^(?:education|academic\s+background|academic\s+credentials|academic\s+qualifications|educational\s+background|degrees|medical\s+education|law\s+school|training)\b",
+        re.IGNORECASE,
+    ),
+    "ACCA_PER": re.compile(
+        r"^(?:acca\s+practical\s+experience\s+requirement\s*\(?per\)?|practical\s+experience\s+requirement\s*\(?per\)?|acca\s+per|supervised\s+professional\s+experience|supervised\s+experience|practical\s+experience\s+requirement)\b",
         re.IGNORECASE,
     ),
     "EXPERIENCE": re.compile(
@@ -233,15 +247,23 @@ SECTION_PATTERNS = {
         re.IGNORECASE,
     ),
     "SKILLS": re.compile(
-        r"^(?:technical\s+skills|core\s+competencies|competencies|skills|skills\s*&\s*proficiencies|areas\s+of\s+expertise|key\s+skills|proficiencies|clinical\s+skills|tools\s*&\s*technologies|tools)\b",
+        r"^(?:technical\s+skills|core\s+competencies|competencies|skills|skills\s*&\s*proficiencies|areas\s+of\s+expertise|key\s+skills|proficiencies|clinical\s+skills|technical\s+and\s+professional\s+competencies|competencies\s*&\s*skills)\b",
+        re.IGNORECASE,
+    ),
+    "SOFTWARE": re.compile(
+        r"^(?:software\s*&\s*tools|software|tools\s*&\s*software|tools\s*&\s*technologies|tools|it\s+skills|technical\s+tools|computer\s+skills)\b",
         re.IGNORECASE,
     ),
     "PROJECTS": re.compile(
         r"^(?:selected\s+projects|academic\s+projects|key\s+projects|projects|portfolio|case\s+studies|notable\s+engagements)\b",
         re.IGNORECASE,
     ),
+    "PROFESSIONAL_QUALIFICATIONS": re.compile(
+        r"^(?:professional\s+qualifications|professional\s+credentials|professional\s+memberships|credentials|qualifications|memberships|licenses\s*&\s*memberships|professional\s+certifications|certifications\s*&\s*licenses)\b",
+        re.IGNORECASE,
+    ),
     "CERTIFICATIONS": re.compile(
-        r"^(?:certifications|licenses|certifications\s*&\s*licenses|credentials|professional\s+certifications|bar\s+admissions|board\s+certifications|accreditations)\b",
+        r"^(?:certifications|licenses|bar\s+admissions|board\s+certifications|accreditations)\b",
         re.IGNORECASE,
     ),
     "PUBLICATIONS": re.compile(
@@ -278,13 +300,19 @@ DEGREE_PATTERNS = [
     r"\b(B\.?Tech(?:nology)?|Bachelor\s+of\s+Technology)\b",
     r"\b(B\.?S\.?|B\.?Sc\.?|Bachelor\s+of\s+Science)\b",
     r"\b(B\.?A\.?|Bachelor\s+of\s+Arts)\b",
+    r"\b(B\.?B\.?A\.?|Bachelor\s+of\s+Business\s+Administration)\b",
+    r"\b(B\.?Com(?:merce)?|Bachelor\s+of\s+Commerce)\b",
+    r"\b(B\.?M\.?S\.?|Bachelor\s+of\s+Management\s+Studies)\b",
+    r"\b(B\.?C\.?A\.?|Bachelor\s+of\s+Computer\s+Applications)\b",
     r"\b(M\.?Tech(?:nology)?|Master\s+of\s+Technology)\b",
     r"\b(M\.?S\.?|M\.?Sc\.?|Master\s+of\s+Science)\b",
     r"\b(M\.?B\.?A\.?|Master\s+of\s+Business\s+Administration)\b",
+    r"\b(M\.?Com(?:merce)?|Master\s+of\s+Commerce)\b",
     r"\b(M\.?B\.?B\.?S\.?|Doctor\s+of\s+Medicine|M\.?D\.?)\b",
     r"\b(B\.?S\.?N\.?|Bachelor\s+of\s+Science\s+in\s+Nursing|Nursing\s+Diploma)\b",
     r"\b(J\.?D\.?|Juris\s+Doctor|LL\.?B\.?|LL\.?M\.?|Bachelor\s+of\s+Laws)\b",
-    r"\b(B\.?Com(?:merce)?|M\.?Com(?:merce)?)\b",
+    r"\b(H\.?S\.?C\.?|Higher\s+Secondary\s+Certificate|Class\s+12(?:th)?|Class\s+XII|12th\s+Grade|A-Levels?)\b",
+    r"\b(S\.?S\.?C\.?|Secondary\s+School\s+Certificate|Class\s+10(?:th)?|Class\s+X|10th\s+Grade|O-Levels?)\b",
     r"\b(Ph\.?D\.?|Doctor\s+of\s+Philosophy)\b",
     r"\b(Diploma|Associate\s+Degree|Certificate|Vocational\s+Certificate)\b",
 ]
@@ -305,8 +333,69 @@ class ResumeParser:
                 sha.update(chunk)
         return sha.hexdigest()
 
+    def _order_page_blocks(self, blocks: List[Any], page_width: float, page_height: float) -> str:
+        """Orders extracted PDF text blocks by visual column and reading flow.
+
+        Identifies full-width headers/banners across the top, separates multi-column regions
+        (e.g., Canva/two-column layouts), and preserves intra-column vertical reading order.
+        """
+        # Filter for text blocks (type == 0) with non-whitespace text
+        text_blocks = [b for b in blocks if len(b) >= 5 and b[6] == 0 and b[4].strip()]
+        if not text_blocks:
+            return ""
+
+        # Check for multi-column layout
+        column_candidates = [b for b in text_blocks if (b[2] - b[0]) < 0.65 * page_width]
+        is_two_column = False
+        split_x = page_width / 2
+
+        if len(column_candidates) >= 3:
+            left_blocks = [b for b in column_candidates if b[2] <= page_width * 0.55 and b[0] < page_width * 0.45]
+            right_blocks = [b for b in column_candidates if b[0] >= page_width * 0.35]
+            if len(left_blocks) >= 1 and len(right_blocks) >= 1 and (len(left_blocks) + len(right_blocks) >= 3):
+                is_two_column = True
+                max_left_x1 = max(b[2] for b in left_blocks)
+                min_right_x0 = min(b[0] for b in right_blocks)
+                if min_right_x0 >= max_left_x1 - 25:
+                    split_x = (max_left_x1 + min_right_x0) / 2
+                else:
+                    split_x = page_width * 0.42
+
+        if not is_two_column:
+            # Single-column: sort blocks by top-to-bottom y0, then left-to-right x0
+            sorted_b = sorted(text_blocks, key=lambda b: (round(b[1] / 8) * 8, b[0]))
+            return "\n\n".join(b[4].strip() for b in sorted_b if b[4].strip())
+
+        # Two-column separation
+        header_blocks = []
+        left_col = []
+        right_col = []
+        footer_blocks = []
+
+        min_col_y = min(b[1] for b in column_candidates)
+
+        for b in text_blocks:
+            is_full_width = (b[2] - b[0]) >= 0.65 * page_width
+            # Top header if above columns or full-width near top
+            if b[3] <= min_col_y + 10 or (is_full_width and b[1] < min_col_y + 60):
+                header_blocks.append(b)
+            elif b[1] > page_height * 0.90 and is_full_width:
+                footer_blocks.append(b)
+            elif (b[0] + b[2]) / 2 < split_x:
+                left_col.append(b)
+            else:
+                right_col.append(b)
+
+        header_blocks.sort(key=lambda b: (b[1], b[0]))
+        left_col.sort(key=lambda b: (b[1], b[0]))
+        right_col.sort(key=lambda b: (b[1], b[0]))
+        footer_blocks.sort(key=lambda b: (b[1], b[0]))
+
+        ordered = header_blocks + left_col + right_col + footer_blocks
+        return "\n\n".join(b[4].strip() for b in ordered if b[4].strip())
+
     def extract_text_from_pdf(self, path_or_bytes: Union[str, Path, bytes]) -> Tuple[str, List[Tuple[int, str]], int]:
-        """Extracts plain text and per-page text from PDF using pypdf.
+        """Extracts plain text and per-page text from PDF using layout-aware PyMuPDF with PyPDF fallback.
 
         Supports both file paths and raw verified in-memory bytes without disk re-reading.
 
@@ -323,6 +412,36 @@ class ResumeParser:
         if not pdf_bytes.startswith(b"%PDF-"):
             raise InvalidFileFormatError("File does not start with valid PDF magic bytes.")
 
+        # 1. Primary Layout-Aware Extraction using PyMuPDF (coordinate-based column preservation)
+        if pymupdf is not None:
+            try:
+                doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+                if doc.is_encrypted:
+                    try:
+                        decrypted = doc.authenticate("")
+                        if not decrypted:
+                            raise EncryptedFileError("PDF document is encrypted with a password.")
+                    except Exception:
+                        raise EncryptedFileError("PDF document is encrypted with a password.")
+
+                pages_data: List[Tuple[int, str]] = []
+                for i, page in enumerate(doc, start=1):
+                    ordered_text = self._order_page_blocks(
+                        page.get_text("blocks"),
+                        page.rect.width,
+                        page.rect.height,
+                    )
+                    pages_data.append((i, ordered_text))
+
+                full_text = "\n\n".join(p[1] for p in pages_data if p[1].strip())
+                if full_text.strip():
+                    return full_text, pages_data, len(pages_data)
+            except (EncryptedFileError, InvalidFileFormatError):
+                raise
+            except Exception as pymupdf_err:
+                logger.warning("PyMuPDF layout-aware extraction fallback: %s", pymupdf_err)
+
+        # 2. Compatibility Fallback using PyPDF
         stream = io.BytesIO(pdf_bytes)
         try:
             reader = PdfReader(stream)
@@ -473,14 +592,21 @@ class ResumeParser:
         # 5. Extract Work Experience
         self._extract_experience(segmented_sections.get("EXPERIENCE", ""), parsed)
 
-        # 6. Extract Skills & Tools
-        self._extract_skills(segmented_sections.get("SKILLS", ""), raw_text, parsed)
+        # 5b. Extract ACCA Practical Experience Requirement (PER)
+        self._extract_acca_per(segmented_sections.get("ACCA_PER", ""), parsed)
+
+        # 6. Extract Skills & Tools (from both SKILLS and SOFTWARE sections)
+        skills_text = segmented_sections.get("SKILLS", "")
+        software_text = segmented_sections.get("SOFTWARE", "")
+        self._extract_skills(skills_text, software_text, raw_text, parsed)
 
         # 7. Extract Projects
         self._extract_projects(segmented_sections.get("PROJECTS", ""), parsed)
 
-        # 8. Extract Certifications & Licenses
-        self._extract_certifications(segmented_sections.get("CERTIFICATIONS", ""), parsed)
+        # 8. Extract Certifications & Professional Qualifications
+        cert_text = segmented_sections.get("CERTIFICATIONS", "")
+        prof_qual_text = segmented_sections.get("PROFESSIONAL_QUALIFICATIONS", "")
+        self._extract_certifications(cert_text, prof_qual_text, parsed)
 
         # 9. Extract Publications, Awards, Languages, Strengths, Interests
         self._extract_supplementary_sections(segmented_sections, raw_text, parsed)
@@ -543,7 +669,7 @@ class ResumeParser:
         if any(k in clean.lower() for k in ["pvt. ltd", "pvt ltd", "inc", "llc", "corp", "corporation", "ltd"]):
             return None
         # Reject lines that look like degrees
-        if any(k in clean.lower() for k in ["b.tech", "b.s.", "b.sc", "b.a.", "m.tech", "m.s.", "mba", "m.d.", "j.d.", "ph.d."]):
+        if any(k in clean.lower() for k in ["b.tech", "b.s.", "b.sc", "b.a.", "bba", "b.com", "m.tech", "m.s.", "mba", "m.d.", "j.d.", "ph.d.", "hsc", "ssc", "cbse"]):
             return None
         # Reject lines that contain contact info
         if any(k in clean.lower() for k in ["@", "http", "phone", "email", "address", "cgpa", "gpa"]):
@@ -637,6 +763,7 @@ class ResumeParser:
         # 4. Location
         loc_patterns = [
             r"\b([A-Za-z\s]+,\s*[A-Za-z\s]+,\s*(?:India|USA|United States|UK|Canada|Germany|Australia|France|Singapore))\b",
+            r"\b((?:Pune|Bengaluru|Bangalore|Mumbai|Delhi|Hyderabad|Chennai|Kolkata|Ahmedabad|San Francisco|New York|London|Berlin|Toronto|Seattle|Boston|Austin|Chicago|Dallas|Denver)(?:,\s*[A-Za-z\s]+)?)\b",
             r"\b([A-Za-z\s]+,\s*(?:Pune|Bengaluru|Bangalore|Mumbai|Delhi|Hyderabad|Chennai|Kolkata|Ahmedabad|San Francisco|New York|London|Berlin|Toronto|Seattle|Boston))\b",
             r"\b(Kothrud,\s*Pune[,\s\w]*)\b",
             r"\b([A-Z][a-zA-Z\s]+,\s*[A-Z]{2}\s+\d{5})\b",
@@ -705,7 +832,7 @@ class ResumeParser:
     # -------------------------------------------------------------------------
 
     def _extract_education(self, edu_text: str, parsed: ParsedResume) -> None:
-        """Extracts education entries across university, vocational, medical, and legal formats."""
+        """Extracts education entries across university, vocational, medical, legal, and school formats."""
         if not edu_text.strip():
             return
 
@@ -716,16 +843,19 @@ class ResumeParser:
         blocks: List[List[str]] = []
         current_block: List[str] = []
 
+        deg_regex = re.compile("|".join(DEGREE_PATTERNS), re.IGNORECASE)
+
         for line in raw_lines:
             is_new_deg = False
+            line_has_deg = bool(deg_regex.search(line))
+
             if current_block:
                 curr_txt = " ".join(current_block).lower()
-                has_inst = any(k in curr_txt for k in ["university", "college", "institute", "school", "academy", "polytechnic"])
-                has_deg = any(k in curr_txt for k in ["b.tech", "b.s", "bachelor", "m.tech", "master", "mba", "m.d", "j.d", "diploma", "ph.d"])
+                has_inst = any(k in curr_txt for k in ["university", "college", "institute", "school", "academy", "polytechnic", "vidyapeeth", "cbse", "icse", "board"])
+                has_deg = bool(deg_regex.search(curr_txt))
 
                 line_lower = line.lower()
-                line_has_inst = any(k in line_lower for k in ["university", "college", "institute", "school", "academy", "polytechnic"])
-                line_has_deg = any(k in line_lower for k in ["b.tech", "b.s", "bachelor", "m.tech", "master", "mba", "m.d", "j.d", "diploma", "ph.d"])
+                line_has_inst = any(k in line_lower for k in ["university", "college", "institute", "school", "academy", "polytechnic", "vidyapeeth", "cbse", "icse", "board"])
 
                 if (has_inst and line_has_inst) or (has_deg and line_has_deg):
                     is_new_deg = True
@@ -750,9 +880,9 @@ class ResumeParser:
                     entry.degree = m.group(0).strip()
                     break
 
-            # Institution detection
+            # Institution / Board detection
             for line in block_lines:
-                if any(kw in line.lower() for kw in ["university", "institute", "college", "school", "academy", "polytechnic", "vidyapeeth", "department", "faculty", "campus", "mit", "iit"]):
+                if any(kw in line.lower() for kw in ["university", "institute", "college", "school", "academy", "polytechnic", "vidyapeeth", "department", "faculty", "campus", "mit", "iit", "cbse", "icse", "board"]):
                     entry.institution = format_title_preserve_acronyms(line)
                     break
 
@@ -770,15 +900,40 @@ class ResumeParser:
                 if not any(k in cand_major.lower() for k in ["university", "college", "cgpa", "expected", "20"]):
                     entry.major = cand_major
 
-            for line in block_lines:
-                if "artificial intelligence" in line.lower() or "computer science" in line.lower() or "data science" in line.lower():
-                    if not entry.major:
-                        entry.major = line
-                    elif line != entry.degree and entry.major not in line:
-                        entry.major = f"{entry.major} – {line}"
+            # Specific major / specialization clues
+            block_lower = block_str.lower()
+            if "finance" in block_lower:
+                if not entry.major:
+                    entry.major = "Finance"
+                elif "finance" not in entry.major.lower():
+                    entry.major = f"{entry.major} – Finance"
+            elif "commerce" in block_lower:
+                if not entry.major:
+                    entry.major = "Commerce"
+            if "artificial intelligence" in block_lower or "computer science" in block_lower or "data science" in block_lower:
+                for line in block_lines:
+                    if "artificial intelligence" in line.lower() or "data science" in line.lower() or "computer science" in line.lower():
+                        if not entry.major:
+                            entry.major = line
+                        elif line != entry.degree and line not in entry.major:
+                            entry.major = f"{entry.major} – {line}"
 
-            # Graduation year
-            year_match = re.search(r"(?:expected\s+graduation|graduation|class\s+of)?[:\s]*\b(20[123]\d)\b", block_str, re.IGNORECASE)
+            # Qualification type classification
+            if any(k in entry.degree.lower() for k in ["hsc", "12", "higher secondary", "a-level"]):
+                entry.qualification_type = "Higher Secondary"
+                if "cbse" in block_lower and not entry.institution:
+                    entry.institution = "CBSE"
+            elif any(k in entry.degree.lower() for k in ["ssc", "10", "secondary school", "o-level"]):
+                entry.qualification_type = "Secondary School"
+                if "cbse" in block_lower and not entry.institution:
+                    entry.institution = "CBSE"
+            elif any(k in entry.degree.lower() for k in ["diploma", "associate"]):
+                entry.qualification_type = "Diploma"
+            else:
+                entry.qualification_type = "Degree"
+
+            # Graduation year / Completion year
+            year_match = re.search(r"(?:expected\s+graduation|graduation|class\s+of|year)?[:\s]*\b(20[123]\d)\b", block_str, re.IGNORECASE)
             if year_match:
                 entry.expected_graduation_year = int(year_match.group(1))
 
@@ -811,105 +966,208 @@ class ResumeParser:
                 parsed.education.append(entry)
 
     # -------------------------------------------------------------------------
-    # WORK EXPERIENCE EXTRACTION
+    # WORK EXPERIENCE & ACCA PER EXTRACTION
     # -------------------------------------------------------------------------
 
-    def _extract_experience(self, exp_text: str, parsed: ParsedResume) -> None:
-        """Extracts work experience across full-time, part-time, healthcare, legal, and engineering roles."""
-        if not exp_text.strip():
-            return
+    def _extract_roles_from_text(
+        self,
+        text: str,
+        default_domain: Optional[str] = None,
+        default_type: str = "Full-time",
+        source_section: str = "Experience",
+    ) -> List[ExperienceEntry]:
+        """Segments text into multiple distinct ExperienceEntry records."""
+        if not text.strip():
+            return []
 
-        lines = [l.strip() for l in exp_text.split("\n") if l.strip()]
+        lines = [l.strip() for l in text.split("\n") if l.strip()]
         if not lines:
-            return
+            return []
 
-        entry = ExperienceEntry()
-        employer_found = False
-        title_found = False
-        bullet_lines = []
+        date_pat = re.compile(
+            r'(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|\d{4})\s*(?:-|–|—|to)\s*(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{4}|\d{4}|Present|Current)|\b\d+\s+(?:month|mo|year|yr)s?\b',
+            re.IGNORECASE,
+        )
+        title_keywords = [
+            "associate", "auditor", "executive", "manager", "engineer", "developer",
+            "lead", "director", "specialist", "coordinator", "analyst", "intern",
+            "officer", "accountant", "consultant", "supervisor", "controller",
+            "doctor", "nurse", "attorney", "counsel", "architect", "designer",
+        ]
+        company_indicators = [
+            "pvt. ltd", "pvt ltd", "ltd", "inc", "llc", "corp", "corporation",
+            "solutions", "infotech", "technologies", "systems", "consulting",
+            "partners", "hospital", "clinic", "firm", "bank", "foundation", "group", "services",
+        ]
+
+        entries: List[ExperienceEntry] = []
+        current: Optional[ExperienceEntry] = None
 
         for line in lines:
             clean_l = re.sub(r"^[\s•*–—\-→⇒►]+\s*", "", line).strip()
-            # If line is bullet point (starts with bullet or indented)
-            if line.startswith(("-", "•", "*", "→", "►", "–")) or (employer_found and title_found):
-                bullet_lines.append(clean_l)
+            lower_l = clean_l.lower()
+
+            # Skip running heads, page numbers, and continued section labels
+            if any(term in lower_l for term in ["(cont", "(continued", "continued)", "page "]) and len(clean_l.split()) <= 8:
+                continue
+            if lower_l.startswith(("work experience", "professional experience", "experience & credentials", "curriculum vitae")):
                 continue
 
-            is_company = any(k in line.lower() for k in ["pvt. ltd", "pvt ltd", "ltd", "inc", "llc", "corp", "hospital", "clinic", "firm", "technologies", "infotech", "solutions", "services", "bank", "company", "systems", "dynamics"])
-            is_title = any(k in line.lower() for k in ["manager", "engineer", "developer", "lead", "director", "specialist", "coordinator", "analyst", "intern", "nurse", "doctor", "physician", "attorney", "accountant", "designer", "consultant", "officer", "associate"])
-
-            if "|" in line:
-                parts = [p.strip() for p in line.split("|")]
-                if any("month" in p.lower() or "year" in p.lower() or re.search(r"\d{4}", p) for p in parts):
+            # Dedicated duration / period line
+            if lower_l.startswith(("duration:", "duration ", "period:", "period ")):
+                if current is not None:
+                    parts = [p.strip() for p in re.split(r"\s*[|—–]\s*", line) if p.strip()]
                     for p in parts:
-                        if "month" in p.lower() or "year" in p.lower() or re.search(r"\d{4}", p):
-                            entry.duration = p
+                        p_lower = p.lower()
+                        if date_pat.search(p) or any(k in p_lower for k in ["present", "current", "month", "year"]):
+                            current.duration = p
                             s_part, e_part = split_date_range(p)
                             if s_part:
-                                entry.start_date = s_part
+                                current.start_date = s_part
                             if e_part:
-                                entry.end_date = e_part
+                                current.end_date = e_part
                                 if "present" in e_part.lower() or "current" in e_part.lower():
-                                    entry.is_current = True
-                        else:
-                            entry.employer = p.title() if p.isupper() else p
-                            employer_found = True
-                else:
-                    if is_title or not title_found:
-                        entry.job_title = line.title() if line.isupper() else line
-                        title_found = True
-            elif is_company and not employer_found:
-                entry.employer = line.title() if line.isupper() else line
-                employer_found = True
-            elif is_title and not title_found:
-                entry.job_title = line.title() if line.isupper() else line
-                title_found = True
-            elif not employer_found:
-                entry.employer = line.title() if line.isupper() else line
-                employer_found = True
-            elif not title_found:
-                entry.job_title = line.title() if line.isupper() else line
-                title_found = True
+                                    current.is_current = True
+                        elif not current.employer and not p_lower.startswith(("duration", "period")):
+                            current.employer = p
+                continue
 
-        entry.responsibilities = bullet_lines
+            is_bullet = line.startswith(("-", "•", "*", "→", "►", "–")) and not ("|" in line or date_pat.search(line))
 
-        if entry.employer:
-            entry.provenance = {
-                "source": "Experience Section",
-                "confidence": 0.95,
-                "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
-            }
-            parsed.work_experience.append(entry)
+            has_delim = any(d in line for d in ["|", " — ", " – "])
+            has_dates = bool(date_pat.search(line))
+            has_company = any(ci in lower_l for ci in company_indicators)
+            has_title_kw = any(kw in lower_l for kw in title_keywords)
+
+            is_new_role = False
+            if not is_bullet and (has_delim or has_dates or has_company or has_title_kw):
+                if current is None:
+                    is_new_role = True
+                elif current.responsibilities:
+                    is_new_role = True
+                elif current.job_title and has_title_kw and not has_company:
+                    is_new_role = True
+                elif current.employer and has_company and not has_title_kw:
+                    is_new_role = True
+
+            if is_new_role:
+                if current and (current.job_title or current.employer):
+                    entries.append(current)
+                current = ExperienceEntry(
+                    employment_type=default_type,
+                    domain_expertise=default_domain,
+                    provenance={
+                        "source": source_section,
+                        "confidence": 0.95,
+                        "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
+                    },
+                )
+
+            if is_bullet:
+                if current:
+                    current.responsibilities.append(clean_l)
+                continue
+
+            if current is not None:
+                parts = [p.strip() for p in re.split(r"\s*[|—–]\s*", line) if p.strip()]
+                for p in parts:
+                    p_lower = p.lower()
+                    if date_pat.search(p) or any(k in p_lower for k in ["present", "current", "month", "year"]):
+                        current.duration = p
+                        s_part, e_part = split_date_range(p)
+                        if s_part:
+                            current.start_date = s_part
+                        if e_part:
+                            current.end_date = e_part
+                            if "present" in e_part.lower() or "current" in e_part.lower():
+                                current.is_current = True
+                        m_mo = re.search(r"(\d+)\s*(?:month|mo)", p, re.IGNORECASE)
+                        if m_mo:
+                            current.duration_months = int(m_mo.group(1))
+                        m_yr = re.search(r"(\d+)\s*(?:year|yr)", p, re.IGNORECASE)
+                        if m_yr:
+                            current.duration_months = (current.duration_months or 0) + int(m_yr.group(1)) * 12
+                    elif any(ci in p_lower for ci in company_indicators) and not current.employer:
+                        current.employer = p.title() if p.isupper() else p
+                    elif any(kw in p_lower for kw in title_keywords) and not current.job_title:
+                        current.job_title = p.title() if p.isupper() else p
+                    elif not current.employer:
+                        current.employer = p.title() if p.isupper() else p
+                    elif not current.job_title:
+                        current.job_title = p.title() if p.isupper() else p
+                    else:
+                        current.responsibilities.append(p)
+
+        if current and (current.job_title or current.employer):
+            entries.append(current)
+
+        return entries
+
+    def _extract_experience(self, exp_text: str, parsed: ParsedResume) -> None:
+        """Extracts work experience across full-time, part-time, healthcare, legal, and engineering roles."""
+        entries = self._extract_roles_from_text(exp_text, source_section="Experience")
+        parsed.work_experience.extend(entries)
+
+    def _extract_acca_per(self, per_text: str, parsed: ParsedResume) -> None:
+        """Extracts ACCA Practical Experience Requirement (PER) supervised professional experience."""
+        if not per_text.strip():
+            return
+        per_entries = self._extract_roles_from_text(
+            per_text,
+            default_domain="ACCA_PER",
+            default_type="Supervised Experience (PER)",
+            source_section="ACCA PER",
+        )
+        parsed.per_experience.extend(per_entries)
 
     # -------------------------------------------------------------------------
     # SKILLS & COMPETENCIES EXTRACTION
     # -------------------------------------------------------------------------
 
-    def _extract_skills(self, skills_text: str, full_text: str, parsed: ParsedResume) -> None:
-        """Extracts skills and tools from skills section and document text without technology bias."""
-        extracted: List[str] = []
-        if skills_text.strip():
-            for raw_line in skills_text.split("\n"):
+    def _extract_skills(self, skills_text: str, software_text: str, full_text: str, parsed: ParsedResume) -> None:
+        """Extracts skills, competencies, and tools across domains without programming bias."""
+        extracted_skills: List[str] = []
+        extracted_tools: List[str] = []
+
+        all_text = (skills_text + "\n" + software_text).strip()
+        if all_text:
+            for raw_line in all_text.split("\n"):
                 clean_line = re.sub(r"^[\s→⇒►•*–—\-]+\s*", "", raw_line).strip()
                 if not clean_line:
                     continue
                 tokens = re.split(r"[,;]+", clean_line)
                 for t in tokens:
                     tok = t.strip()
-                    tok = re.sub(r"^[A-Za-z\s]+:\s*", "", tok).strip()
-                    if tok and 1 <= len(tok) <= 50:
-                        if tok not in extracted:
-                            extracted.append(tok)
-                        if " & " in tok:
-                            sub_parts = tok.split(" & ")
-                            for sp in sub_parts:
-                                sp_clean = sp.strip()
-                                if sp_clean and sp_clean not in extracted:
-                                    extracted.append(sp_clean)
+                    tok = re.sub(r"^[A-Za-z\s&]+:\s*", "", tok).strip()
+                    if tok and 1 <= len(tok) <= 60:
+                        if tok not in extracted_skills:
+                            extracted_skills.append(tok)
+                        # Identify software and tools
+                        if any(sw in tok.lower() for sw in ["digita", "fyi", "xero", "approvalmax", "coreplan", "office", "excel", "tally", "quickbooks", "word", "powerpoint", "docker", "git", "studio"]):
+                            if tok not in extracted_tools:
+                                extracted_tools.append(tok)
 
-        parsed.technical_skills = extracted
+        # Explicit software section items
+        if software_text.strip():
+            for raw_line in software_text.split("\n"):
+                clean_line = re.sub(r"^[\s→⇒►•*–—\-]+\s*", "", raw_line).strip()
+                tokens = re.split(r"[,;]+", clean_line)
+                for t in tokens:
+                    tok = t.strip()
+                    tok = re.sub(r"^[A-Za-z\s&]+:\s*", "", tok).strip()
+                    if tok and tok not in extracted_tools:
+                        extracted_tools.append(tok)
+                        if tok not in extracted_skills:
+                            extracted_skills.append(tok)
+
+        parsed.technical_skills = extracted_skills
+        parsed.tools_and_software = extracted_tools
+        parsed.professional_skills = [
+            s for s in extracted_skills
+            if any(dom in s.lower() for dom in ["tax", "audit", "account", "reconcil", "payable", "financial", "working capital", "control", "compliance"])
+        ]
         parsed.field_provenance["technical_skills"] = ProvenanceField(
-            value=extracted,
+            value=extracted_skills,
             source_section="Skills",
             confidence=0.95,
             verification_status=VerificationStatus.EXTRACTED_UNVERIFIED,
@@ -984,23 +1242,39 @@ class ResumeParser:
     # CERTIFICATIONS & LICENSES
     # -------------------------------------------------------------------------
 
-    def _extract_certifications(self, cert_text: str, parsed: ParsedResume) -> None:
-        """Extracts professional certifications, bar admissions, medical licenses, and board certs."""
-        if not cert_text.strip():
+    def _extract_certifications(
+        self,
+        cert_text: str,
+        prof_qual_text: str = "",
+        parsed: Optional[ParsedResume] = None,
+    ) -> None:
+        """Extracts professional certifications, memberships (e.g. ACCA Member), and statutory licenses."""
+        if parsed is None:
+            return
+        combined_text = (prof_qual_text + "\n" + cert_text).strip()
+        if not combined_text:
             return
 
-        lines = [l.strip() for l in cert_text.split("\n") if l.strip()]
+        lines = [l.strip() for l in combined_text.split("\n") if l.strip()]
         for line in lines:
             clean = re.sub(r"^[\s•*–—\-]+\s*", "", line).strip()
             if not clean:
                 continue
 
             entry = CertificationEntry()
-            if "–" in clean or "-" in clean or "|" in clean:
+            lower_clean = clean.lower()
+
+            if "acca member" in lower_clean or "association of chartered certified accountants" in lower_clean:
+                entry.name = "ACCA Member"
+                entry.issuer = "Association of Chartered Certified Accountants"
+                entry.issuing_organization = "Association of Chartered Certified Accountants"
+                entry.membership = "ACCA Member"
+            elif "–" in clean or "-" in clean or "|" in clean:
                 parts = re.split(r"\s*[–\-|]\s*", clean, maxsplit=1)
                 entry.name = parts[0].strip()
                 if len(parts) > 1:
                     entry.issuing_organization = parts[1].strip()
+                    entry.issuer = parts[1].strip()
             else:
                 entry.name = clean
 
@@ -1010,6 +1284,8 @@ class ResumeParser:
                 "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
             }
             parsed.certifications.append(entry)
+            if any(k in lower_clean for k in ["acca", "chartered", "cpa", "cfa", "ca"]):
+                parsed.professional_qualifications.append(entry)
 
     # -------------------------------------------------------------------------
     # SUPPLEMENTARY SECTIONS

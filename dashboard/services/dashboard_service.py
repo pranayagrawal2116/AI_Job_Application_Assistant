@@ -352,7 +352,16 @@ class DashboardService:
                 target_locations = inferencer.infer_locations(parsed_data or prof_data)
 
         if not target_roles:
-            target_roles = ["Software Engineer Intern", "Developer Intern"]
+            # Derive role from skills or educational major without assuming software engineering
+            major = ""
+            for edu in prof_data.get("education", []):
+                major = edu.get("major") or edu.get("degree") or ""
+                if major:
+                    break
+            if major:
+                target_roles = [f"{major} Specialist", f"{major} Associate"]
+            else:
+                target_roles = ["Associate", "Specialist"]
         if not target_locations:
             target_locations = ["Remote", "India"]
 

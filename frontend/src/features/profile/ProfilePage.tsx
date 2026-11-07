@@ -23,6 +23,9 @@ import {
   Sparkles,
   X,
   ShieldCheck,
+  Award,
+  Languages,
+  Wrench,
 } from 'lucide-react';
 
 export const ProfilePage: React.FC = () => {
@@ -93,11 +96,11 @@ export const ProfilePage: React.FC = () => {
     setErrorMsg(null);
     try {
       const uploaded = await api.uploadResume(file);
-      // Automatically sync profile with parsed resume
-      try {
-        await api.syncProfileWithResume(uploaded.id);
-      } catch (syncErr: any) {
-        console.warn('Profile sync non-fatal warning:', syncErr);
+      if (uploaded.sync_status === 'FAILED') {
+        setErrorMsg(`Resume uploaded, but profile synchronization encountered an error: ${uploaded.sync_error || 'Check document structure'}`);
+      } else {
+        setSaveSuccess(true);
+        setTimeout(() => setSaveSuccess(false), 4000);
       }
       await loadData();
     } catch (err: any) {
@@ -515,21 +518,23 @@ export const ProfilePage: React.FC = () => {
                       <input
                         type="text"
                         placeholder="Grad Year"
-                        value={edu.graduation_year || ''}
+                        value={edu.graduation_year || edu.expected_graduation_year || ''}
                         onChange={(e) => {
                           const updated = [...(profile.education || [])];
                           updated[idx].graduation_year = e.target.value;
+                          updated[idx].expected_graduation_year = e.target.value;
                           setProfile({ ...profile, education: updated });
                         }}
                         className="w-1/2 px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
                       />
                       <input
                         type="text"
-                        placeholder="CGPA (e.g. 7.6)"
-                        value={edu.cgpa || ''}
+                        placeholder="CGPA / %"
+                        value={edu.cgpa || edu.current_cgpa || (edu.percentage ? `${edu.percentage}%` : '')}
                         onChange={(e) => {
                           const updated = [...(profile.education || [])];
                           updated[idx].cgpa = e.target.value;
+                          updated[idx].current_cgpa = e.target.value;
                           setProfile({ ...profile, education: updated });
                         }}
                         className="w-1/2 px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
@@ -715,6 +720,159 @@ export const ProfilePage: React.FC = () => {
               ))}
             </div>
           )}
+
+          {/* ACCA Practical Experience Requirement (PER) / Supervised Training */}
+          <div className="pt-6 border-t border-slate-200/80 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h4 className="text-sm font-bold text-slate-900">
+                    ACCA Practical Experience Requirement (PER) / Supervised Training
+                  </h4>
+                  <span className="px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-50 text-blue-700 border border-blue-200">
+                    Professional Qualification Record
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Supervised professional experience, mentor sign-offs, and practical performance objectives.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const current = profile.per_experience || [];
+                  setProfile({
+                    ...profile,
+                    per_experience: [
+                      ...current,
+                      {
+                        employer: '',
+                        job_title: 'Trainee / Supervised Experience',
+                        supervisory_context: 'Supervised by ACCA Member / Senior Accountant',
+                        start_date: '',
+                        end_date: '',
+                        duration: '',
+                        responsibilities: [],
+                        provenance: 'USER_CONFIRMED',
+                      },
+                    ],
+                  });
+                }}
+                className="px-3 py-1.5 rounded-xl bg-blue-50 text-blue-700 font-semibold text-xs border border-blue-200 flex items-center gap-1 hover:bg-blue-100 self-start sm:self-auto"
+              >
+                <Plus size={14} />
+                <span>Add PER Record</span>
+              </button>
+            </div>
+
+            {(profile.per_experience || []).length === 0 ? (
+              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/70 text-slate-500 text-xs flex items-center gap-2">
+                <Briefcase size={16} className="text-slate-400 shrink-0" />
+                <span>No ACCA Practical Experience Requirement (PER) records identified. Add records above if applicable to your professional credentialing.</span>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {profile.per_experience?.map((per, idx) => (
+                  <div key={idx} className="p-4 rounded-2xl bg-blue-50/40 border border-blue-200/70 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-bold text-blue-950">PER Objective #{idx + 1}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated.splice(idx, 1);
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        className="text-rose-600 hover:text-rose-700"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <input
+                        type="text"
+                        placeholder="Organization / Mentor Context"
+                        value={per.employer || per.supervisory_context || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated[idx].employer = e.target.value;
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Role / Objective Title"
+                        value={per.job_title || per.role_name || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated[idx].job_title = e.target.value;
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      <input
+                        type="text"
+                        placeholder="Start Date (e.g. 2023-01)"
+                        value={per.start_date || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated[idx].start_date = e.target.value;
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                      <input
+                        type="text"
+                        placeholder="End Date (e.g. Present)"
+                        value={per.end_date || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated[idx].end_date = e.target.value;
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Duration (e.g. 12 mos)"
+                        value={per.duration || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated[idx].duration = e.target.value;
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                        Performance Objectives & Practical Competencies Achieved
+                      </label>
+                      <textarea
+                        rows={2}
+                        value={(per.responsibilities || []).join('\n')}
+                        onChange={(e) => {
+                          const updated = [...(profile.per_experience || [])];
+                          updated[idx].responsibilities = e.target.value
+                            .split('\n')
+                            .filter((s) => s.trim().length > 0);
+                          setProfile({ ...profile, per_experience: updated });
+                        }}
+                        placeholder="Achieved Performance Objectives: SA100 preparation, UK Corporation Tax compliance, Bank reconciliation..."
+                        className="w-full p-2.5 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
         </div>
       )}
 
@@ -830,17 +988,21 @@ export const ProfilePage: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 5: SKILLS */}
+      {/* TAB 5: SKILLS & QUALIFICATIONS */}
       {activeTab === 'skills' && (
-        <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
+        <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-8">
+          {/* Domain & Technical Skills */}
           <div>
-            <h3 className="text-sm font-bold text-slate-900 mb-1">Technical Skills & Competencies</h3>
-            <p className="text-xs text-slate-500 mb-4">
-              Enter skills separated by commas (e.g. Python, React, Machine Learning, Docker).
+            <div className="flex items-center gap-2 mb-1">
+              <Code2 size={16} className="text-brand-600" />
+              <h3 className="text-sm font-bold text-slate-900">Domain Competencies & Technical Skills</h3>
+            </div>
+            <p className="text-xs text-slate-500 mb-3">
+              Core professional capabilities separated by commas (e.g. UK Taxation, SA100 Self Assessment, Financial Reporting, Python, Docker).
             </p>
 
             <textarea
-              rows={4}
+              rows={3}
               value={
                 Array.isArray(profile.technical_skills)
                   ? profile.technical_skills.join(', ')
@@ -855,8 +1017,173 @@ export const ProfilePage: React.FC = () => {
                   .filter((s) => s.length > 0);
                 setProfile({ ...profile, technical_skills: skills });
               }}
-              placeholder="Python, TypeScript, FastAPI, React, SQL, PyTorch, Docker, Git"
+              placeholder="UK Taxation, SA100 Self Assessment, Financial Reporting, Audit, Python, SQL"
               className="w-full p-3.5 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
+            />
+          </div>
+
+          {/* Professional Qualifications & Statutory Certifications */}
+          <div className="pt-6 border-t border-slate-100">
+            <div className="flex items-center justify-between mb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Award size={16} className="text-purple-600" />
+                  <h3 className="text-sm font-bold text-slate-900">Professional Qualifications & Memberships</h3>
+                </div>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Statutory professional bodies, credentials, and memberships (e.g. ACCA Member, CPA, CFA, Bar Council).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const current = profile.professional_qualifications || profile.certifications || [];
+                  const updated = [
+                    ...current,
+                    {
+                      name: '',
+                      issuer: 'ACCA (Association of Chartered Certified Accountants)',
+                      membership: 'Full Member',
+                      provenance: 'USER_CONFIRMED',
+                    },
+                  ];
+                  setProfile({
+                    ...profile,
+                    professional_qualifications: updated,
+                    certifications: updated,
+                  });
+                }}
+                className="px-3 py-1.5 rounded-xl bg-purple-50 text-purple-700 font-semibold text-xs border border-purple-200 flex items-center gap-1 hover:bg-purple-100"
+              >
+                <Plus size={14} />
+                <span>Add Credential</span>
+              </button>
+            </div>
+
+            {((profile.professional_qualifications || profile.certifications || []).length === 0) ? (
+              <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200/70 text-slate-500 text-xs flex items-center gap-2">
+                <Award size={16} className="text-slate-400 shrink-0" />
+                <span>No professional qualifications or certifications recorded. Click Add Credential to record verified credentials.</span>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                {(profile.professional_qualifications || profile.certifications || []).map((qual, idx) => (
+                  <div key={idx} className="p-3.5 rounded-2xl bg-purple-50/30 border border-purple-200/60 flex items-center justify-between gap-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 flex-1">
+                      <input
+                        type="text"
+                        placeholder="Credential / Title (e.g. ACCA Member)"
+                        value={qual.name}
+                        onChange={(e) => {
+                          const updated = [...(profile.professional_qualifications || profile.certifications || [])];
+                          updated[idx] = { ...updated[idx], name: e.target.value };
+                          setProfile({
+                            ...profile,
+                            professional_qualifications: updated,
+                            certifications: updated,
+                          });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white font-medium"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Issuing Authority (e.g. ACCA)"
+                        value={qual.issuer || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.professional_qualifications || profile.certifications || [])];
+                          updated[idx] = { ...updated[idx], issuer: e.target.value };
+                          setProfile({
+                            ...profile,
+                            professional_qualifications: updated,
+                            certifications: updated,
+                          });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                      <input
+                        type="text"
+                        placeholder="Membership Status (e.g. Member / Affiliate)"
+                        value={qual.membership || ''}
+                        onChange={(e) => {
+                          const updated = [...(profile.professional_qualifications || profile.certifications || [])];
+                          updated[idx] = { ...updated[idx], membership: e.target.value };
+                          setProfile({
+                            ...profile,
+                            professional_qualifications: updated,
+                            certifications: updated,
+                          });
+                        }}
+                        className="px-3 py-2 rounded-xl border border-slate-200 text-xs bg-white"
+                      />
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const updated = [...(profile.professional_qualifications || profile.certifications || [])];
+                        updated.splice(idx, 1);
+                        setProfile({
+                          ...profile,
+                          professional_qualifications: updated,
+                          certifications: updated,
+                        });
+                      }}
+                      className="text-rose-600 hover:text-rose-700 p-1"
+                    >
+                      <Trash2 size={15} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Software Tools & Enterprise Platforms */}
+          <div className="pt-6 border-t border-slate-100">
+            <div className="flex items-center gap-2 mb-1">
+              <Wrench size={16} className="text-emerald-600" />
+              <h3 className="text-sm font-bold text-slate-900">Software Tools & Platforms</h3>
+            </div>
+            <p className="text-xs text-slate-500 mb-3">
+              Industry applications and software suites separated by commas (e.g. Digita, Xero, ApprovalMax, FYI, Coreplan, Microsoft Office Suite).
+            </p>
+
+            <textarea
+              rows={2}
+              value={(profile.tools_and_software || []).join(', ')}
+              onChange={(e) => {
+                const tools = e.target.value
+                  .split(',')
+                  .map((s) => s.trim())
+                  .filter((s) => s.length > 0);
+                setProfile({ ...profile, tools_and_software: tools });
+              }}
+              placeholder="Digita, Xero, ApprovalMax, FYI, Coreplan, Microsoft Office Suite"
+              className="w-full p-3 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
+            />
+          </div>
+
+          {/* Languages */}
+          <div className="pt-6 border-t border-slate-100">
+            <div className="flex items-center gap-2 mb-1">
+              <Languages size={16} className="text-blue-600" />
+              <h3 className="text-sm font-bold text-slate-900">Languages</h3>
+            </div>
+            <p className="text-xs text-slate-500 mb-3">
+              Spoken and business languages separated by commas (e.g. English, Hindi, Gujarati).
+            </p>
+
+            <input
+              type="text"
+              value={(profile.languages || []).join(', ')}
+              onChange={(e) => {
+                const langs = e.target.value
+                  .split(',')
+                  .map((s) => s.trim())
+                  .filter((s) => s.length > 0);
+                setProfile({ ...profile, languages: langs });
+              }}
+              placeholder="English, Hindi, Gujarati"
+              className="w-full p-3 rounded-xl border border-slate-200 text-xs focus:ring-2 focus:ring-brand-500 focus:outline-none"
             />
           </div>
         </div>

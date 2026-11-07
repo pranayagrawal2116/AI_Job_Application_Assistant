@@ -67,6 +67,8 @@ export interface ResumeItem {
   is_primary: boolean;
   upload_date?: string;
   created_at?: string;
+  sync_status?: string;
+  sync_error?: string;
 }
 
 export interface CandidateProfile {
@@ -94,8 +96,12 @@ export interface CandidateProfile {
     institution: string;
     degree: string;
     field_of_study?: string;
+    major?: string;
     graduation_year?: number | string;
+    expected_graduation_year?: number | string;
     cgpa?: number | string;
+    current_cgpa?: number | string;
+    percentage?: number | string;
     provenance?: string;
   }>;
   work_experience?: Array<{
@@ -108,12 +114,33 @@ export interface CandidateProfile {
     responsibilities?: string[];
     provenance?: string;
   }>;
+  per_experience?: Array<{
+    employer?: string;
+    job_title?: string;
+    role_name?: string;
+    start_date?: string;
+    end_date?: string;
+    is_current?: boolean;
+    duration?: string;
+    responsibilities?: string[];
+    supervisory_context?: string;
+    provenance?: string;
+  }>;
   technical_skills?: string[] | Record<string, string[]>;
   professional_skills?: string[];
+  tools_and_software?: string[];
+  languages?: string[];
   certifications?: Array<{
     name: string;
     issuer?: string;
     issue_date?: string;
+    membership?: string;
+    provenance?: string;
+  }>;
+  professional_qualifications?: Array<{
+    name: string;
+    issuer?: string;
+    membership?: string;
     provenance?: string;
   }>;
   projects?: Array<{

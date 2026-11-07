@@ -567,6 +567,175 @@ PERSONA_DEFINITIONS: Dict[str, Dict[str, Any]] = {
             }
         ],
     },
+    "acca_finance_professional": {
+        "full_name": "Pranjali Agrawal",
+        "email": "pranjali.finance@synthetic-domain.org",
+        "phone": "+91 98765 43210",
+        "location": "Pune, India",
+        "headline": "ACCA Member | Finance & Taxation Specialist",
+        "summary": "ACCA Member with multi-year accounting and tax experience in UK tax compliance, SA100 Self Assessment filing, audit, and financial reporting.",
+        "education": [
+            {
+                "institution": "MIT World Peace University",
+                "degree": "BBA Finance",
+                "major": "Finance",
+                "expected_graduation_year": 2024,
+                "cgpa": 7.69,
+            },
+            {
+                "institution": "CBSE",
+                "degree": "HSC Commerce",
+                "major": "Commerce",
+                "expected_graduation_year": 2021,
+                "percentage": 93.8,
+            },
+        ],
+        "work_experience": [
+            {
+                "employer": "Terra Global Partners",
+                "job_title": "Tax Associate",
+                "start_date": "2024-09",
+                "end_date": "Present",
+                "duration": "Present",
+                "responsibilities": [
+                    "Prepared SA100 Self Assessment tax returns and UK tax computations.",
+                    "Handled HMRC correspondence and Making Tax Digital compliance.",
+                ],
+            },
+            {
+                "employer": "Apex Retail Audits",
+                "job_title": "Stock Auditor",
+                "start_date": "2024-01",
+                "end_date": "2024-07",
+                "duration": "7 months",
+                "responsibilities": [
+                    "Conducted comprehensive inventory audits and stock reconciliations.",
+                    "Identified shrinkage discrepancies and improved internal stock controls.",
+                ],
+            },
+            {
+                "employer": "Global Accounting Solutions",
+                "job_title": "Accounts Associate",
+                "start_date": "2023-02",
+                "end_date": "2024-01",
+                "duration": "12 months",
+                "responsibilities": [
+                    "Managed accounts payable and supplier payment runs in Xero and ApprovalMax.",
+                    "Conducted monthly balance sheet reconciliations and working capital analysis.",
+                ],
+            },
+            {
+                "employer": "Zenith Financial Corp",
+                "job_title": "Internal Auditor",
+                "start_date": "2022-08",
+                "end_date": "2023-01",
+                "duration": "6 months",
+                "responsibilities": [
+                    "Evaluated internal accounting controls and regulatory compliance.",
+                    "Prepared audit reports and recommendations for senior management.",
+                ],
+            },
+            {
+                "employer": "Om Logistics & Trade",
+                "job_title": "Accounts Executive",
+                "start_date": "2021-01",
+                "end_date": "2022-07",
+                "duration": "19 months",
+                "responsibilities": [
+                    "Handled accounts receivable, invoicing, and debtor ledger reconciliation.",
+                    "Prepared daily cash flow statements and vendor payment schedules.",
+                ],
+            },
+        ],
+        "per_experience": [
+            {
+                "employer": "Terra Global Partners",
+                "job_title": "Supervised Tax & Accounting Trainee",
+                "supervisory_context": "Supervised by Senior Tax Accountant / ACCA Member",
+                "duration": "36 months",
+                "responsibilities": [
+                    "Completed ACCA Performance Objectives in UK Tax, Audit, and Financial Reporting.",
+                    "Verified practical experience records signed off by registered practical experience supervisor.",
+                ],
+            }
+        ],
+        "skills": [
+            "UK taxation",
+            "SA100 Self Assessment",
+            "Making Tax Digital",
+            "Tax computations",
+            "Tax compliance",
+            "Accounts payable",
+            "Supplier payment analysis",
+            "Working capital analysis",
+            "Financial reporting",
+            "Internal audit",
+            "Stock audit",
+            "Receivables audit",
+            "Internal controls",
+            "Reconciliation",
+        ],
+        "tools_and_software": [
+            "Digita",
+            "FYI",
+            "Xero",
+            "ApprovalMax",
+            "Coreplan",
+            "Microsoft Office Suite",
+        ],
+        "languages": ["English", "Hindi", "Gujarati"],
+        "certifications": ["ACCA Member"],
+        "professional_qualifications": [
+            {
+                "name": "ACCA Member",
+                "issuer": "Association of Chartered Certified Accountants",
+                "membership": "Member",
+            }
+        ],
+    },
+    "cs_mobile_ai_student": {
+        "full_name": "Rohan Sharma",
+        "email": "rohan.sharma@synthetic-domain.org",
+        "phone": "+91 91234 56789",
+        "location": "Pune, India",
+        "headline": "B.Tech Computer Science (AI & Data Science) Student",
+        "summary": "Engineering student specializing in AI & Data Science with hands-on project experience in Flutter, Dart, Python, and full-stack API integration.",
+        "education": [
+            {
+                "institution": "MIT World Peace University",
+                "degree": "B.Tech Computer Science (AI & Data Science)",
+                "major": "Computer Science",
+                "expected_graduation_year": 2028,
+                "cgpa": 7.6,
+            }
+        ],
+        "work_experience": [
+            {
+                "employer": "Sarita Infotech Pvt. Ltd.",
+                "job_title": "Project Manager | Mobile App Development",
+                "start_date": "2024-05",
+                "end_date": "2024-08",
+                "duration": "3 months",
+                "responsibilities": [
+                    "Coordinated cross-functional mobile development team for healthcare application.",
+                    "Integrated ABDM (Ayushman Bharat Digital Mission) compliant APIs into Flutter mobile app.",
+                ],
+            }
+        ],
+        "skills": ["Flutter", "Dart", "Python", "JavaScript", "C/C++", "SQLite", "MySQL", "REST API", "Git"],
+        "projects": [
+            {
+                "title": "Medical Chatbot",
+                "description": "AI-powered medical triage chatbot assisting patient symptom analysis using Python and NLP.",
+                "technologies": ["Python", "FastAPI", "NLP", "SQLite"],
+            },
+            {
+                "title": "Sarita ABDM Integration",
+                "description": "Mobile healthcare module for QR patient registration and digital health records.",
+                "technologies": ["Flutter", "Dart", "REST API"],
+            },
+        ],
+    },
 }
 
 
@@ -702,6 +871,155 @@ def generate_persona_pdf(persona_id: str) -> bytes:
             c.setFont("Helvetica", 9)
             c.drawString(50, y, proj["description"][:95])
             y -= 15
+
+    c.save()
+    return stream.getvalue()
+
+
+def generate_two_column_acca_pdf(persona_id: str = "acca_finance_professional") -> bytes:
+    """Generates an authentic two-column, layout-aware PDF.
+
+    Layout structure:
+    - Top full-width header (x=50, y=740..770): Name, headline, contact info.
+    - Left column (x=50..220): Education, Professional Qualifications, Domain Skills, Software, Languages.
+    - Right column (x=240..560): Work Experience (5 distinct roles) and ACCA PER.
+    """
+    p = PERSONA_DEFINITIONS[persona_id]
+    stream = io.BytesIO()
+    c = canvas.Canvas(stream, pagesize=letter)
+    width, height = letter
+
+    # Page 1
+    # Full-width Header
+    y_hdr = height - 40
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, y_hdr, p["full_name"])
+    y_hdr -= 18
+    c.setFont("Helvetica-Bold", 10)
+    c.drawString(50, y_hdr, p["headline"])
+    y_hdr -= 14
+    c.setFont("Helvetica", 8.5)
+    c.drawString(50, y_hdr, f"{p['email']}  |  {p['phone']}  |  {p['location']}")
+    y_hdr -= 10
+    c.setLineWidth(0.5)
+    c.line(50, y_hdr, width - 50, y_hdr)
+
+    # Left Column (x=50)
+    y_left = y_hdr - 20
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_left, "Education")
+    y_left -= 14
+    for edu in p["education"]:
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(50, y_left, edu["institution"])
+        y_left -= 11
+        c.setFont("Helvetica", 8)
+        score_str = f"CGPA: {edu.get('cgpa')}" if edu.get("cgpa") else f"{edu.get('percentage')}%"
+        c.drawString(50, y_left, f"{edu['degree']} | {score_str} | {edu['expected_graduation_year']}")
+        y_left -= 15
+
+    # Professional Qualifications
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_left, "Professional Qualifications")
+    y_left -= 14
+    for qual in p.get("professional_qualifications", []):
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(50, y_left, qual["name"])
+        y_left -= 11
+        c.setFont("Helvetica", 8)
+        c.drawString(50, y_left, qual["issuer"])
+        y_left -= 15
+
+    # Domain Skills
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_left, "Skills & Competencies")
+    y_left -= 14
+    c.setFont("Helvetica", 8)
+    for sk in p["skills"][:8]:
+        c.drawString(50, y_left, f"• {sk}")
+        y_left -= 11
+    y_left -= 4
+
+    # Software & Tools
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_left, "Software & Tools")
+    y_left -= 14
+    c.setFont("Helvetica", 8)
+    for sw in p.get("tools_and_software", []):
+        c.drawString(50, y_left, f"• {sw}")
+        y_left -= 11
+    y_left -= 4
+
+    # Languages
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_left, "Languages")
+    y_left -= 14
+    c.setFont("Helvetica", 8)
+    c.drawString(50, y_left, ", ".join(p.get("languages", [])))
+
+    # Right Column (x=240)
+    y_right = y_hdr - 20
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(240, y_right, "Work Experience")
+    y_right -= 14
+
+    for exp in p["work_experience"][:3]:
+        c.setFont("Helvetica-Bold", 9)
+        c.drawString(240, y_right, f"{exp['job_title']} | {exp['employer']}")
+        y_right -= 11
+        c.setFont("Helvetica-Oblique", 8)
+        c.drawString(240, y_right, f"{exp.get('start_date', '')} - {exp.get('end_date', '')} ({exp.get('duration', '')})")
+        y_right -= 11
+        c.setFont("Helvetica", 8)
+        for resp in exp["responsibilities"]:
+            c.drawString(245, y_right, f"- {resp[:65]}")
+            y_right -= 10
+        y_right -= 6
+
+    # Page 2: Continuation of Experience & ACCA PER
+    c.showPage()
+    y_p2 = height - 40
+    c.setFont("Helvetica-Bold", 12)
+    c.drawString(50, y_p2, f"{p['full_name']} — Experience & Credentials (Cont.)")
+    y_p2 -= 12
+    c.setLineWidth(0.5)
+    c.line(50, y_p2, width - 50, y_p2)
+    y_p2 -= 20
+
+    c.setFont("Helvetica-Bold", 11)
+    c.drawString(50, y_p2, "Work Experience (Cont.)")
+    y_p2 -= 15
+
+    for exp in p["work_experience"][3:]:
+        c.setFont("Helvetica-Bold", 9.5)
+        c.drawString(50, y_p2, f"{exp['job_title']} | {exp['employer']}")
+        y_p2 -= 12
+        c.setFont("Helvetica-Oblique", 8.5)
+        c.drawString(50, y_p2, f"{exp.get('start_date', '')} - {exp.get('end_date', '')} ({exp.get('duration', '')})")
+        y_p2 -= 12
+        c.setFont("Helvetica", 8.5)
+        for resp in exp["responsibilities"]:
+            c.drawString(55, y_p2, f"- {resp[:85]}")
+            y_p2 -= 11
+        y_p2 -= 8
+
+    # ACCA PER Section
+    if p.get("per_experience"):
+        y_p2 -= 10
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(50, y_p2, "ACCA Practical Experience Requirement (PER)")
+        y_p2 -= 15
+        for per in p["per_experience"]:
+            c.setFont("Helvetica-Bold", 9.5)
+            c.drawString(50, y_p2, f"{per['job_title']} | {per.get('supervisory_context', '')}")
+            y_p2 -= 12
+            c.setFont("Helvetica", 8.5)
+            c.drawString(50, y_p2, f"Duration: {per.get('duration', '')} | {per['employer']}")
+            y_p2 -= 12
+            for resp in per["responsibilities"]:
+                c.drawString(55, y_p2, f"- {resp[:85]}")
+                y_p2 -= 11
+            y_p2 -= 8
 
     c.save()
     return stream.getvalue()

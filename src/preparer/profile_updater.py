@@ -97,15 +97,55 @@ class ProfileUpdater:
                 "responsibilities": proj.responsibilities,
             })
 
+        # ACCA PER / Supervised Professional Experience
+        per_list = []
+        for per in getattr(resume, "per_experience", []):
+            start_d = per.start_date
+            end_d = per.end_date
+            is_curr = per.is_current
+            dur_str = per.duration or ""
+
+            if (not start_d or not end_d) and dur_str:
+                s_part, e_part = split_date_range(dur_str)
+                if s_part:
+                    start_d = start_d or s_part
+                if e_part:
+                    end_d = end_d or e_part
+                    if "present" in e_part.lower() or "current" in e_part.lower():
+                        is_curr = True
+
+            per_list.append({
+                "employer": per.employer,
+                "job_title": per.job_title,
+                "role_name": per.job_title,
+                "duration": dur_str,
+                "start_date": start_d,
+                "end_date": end_d,
+                "is_current": is_curr,
+                "responsibilities": per.responsibilities,
+                "supervisory_context": per.domain_expertise or "ACCA Practical Experience Requirement (PER)",
+                "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
+            })
+
         # Certifications
         cert_list = []
         for cert in resume.certifications:
             cert_list.append({
                 "name": cert.name,
-                "issuer": cert.issuer,
+                "issuer": cert.issuer or cert.issuing_organization,
                 "date_issued": cert.date_issued,
                 "expiry_date": cert.expiry_date,
                 "credential_id": cert.credential_id,
+            })
+
+        # Professional Qualifications & Memberships
+        prof_qual_list = []
+        for pq in getattr(resume, "professional_qualifications", []):
+            prof_qual_list.append({
+                "name": pq.name,
+                "issuer": pq.issuer or pq.issuing_organization,
+                "membership": pq.membership or pq.name,
+                "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
             })
 
         # Technical skills (categorized without fabricating unverified tools)
@@ -188,6 +228,7 @@ class ProfileUpdater:
             "personal_info": copy.deepcopy(personal_dict),  # Compatibility mapping for frontend
             "education": edu_list,
             "work_experience": exp_list,
+            "per_experience": per_list,
             "technical_skills": {
                 "programming_languages": prog_languages,
                 "mobile_development": mobile_skills,
@@ -201,6 +242,7 @@ class ProfileUpdater:
             "tools_and_software": resume.tools_and_software,
             "projects": proj_list,
             "certifications": cert_list,
+            "professional_qualifications": prof_qual_list,
             "candidate_inputs": candidate_inputs,
             "preferences": search_preferences,
             "search_preferences": search_preferences,
@@ -474,7 +516,7 @@ class ProfileUpdater:
                 }
 
         # Sync auxiliary sections if present in new resume
-        for aux in ["languages", "awards", "publications", "custom_sections"]:
+        for aux in ["languages", "awards", "publications", "custom_sections", "per_experience", "professional_qualifications", "tools_and_software", "professional_skills"]:
             if new_prof.get(aux):
                 updated[aux] = new_prof[aux]
 

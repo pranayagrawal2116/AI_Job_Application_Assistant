@@ -1,9 +1,11 @@
 """Job discovery, exploration, and manual ingestion endpoints."""
 
+from datetime import datetime, timezone
 import json
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from pydantic import BaseModel
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
 from backend.api.schemas.jobs import (
@@ -99,7 +101,7 @@ def list_jobs(
         raw_skills = row.get("required_skills", "")
         skills_list = _normalize_skill_list(raw_skills)
 
-        # Candidate-specific match overlay
+        # Candidate-specific match overlay (Zero fallback to shared catalogue scores)
         user_match = user_matches.get(jid)
         if user_match:
             score = float(user_match.match_score)
@@ -110,12 +112,13 @@ def list_jobs(
             explanation = user_match.explanation or ""
             breakdown = _normalize_dict(user_match.score_breakdown)
         else:
-            score = float(row.get("match_score", 0.0) or 0.0)
-            eligible = bool(row.get("is_eligible", 1))
-            match_classification = str(row.get("match_classification", "") or "Moderate")
+            # Candidate has not been evaluated for this job yet — do NOT substitute global catalog scores
+            score = 0.0
+            eligible = False
+            match_classification = "Not Evaluated"
             matching_skills = []
             missing_skills = []
-            explanation = ""
+            explanation = "Personalized evaluation pending for this candidate."
             breakdown = {}
 
         work_arr = str(row.get("work_arrangement", "Onsite") or "Onsite")
@@ -165,6 +168,20 @@ def list_jobs(
             )
         )
         
+        # Deduplicate catalog listings by composite (company, title, location) and normalized URL
+    seen_keys = set()
+    deduped_items = []
+    for item in items:
+        norm_key = (item.company_name.lower().strip(), item.job_title.lower().strip(), item.location.lower().strip())
+        norm_url = item.job_url.split("?")[0].rstrip("/").lower() if item.job_url else ""
+        if norm_key in seen_keys or (norm_url and norm_url in seen_keys):
+            continue
+        seen_keys.add(norm_key)
+        if norm_url:
+            seen_keys.add(norm_url)
+        deduped_items.append(item)
+    items = deduped_items
+
     # Sort by match_score descending if recommended_only or default sorting
     if recommended_only:
         items.sort(key=lambda j: j.match_score, reverse=True)
@@ -433,3 +450,122 @@ def list_custom_job_descriptions(auth_ctx=Depends(get_current_user_and_session))
         )
         for jd in jds
     ]
+
+
+class JobsDiscoveryRequest(BaseModel):
+    roles: Optional[List[str]] = None
+    locations: Optional[List[str]] = None
+
+
+@router.post("/discovery")
+def trigger_jobs_discovery(
+    req: Optional[JobsDiscoveryRequest] = None,
+    background_tasks: BackgroundTasks = None,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Initiates non-blocking background job discovery and returns run identifier immediately."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+
+    active_run = service.db.get_active_discovery_run(user_id)
+    if active_run:
+        return {
+            "run_id": active_run["id"],
+            "status": "RUNNING",
+            "message": "A discovery run is already in progress for your profile.",
+            "started_at": active_run.get("started_at") or datetime.now(timezone.utc).isoformat(),
+        }
+
+    roles = req.roles if req else None
+    locations = req.locations if req else None
+
+    # Resolve roles and locations without tech bias
+    prof_rec = service.db.get_user_candidate_profile(user_id)
+    prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
+    prefs = prof_data.get("search_preferences", {}) or prof_data.get("preferences", {})
+
+    target_roles = list(roles) if roles and len(roles) > 0 else list(prefs.get("target_roles", []))
+    target_locations = list(locations) if locations and len(locations) > 0 else list(prefs.get("target_locations", []))
+
+    if not target_roles or not target_locations:
+        resumes = service.get_user_resumes(user_id)
+        if resumes:
+            from src.preparer.career_role_inferencer import CareerRoleInferencer
+            inferencer = CareerRoleInferencer()
+            if not target_roles:
+                inferred = inferencer.infer_roles(prof_data)
+                target_roles = [r.role_title for r in inferred[:5]]
+            if not target_locations:
+                target_locations = inferencer.infer_locations(prof_data)
+
+    if not target_roles:
+        target_roles = ["Associate", "Specialist"]
+    if not target_locations:
+        target_locations = ["Remote", "India"]
+
+    run_rec = service.db.create_discovery_run(user_id, target_roles, target_locations)
+    run_id = run_rec["id"]
+    service.db.update_discovery_run(run_id, status="RUNNING")
+
+    def _execute():
+        try:
+            summary = service.coordinator.run_discovery(
+                roles=target_roles,
+                locations=target_locations,
+                max_queries=5,
+                max_results_per_source=5,
+                enable_evaluation=False,
+            )
+            # Evaluate personalized scores for candidate
+            resumes = service.get_user_resumes(user_id)
+            prim = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
+            if prim:
+                for job in service.db.get_all_jobs()[:30]:
+                    try:
+                        service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job.id)
+                    except Exception:
+                        pass
+            final_status = "PARTIAL" if summary.restricted_incidents > 0 and summary.new_jobs_saved > 0 else (
+                "COMPLETED" if summary.new_jobs_saved > 0 or summary.restricted_incidents == 0 else "PARTIAL"
+            )
+            service.db.update_discovery_run(
+                run_id=run_id,
+                status=final_status,
+                new_jobs_count=summary.new_jobs_saved,
+                duplicates_skipped=summary.duplicates_skipped,
+                restricted_count=summary.restricted_incidents,
+            )
+        except Exception as exc:
+            logger.exception("Discovery background task failed: %s", exc)
+            service.db.update_discovery_run(run_id, status="FAILED", error_message=str(exc))
+
+    if background_tasks is not None:
+        background_tasks.add_task(_execute)
+    else:
+        import threading
+        t = threading.Thread(target=_execute, daemon=True)
+        t.start()
+
+    return {
+        "run_id": run_id,
+        "status": "RUNNING",
+        "message": "Discovery initiated. Searching permitted sources and computing personalized matches.",
+        "started_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/discovery/{run_id}")
+def get_jobs_discovery_status(run_id: int, auth_ctx=Depends(get_current_user_and_session)):
+    """Retrieves current execution status, progress, and discovered counts for a discovery run."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+
+    with service.db.connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM discovery_runs WHERE id = ? AND user_id = ?", (run_id, user_id))
+        row = cursor.fetchone()
+
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Discovery run not found.")
+
+    return dict(row)

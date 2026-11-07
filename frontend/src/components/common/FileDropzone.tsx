@@ -130,7 +130,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
-      className={`relative border-2 border-dashed rounded-2xl p-6 sm:p-8 text-center transition-all cursor-pointer select-none ${
+      className={`relative border-2 border-dashed rounded-2xl p-6 sm:p-8 text-center transition-all cursor-pointer select-none overflow-hidden ${
         disabled || isLoading
           ? 'opacity-60 cursor-not-allowed bg-slate-50 border-slate-200'
           : isDragging
@@ -147,7 +147,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
       }}
       aria-label="Upload document dropzone"
     >
-      {/* Accessible, visually hidden file input — NOT display:none so browsers and screen readers interact reliably */}
+      {/* Native file input overlay for universal browser & Safari compatibility */}
       <input
         ref={fileInputRef}
         type="file"
@@ -156,7 +156,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
         accept={accept}
         disabled={disabled || isLoading}
         onChange={handleInputChange}
-        className="sr-only"
+        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
         tabIndex={-1}
         aria-hidden="true"
       />
@@ -196,7 +196,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
                   onClearFile();
                   if (fileInputRef.current) fileInputRef.current.value = '';
                 }}
-                className="p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                className="relative z-20 p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
                 title="Remove file"
               >
                 <X size={16} />
