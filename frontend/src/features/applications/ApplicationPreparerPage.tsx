@@ -64,6 +64,8 @@ export const ApplicationPreparerPage: React.FC = () => {
   const [approverName, setApproverName] = useState('');
   const [isAuthorizing, setIsAuthorizing] = useState(false);
   const [isApproved, setIsApproved] = useState(false);
+  const [isPreparingPacket, setIsPreparingPacket] = useState(false);
+  const [downloadingDoc, setDownloadingDoc] = useState<string | null>(null);
 
   // Manual Submission Confirmation State
   const [candidateConfirmedSubmission, setCandidateConfirmedSubmission] = useState(false);
@@ -186,6 +188,43 @@ export const ApplicationPreparerPage: React.FC = () => {
       setErrorMsg(err.message || 'Failed to record submission.');
     } finally {
       setIsSubmittingConfirm(false);
+    }
+  };
+
+  const handlePreparePacket = async () => {
+    setIsPreparingPacket(true);
+    setErrorMsg(null);
+    try {
+      const res = await api.prepareApplicationPacket(appId);
+      setSuccessMsg('Application packet generated and sealed for review!');
+      if (res?.packet) {
+        setPacketInfo(res.packet);
+      }
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to prepare packet.');
+    } finally {
+      setIsPreparingPacket(false);
+    }
+  };
+
+  const handleDownloadDoc = async (docType: string, docFormat: string) => {
+    setDownloadingDoc(`${docType}_${docFormat}`);
+    setErrorMsg(null);
+    try {
+      const blob = await api.downloadDocument(appId, docType, docFormat);
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      const cleanCompany = (app?.company_name || 'Application').replace(/[^a-zA-Z0-9_-]/g, '_');
+      a.download = `${cleanCompany}_${docType}.${docFormat}`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+    } catch (err: any) {
+      setErrorMsg(err.message || `Download failed for ${docType} (${docFormat}).`);
+    } finally {
+      setDownloadingDoc(null);
     }
   };
 
@@ -632,6 +671,14 @@ export const ApplicationPreparerPage: React.FC = () => {
                 Back
               </button>
               <button
+                onClick={handlePreparePacket}
+                disabled={isPreparingPacket}
+                className="px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold text-xs flex items-center gap-1.5 transition-all disabled:opacity-50"
+              >
+                {isPreparingPacket ? <LoadingSpinner size={13} /> : <CheckCircle2 size={14} className="text-emerald-600" />}
+                <span>{isPreparingPacket ? 'Generating Documents...' : 'Generate & Seal Packet'}</span>
+              </button>
+              <button
                 onClick={() => setCurrentStep(6)}
                 className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 flex items-center gap-1.5 transition-all"
               >
@@ -652,17 +699,19 @@ export const ApplicationPreparerPage: React.FC = () => {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => alert('PDF export ready for download!')}
-                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors"
+                  onClick={() => handleDownloadDoc('resume', 'pdf')}
+                  disabled={downloadingDoc === 'resume_pdf'}
+                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors disabled:opacity-50"
                 >
-                  <Download size={13} />
+                  {downloadingDoc === 'resume_pdf' ? <LoadingSpinner size={12} /> : <Download size={13} />}
                   <span>Download PDF</span>
                 </button>
                 <button
-                  onClick={() => alert('DOCX export ready for download!')}
-                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors"
+                  onClick={() => handleDownloadDoc('resume', 'docx')}
+                  disabled={downloadingDoc === 'resume_docx'}
+                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors disabled:opacity-50"
                 >
-                  <Download size={13} />
+                  {downloadingDoc === 'resume_docx' ? <LoadingSpinner size={12} /> : <Download size={13} />}
                   <span>Download DOCX</span>
                 </button>
               </div>
@@ -678,17 +727,19 @@ export const ApplicationPreparerPage: React.FC = () => {
               </div>
               <div className="flex items-center gap-2">
                 <button
-                  onClick={() => alert('Cover letter PDF ready for download!')}
-                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors"
+                  onClick={() => handleDownloadDoc('cover-letter', 'pdf')}
+                  disabled={downloadingDoc === 'cover-letter_pdf'}
+                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors disabled:opacity-50"
                 >
-                  <Download size={13} />
+                  {downloadingDoc === 'cover-letter_pdf' ? <LoadingSpinner size={12} /> : <Download size={13} />}
                   <span>Download PDF</span>
                 </button>
                 <button
-                  onClick={() => alert('Cover letter DOCX ready for download!')}
-                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors"
+                  onClick={() => handleDownloadDoc('cover-letter', 'docx')}
+                  disabled={downloadingDoc === 'cover-letter_docx'}
+                  className="flex-1 py-2 rounded-xl bg-white border border-slate-200 hover:bg-slate-100 text-slate-700 font-semibold text-xs flex items-center justify-center gap-1 transition-colors disabled:opacity-50"
                 >
-                  <Download size={13} />
+                  {downloadingDoc === 'cover-letter_docx' ? <LoadingSpinner size={12} /> : <Download size={13} />}
                   <span>Download DOCX</span>
                 </button>
               </div>

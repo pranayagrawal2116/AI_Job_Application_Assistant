@@ -421,8 +421,8 @@ class TestPhase71Migrations(unittest.TestCase):
         # Scenario 7: Hash mismatch -> READY_FOR_REVIEW
         self.assertEqual(db.get_user_application(7, 1).status, ApplicationStatus.READY_FOR_REVIEW.value)
 
-    def test_preflight_aborts_on_null_user_id(self):
-        """Migration must abort with MigrationPreflightError if any application has NULL user_id."""
+    def test_unowned_application_is_quarantined_safely(self):
+        """Unowned application with NULL user_id must be safely moved to legacy_quarantined_applications."""
         conn = self._create_legacy_database()
         cursor = conn.cursor()
         cursor.execute("INSERT INTO users (id, email, password_hash, password_salt, full_name) VALUES (1, 'u@t.com', 'h', 's', 'U')")
@@ -430,9 +430,20 @@ class TestPhase71Migrations(unittest.TestCase):
         conn.commit()
         conn.close()
 
-        with self.assertRaises(MigrationPreflightError) as ctx:
-            DatabaseManager(db_path=self.db_path)
-        self.assertIn("NULL user_id", str(ctx.exception))
+        db = DatabaseManager(db_path=self.db_path)
+        # Verify application 1 is not in active applications for user 1
+        self.assertIsNone(db.get_user_application(1, 1))
+
+        # Verify application 1 is safely quarantined
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute("SELECT id, company_name, quarantine_reason FROM legacy_quarantined_applications WHERE id = 1")
+        row = c.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], 1)
+        self.assertEqual(row[1], 'Orphaned Co')
+        self.assertEqual(row[2], 'UNOWNED_LEGACY_APPLICATION_NULL_USER_ID')
+        conn.close()
 
     def test_preflight_aborts_on_cross_user_jd_reference(self):
         """Migration must abort with MigrationPreflightError if application references JD owned by another user."""

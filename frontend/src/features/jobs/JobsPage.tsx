@@ -22,6 +22,7 @@ import {
   FileText,
   Link as LinkIcon,
   Upload,
+  Sparkles,
 } from 'lucide-react';
 
 export const JobsPage: React.FC = () => {
@@ -40,6 +41,12 @@ export const JobsPage: React.FC = () => {
 
   // Selected job for detail modal
   const [selectedJob, setSelectedJob] = useState<JobItem | null>(null);
+  const [candidateResumes, setCandidateResumes] = useState<any[]>([]);
+  const [evaluatingResumeId, setEvaluatingResumeId] = useState<number | null>(null);
+  const [evaluatingProfile, setEvaluatingProfile] = useState<string>('student_intern');
+  const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
+  const [matchEvaluation, setMatchEvaluation] = useState<any | null>(null);
+  const [evalError, setEvalError] = useState<string | null>(null);
 
   // Add Job Manually modal/tab state
   const [manualMode, setManualMode] = useState<'text' | 'file' | 'url'>('text');
@@ -76,6 +83,33 @@ export const JobsPage: React.FC = () => {
       fetchJobs();
     }
   }, [activeTab, arrangement, platform, onlyEligible, minScore]);
+
+  useEffect(() => {
+    api.getResumes().then((res) => {
+      setCandidateResumes(res);
+      if (res && res.length > 0) {
+        setEvaluatingResumeId(res[0].id);
+      }
+    }).catch(() => {});
+  }, []);
+
+  const handleRunEvaluation = async () => {
+    if (!selectedJob || !evaluatingResumeId) return;
+    setIsEvaluating(true);
+    setEvalError(null);
+    try {
+      const res = await api.evaluateMatch({
+        resume_id: evaluatingResumeId,
+        job_id: selectedJob.id,
+        scoring_profile: evaluatingProfile,
+      });
+      setMatchEvaluation(res);
+    } catch (err: any) {
+      setEvalError(err.message || 'Match evaluation failed.');
+    } finally {
+      setIsEvaluating(false);
+    }
+  };
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
@@ -619,6 +653,116 @@ export const JobsPage: React.FC = () => {
                 </div>
               </div>
             )}
+
+            {/* Interactive Match Evaluation Section */}
+            <div className="p-4 rounded-2xl border border-brand-100 bg-brand-50/40 space-y-3">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Sparkles size={16} className="text-brand-600" />
+                  <h4 className="font-bold text-slate-900 text-xs">Evaluate Match Against My Resume</h4>
+                </div>
+                {candidateResumes.length === 0 && (
+                  <span className="text-[10px] text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded-full">
+                    Upload resume in Profile first
+                  </span>
+                )}
+              </div>
+
+              {candidateResumes.length > 0 && (
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Select Resume</label>
+                    <select
+                      value={evaluatingResumeId || ''}
+                      onChange={(e) => setEvaluatingResumeId(Number(e.target.value))}
+                      className="w-full px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white text-xs"
+                    >
+                      {candidateResumes.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.original_filename} ({r.label || 'General'})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">Scoring Profile</label>
+                    <select
+                      value={evaluatingProfile}
+                      onChange={(e) => setEvaluatingProfile(e.target.value)}
+                      className="w-full px-2.5 py-1.5 rounded-xl border border-slate-200 bg-white text-xs"
+                    >
+                      <option value="student_intern">Student / Intern (Heavy Academics & Projects)</option>
+                      <option value="mid_career">Mid-Career (Experience & Domain)</option>
+                      <option value="executive">Executive / Leadership</option>
+                      <option value="career_changer">Career Changer (Transferable Skills)</option>
+                    </select>
+                  </div>
+                </div>
+              )}
+
+              {candidateResumes.length > 0 && (
+                <button
+                  onClick={handleRunEvaluation}
+                  disabled={isEvaluating || !evaluatingResumeId}
+                  className="w-full py-2 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs flex items-center justify-center gap-1.5 transition-colors disabled:opacity-50"
+                >
+                  {isEvaluating ? <LoadingSpinner size={13} /> : <Sparkles size={14} />}
+                  <span>{isEvaluating ? 'Evaluating Multi-Dimensional Match...' : 'Run Personalized Match Analysis'}</span>
+                </button>
+              )}
+
+              {evalError && (
+                <div className="p-2.5 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-[11px]">
+                  {evalError}
+                </div>
+              )}
+
+              {matchEvaluation && (
+                <div className="p-3.5 rounded-xl bg-white border border-brand-200 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-slate-800 text-xs">Analysis Result:</span>
+                    <div className="flex items-center gap-2">
+                      <span className={`px-2.5 py-0.5 rounded-full text-xs font-extrabold border ${getScoreColor(matchEvaluation.match_score)}`}>
+                        {formatScore(matchEvaluation.match_score)} ({matchEvaluation.match_classification})
+                      </span>
+                      <Badge variant={matchEvaluation.eligibility_status === 'ELIGIBLE' ? 'success' : 'danger'}>
+                        {matchEvaluation.eligibility_status}
+                      </Badge>
+                    </div>
+                  </div>
+
+                  {matchEvaluation.matching_skills && matchEvaluation.matching_skills.length > 0 && (
+                    <div>
+                      <span className="text-[11px] font-semibold text-emerald-700 block mb-1">
+                        Matching Skills ({matchEvaluation.matching_skills.length}):
+                      </span>
+                      <div className="flex flex-wrap gap-1">
+                        {matchEvaluation.matching_skills.map((s: string, i: number) => (
+                          <span key={i} className="px-2 py-0.5 bg-emerald-50 text-emerald-700 border border-emerald-200 rounded-md text-[10px] font-medium">
+                            ✓ {s}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {matchEvaluation.missing_skills && matchEvaluation.missing_skills.length > 0 && (
+                    <div>
+                      <span className="text-[11px] font-semibold text-amber-700 block mb-1">
+                        Skill Gaps ({matchEvaluation.missing_skills.length}):
+                      </span>
+                      <div className="flex flex-wrap gap-1">
+                        {matchEvaluation.missing_skills.map((s: string, i: number) => (
+                          <span key={i} className="px-2 py-0.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-md text-[10px] font-medium">
+                            ✗ {s}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
 
             {/* Actions */}
             <div className="pt-4 border-t border-slate-100 flex items-center justify-between gap-3">

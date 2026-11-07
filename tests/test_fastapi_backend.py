@@ -161,3 +161,54 @@ def test_auth_and_session_lifecycle(test_client):
     # Verify session revoked
     me_revoked_resp = test_client.get("/api/auth/me", headers=headers)
     assert me_revoked_resp.status_code == 401
+
+
+def test_cookie_auth_and_csrf_protection(test_client):
+    import uuid
+    uid = uuid.uuid4().hex[:8]
+    email = f"csrf_candidate_{uid}@example.com"
+    password = "SecurePassword123!"
+    full_name = f"CSRF Candidate {uid}"
+
+    # 1. Register with client to obtain cookies
+    reg_resp = test_client.post(
+        "/api/auth/register",
+        json={"email": email, "password": password, "full_name": full_name},
+    )
+    assert reg_resp.status_code == 201
+    assert "session_id" in test_client.cookies
+    assert "csrf_token" in test_client.cookies
+    csrf_token = test_client.cookies["csrf_token"]
+
+    # 2. Mutating request WITHOUT X-CSRF-Token header should fail with 403 Forbidden
+    fail_resp = test_client.put(
+        "/api/profile",
+        json={"profile_data": {"personal_info": {"full_name": full_name, "email": email}}},
+    )
+    assert fail_resp.status_code == 403
+    assert "CSRF verification failed" in fail_resp.json()["detail"]
+
+    # 3. Mutating request with incorrect X-CSRF-Token header should fail with 403
+    fail_resp2 = test_client.put(
+        "/api/profile",
+        headers={"X-CSRF-Token": "invalid_csrf_token"},
+        json={"profile_data": {"personal_info": {"full_name": full_name, "email": email}}},
+    )
+    assert fail_resp2.status_code == 403
+
+    # 4. Mutating request WITH matching X-CSRF-Token header should succeed
+    success_resp = test_client.put(
+        "/api/profile",
+        headers={"X-CSRF-Token": csrf_token},
+        json={"profile_data": {"personal_info": {"full_name": full_name, "email": email}, "technical_skills": ["FastAPI", "React"]}},
+    )
+    assert success_resp.status_code == 200
+
+    # 5. Non-mutating GET request should succeed without CSRF token
+    get_resp = test_client.get("/api/auth/me")
+    assert get_resp.status_code == 200
+    assert get_resp.json()["email"] == email
+
+    # 6. Logout with CSRF token
+    logout_resp = test_client.post("/api/auth/logout", headers={"X-CSRF-Token": csrf_token})
+    assert logout_resp.status_code == 200

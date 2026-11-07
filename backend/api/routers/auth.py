@@ -1,5 +1,7 @@
 """Authentication endpoints using Argon2id and SessionManager."""
 
+import os
+import secrets
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.schemas.auth import (
@@ -19,6 +21,11 @@ from src.database.exceptions import (
 router = APIRouter(prefix="/api/auth", tags=["Authentication"])
 
 
+def _is_secure_cookie() -> bool:
+    env = os.getenv("APP_ENV", "").lower()
+    return env in ("prod", "production") or os.getenv("SECURE_COOKIES", "false").lower() == "true"
+
+
 @router.post("/register", response_model=SessionResponse, status_code=status.HTTP_201_CREATED)
 def register(req: RegisterRequest, response: Response):
     """Registers a new candidate with Argon2id password hashing."""
@@ -33,13 +40,26 @@ def register(req: RegisterRequest, response: Response):
         )
         _, session = service.login_candidate(email=req.email, password=req.password)
         
+        csrf_token = secrets.token_urlsafe(32)
+        is_secure = _is_secure_cookie()
+        
         # Set HttpOnly session cookie
         response.set_cookie(
             key="session_id",
             value=session.session_id,
             httponly=True,
             samesite="lax",
-            secure=False,  # Set true in production over HTTPS
+            secure=is_secure,
+            max_age=86400 * 7,
+        )
+        
+        # Set non-HttpOnly CSRF token cookie for frontend headers
+        response.set_cookie(
+            key="csrf_token",
+            value=csrf_token,
+            httponly=False,
+            samesite="lax",
+            secure=is_secure,
             max_age=86400 * 7,
         )
         
@@ -68,12 +88,24 @@ def login(req: LoginRequest, response: Response, request: Request):
     try:
         user, session = service.login_candidate(email=req.email, password=req.password, client_ip=client_ip)
         
+        csrf_token = secrets.token_urlsafe(32)
+        is_secure = _is_secure_cookie()
+        
         response.set_cookie(
             key="session_id",
             value=session.session_id,
             httponly=True,
             samesite="lax",
-            secure=False,
+            secure=is_secure,
+            max_age=86400 * 7,
+        )
+        
+        response.set_cookie(
+            key="csrf_token",
+            value=csrf_token,
+            httponly=False,
+            samesite="lax",
+            secure=is_secure,
             max_age=86400 * 7,
         )
         
@@ -98,12 +130,13 @@ def logout(
     response: Response,
     auth_ctx=Depends(get_current_user_and_session),
 ):
-    """Revokes active server session and clears cookie."""
+    """Revokes active server session and clears cookies."""
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
     service.logout_candidate(session.session_id)
     
     response.delete_cookie(key="session_id")
+    response.delete_cookie(key="csrf_token")
     return {"message": "Signed out successfully", "status": "ok"}
 
 

@@ -6,7 +6,7 @@
 
 [CmdletBinding()]
 param(
-    [string]$Port = "8501",
+    [string]$Port = "8000",
     [string]$Address = "127.0.0.1"
 )
 
@@ -23,6 +23,6 @@ if (-not $pyCmd) {
     Write-Error "Python executable not found in PATH."
 }
 
-# Run Streamlit
-Write-Host "Running: python -m streamlit run dashboard\app.py --server.port $Port --server.address $Address" -ForegroundColor Green
-& python -m streamlit run dashboard\app.py --server.port $Port --server.address $Address
+# Run FastAPI ASGI server (serves REST API and React SPA from frontend/dist)
+Write-Host "Running: python -m uvicorn backend.api.main:app --host $Address --port $Port" -ForegroundColor Green
+& python -m uvicorn backend.api.main:app --host $Address --port $Port

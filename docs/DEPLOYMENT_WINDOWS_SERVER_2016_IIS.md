@@ -11,13 +11,13 @@ Internet / Client Browser
           ▼
    IIS 10 Web Server
    ├── URL Rewrite 2.1
-   ├── Application Request Routing (ARR) 3.0
-   └── IIS WebSocket Protocol Feature
+   └── Application Request Routing (ARR) 3.0
           │ (Reverse Proxy via 127.0.0.1)
           ▼
- Streamlit Application (NSSM Windows Service)
-   ├── Listening on: 127.0.0.1:8501 (Headless, Localhost only)
-   ├── Process: Python 3.11 x64
+ FastAPI ASGI Application (NSSM Windows Service)
+   ├── Listening on: 127.0.0.1:8000 (Localhost only)
+   ├── Process: Python 3.11 x64 (uvicorn backend.api.main:app)
+   ├── Serves: React SPA frontend (/ & /assets) + REST API (/api/*)
    └── Multi-Tenant Candidate Session Manager
           │
           ▼

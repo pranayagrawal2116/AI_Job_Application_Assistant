@@ -619,6 +619,56 @@ BEGIN
 END;
 
 -- ---------------------------------------------------------------------
+-- 16. LEGACY QUARANTINED APPLICATIONS & EVENTS (Phase B Migration Safety)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS legacy_quarantined_applications (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER,
+    job_description_id INTEGER,
+    user_id INTEGER,
+    resume_id INTEGER,
+    company_name TEXT,
+    job_title TEXT,
+    status TEXT,
+    application_source TEXT,
+    external_application_url TEXT,
+    target_role TEXT,
+    employment_type TEXT,
+    location TEXT,
+    salary_range TEXT,
+    application_deadline TEXT,
+    date_prepared TEXT,
+    date_submitted TEXT,
+    resume_used TEXT,
+    cover_letter_reference TEXT,
+    notes TEXT,
+    is_archived INTEGER,
+    created_at TEXT,
+    updated_at TEXT,
+    quarantine_reason TEXT NOT NULL,
+    quarantined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS legacy_quarantined_application_events (
+    id INTEGER PRIMARY KEY,
+    application_id INTEGER,
+    user_id INTEGER,
+    sequence_no INTEGER,
+    event_type TEXT,
+    previous_status TEXT,
+    new_status TEXT,
+    actor_type TEXT,
+    actor_identifier TEXT,
+    session_reference TEXT,
+    event_payload_json TEXT,
+    previous_event_hash TEXT,
+    event_hash TEXT,
+    created_at TEXT,
+    quarantined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+
+-- ---------------------------------------------------------------------
 -- INDEXES FOR PERFORMANCE, FAST SEARCH, AND ISOLATION
 -- ---------------------------------------------------------------------
 CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);

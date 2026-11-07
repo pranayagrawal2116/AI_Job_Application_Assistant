@@ -9,27 +9,25 @@ import {
   User,
 } from '@/types';
 
+function getCookie(name: string): string | null {
+  if (typeof document === 'undefined') return null;
+  const match = document.cookie.match(new RegExp('(^|;\\s*)(' + name + ')=([^;]*)'));
+  return match ? decodeURIComponent(match[3]) : null;
+}
+
 class ApiClient {
   private baseUrl: string = '/api';
 
-  private getToken(): string | null {
-    return localStorage.getItem('auth_token');
-  }
-
-  public setToken(token: string | null) {
-    if (token) {
-      localStorage.setItem('auth_token', token);
-    } else {
-      localStorage.removeItem('auth_token');
-    }
-  }
-
   private async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
-    const token = this.getToken();
     const headers = new Headers(options.headers || {});
+    const method = (options.method || 'GET').toUpperCase();
 
-    if (token) {
-      headers.set('Authorization', `Bearer ${token}`);
+    // Attach CSRF protection token on mutating requests
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+      const csrfToken = getCookie('csrf_token');
+      if (csrfToken) {
+        headers.set('X-CSRF-Token', csrfToken);
+      }
     }
 
     if (!headers.has('Content-Type') && !(options.body instanceof FormData)) {
@@ -39,15 +37,10 @@ class ApiClient {
     const config: RequestInit = {
       ...options,
       headers,
-      credentials: 'include', // Send cookies for HttpOnly session
+      credentials: 'include', // Automatically send and receive HttpOnly session cookies
     };
 
     const response = await fetch(`${this.baseUrl}${endpoint}`, config);
-
-    if (response.status === 401) {
-      this.setToken(null);
-      // Let caller handle or redirect to login
-    }
 
     if (!response.ok) {
       let errorMsg = `Error ${response.status}: ${response.statusText}`;
@@ -65,33 +58,21 @@ class ApiClient {
 
   // Auth endpoints
   async register(data: { email: string; password: string; full_name: string; profession_industry?: string }): Promise<AuthResponse> {
-    const res = await this.request<AuthResponse>('/auth/register', {
+    return this.request<AuthResponse>('/auth/register', {
       method: 'POST',
       body: JSON.stringify(data),
     });
-    if (res.session_id) {
-      this.setToken(res.session_id);
-    }
-    return res;
   }
 
   async login(data: { email: string; password: string }): Promise<AuthResponse> {
-    const res = await this.request<AuthResponse>('/auth/login', {
+    return this.request<AuthResponse>('/auth/login', {
       method: 'POST',
       body: JSON.stringify(data),
     });
-    if (res.session_id) {
-      this.setToken(res.session_id);
-    }
-    return res;
   }
 
   async logout(): Promise<void> {
-    try {
-      await this.request('/auth/logout', { method: 'POST' });
-    } finally {
-      this.setToken(null);
-    }
+    await this.request('/auth/logout', { method: 'POST' });
   }
 
   async getMe(): Promise<User> {
@@ -279,13 +260,67 @@ class ApiClient {
     });
   }
 
+  // Matching
+  async evaluateMatch(data: {
+    resume_id: number;
+    job_id?: number;
+    job_description_id?: number;
+    scoring_profile?: string;
+  }): Promise<any> {
+    return this.request('/matching/evaluate', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    });
+  }
+
+  async getScoringProfiles(): Promise<{ profiles: Record<string, string> }> {
+    return this.request('/matching/profiles');
+  }
+
+  async getMatchHistory(jobId?: number, jobDescriptionId?: number): Promise<any[]> {
+    const params = new URLSearchParams();
+    if (jobId) params.set('job_id', String(jobId));
+    if (jobDescriptionId) params.set('job_description_id', String(jobDescriptionId));
+    return this.request(`/matching/history?${params.toString()}`);
+  }
+
+  // Application Preparation & Documents
+  async prepareApplicationPacket(id: number): Promise<any> {
+    return this.request(`/applications/${id}/prepare-packet`, {
+      method: 'POST',
+    });
+  }
+
+  async downloadDocument(appId: number, docType: string, docFormat: string): Promise<Blob> {
+    const response = await fetch(`${this.baseUrl}/applications/${appId}/documents/${docType}/${docFormat}`, {
+      method: 'GET',
+      credentials: 'include',
+    });
+    if (!response.ok) {
+      let msg = `Download failed: ${response.statusText}`;
+      try {
+        const err = await response.json();
+        msg = err.detail || msg;
+      } catch (e) {}
+      throw new Error(msg);
+    }
+    return response.blob();
+  }
+
   // Settings
   async createBackup(): Promise<any> {
     return this.request('/settings/backup', { method: 'POST' });
   }
 
-  async exportCsv(): Promise<any> {
-    return this.request('/settings/export/csv');
+  async exportCsv(): Promise<Blob> {
+    const response = await fetch(`${this.baseUrl}/settings/export/csv`, {
+      method: 'GET',
+      credentials: 'include',
+    });
+    if (!response.ok) {
+      throw new Error(`Export failed: ${response.statusText}`);
+    }
+    return response.blob();
   }
 }
 

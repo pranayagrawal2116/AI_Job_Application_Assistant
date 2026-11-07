@@ -39,8 +39,16 @@ export const SettingsPage: React.FC = () => {
     setIsExporting(true);
     setExportMsg(null);
     try {
-      const res = await api.exportCsv();
-      setExportMsg(`Exported ${res.total_jobs} opportunities to ${res.export_path}`);
+      const blob = await api.exportCsv();
+      const url = window.URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `opportunities_export_${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+      window.URL.revokeObjectURL(url);
+      document.body.removeChild(a);
+      setExportMsg('Export file downloaded successfully.');
     } catch (e: any) {
       setExportMsg(`Export failed: ${e.message}`);
     } finally {

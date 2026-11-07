@@ -1494,6 +1494,194 @@ class DatabaseManager:
             cursor.execute("PRAGMA foreign_keys = OFF;")
             cursor.execute("BEGIN IMMEDIATE TRANSACTION;")
 
+            # Step 1.1: Ensure quarantine tables exist
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS legacy_quarantined_applications (
+                    id INTEGER PRIMARY KEY,
+                    job_id INTEGER,
+                    job_description_id INTEGER,
+                    user_id INTEGER,
+                    resume_id INTEGER,
+                    company_name TEXT,
+                    job_title TEXT,
+                    status TEXT,
+                    application_source TEXT,
+                    external_application_url TEXT,
+                    target_role TEXT,
+                    employment_type TEXT,
+                    location TEXT,
+                    salary_range TEXT,
+                    application_deadline TEXT,
+                    date_prepared TEXT,
+                    date_submitted TEXT,
+                    resume_used TEXT,
+                    cover_letter_reference TEXT,
+                    notes TEXT,
+                    is_archived INTEGER,
+                    created_at TEXT,
+                    updated_at TEXT,
+                    quarantine_reason TEXT NOT NULL,
+                    quarantined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS legacy_quarantined_application_events (
+                    id INTEGER PRIMARY KEY,
+                    application_id INTEGER,
+                    user_id INTEGER,
+                    sequence_no INTEGER,
+                    event_type TEXT,
+                    previous_status TEXT,
+                    new_status TEXT,
+                    actor_type TEXT,
+                    actor_identifier TEXT,
+                    session_reference TEXT,
+                    event_payload_json TEXT,
+                    previous_event_hash TEXT,
+                    event_hash TEXT,
+                    created_at TEXT,
+                    quarantined_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            # Step 1.2: Reconcile or quarantine unowned or invalid applications
+            try:
+                conn.create_function("verify_privacy_erasure_authorization", 1, lambda uid: 1)
+            except Exception:
+                pass
+
+            cursor.execute("""
+                SELECT id, job_id, job_description_id, user_id, resume_id,
+                       company_name, job_title, status, application_source,
+                       external_application_url, target_role, employment_type,
+                       location, salary_range, application_deadline, date_prepared,
+                       date_submitted, resume_used, cover_letter_reference, notes,
+                       is_archived, created_at, updated_at
+                FROM applications
+                WHERE user_id IS NULL OR user_id NOT IN (SELECT id FROM users)
+            """)
+            problematic_apps = [dict(r) for r in cursor.fetchall()]
+
+            if problematic_apps:
+                logger.info(f"Phase 7.1 migration: Found {len(problematic_apps)} unowned or invalid application(s). Running reconciliation & quarantine...")
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='job_descriptions'")
+                has_jd_tbl = cursor.fetchone() is not None
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='resumes'")
+                has_res_tbl = cursor.fetchone() is not None
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='prepared_packets'")
+                has_pkt_tbl = cursor.fetchone() is not None
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_approvals'")
+                has_appr_tbl = cursor.fetchone() is not None
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='submission_confirmations'")
+                has_sub_tbl = cursor.fetchone() is not None
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_events'")
+                has_evt_tbl = cursor.fetchone() is not None
+
+                for app in problematic_apps:
+                    app_id = app["id"]
+                    candidate_owners = set()
+
+                    if has_jd_tbl and app.get("job_description_id"):
+                        cursor.execute("SELECT user_id FROM job_descriptions WHERE id = ?", (app["job_description_id"],))
+                        jd_r = cursor.fetchone()
+                        if jd_r and jd_r[0] is not None:
+                            candidate_owners.add(jd_r[0])
+
+                    if has_res_tbl and app.get("resume_id"):
+                        cursor.execute("SELECT user_id FROM resumes WHERE id = ?", (app["resume_id"],))
+                        res_r = cursor.fetchone()
+                        if res_r and res_r[0] is not None:
+                            candidate_owners.add(res_r[0])
+
+                    if has_pkt_tbl:
+                        cursor.execute("SELECT DISTINCT user_id FROM prepared_packets WHERE application_id = ? AND user_id IS NOT NULL", (app_id,))
+                        for r in cursor.fetchall():
+                            candidate_owners.add(r[0])
+
+                    if has_appr_tbl:
+                        cursor.execute("SELECT DISTINCT user_id FROM application_approvals WHERE application_id = ? AND user_id IS NOT NULL", (app_id,))
+                        for r in cursor.fetchall():
+                            candidate_owners.add(r[0])
+
+                    if has_sub_tbl:
+                        cursor.execute("SELECT DISTINCT user_id FROM submission_confirmations WHERE application_id = ? AND user_id IS NOT NULL", (app_id,))
+                        for r in cursor.fetchall():
+                            candidate_owners.add(r[0])
+
+                    if has_evt_tbl:
+                        cursor.execute("SELECT DISTINCT user_id FROM application_events WHERE application_id = ? AND user_id IS NOT NULL", (app_id,))
+                        for r in cursor.fetchall():
+                            candidate_owners.add(r[0])
+
+                    # Verify which candidates exist in users table
+                    valid_candidates = set()
+                    if candidate_owners:
+                        q_marks = ",".join("?" for _ in candidate_owners)
+                        cursor.execute(f"SELECT id FROM users WHERE id IN ({q_marks})", list(candidate_owners))
+                        valid_candidates = {r[0] for r in cursor.fetchall()}
+
+                    if len(valid_candidates) == 1 and len(candidate_owners) == 1:
+                        # Unambiguous ownership: Reconcile!
+                        reconciled_user = list(valid_candidates)[0]
+                        cursor.execute("UPDATE applications SET user_id = ? WHERE id = ?", (reconciled_user, app_id))
+                        if has_evt_tbl:
+                            cursor.execute("UPDATE application_events SET user_id = ? WHERE application_id = ? AND (user_id IS NULL OR user_id NOT IN (SELECT id FROM users))", (reconciled_user, app_id))
+                        logger.info(f"Reconciled unowned application {app_id} to user {reconciled_user} based on verified linked evidence.")
+                    else:
+                        # Cannot safely reconcile -> Quarantine
+                        if len(candidate_owners) > 1 or len(valid_candidates) > 1:
+                            quarantine_reason = "CONFLICTING_OWNERSHIP"
+                        elif app.get("user_id") is None:
+                            quarantine_reason = "UNOWNED_LEGACY_APPLICATION_NULL_USER_ID"
+                        else:
+                            quarantine_reason = "INVALID_USER_ID_NOT_IN_USERS"
+
+                        logger.warning(f"Quarantining application {app_id}: {quarantine_reason}")
+                        cursor.execute("""
+                            INSERT INTO legacy_quarantined_applications (
+                                id, job_id, job_description_id, user_id, resume_id,
+                                company_name, job_title, status, application_source,
+                                external_application_url, target_role, employment_type,
+                                location, salary_range, application_deadline, date_prepared,
+                                date_submitted, resume_used, cover_letter_reference, notes,
+                                is_archived, created_at, updated_at, quarantine_reason
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (
+                            app["id"], app.get("job_id"), app.get("job_description_id"), app.get("user_id"), app.get("resume_id"),
+                            app.get("company_name"), app.get("job_title"), app.get("status"), app.get("application_source"),
+                            app.get("external_application_url"), app.get("target_role"), app.get("employment_type"),
+                            app.get("location"), app.get("salary_range"), app.get("application_deadline"), app.get("date_prepared"),
+                            app.get("date_submitted"), app.get("resume_used"), app.get("cover_letter_reference"), app.get("notes"),
+                            app.get("is_archived") or 0, app.get("created_at"), app.get("updated_at"), quarantine_reason
+                        ))
+
+                        if has_evt_tbl:
+                            cursor.execute("SELECT * FROM application_events WHERE application_id = ?", (app_id,))
+                            evts = [dict(r) for r in cursor.fetchall()]
+                            for evt in evts:
+                                cursor.execute("""
+                                    INSERT INTO legacy_quarantined_application_events (
+                                        id, application_id, user_id, sequence_no, event_type,
+                                        previous_status, new_status, actor_type, actor_identifier,
+                                        session_reference, event_payload_json, previous_event_hash, event_hash,
+                                        created_at
+                                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                """, (
+                                    evt["id"], evt["application_id"], evt.get("user_id"), evt["sequence_no"], evt["event_type"],
+                                    evt.get("previous_status"), evt.get("new_status"), evt["actor_type"], evt["actor_identifier"],
+                                    evt.get("session_reference"), evt["event_payload_json"], evt["previous_event_hash"], evt["event_hash"],
+                                    evt["created_at"]
+                                ))
+                            cursor.execute("DELETE FROM application_events WHERE application_id = ?", (app_id,))
+
+                        # Null out references in application_logs if present
+                        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='application_logs'")
+                        if cursor.fetchone():
+                            cursor.execute("UPDATE application_logs SET application_id = NULL WHERE application_id = ?", (app_id,))
+
+                        # Delete from applications
+                        cursor.execute("DELETE FROM applications WHERE id = ?", (app_id,))
+
             # Preflight Check 1: Null user_ids in applications
             cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id IS NULL")
             null_users = cursor.fetchone()[0]

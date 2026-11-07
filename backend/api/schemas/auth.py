@@ -26,6 +26,6 @@ class UserResponse(BaseModel):
 
 
 class SessionResponse(BaseModel):
-    session_id: str
+    session_id: Optional[str] = None
     user: UserResponse
     message: str = "Authenticated successfully"

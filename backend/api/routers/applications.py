@@ -2,6 +2,7 @@
 
 from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import FileResponse
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
 from backend.api.schemas.applications import (
@@ -250,6 +251,244 @@ def generate_cover_letter(
         }
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Cover letter generation failed: {str(e)}")
+
+
+@router.post("/{app_id}/prepare-packet")
+def prepare_packet(
+    app_id: int,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Generates documents and seals immutable PreparedPacket revision for approval gate."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    
+    app = service.get_candidate_application(application_id=app_id, session_id=session.session_id, client_user_id=user_id)
+    candidate_profile = service.db.get_user_candidate_profile(user_id) or {}
+    resumes = service.get_user_resumes(user_id)
+    selected_res = next((r for r in resumes if r.get("id") == app.resume_id), resumes[0] if resumes else None)
+    if not selected_res:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No resume linked to this application. Please upload a resume first.")
+        
+    selected_jd = service.db.get_job_description(app.job_description_id, user_id=user_id) if app.job_description_id else None
+    jd_dict = {
+        "id": selected_jd.id if selected_jd else None,
+        "company_name": selected_jd.company_name if selected_jd else app.company_name,
+        "role_title": getattr(selected_jd, "job_title", getattr(selected_jd, "role_title", app.job_title)) if selected_jd else app.job_title,
+        "raw_content": getattr(selected_jd, "raw_content", ""),
+        "parsed_data": getattr(selected_jd, "parsed_data", {}),
+    }
+
+    try:
+        # 1. Generate tailored resume
+        tailored_resume = service.generate_universal_tailored_resume(
+            user_id=user_id,
+            candidate_profile=candidate_profile,
+            resume_data=selected_res,
+            job_description=jd_dict,
+            resume_id=selected_res["id"],
+            resume_version_num=selected_res.get("active_version", 1),
+        )
+        
+        # 2. Generate cover letter
+        cover_letter = service.generate_universal_cover_letter(
+            user_id=user_id,
+            candidate_profile=candidate_profile,
+            job_description=jd_dict,
+            resume_data=selected_res,
+            tone="Professional & Direct",
+            resume_id=selected_res["id"],
+            resume_version_num=selected_res.get("active_version", 1),
+        )
+
+        # 3. Answer screening questions if available
+        qa_packet = service.batch_answer_screening_questions(
+            user_id=user_id,
+            questions=[],
+            candidate_profile=candidate_profile,
+            job_description=jd_dict,
+            resume_data=selected_res,
+        )
+
+        # 4. Generate documents
+        generated_docs = service.generate_universal_application_documents(
+            user_id=user_id,
+            application_id=app_id,
+            resume=tailored_resume,
+            cover_letter=cover_letter,
+            qa_packet=qa_packet,
+        )
+
+        # 5. Build attachments manifest
+        attachments_manifest = []
+        for doc_key, doc_obj in generated_docs.items():
+            if doc_obj and hasattr(doc_obj, "file_path") and doc_obj.file_path.exists():
+                attachments_manifest.append({
+                    "doc_key": doc_key,
+                    "filename": doc_obj.file_path.name,
+                    "file_format": doc_obj.file_format,
+                    "file_size": doc_obj.file_size_bytes,
+                    "file_hash": doc_obj.file_hash,
+                })
+
+        # 6. Seal prepared packet
+        pkt = service.prepare_universal_application_packet(
+            user_id=user_id,
+            application_id=app_id,
+            original_resume_id=selected_res["id"],
+            original_resume_hash=selected_res.get("file_hash", ""),
+            tailored_resume=tailored_resume,
+            cover_letter=cover_letter,
+            qa_packet=qa_packet,
+            job_description_snapshot_hash=getattr(selected_jd, "snapshot_hash", "GENESIS"),
+            tailored_resume_doc=generated_docs.get("resume_pdf"),
+            cover_letter_doc=generated_docs.get("cover_letter_pdf"),
+            attachments_manifest=attachments_manifest,
+            candidate_profile_version=1,
+            candidate_profile_hash="profile_hash",
+            template_id="modern",
+            template_version="1.0",
+            original_resume_version_num=selected_res.get("active_version", 1),
+            job_description_id=app.job_description_id,
+            generated_docs=generated_docs,
+            tailored_resume_pdf_doc=generated_docs.get("resume_pdf"),
+            tailored_resume_docx_doc=generated_docs.get("resume_docx"),
+            cover_letter_pdf_doc=generated_docs.get("cover_letter_pdf"),
+            cover_letter_docx_doc=generated_docs.get("cover_letter_docx"),
+        )
+        
+        # Advance status to READY_FOR_REVIEW if currently DRAFT or PREPARING
+        if app.status in ("DRAFT", "PREPARING"):
+            service.transition_application_status(
+                application_id=app_id,
+                new_status="READY_FOR_REVIEW",
+                session_id=session.session_id,
+                client_user_id=user_id,
+            )
+
+        return {
+            "status": "ok",
+            "message": "Application packet prepared successfully.",
+            "packet": {
+                "id": pkt.id,
+                "packet_version": pkt.packet_version,
+                "packet_version_hash": pkt.packet_version_hash,
+                "is_active_revision": bool(pkt.is_active_revision),
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Packet preparation failed: {str(e)}")
+
+
+@router.get("/{app_id}/documents/{doc_type}/{doc_format}")
+def download_document(
+    app_id: int,
+    doc_type: str,
+    doc_format: str,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Downloads ATS-optimized application documents with strict ownership validation."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    
+    app = service.get_candidate_application(application_id=app_id, session_id=session.session_id, client_user_id=user_id)
+    if app.user_id != user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
+
+    doc_type_clean = doc_type.lower().replace("-", "_")
+    doc_format_clean = doc_format.lower()
+    
+    if doc_format_clean not in ("pdf", "docx"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Unsupported format. Only pdf and docx are supported.")
+        
+    valid_types = {
+        "resume": f"resume_{doc_format_clean}",
+        "cover_letter": f"cover_letter_{doc_format_clean}",
+        "screening_qa": f"screening_qa_{doc_format_clean}",
+        "packet": f"packet_{doc_format_clean}",
+    }
+    
+    doc_key = valid_types.get(doc_type_clean)
+    if not doc_key:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Unknown document type '{doc_type}'.")
+
+    app_dir = service.file_validator.get_candidate_storage_root(user_id) / "applications" / str(app_id)
+    target_files = list(app_dir.glob(f"*{doc_type_clean}*.{doc_format_clean}")) if app_dir.exists() else []
+
+    if not target_files:
+        try:
+            candidate_profile = service.db.get_user_candidate_profile(user_id) or {}
+            resumes = service.get_user_resumes(user_id)
+            selected_res = next((r for r in resumes if r.get("id") == app.resume_id), resumes[0] if resumes else None)
+            if not selected_res:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No resume available to render document.")
+                
+            selected_jd = service.db.get_job_description(app.job_description_id, user_id=user_id) if app.job_description_id else None
+            jd_dict = {
+                "id": selected_jd.id if selected_jd else None,
+                "company_name": selected_jd.company_name if selected_jd else app.company_name,
+                "role_title": getattr(selected_jd, "job_title", getattr(selected_jd, "role_title", app.job_title)) if selected_jd else app.job_title,
+                "raw_content": getattr(selected_jd, "raw_content", ""),
+                "parsed_data": getattr(selected_jd, "parsed_data", {}),
+            }
+            
+            tailored_resume = service.generate_universal_tailored_resume(
+                user_id=user_id,
+                candidate_profile=candidate_profile,
+                resume_data=selected_res,
+                job_description=jd_dict,
+                resume_id=selected_res["id"],
+                resume_version_num=selected_res.get("active_version", 1),
+            )
+            cover_letter = service.generate_universal_cover_letter(
+                user_id=user_id,
+                candidate_profile=candidate_profile,
+                job_description=jd_dict,
+                resume_data=selected_res,
+                tone="Professional & Direct",
+                resume_id=selected_res["id"],
+                resume_version_num=selected_res.get("active_version", 1),
+            )
+            qa_packet = service.batch_answer_screening_questions(
+                user_id=user_id,
+                questions=[],
+                candidate_profile=candidate_profile,
+                job_description=jd_dict,
+                resume_data=selected_res,
+            )
+            generated_docs = service.generate_universal_application_documents(
+                user_id=user_id,
+                application_id=app_id,
+                resume=tailored_resume,
+                cover_letter=cover_letter,
+                qa_packet=qa_packet,
+            )
+            doc_obj = generated_docs.get(doc_key)
+            if doc_obj and hasattr(doc_obj, "file_path") and doc_obj.file_path.exists():
+                target_files.append(doc_obj.file_path)
+        except Exception as e:
+            raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to generate document: {str(e)}")
+
+    if not target_files:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Document {doc_type} ({doc_format}) could not be located or generated.")
+
+    chosen_file = target_files[0]
+    
+    # Path traversal protection
+    try:
+        chosen_file.resolve().relative_to(service.file_validator.get_candidate_storage_root(user_id).resolve())
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Illegal document path traversal.")
+
+    media_type = "application/pdf" if doc_format_clean == "pdf" else "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    clean_company = "".join(c for c in app.company_name if c.isalnum() or c in (" ", "_", "-")).strip() or "Application"
+    clean_title = "".join(c for c in app.job_title if c.isalnum() or c in (" ", "_", "-")).strip() or "Opportunity"
+    download_filename = f"{clean_company}_{clean_title}_{doc_type_clean}.{doc_format_clean}"
+
+    return FileResponse(
+        path=str(chosen_file),
+        filename=download_filename,
+        media_type=media_type,
+    )
 
 
 @router.get("/{app_id}/packets/latest")

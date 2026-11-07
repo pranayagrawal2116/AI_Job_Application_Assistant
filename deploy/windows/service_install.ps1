@@ -105,11 +105,11 @@ if ($existingService) {
 
 # 7. Install Windows Service with NSSM
 Write-Host "Installing Windows Service '$ServiceName'..." -ForegroundColor Cyan
-$appArgs = "-m streamlit run dashboard\app.py --server.port 8501 --server.address 127.0.0.1 --server.headless true"
+$appArgs = "-m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000"
 
 & $nssmPath install $ServiceName $PythonExe $appArgs
 & $nssmPath set $ServiceName AppDirectory $InstallDir
-& $nssmPath set $ServiceName Description "Universal AI Job Application Assistant (Streamlit on 127.0.0.1:8501 behind IIS 10)"
+& $nssmPath set $ServiceName Description "Universal AI Job Application Assistant (FastAPI ASGI on 127.0.0.1:8000 behind IIS 10)"
 & $nssmPath set $ServiceName Start SERVICE_AUTO_START
 
 # Log rotation: 10 MB limit per log, keep archive
@@ -132,7 +132,7 @@ $svcStatus = (Get-Service -Name $ServiceName).Status
 if ($svcStatus -eq "Running") {
     Write-Host "======================================================================" -ForegroundColor Green
     Write-Host " [SUCCESS] Service '$ServiceName' is RUNNING!" -ForegroundColor Green
-    Write-Host " Local Endpoint: http://127.0.0.1:8501" -ForegroundColor Green
+    Write-Host " Local Endpoint: http://127.0.0.1:8000" -ForegroundColor Green
     Write-Host " Logs Directory: $DataDir\logs" -ForegroundColor Green
     Write-Host "======================================================================" -ForegroundColor Green
 } else {
