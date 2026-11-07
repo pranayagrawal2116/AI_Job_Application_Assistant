@@ -522,3 +522,12 @@ Phase 9.1.2.12 is 100% complete, fully verified, and ready for deployment. The a
 
 > **STRICT STOP CONDITION OBSERVED:**  
 > Phase 9.1.2.12 is 100% complete and verified. Work has ceased immediately upon publication of this report. Phase 9.1.3 has NOT been started. Awaiting explicit user instruction before proceeding to subsequent milestones.
+
+---
+
+## 19. Post-Implementation Review Note (Phase 9.1.2.13 Continuity)
+
+During subsequent source inspection of Phase 9.1.2.12, three residual enhancements were identified for Phase 9.1.2.13:
+1. **Production Clock Policy Alias (`APP_ENV=prod`):** `set_test_clock()` checked raw environment strings without the canonical `resolve_app_env()` alias normalizer, allowing `prod` or missing environments to bypass production clock guards. In Phase 9.1.2.13, `resolve_app_env()` was authoritatively adopted and `ContextVar` context isolation was introduced.
+2. **Exact Timestamp Provenance:** Timestamp provenance comparison in `record_legacy_evidence_attestation()` previously permitted a 1-millisecond tolerance (`abs(...) > 0.001`). In Phase 9.1.2.13, this was replaced with exact UTC microsecond equality (`ve_iat == ap_iat` and `ve_exp == ap_exp`).
+3. **Real Multi-Threaded Concurrency Verification:** Test TC-50 in Phase 9.1.2.11 demonstrated sequential transaction ordering (revocation committed before attestation attempted), but did not exercise concurrent multi-threaded write lock contention. Genuine multi-threaded lock contention and serialization (both Revocation-wins and Attestation-wins scenarios) were formally verified in Phase 9.1.2.13.

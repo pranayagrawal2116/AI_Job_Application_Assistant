@@ -983,6 +983,34 @@ When interacting with the browser via Playwright MCP:
     - 0 pyflakes errors, 0 ruff errors.
     - Published comprehensive implementation report in `docs/PHASE_9_1_2_12_IMPLEMENTATION_REPORT.md`.
 
+- [x] **Architecture v2.1.1 Phase 9.1.2.13: Production Clock Guard, Exact Provenance Timestamps & Real Concurrency Verification** (Complete)
+  - Production Clock-Injection Security & Context Isolation:
+    - Integrated authoritative `resolve_app_env()` into `set_test_clock()` and `frozen_utc_clock()`, strictly rejecting non-None clocks in `production`, `prod`, ` PROD `, `staging`, `qa`, and failing closed on missing, empty, whitespace, and unknown environments.
+    - Permitted clock injection strictly in `development`, `dev`, and `test`; `set_test_clock(None)` safely clears overrides across all environments.
+    - ContextVar context isolation (`_CLOCK_VAR: ContextVar[Optional[Callable[[], datetime]]]`) eliminates cross-thread and cross-context clock contamination; background threads default safely to system clock.
+    - Strict return-value validation in `get_current_utc_time()` enforcing timezone awareness and UTC conversion, rejecting non-datetime values and naive datetimes.
+  - Exact Cryptographic Provenance Timestamp Binding:
+    - Completely eliminated the 1ms comparison tolerance (`abs(...) > 0.001`) in `DatabaseManager.record_legacy_evidence_attestation()`.
+    - Enforced exact equality after UTC normalization: `ve_iat == ap_iat` and `ve_exp == ap_exp`, strictly rejecting 1-microsecond and sub-millisecond mismatches (e.g. 500us).
+    - Preserved UTC-normalization compatibility: timezone-equivalent representations (`+00:00`, `Z`, non-UTC offsets) normalize to the exact microsecond.
+    - Rejects timezone-naive, missing, and malformed timestamps.
+  - Real SQLite Multi-Thread Concurrency Verification:
+    - Corrected misleading docstring on legacy sequential test TC-50 in `tests/test_phase_9_1_2_11_credential_registry_and_atomic_attestation.py`.
+    - Implemented genuine multi-threaded concurrency tests using separate SQLite connections to a file-backed WAL database synchronized deterministically with `threading.Event`:
+      - *Scenario A (Revocation wins):* Thread A holds `BEGIN IMMEDIATE` with principal revocation; Thread B attempts attestation, enters `BEGIN IMMEDIATE`, genuinely blocks on SQLite write lock, unblocks post-commit, and is rejected by revocation query on its write cursor.
+      - *Scenario B (Attestation wins):* Thread A holds `BEGIN IMMEDIATE` with inserted attestation; Thread B attempts revocation and blocks on SQLite write lock; Thread A commits attestation; Thread B commits revocation; historical attestation remains immutable; subsequent preflight rejects revoked evidence.
+      - *Scenario C (Caller-supplied immediate transaction):* Verified sentinel write and caller lock contention; rejected deferred transactions.
+      - *Scenario D (Failure & rollback):* Verified atomic rollback on principal and key revocation query failures and invalid lock states; zero partial rows.
+  - Registry & Authenticator Invariant Precision:
+    - Reconciled documentation claims distinguishing frozen dataclass record values (`_IssuedCredentialRecord`), provider-controlled mutable registry container (`self._issued_credentials`), application-level encapsulation, and Python in-process interpreter constraints.
+    - Confirmed unconditional verification of all 11 provenance claims and duplicate credential ID conflict rejection.
+  - Dedicated Test Suite & Comprehensive Verification:
+    - Authored 46 dedicated tests in `tests/test_phase_9_1_2_13_clock_precision_and_concurrency.py` across 4 requirement categories (46/46 passing, 100%).
+    - Verified all 596 Phase 9 test cases pass (100%).
+    - Verified all 1,914 repository test cases pass (100%).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Published comprehensive implementation report in `docs/PHASE_9_1_2_13_IMPLEMENTATION_REPORT.md`.
+
 ---
 
 ## 7. Approval Requirement

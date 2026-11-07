@@ -1148,7 +1148,12 @@ class TestPhase91211CredentialRegistryAndAtomicAttestation(unittest.TestCase):
         self.assertEqual(row.attested_by, "atomic_runner_49")
 
     def test_50_revocation_and_attestation_concurrency_obeys_transaction_ordering(self) -> None:
-        """TC-50: Revocation and attestation concurrency obeys SQLite IMMEDIATE write lock ordering."""
+        """TC-50: Sequential transaction ordering verification: committed revocation rejects subsequent attestation.
+
+        Note (Phase 9.1.2.13 Clarification):
+        This test verifies sequential transaction isolation (revocation committed before attestation attempted).
+        Genuine concurrent multi-threaded write lock contention is verified in test_phase_9_1_2_13_clock_precision_and_concurrency.py.
+        """
         provider = self._create_provider()
         token = provider.mint_service_token(
             principal_id="concurrent_runner_50",

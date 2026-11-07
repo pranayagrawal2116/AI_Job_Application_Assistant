@@ -13,6 +13,7 @@ cryptographically authentic, and strictly bound evidence artifact.
 from abc import ABC, abstractmethod
 import base64
 from contextlib import contextmanager
+import contextvars
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -101,18 +102,26 @@ def resolve_app_env() -> str:
     )
 
 
-# Central injectable UTC clock provider (Phase 9.1.2.12 Part F)
+# Central injectable UTC clock provider (Phase 9.1.2.12 Part F, Phase 9.1.2.13 Part A)
+_CLOCK_VAR: contextvars.ContextVar[Optional[Callable[[], datetime]]] = contextvars.ContextVar(
+    "_CLOCK_VAR", default=None
+)
 _CLOCK_PROVIDER: Optional[Callable[[], datetime]] = None
 
 
 def get_current_utc_time() -> datetime:
-    """Returns current UTC datetime from configured clock provider or system clock."""
-    if _CLOCK_PROVIDER is not None:
-        val = _CLOCK_PROVIDER()
+    """Returns current UTC datetime from configured context clock provider or system clock."""
+    provider = _CLOCK_VAR.get()
+    if provider is not None:
+        val = provider()
         if not isinstance(val, datetime):
-            raise SecurityAuthorizationError("Configured clock provider returned non-datetime value.")
+            raise SecurityAuthorizationError(
+                f"Configured clock provider returned invalid type '{type(val).__name__}', expected datetime."
+            )
         if val.tzinfo is None:
-            return val.replace(tzinfo=timezone.utc)
+            raise SecurityAuthorizationError(
+                "Configured clock provider returned timezone-naive datetime."
+            )
         return val.astimezone(timezone.utc)
     return datetime.now(timezone.utc)
 
@@ -120,30 +129,65 @@ def get_current_utc_time() -> datetime:
 def set_test_clock(clock: Optional[Callable[[], datetime]]) -> None:
     """Configures a custom UTC clock provider for deterministic testing.
 
-    Security Invariant:
-    Fails closed if invoked in production-like environments with a non-None clock.
+    Security Invariants (Phase 9.1.2.13):
+    1. Uses authoritative resolve_app_env() for environment resolution.
+    2. Prohibits clock injection in 'production', 'prod', 'staging', 'qa', or unknown environments.
+    3. Fails closed if APP_ENV is missing, empty, whitespace, or invalid.
+    4. Permits non-None clock injection ONLY in recognized non-production environments ('development', 'dev', 'test').
+    5. Always permits clearing an existing test override (clock=None) regardless of environment.
+    6. Uses ContextVar to prevent cross-thread or cross-context clock contamination.
     """
     global _CLOCK_PROVIDER
     if clock is not None:
-        current_env = os.environ.get("APP_ENV", "development").strip().lower()
-        if current_env in ("production", "staging", "qa"):
+        env = resolve_app_env()
+        if env in ("production", "staging", "qa"):
             raise SecurityAuthorizationError(
-                f"Clock injection is strictly prohibited in production-like environment '{current_env}'."
+                f"Clock injection is strictly prohibited in production-like environment '{env}'."
             )
+        if env not in ("development", "test"):
+            raise SecurityAuthorizationError(
+                f"Clock injection is not permitted in environment '{env}'."
+            )
+    _CLOCK_VAR.set(clock)
     _CLOCK_PROVIDER = clock
 
 
 @contextmanager
 def frozen_utc_clock(target_time: datetime) -> Generator[None, None, None]:
-    """Context manager for freezing UTC clock during tests."""
-    target_utc = target_time if target_time.tzinfo is not None else target_time.replace(tzinfo=timezone.utc)
-    target_utc = target_utc.astimezone(timezone.utc)
-    old_clock = _CLOCK_PROVIDER
+    """Context manager for freezing UTC clock during tests with automatic context restoration.
+
+    Security Invariants (Phase 9.1.2.13):
+    - Target time must be an explicit timezone-aware datetime instance.
+    - Enforces resolve_app_env() policy before setting the clock.
+    - ContextVar token reset guarantees reliable restoration even across nested contexts or exceptions.
+    """
+    if not isinstance(target_time, datetime):
+        raise SecurityAuthorizationError(
+            f"Target time must be a datetime instance, got '{type(target_time).__name__}'."
+        )
+    if target_time.tzinfo is None:
+        raise SecurityAuthorizationError(
+            "Target time must be a timezone-aware datetime."
+        )
+    target_utc = target_time.astimezone(timezone.utc)
+    env = resolve_app_env()
+    if env in ("production", "staging", "qa"):
+        raise SecurityAuthorizationError(
+            f"Clock injection is strictly prohibited in production-like environment '{env}'."
+        )
+    if env not in ("development", "test"):
+        raise SecurityAuthorizationError(
+            f"Clock injection is not permitted in environment '{env}'."
+        )
+    token = _CLOCK_VAR.set(lambda: target_utc)
+    global _CLOCK_PROVIDER
+    old_global = _CLOCK_PROVIDER
+    _CLOCK_PROVIDER = lambda: target_utc
     try:
-        set_test_clock(lambda: target_utc)
         yield
     finally:
-        set_test_clock(old_clock)
+        _CLOCK_VAR.reset(token)
+        _CLOCK_PROVIDER = old_global
 
 
 @dataclass(frozen=True)

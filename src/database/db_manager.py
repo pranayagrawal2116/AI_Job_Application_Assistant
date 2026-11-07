@@ -6061,12 +6061,12 @@ class DatabaseManager:
 
                 ve_iat = _normalize_datetime(getattr(verified_evidence, "issued_at", None))
                 ap_iat = _normalize_datetime(attesting_principal.issued_at)
-                if abs((ve_iat - ap_iat).total_seconds()) > 0.001:
+                if ve_iat != ap_iat:
                     raise SecurityAuthorizationError("Verified evidence issued_at timestamp does not match attesting principal context.")
 
                 ve_exp = _normalize_datetime(getattr(verified_evidence, "expires_at", None))
                 ap_exp = _normalize_datetime(attesting_principal.expires_at)
-                if abs((ve_exp - ap_exp).total_seconds()) > 0.001:
+                if ve_exp != ap_exp:
                     raise SecurityAuthorizationError("Verified evidence expires_at timestamp does not match attesting principal context.")
 
         elif isinstance(attesting_principal, str):
@@ -6207,20 +6207,25 @@ class DatabaseManager:
         if cursor is not None:
             if not isinstance(cursor, sqlite3.Cursor):
                 raise SecurityAuthorizationError(f"Invalid cursor: expected sqlite3.Cursor, got {type(cursor).__name__}.")
-            cur_conn = cursor.connection
-            if cur_conn is None:
-                raise SecurityAuthorizationError("Invalid cursor: cursor connection is closed or None.")
-            if cur_conn.isolation_level is not None:
-                raise SecurityAuthorizationError(
-                    "Caller transaction must have isolation_level=None (autocommit mode) with explicit BEGIN IMMEDIATE."
-                )
-            if not cur_conn.in_transaction:
-                raise SecurityAuthorizationError("Caller cursor must be inside an active transaction.")
-            if not getattr(cur_conn, "_tx_is_immediate", False):
-                raise SecurityAuthorizationError(
-                    "Caller transaction must hold an immediate write lock (BEGIN IMMEDIATE). "
-                    "Deferred transactions are strictly prohibited for legacy attestation persistence."
-                )
+            try:
+                cur_conn = cursor.connection
+                if cur_conn is None:
+                    raise SecurityAuthorizationError("Invalid cursor: cursor connection is closed or None.")
+                if cur_conn.isolation_level is not None:
+                    raise SecurityAuthorizationError(
+                        "Caller transaction must have isolation_level=None (autocommit mode) with explicit BEGIN IMMEDIATE."
+                    )
+                if not cur_conn.in_transaction:
+                    raise SecurityAuthorizationError("Caller cursor must be inside an active transaction.")
+                if not getattr(cur_conn, "_tx_is_immediate", False):
+                    raise SecurityAuthorizationError(
+                        "Caller transaction must hold an immediate write lock (BEGIN IMMEDIATE). "
+                        "Deferred transactions are strictly prohibited for legacy attestation persistence."
+                    )
+            except SecurityAuthorizationError:
+                raise
+            except Exception as conn_err:
+                raise SecurityAuthorizationError(f"Invalid cursor: connection is closed or in invalid state: {conn_err}") from conn_err
             return _execute_atomic_attestation(cursor)
         else:
             with self.immediate_transaction() as conn:
