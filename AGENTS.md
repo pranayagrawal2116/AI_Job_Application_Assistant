@@ -1011,6 +1011,29 @@ When interacting with the browser via Playwright MCP:
     - 0 pyflakes errors, 0 ruff errors.
     - Published comprehensive implementation report in `docs/PHASE_9_1_2_13_IMPLEMENTATION_REPORT.md`.
 
+- [x] **Architecture v2.1.1 Phase 9.1.2.14: Deterministic SQLite Concurrency Testing & Clock State Cleanup** (Complete)
+  - Removal of Sleep-Based Concurrency Coordination:
+    - Completely eliminated all `time.sleep(0.05)` delays from multi-threaded SQLite concurrency tests (TC-36, TC-37, TC-38 in `tests/test_phase_9_1_2_13_clock_precision_and_concurrency.py`).
+    - Replaced with deterministic synchronization using `threading.Event`, native `sqlite3.Connection.set_trace_callback` to intercept C-level `BEGIN IMMEDIATE` execution at the precise instant of invocation, and zero-timeout (`timeout=0.0`) contention probes proving physical database write-lock acquisition.
+    - Verified all 6 lifecycle states deterministically: (1) Worker thread created, (2) entered transaction path, (3) attempted SQLite write-lock operation, (4) acquired write lock or observed contention, (5) original transaction commits/rolls back, (6) competing transaction completes.
+  - Failure-Safe Concurrency Test Cleanup:
+    - Implemented guaranteed `try/finally` cleanup on all concurrent test transactions, connections, and worker threads.
+    - Ensured uncommitted transactions are rolled back, connections are closed, monkeypatches are restored, and worker threads are joined with bounded timeouts even upon mid-flight assertion failures or unexpected exceptions.
+    - Verified that database instances remain immediately unlocked and fully writable post-cleanup without residual contention or leaked locks.
+  - Worker Exception Propagation:
+    - Captured and propagated worker thread exceptions (including `SecurityAuthorizationError`) to the main test thread, ensuring zero silent worker failures.
+  - Clock State Cleanup & ContextVar Isolation:
+    - Completely eliminated the redundant module-level mutable global `_CLOCK_PROVIDER` in `src/security/legacy_evidence_verifier.py`, making `_CLOCK_VAR: ContextVar` the sole source of injected clock state.
+    - Verified context isolation across threads, `contextvars.copy_context()` snapshots, nested `frozen_utc_clock` restoration, and exception-safe restoration.
+    - Verified that `_CLOCK_PROVIDER` is strictly absent from `src.security.legacy_evidence_verifier` module attributes.
+  - Dedicated Test Suite & Comprehensive Verification:
+    - Authored 15 dedicated tests in `tests/test_phase_9_1_2_14_deterministic_concurrency_cleanup.py` (15/15 passing, 100%).
+    - Updated `tests/test_phase_9_1_2_13_clock_precision_and_concurrency.py` (46/46 passing, 100%, 0 sleeps).
+    - Verified all 611 Phase 9 regression tests pass (100%).
+    - Verified all 1,929 repository test cases pass (100%).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Published comprehensive implementation report in `docs/PHASE_9_1_2_14_IMPLEMENTATION_REPORT.md`.
+
 ---
 
 ## 7. Approval Requirement

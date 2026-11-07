@@ -102,11 +102,10 @@ def resolve_app_env() -> str:
     )
 
 
-# Central injectable UTC clock provider (Phase 9.1.2.12 Part F, Phase 9.1.2.13 Part A)
+# Central injectable UTC clock provider (Phase 9.1.2.12 Part F, Phase 9.1.2.13 Part A, Phase 9.1.2.14 Part D)
 _CLOCK_VAR: contextvars.ContextVar[Optional[Callable[[], datetime]]] = contextvars.ContextVar(
     "_CLOCK_VAR", default=None
 )
-_CLOCK_PROVIDER: Optional[Callable[[], datetime]] = None
 
 
 def get_current_utc_time() -> datetime:
@@ -129,15 +128,14 @@ def get_current_utc_time() -> datetime:
 def set_test_clock(clock: Optional[Callable[[], datetime]]) -> None:
     """Configures a custom UTC clock provider for deterministic testing.
 
-    Security Invariants (Phase 9.1.2.13):
+    Security Invariants (Phase 9.1.2.13 / Phase 9.1.2.14):
     1. Uses authoritative resolve_app_env() for environment resolution.
     2. Prohibits clock injection in 'production', 'prod', 'staging', 'qa', or unknown environments.
     3. Fails closed if APP_ENV is missing, empty, whitespace, or invalid.
     4. Permits non-None clock injection ONLY in recognized non-production environments ('development', 'dev', 'test').
     5. Always permits clearing an existing test override (clock=None) regardless of environment.
-    6. Uses ContextVar to prevent cross-thread or cross-context clock contamination.
+    6. Uses ContextVar exclusively to prevent cross-thread or cross-context clock contamination.
     """
-    global _CLOCK_PROVIDER
     if clock is not None:
         env = resolve_app_env()
         if env in ("production", "staging", "qa"):
@@ -149,14 +147,13 @@ def set_test_clock(clock: Optional[Callable[[], datetime]]) -> None:
                 f"Clock injection is not permitted in environment '{env}'."
             )
     _CLOCK_VAR.set(clock)
-    _CLOCK_PROVIDER = clock
 
 
 @contextmanager
 def frozen_utc_clock(target_time: datetime) -> Generator[None, None, None]:
     """Context manager for freezing UTC clock during tests with automatic context restoration.
 
-    Security Invariants (Phase 9.1.2.13):
+    Security Invariants (Phase 9.1.2.13 / Phase 9.1.2.14):
     - Target time must be an explicit timezone-aware datetime instance.
     - Enforces resolve_app_env() policy before setting the clock.
     - ContextVar token reset guarantees reliable restoration even across nested contexts or exceptions.
@@ -180,14 +177,10 @@ def frozen_utc_clock(target_time: datetime) -> Generator[None, None, None]:
             f"Clock injection is not permitted in environment '{env}'."
         )
     token = _CLOCK_VAR.set(lambda: target_utc)
-    global _CLOCK_PROVIDER
-    old_global = _CLOCK_PROVIDER
-    _CLOCK_PROVIDER = lambda: target_utc
     try:
         yield
     finally:
         _CLOCK_VAR.reset(token)
-        _CLOCK_PROVIDER = old_global
 
 
 @dataclass(frozen=True)
