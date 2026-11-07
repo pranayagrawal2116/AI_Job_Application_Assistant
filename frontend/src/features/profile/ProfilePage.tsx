@@ -478,7 +478,18 @@ export const ProfilePage: React.FC = () => {
                   className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-3"
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">Degree #{idx + 1}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-slate-800">Degree #{idx + 1}</span>
+                      {edu.provenance === 'USER_CONFIRMED' || edu.provenance === 'USER_CORRECTED' ? (
+                        <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                          Candidate Confirmed
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-medium text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+                          Extracted from Resume — Needs Review
+                        </span>
+                      )}
+                    </div>
                     <button
                       onClick={() => {
                         const updated = [...(profile.education || [])];
@@ -623,7 +634,18 @@ export const ProfilePage: React.FC = () => {
                   className="p-4 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-3"
                 >
                   <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-slate-800">Experience #{idx + 1}</span>
+                    <div className="flex items-center gap-2">
+                      <span className="text-xs font-bold text-slate-800">Experience #{idx + 1}</span>
+                      {exp.provenance === 'USER_CONFIRMED' || exp.provenance === 'USER_CORRECTED' ? (
+                        <span className="text-[10px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
+                          Candidate Confirmed
+                        </span>
+                      ) : (
+                        <span className="text-[10px] font-medium text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+                          Extracted from Resume — Needs Review
+                        </span>
+                      )}
+                    </div>
                     <button
                       onClick={() => {
                         const updated = [...(profile.work_experience || [])];

@@ -46,11 +46,8 @@ export const OnboardingWizard: React.FC = () => {
       const res = await api.uploadResume(file);
       setUploadedResume(res);
 
-      // Automatically sync profile with parsed resume
-      try {
-        await api.syncProfileWithResume(res.id);
-      } catch (syncErr: any) {
-        console.warn('Profile sync non-fatal warning:', syncErr);
+      if (res.sync_status === 'FAILED') {
+        console.warn('Initial profile sync warning:', res.sync_error);
       }
 
       // Fetch newly extracted profile and dynamic suggested roles
@@ -96,17 +93,23 @@ export const OnboardingWizard: React.FC = () => {
     setError(null);
 
     try {
-      // 1. Save candidate confirmed target roles & preferences
+      // 1. Resolve candidate locations, avoiding forcing India if international
+      const candLoc = personal?.location || (profileData as any)?.location;
+      const targetLocs = candLoc && !candLoc.toLowerCase().includes('india')
+        ? [candLoc, 'Remote']
+        : ['Remote', 'India'];
+
+      // 2. Save candidate confirmed target roles & preferences
       await api.updateSearchPreferences({
         target_roles: selectedRoleTitles,
-        target_locations: ['Remote', 'India'],
+        target_locations: targetLocs,
         auto_discover_enabled: true,
       });
 
-      // 2. Trigger automatic candidate-scoped discovery
-      await api.triggerDiscovery(selectedRoleTitles);
+      // 3. Trigger automatic candidate-scoped discovery
+      await api.triggerDiscovery(selectedRoleTitles, targetLocs);
 
-      // 3. Direct candidate straight to Find Jobs with their recommendations
+      // 4. Direct candidate straight to Find Jobs with their recommendations
       navigate('/jobs');
     } catch (err: any) {
       setError(err.message || 'Failed to start automated discovery.');

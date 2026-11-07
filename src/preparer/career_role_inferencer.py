@@ -5,6 +5,7 @@ Infers suitable job categories and search roles from actual candidate resume evi
 """
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 import re
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +22,19 @@ class InferredRole:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class InferredResult:
+    """Consolidated inferred roles container."""
+    inferred_roles: List[InferredRole] = field(default_factory=list)
+    suggested_roles: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "inferred_roles": [r.to_dict() for r in self.inferred_roles],
+            "suggested_roles": list(self.suggested_roles),
+        }
 
 
 class CareerRoleInferencer:
@@ -160,16 +174,67 @@ class CareerRoleInferencer:
             "category": "Electrical Engineering",
             "min_matches": 2,
         },
-        # Healthcare
+        # Healthcare & Medicine
         "Clinical Healthcare Specialist": {
             "keywords": ["patient care", "nursing", "clinical assessment", "pharmacology", "triage", "healthcare", "medical"],
             "category": "Healthcare",
             "min_matches": 2,
         },
+        "Cardiologist": {
+            "keywords": ["cardiology", "interventional cardiology", "echocardiography", "coronary", "catheterization", "cardiac"],
+            "category": "Healthcare",
+            "min_matches": 2,
+        },
+        "Physician / Clinical Specialist": {
+            "keywords": ["internal medicine", "patient diagnosis", "clinical protocols", "emr", "attending", "medical staff"],
+            "category": "Healthcare",
+            "min_matches": 2,
+        },
         # Legal
+        "Corporate Counsel": {
+            "keywords": ["corporate law", "m&a", "mergers", "cross-border", "due diligence", "contract negotiation", "securities"],
+            "category": "Legal",
+            "min_matches": 2,
+        },
         "Legal Associate": {
             "keywords": ["contract drafting", "legal research", "litigation", "compliance", "regulatory", "due diligence"],
             "category": "Legal",
+            "min_matches": 2,
+        },
+        # Education
+        "STEM Educator": {
+            "keywords": ["physics", "curriculum development", "ap physics", "stem", "classroom instruction", "pedagogy"],
+            "category": "Education",
+            "min_matches": 2,
+        },
+        # Sales & Revenue
+        "Enterprise Account Executive": {
+            "keywords": ["enterprise sales", "saas sales", "arr", "quota", "sales pipeline", "solution selling", "crm"],
+            "category": "Sales",
+            "min_matches": 2,
+        },
+        # Supply Chain & Operations
+        "Supply Chain Director": {
+            "keywords": ["supply chain", "cold-chain", "logistics", "procurement", "inventory management", "vendor management", "freight"],
+            "category": "Operations",
+            "min_matches": 2,
+        },
+        # Life Sciences & Biotech
+        "Biomarker Research Scientist": {
+            "keywords": ["oncology", "biomarker", "assay development", "genomics", "pcr", "flow cytometry", "translational"],
+            "category": "Life Sciences",
+            "min_matches": 2,
+        },
+        # Hospitality & Management
+        "Hospitality Operations Manager": {
+            "keywords": ["hospitality", "resort operations", "guest satisfaction", "hotel management", "f&b", "hotel operations"],
+            "category": "Hospitality",
+            "min_matches": 2,
+        },
+        # Behavioral Health
+        "Behavior Analyst": {
+            "keywords": ["behavior analysis", "bcba", "applied behavior", "special education", "iep", "intervention plan"],
+            "category": "Education",
             "min_matches": 2,
         },
     }
@@ -192,8 +257,12 @@ class CareerRoleInferencer:
         "management": ["Business Analyst", "Operations Associate"],
         "marketing": ["Marketing Specialist", "Digital Marketing Associate"],
         "nursing": ["Staff Nurse", "Clinical Specialist"],
+        "medicine": ["Physician", "Clinical Fellow"],
         "law": ["Legal Associate", "Corporate Counsel", "Legal Analyst"],
         "design": ["UI/UX Designer", "Product Designer"],
+        "physics": ["STEM Educator", "Research Scientist"],
+        "biology": ["Biomarker Research Scientist", "Laboratory Specialist"],
+        "biotechnology": ["Biomarker Research Scientist", "Research Scientist"],
     }
 
     def infer_roles(self, data: Any) -> List[InferredRole]:
@@ -203,6 +272,11 @@ class CareerRoleInferencer:
 
         # Check if student/fresher indicator
         is_student_or_fresher = self._is_student_or_fresher(resume_dict)
+        senior_terms = [
+            "intern", "manager", "director", "lead", "principal", "attending", "chief",
+            "executive", "senior", "counsel", "cardiologist", "physician", "surgeon",
+            "chair", "officer", "partner", "vp", "president", "consultant", "head",
+        ]
 
         # 1. Evidence from Previous / Current Job Titles
         for exp in resume_dict.get("work_experience", []):
@@ -218,7 +292,7 @@ class CareerRoleInferencer:
                     confidence=0.95,
                     skills=exp.get("technologies", []),
                 )
-                if is_student_or_fresher and "intern" not in clean_title.lower():
+                if is_student_or_fresher and not any(k in clean_title.lower() for k in senior_terms):
                     self._add_or_update_role(
                         inferred,
                         role_title=f"{clean_title} Intern",
@@ -240,7 +314,7 @@ class CareerRoleInferencer:
                         evidence = f"Degree in {edu.get('degree', '') or major}" + (f" from {inst}" if inst else "")
                         conf = 0.85
                         self._add_or_update_role(inferred, r, evidence, conf)
-                        if is_student_or_fresher and "intern" not in r.lower():
+                        if is_student_or_fresher and not any(k in r.lower() for k in senior_terms):
                             self._add_or_update_role(inferred, f"{r} Intern", evidence, conf)
 
         # 2b. Evidence from Certifications & Professional Qualifications
@@ -301,7 +375,7 @@ class CareerRoleInferencer:
                     confidence=conf,
                     skills=matched_keywords,
                 )
-                if is_student_or_fresher and "intern" not in role_name.lower():
+                if is_student_or_fresher and not any(k in role_name.lower() for k in senior_terms):
                     self._add_or_update_role(
                         inferred,
                         role_title=f"{role_name} Intern",
@@ -371,6 +445,14 @@ class CareerRoleInferencer:
         # Cap at top 8 recommendations
         return sorted_roles[:8]
 
+    def infer_roles_from_resume(self, data: Any) -> InferredResult:
+        """Convenience method returning both InferredRole objects and plain role title strings."""
+        roles = self.infer_roles(data)
+        return InferredResult(
+            inferred_roles=roles,
+            suggested_roles=[r.role_title for r in roles],
+        )
+
     def infer_locations(self, data: Any) -> List[str]:
         """Extracts candidate's natural location preference from resume facts."""
         resume_dict = self._normalize_input(data)
@@ -386,9 +468,10 @@ class CareerRoleInferencer:
                 if p not in locations and len(p) > 1:
                     locations.append(p)
 
-        # Default national / broad fallback if only specific city found
-        if "India" not in locations:
-            locations.append("India")
+        # Only add India if candidate explicitly resides in India or no location was found
+        if "india" in loc.lower() or (len(locations) == 1 and locations[0] == "Remote"):
+            if "India" not in locations:
+                locations.append("India")
 
         return locations
 
@@ -402,20 +485,69 @@ class CareerRoleInferencer:
 
     def _is_student_or_fresher(self, resume_dict: Dict[str, Any]) -> bool:
         """Determines if candidate is currently a student or fresher based on graduation year."""
-        current_year = 2026
+        current_year = datetime.now(timezone.utc).year
+
+        # 1. Professional qualifications / statutory certifications
+        certs = resume_dict.get("certifications", []) + resume_dict.get("professional_qualifications", [])
+        for cert in certs:
+            c_str = str(cert.get("name", "") if isinstance(cert, dict) else cert).lower()
+            if any(p in c_str for p in ["acca", "cpa", "cfa", "bar", "m.d.", "md", "ph.d", "phd", "pmp", "bcba", "registered nurse", "board-certified", "architect", "mbbs"]):
+                return False
+
+        # Calculate total experience months
+        exps = resume_dict.get("work_experience", [])
+        total_months = 0
+        for exp in exps:
+            dur = exp.get("duration") or ""
+            m_mo = re.search(r"(\d+)\s*(?:month|mo)", dur, re.IGNORECASE)
+            if m_mo:
+                total_months += int(m_mo.group(1))
+            m_yr = re.search(r"(\d+)\s*(?:year|yr)", dur, re.IGNORECASE)
+            if m_yr:
+                total_months += int(m_yr.group(1)) * 12
+
+        # 2. Check future graduation year
         for edu in resume_dict.get("education", []):
             grad_yr = edu.get("expected_graduation_year") or edu.get("graduation_year")
             if grad_yr:
                 try:
                     yr = int(str(grad_yr).strip())
-                    if yr >= current_year - 1:
-                        return True
+                    if yr >= current_year:
+                        # Currently enrolled: student unless extensive past professional experience (>= 24 mo)
+                        return total_months < 24
                 except Exception:
                     pass
 
-        # Check total experience duration
-        exps = resume_dict.get("work_experience", [])
-        if not exps or len(exps) <= 1:
+        # 3. Check senior keywords in headline or work experience
+        senior_keywords = [
+            "director", "vp", "vice president", "attending",
+            "chief", "partner", "chair", "executive", "senior", "counsel",
+            "cardiologist", "physician", "surgeon", "fellow", "consultant", "manager", "head",
+        ]
+        headline = (resume_dict.get("headline") or resume_dict.get("professional_headline") or "").lower()
+        if any(re.search(r"\b" + kw + r"\b", headline) for kw in senior_keywords):
+            return False
+
+        for exp in exps:
+            title = (exp.get("job_title") or "").lower()
+            if any(re.search(r"\b" + kw + r"\b", title) for kw in senior_keywords):
+                return False
+
+        if total_months >= 12:
+            return False
+
+        # 4. Past graduation check
+        for edu in resume_dict.get("education", []):
+            grad_yr = edu.get("expected_graduation_year") or edu.get("graduation_year")
+            if grad_yr:
+                try:
+                    yr = int(str(grad_yr).strip())
+                    if yr < current_year - 1:
+                        return False
+                except Exception:
+                    pass
+
+        if not exps and total_months == 0:
             return True
 
         return False

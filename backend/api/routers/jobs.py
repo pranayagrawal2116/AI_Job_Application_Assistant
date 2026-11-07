@@ -265,12 +265,17 @@ def get_job_match_explanation(job_id: int, auth_ctx=Depends(get_current_user_and
                 logger.warning("On-the-fly match evaluation failed for job %s: %s", job_id, e)
 
     if match_rec:
+        is_eligible = (
+            True if match_rec.eligibility_status == "ELIGIBLE"
+            else (False if match_rec.eligibility_status == "INELIGIBLE" else None)
+        )
         return {
             "job_id": job_id,
+            "is_evaluated": True,
             "match_score": float(match_rec.match_score),
             "match_classification": match_rec.match_classification,
             "eligibility_status": match_rec.eligibility_status,
-            "is_eligible": match_rec.eligibility_status != "INELIGIBLE",
+            "is_eligible": is_eligible,
             "score_breakdown": _normalize_dict(match_rec.score_breakdown),
             "explanation": match_rec.explanation,
             "matching_skills": _normalize_skill_list(match_rec.matching_skills),
@@ -284,15 +289,20 @@ def get_job_match_explanation(job_id: int, auth_ctx=Depends(get_current_user_and
 
     return {
         "job_id": job_id,
-        "match_score": float(job.match_score or 0.0),
-        "match_classification": job.match_classification or "Moderate",
-        "eligibility_status": "ELIGIBLE" if job.is_eligible else "INELIGIBLE",
-        "is_eligible": bool(job.is_eligible),
-        "score_breakdown": _normalize_dict(job.score_breakdown),
-        "explanation": "Calculated based on general catalog scoring criteria.",
+        "is_evaluated": False,
+        "match_score": None,
+        "match_classification": "Not Evaluated",
+        "eligibility_status": "UNKNOWN",
+        "is_eligible": None,
+        "score_breakdown": {},
+        "explanation": "This opportunity has not yet been evaluated against your resume.",
         "matching_skills": [],
         "missing_skills": [],
-        "evaluated_at": job.discovery_date,
+        "education_analysis": None,
+        "experience_analysis": None,
+        "eligibility_reasons": [],
+        "recommendations": ["Upload a primary resume or initiate discovery to evaluate your match."],
+        "evaluated_at": None,
     }
 
 
@@ -471,7 +481,7 @@ def trigger_jobs_discovery(
     if active_run:
         return {
             "run_id": active_run["id"],
-            "status": "RUNNING",
+            "status": "already_running",
             "message": "A discovery run is already in progress for your profile.",
             "started_at": active_run.get("started_at") or datetime.now(timezone.utc).isoformat(),
         }
@@ -499,11 +509,27 @@ def trigger_jobs_discovery(
                 target_locations = inferencer.infer_locations(prof_data)
 
     if not target_roles:
-        target_roles = ["Associate", "Specialist"]
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No target roles found. Please upload a resume or configure target roles in your profile first.",
+        )
     if not target_locations:
-        target_locations = ["Remote", "India"]
+        target_locations = ["Remote"]
 
-    run_rec = service.db.create_discovery_run(user_id, target_roles, target_locations)
+    try:
+        run_rec = service.db.create_discovery_run(user_id, target_roles, target_locations)
+    except Exception as e:
+        from src.database.exceptions import DuplicateDiscoveryRunError
+        if isinstance(e, DuplicateDiscoveryRunError):
+            act = service.db.get_active_discovery_run(user_id)
+            return {
+                "run_id": act["id"] if act else None,
+                "status": "already_running",
+                "message": "A discovery run is already in progress for your profile.",
+                "started_at": act.get("started_at") if act else datetime.now(timezone.utc).isoformat(),
+            }
+        raise
+
     run_id = run_rec["id"]
     service.db.update_discovery_run(run_id, status="RUNNING")
 
@@ -516,15 +542,18 @@ def trigger_jobs_discovery(
                 max_results_per_source=5,
                 enable_evaluation=False,
             )
-            # Evaluate personalized scores for candidate
+            # Evaluate personalized scores for candidate strictly against newly saved jobs
             resumes = service.get_user_resumes(user_id)
             prim = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
-            if prim:
-                for job in service.db.get_all_jobs()[:30]:
-                    try:
-                        service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job.id)
-                    except Exception:
-                        pass
+            if prim and summary.saved_jobs:
+                for saved_item in summary.saved_jobs:
+                    job_id_to_eval = saved_item.get("id")
+                    if job_id_to_eval:
+                        try:
+                            service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job_id_to_eval)
+                        except Exception as eval_err:
+                            logger.warning("Personalized evaluation failed for newly discovered job %s: %s", job_id_to_eval, eval_err)
+
             final_status = "PARTIAL" if summary.restricted_incidents > 0 and summary.new_jobs_saved > 0 else (
                 "COMPLETED" if summary.new_jobs_saved > 0 or summary.restricted_incidents == 0 else "PARTIAL"
             )
@@ -552,6 +581,17 @@ def trigger_jobs_discovery(
         "message": "Discovery initiated. Searching permitted sources and computing personalized matches.",
         "started_at": datetime.now(timezone.utc).isoformat(),
     }
+
+
+@router.get("/discovery/latest")
+def get_latest_discovery_run_status(auth_ctx=Depends(get_current_user_and_session)):
+    """Retrieves latest discovery run for the candidate."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    latest = service.db.get_latest_discovery_run(user_id)
+    if not latest:
+        return {"has_run": False, "run": None}
+    return {"has_run": True, "run": dict(latest)}
 
 
 @router.get("/discovery/{run_id}")

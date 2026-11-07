@@ -337,3 +337,19 @@ class QuarantinedSourceError(SecurityPreflightError):
         self.risk_score = risk_score
 
 
+# -----------------------------------------------------------------------------
+# PHASE B.3.2: DISCOVERY LOCKING & CONCURRENCY EXCEPTIONS
+# -----------------------------------------------------------------------------
+
+class DuplicateDiscoveryRunError(DatabaseError):
+    """Raised when an active discovery run (PENDING or RUNNING) already exists for the candidate."""
+
+    def __init__(self, user_id: int, active_run_id: Optional[int] = None):
+        msg = f"An active job discovery run is already in progress for candidate #{user_id}."
+        if active_run_id:
+            msg += f" (Run #{active_run_id})"
+        super().__init__(msg)
+        self.user_id = user_id
+        self.active_run_id = active_run_id
+
+

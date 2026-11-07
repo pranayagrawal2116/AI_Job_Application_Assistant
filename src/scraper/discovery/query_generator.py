@@ -17,17 +17,18 @@ class QueryGenerator:
     def __init__(self, config_path: Optional[Path] = None):
         self.roles: List[str] = []
         self.locations = list(self.DEFAULT_TARGET_LOCATIONS)
-        if config_path and config_path.exists():
-            self._load_from_config(config_path)
+        target_path = config_path if config_path is not None else Path("config/search_criteria.json")
+        if target_path and target_path.exists():
+            self._load_from_config(target_path)
 
     def _load_from_config(self, config_path: Path) -> None:
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                custom_roles = data.get("target_roles")
+                custom_roles = data.get("target_roles") or data.get("search_queries")
                 if custom_roles and isinstance(custom_roles, list):
                     self.roles = custom_roles
-                custom_locs = data.get("locations")
+                custom_locs = data.get("locations") or data.get("target_locations")
                 if custom_locs and isinstance(custom_locs, list):
                     self.locations = custom_locs
         except Exception:

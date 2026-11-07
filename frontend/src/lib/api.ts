@@ -167,6 +167,21 @@ class ApiClient {
     });
   }
 
+  async triggerJobsDiscovery(roles?: string[], locations?: string[]): Promise<{ run_id: number; status: string; message: string; started_at?: string }> {
+    return this.request('/jobs/discovery', {
+      method: 'POST',
+      body: JSON.stringify({ roles, locations }),
+    });
+  }
+
+  async getDiscoveryRun(runId: number): Promise<any> {
+    return this.request(`/jobs/discovery/${runId}`);
+  }
+
+  async getLatestDiscoveryRun(): Promise<{ has_run: boolean; run: any }> {
+    return this.request('/jobs/discovery/latest');
+  }
+
   async getDiscoveryStatus(): Promise<DiscoveryStatus> {
     return this.request<DiscoveryStatus>('/discovery/status');
   }

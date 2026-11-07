@@ -89,12 +89,85 @@ export const JobsPage: React.FC = () => {
     }
   };
 
+  const pollDiscoveryRun = async (runId: number) => {
+    const startTime = Date.now();
+    const TIMEOUT_MS = 60000; // 60s timeout
+
+    const checkStatus = async () => {
+      try {
+        const run = await api.getDiscoveryRun(runId);
+        if (!run) {
+          setIsTriggeringDiscovery(false);
+          return;
+        }
+
+        if (run.status === 'COMPLETED') {
+          setIsTriggeringDiscovery(false);
+          const found = run.jobs_found ?? 0;
+          const saved = run.jobs_saved ?? 0;
+          const skipped = run.duplicates_skipped ?? 0;
+          setDiscoveryNotification(
+            `Discovery completed! Found ${found} opportunities (${saved} new saved, ${skipped} duplicates skipped).`
+          );
+          await loadDiscoveryMeta();
+          await fetchJobs();
+          return;
+        }
+
+        if (run.status === 'PARTIAL') {
+          setIsTriggeringDiscovery(false);
+          const saved = run.jobs_saved ?? 0;
+          setDiscoveryNotification(
+            `Discovery finished with partial results (${saved} saved). Some sources were restricted or rate-limited.`
+          );
+          await loadDiscoveryMeta();
+          await fetchJobs();
+          return;
+        }
+
+        if (run.status === 'FAILED') {
+          setIsTriggeringDiscovery(false);
+          const err = run.error_message || 'Discovery failed. Please try again.';
+          setDiscoveryNotification(`Discovery error: ${err}`);
+          await loadDiscoveryMeta();
+          return;
+        }
+
+        if (Date.now() - startTime > TIMEOUT_MS) {
+          setIsTriggeringDiscovery(false);
+          setDiscoveryNotification('Discovery is still running in the background. Check back in a moment.');
+          await loadDiscoveryMeta();
+          return;
+        }
+
+        setTimeout(checkStatus, 2000);
+      } catch (err: any) {
+        console.warn('Error polling discovery run:', err);
+        setIsTriggeringDiscovery(false);
+      }
+    };
+
+    setTimeout(checkStatus, 2000);
+  };
+
   const loadDiscoveryMeta = async () => {
     try {
       const statusRes = await api.getDiscoveryStatus();
       setDiscoveryStatus(statusRes);
       if (statusRes.suggested_roles && statusRes.suggested_roles.length > 0) {
         setSuggestedRoles(statusRes.suggested_roles);
+      }
+
+      // Check if an active run is ongoing and resume polling
+      if (statusRes.active_run && (statusRes.active_run.status === 'PENDING' || statusRes.active_run.status === 'RUNNING')) {
+        setIsTriggeringDiscovery(true);
+        setDiscoveryNotification('Resuming active background discovery run...');
+        pollDiscoveryRun(statusRes.active_run.id);
+      } else if (statusRes.latest_run?.status === 'FAILED') {
+        const msg = statusRes.latest_run.error_message || '';
+        if (msg.toLowerCase().includes('restart') || msg.toLowerCase().includes('interrupted')) {
+          setDiscoveryNotification('A previous discovery run was interrupted by a server restart. You can safely retry discovery now.');
+        }
       }
     } catch (e) {
       // Fallback
@@ -160,15 +233,21 @@ export const JobsPage: React.FC = () => {
 
   const handleTriggerDiscovery = async () => {
     setIsTriggeringDiscovery(true);
-    setDiscoveryNotification(null);
+    setDiscoveryNotification('Initiating job discovery across supported platforms...');
     try {
       const res = await api.triggerDiscovery();
-      setDiscoveryNotification(res.message || 'Discovery started. Searching opportunities...');
-      await loadDiscoveryMeta();
-      setTimeout(() => {
-        fetchJobs();
-        setIsTriggeringDiscovery(false);
-      }, 2500);
+      const runId = res.run_id;
+      if (runId) {
+        setDiscoveryNotification(res.message || 'Discovery running in background...');
+        pollDiscoveryRun(runId);
+      } else {
+        setDiscoveryNotification(res.message || 'Discovery started.');
+        await loadDiscoveryMeta();
+        setTimeout(() => {
+          fetchJobs();
+          setIsTriggeringDiscovery(false);
+        }, 3000);
+      }
     } catch (err: any) {
       setDiscoveryNotification(err.message || 'Failed to trigger discovery.');
       setIsTriggeringDiscovery(false);
@@ -624,15 +703,19 @@ export const JobsPage: React.FC = () => {
                         >
                           {formatScore(job.match_score)} Match
                         </span>
-                        {job.is_eligible ? (
+                        {job.is_eligible === true ? (
                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
                             <CheckCircle2 size={12} />
                             Eligible
                           </span>
-                        ) : (
+                        ) : job.is_eligible === false ? (
                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-rose-700 bg-rose-50 px-2 py-0.5 rounded-full border border-rose-200">
                             <XCircle size={12} />
                             Ineligible
+                          </span>
+                        ) : (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
+                            Pending Evaluation
                           </span>
                         )}
                       </div>
@@ -773,12 +856,14 @@ export const JobsPage: React.FC = () => {
                     selectedJob.match_score
                   )}`}
                 >
-                  {formatScore(selectedJob.match_score)} ({selectedJob.match_classification})
+                  {formatScore(selectedJob.match_score)} {selectedJob.match_classification ? `(${selectedJob.match_classification})` : ''}
                 </span>
-                {selectedJob.is_eligible ? (
+                {selectedJob.is_eligible === true ? (
                   <Badge variant="success">Eligible</Badge>
-                ) : (
+                ) : selectedJob.is_eligible === false ? (
                   <Badge variant="danger">Ineligible</Badge>
+                ) : (
+                  <Badge variant="warning">Pending Evaluation</Badge>
                 )}
               </div>
             </div>
@@ -790,6 +875,14 @@ export const JobsPage: React.FC = () => {
               </div>
             ) : matchExplanation ? (
               <div className="space-y-4">
+                {matchExplanation.is_evaluated === false && (
+                  <div className="p-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900">
+                    <p className="font-semibold">Match evaluation has not been performed yet.</p>
+                    <p className="text-[11px] text-amber-700 mt-1">
+                      Upload or select a primary resume to evaluate alignment against this job posting, or start application preparation to tailor your materials.
+                    </p>
+                  </div>
+                )}
                 {/* 100-pt Dimension Breakdown */}
                 {matchExplanation.score_breakdown && Object.keys(matchExplanation.score_breakdown).length > 0 && (
                   <div className="p-4 rounded-2xl bg-white border border-slate-200/80 space-y-3">

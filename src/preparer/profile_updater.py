@@ -4,7 +4,7 @@ import copy
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from src.database.db_manager import DatabaseManager
 from src.matcher.terminology import split_date_range
@@ -25,31 +25,50 @@ class ProfileUpdater:
         self.db = db_manager or DatabaseManager()
         self.profile_path = Path(profile_path or "data/profile/candidate_profile.json").resolve()
 
-    def build_profile_dict(self, resume: ParsedResume) -> Dict[str, Any]:
+    def build_profile_dict(
+        self,
+        resume: Union[ParsedResume, Dict[str, Any]],
+        existing_profile: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Constructs canonical candidate profile JSON structure from verified resume data.
         
         Strict zero-hallucination policy: Only verified fields from the resume are populated.
+        Supports both ParsedResume instances and parsed dictionary payloads.
         """
+        def _get_val(obj: Any, attr: str, default: Any = None) -> Any:
+            if isinstance(obj, dict):
+                return obj.get(attr, default)
+            return getattr(obj, attr, default)
+
         # Education
         edu_list = []
-        for edu in resume.education:
+        raw_edu = _get_val(resume, "education", [])
+        for edu in raw_edu:
+            inst = _get_val(edu, "institution", "")
+            deg = _get_val(edu, "degree", "")
+            maj = _get_val(edu, "major", "")
+            grad_yr = _get_val(edu, "expected_graduation_year") or _get_val(edu, "graduation_year")
+            cgpa_val = _get_val(edu, "cgpa") or _get_val(edu, "current_cgpa")
+            c_work = _get_val(edu, "coursework", [])
+            hnrs = _get_val(edu, "honors", [])
             edu_list.append({
-                "institution": edu.institution,
-                "degree": edu.degree,
-                "major": edu.major,
-                "expected_graduation_year": edu.expected_graduation_year,
-                "current_cgpa": edu.cgpa,
-                "coursework": edu.coursework,
-                "honors": edu.honors,
+                "institution": inst,
+                "degree": deg,
+                "major": maj,
+                "expected_graduation_year": grad_yr,
+                "current_cgpa": cgpa_val,
+                "coursework": c_work,
+                "honors": hnrs,
             })
 
         # Experience
         exp_list = []
-        for exp in resume.work_experience:
-            start_d = exp.start_date
-            end_d = exp.end_date
-            is_curr = exp.is_current
-            dur_str = exp.duration or ""
+        raw_exp = _get_val(resume, "work_experience", [])
+        for exp in raw_exp:
+            start_d = _get_val(exp, "start_date")
+            end_d = _get_val(exp, "end_date")
+            is_curr = bool(_get_val(exp, "is_current", False))
+            dur_str = _get_val(exp, "duration", "") or ""
 
             if (not start_d or not end_d) and dur_str:
                 s_part, e_part = split_date_range(dur_str)
@@ -60,7 +79,7 @@ class ProfileUpdater:
                     if "present" in e_part.lower() or "current" in e_part.lower():
                         is_curr = True
 
-            duration_months = getattr(exp, "duration_months", None)
+            duration_months = _get_val(exp, "duration_months")
             if duration_months is None and dur_str:
                 import re
                 m = re.search(r"(\d+)\s*(?:month|mo)", dur_str, re.IGNORECASE)
@@ -71,39 +90,42 @@ class ProfileUpdater:
                     duration_months = (duration_months or 0) + int(y.group(1)) * 12
 
             exp_status = VerificationStatus.EXTRACTED_UNVERIFIED
-            if exp.provenance and isinstance(exp.provenance, dict):
-                exp_status = exp.provenance.get("verification_status", VerificationStatus.EXTRACTED_UNVERIFIED)
+            exp_prov = _get_val(exp, "provenance")
+            if exp_prov and isinstance(exp_prov, dict):
+                exp_status = exp_prov.get("verification_status", VerificationStatus.EXTRACTED_UNVERIFIED)
 
             exp_list.append({
-                "employer": exp.employer,
-                "job_title": exp.job_title,
+                "employer": _get_val(exp, "employer", ""),
+                "job_title": _get_val(exp, "job_title", ""),
                 "duration": dur_str,
                 "duration_months": duration_months,
                 "start_date": start_d,
                 "end_date": end_d,
                 "is_current": is_curr,
-                "responsibilities": exp.responsibilities,
-                "achievements": exp.achievements,
+                "responsibilities": _get_val(exp, "responsibilities", []),
+                "achievements": _get_val(exp, "achievements", []),
                 "verification_status": exp_status,
             })
 
         # Projects
         proj_list = []
-        for proj in resume.projects:
+        raw_proj = _get_val(resume, "projects", [])
+        for proj in raw_proj:
             proj_list.append({
-                "title": proj.title,
-                "description": proj.description,
-                "technologies": proj.technologies,
-                "responsibilities": proj.responsibilities,
+                "title": _get_val(proj, "title", ""),
+                "description": _get_val(proj, "description", ""),
+                "technologies": _get_val(proj, "technologies", []),
+                "responsibilities": _get_val(proj, "responsibilities", []),
             })
 
         # ACCA PER / Supervised Professional Experience
         per_list = []
-        for per in getattr(resume, "per_experience", []):
-            start_d = per.start_date
-            end_d = per.end_date
-            is_curr = per.is_current
-            dur_str = per.duration or ""
+        raw_per = _get_val(resume, "per_experience", [])
+        for per in raw_per:
+            start_d = _get_val(per, "start_date")
+            end_d = _get_val(per, "end_date")
+            is_curr = bool(_get_val(per, "is_current", False))
+            dur_str = _get_val(per, "duration", "") or ""
 
             if (not start_d or not end_d) and dur_str:
                 s_part, e_part = split_date_range(dur_str)
@@ -115,55 +137,68 @@ class ProfileUpdater:
                         is_curr = True
 
             per_list.append({
-                "employer": per.employer,
-                "job_title": per.job_title,
-                "role_name": per.job_title,
+                "employer": _get_val(per, "employer", ""),
+                "job_title": _get_val(per, "job_title", ""),
+                "role_name": _get_val(per, "job_title", ""),
                 "duration": dur_str,
                 "start_date": start_d,
                 "end_date": end_d,
                 "is_current": is_curr,
-                "responsibilities": per.responsibilities,
-                "supervisory_context": per.domain_expertise or "ACCA Practical Experience Requirement (PER)",
+                "responsibilities": _get_val(per, "responsibilities", []),
+                "supervisory_context": _get_val(per, "domain_expertise") or "ACCA Practical Experience Requirement (PER)",
                 "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
             })
 
         # Certifications
         cert_list = []
-        for cert in resume.certifications:
+        raw_cert = _get_val(resume, "certifications", [])
+        for cert in raw_cert:
+            c_name = _get_val(cert, "name", "")
+            c_issuer = _get_val(cert, "issuer") or _get_val(cert, "issuing_organization", "")
             cert_list.append({
-                "name": cert.name,
-                "issuer": cert.issuer or cert.issuing_organization,
-                "date_issued": cert.date_issued,
-                "expiry_date": cert.expiry_date,
-                "credential_id": cert.credential_id,
+                "name": c_name,
+                "issuer": c_issuer,
+                "date_issued": _get_val(cert, "date_issued"),
+                "expiry_date": _get_val(cert, "expiry_date"),
+                "credential_id": _get_val(cert, "credential_id"),
             })
 
         # Professional Qualifications & Memberships
         prof_qual_list = []
-        for pq in getattr(resume, "professional_qualifications", []):
+        raw_pq = _get_val(resume, "professional_qualifications", [])
+        for pq in raw_pq:
+            pq_name = _get_val(pq, "name", "")
+            pq_issuer = _get_val(pq, "issuer") or _get_val(pq, "issuing_organization", "")
+            pq_mem = _get_val(pq, "membership") or pq_name
             prof_qual_list.append({
-                "name": pq.name,
-                "issuer": pq.issuer or pq.issuing_organization,
-                "membership": pq.membership or pq.name,
+                "name": pq_name,
+                "issuer": pq_issuer,
+                "membership": pq_mem,
                 "verification_status": VerificationStatus.EXTRACTED_UNVERIFIED,
             })
 
         # Technical skills (categorized without fabricating unverified tools)
-        prog_languages = [s for s in ["Python", "Dart", "JavaScript", "C/C++", "C++", "C", "Java", "TypeScript", "Go", "Rust", "SQL", "R"] if s in resume.technical_skills]
-        mobile_skills = [s for s in ["Flutter", "Android application development", "Android Studio", "React Native", "iOS", "Swift"] if s in resume.technical_skills]
-        backend_api = [s for s in ["REST API integration", "Node.js", "Node.js fundamentals", "Postman", "JSON", "XML", "FastAPI", "Django", "Flask"] if s in resume.technical_skills]
-        databases = [s for s in ["SQLite", "MySQL", "PostgreSQL", "MongoDB", "Redis"] if s in resume.technical_skills]
-        dev_tools = [s for s in ["Git", "GitHub", "Git & GitHub", "VS Code", "Android Studio", "Postman", "Docker", "Kubernetes"] if s in resume.technical_skills]
+        raw_tech = _get_val(resume, "technical_skills") or _get_val(resume, "skills", [])
+        prog_languages = [s for s in ["Python", "Dart", "JavaScript", "C/C++", "C++", "C", "Java", "TypeScript", "Go", "Rust", "SQL", "R"] if s in raw_tech]
+        mobile_skills = [s for s in ["Flutter", "Android application development", "Android Studio", "React Native", "iOS", "Swift"] if s in raw_tech]
+        backend_api = [s for s in ["REST API integration", "Node.js", "Node.js fundamentals", "Postman", "JSON", "XML", "FastAPI", "Django", "Flask"] if s in raw_tech]
+        databases = [s for s in ["SQLite", "MySQL", "PostgreSQL", "MongoDB", "Redis"] if s in raw_tech]
+        dev_tools = [s for s in ["Git", "GitHub", "Git & GitHub", "VS Code", "Android Studio", "Postman", "Docker", "Kubernetes"] if s in raw_tech]
 
         # Preserve existing candidate inputs if already configured by the user
         existing_inputs = {}
-        if self.profile_path.exists():
+        if existing_profile is not None:
+            existing_inputs = existing_profile.get("candidate_inputs", {})
+        elif self.db is None and self.profile_path.exists():
             try:
                 with open(self.profile_path, "r", encoding="utf-8") as pf:
                     existing_data = json.load(pf)
                     existing_inputs = existing_data.get("candidate_inputs", {})
             except Exception:
                 pass
+
+        c_github = existing_inputs.get("github_url") or _get_val(resume, "github_url") or ""
+        c_linkedin = existing_inputs.get("linkedin_url") or _get_val(resume, "linkedin_url") or ""
 
         candidate_inputs = {
             "expected_stipend": existing_inputs.get("expected_stipend"),
@@ -174,33 +209,52 @@ class ProfileUpdater:
             "relocation_willingness": existing_inputs.get("relocation_willingness"),
             "work_mode_preference": existing_inputs.get("work_mode_preference"),
             "notice_period": existing_inputs.get("notice_period"),
-            "github_url": existing_inputs.get("github_url") or resume.github_url or "",
-            "linkedin_url": existing_inputs.get("linkedin_url") or resume.linkedin_url or "",
+            "github_url": c_github,
+            "linkedin_url": c_linkedin,
         }
 
         # Personal info
+        r_name = _get_val(resume, "full_name") or _get_val(resume, "name") or ""
+        r_email = _get_val(resume, "email") or ""
+        r_phone = _get_val(resume, "phone") or ""
+        r_loc = _get_val(resume, "location") or ""
+        r_head = _get_val(resume, "professional_headline") or _get_val(resume, "headline") or ""
+        r_port = _get_val(resume, "portfolio_url") or ""
+        r_web = _get_val(resume, "websites", [])
+        r_sum = _get_val(resume, "about_me") or _get_val(resume, "summary") or ""
+
         personal_dict = {
-            "full_name": resume.full_name or "",
-            "email": resume.email or "",
-            "phone": resume.phone or "",
-            "location": resume.location or "",
-            "headline": resume.professional_headline or "",
+            "full_name": r_name,
+            "email": (existing_profile.get("personal", {}).get("email") if existing_profile else None) or r_email,
+            "phone": r_phone,
+            "location": r_loc,
+            "headline": r_head,
             "github": candidate_inputs["github_url"],
             "linkedin": candidate_inputs["linkedin_url"],
-            "portfolio": resume.portfolio_url or "",
-            "websites": resume.websites,
-            "summary": resume.about_me,
+            "portfolio": r_port,
+            "websites": r_web,
+            "summary": r_sum,
         }
 
         # Dynamic Career Role & Search Preference Inference (Zero Hardcoded Universal Roles)
         from src.preparer.career_role_inferencer import CareerRoleInferencer
         inferencer = CareerRoleInferencer()
-        inferred_roles = inferencer.infer_roles(resume)
-        inferred_locations = inferencer.infer_locations(resume)
+        if isinstance(resume, dict):
+            inferred_roles_res = inferencer.infer_roles_from_resume(resume)
+            inferred_roles = inferred_roles_res.inferred_roles
+            inferred_locations = inferencer.infer_locations(resume)
+            res_dict = resume
+        else:
+            inferred_roles = inferencer.infer_roles(resume)
+            inferred_locations = inferencer.infer_locations(resume)
+            res_dict = resume.to_dict() if hasattr(resume, "to_dict") else {}
 
         # Preserve existing user-configured search preferences if present
         existing_prefs = {}
-        if self.profile_path.exists():
+        if existing_profile is not None:
+            existing_prefs = existing_profile.get("search_preferences", {}) or existing_profile.get("preferences", {})
+        elif self.db is None and self.profile_path.exists():
+            # Legacy single-user file mode only
             try:
                 with open(self.profile_path, "r", encoding="utf-8") as pf:
                     existing_data = json.load(pf)
@@ -212,15 +266,19 @@ class ProfileUpdater:
         saved_locs = existing_prefs.get("target_locations")
         auto_disc = existing_prefs.get("auto_discover_enabled", True)
 
-        target_roles = saved_roles if saved_roles and isinstance(saved_roles, list) and len(saved_roles) > 0 else [r.role_title for r in inferred_roles[:5]]
+        target_roles = (
+            saved_roles
+            if saved_roles and isinstance(saved_roles, list) and len(saved_roles) > 0
+            else [r.role_title if hasattr(r, "role_title") else str(r) for r in inferred_roles[:5]]
+        )
         target_locations = saved_locs if saved_locs and isinstance(saved_locs, list) and len(saved_locs) > 0 else inferred_locations
 
         search_preferences = {
             "target_roles": target_roles,
-            "suggested_roles": [r.to_dict() for r in inferred_roles],
+            "suggested_roles": [r.to_dict() if hasattr(r, "to_dict") else {"role_title": str(r)} for r in inferred_roles],
             "target_locations": target_locations,
             "auto_discover_enabled": bool(auto_disc),
-            "experience_level": existing_prefs.get("experience_level") or ("Student / Fresher" if inferencer._is_student_or_fresher(resume.to_dict()) else "Professional"),
+            "experience_level": existing_prefs.get("experience_level") or ("Student / Fresher" if inferencer._is_student_or_fresher(res_dict) else "Professional"),
         }
 
         profile_data = {
@@ -235,29 +293,29 @@ class ProfileUpdater:
                 "backend_and_apis": backend_api,
                 "databases": databases,
                 "developer_tools": dev_tools,
-                "all_skills": resume.technical_skills,
+                "all_skills": _get_val(resume, "technical_skills") or raw_tech,
             },
-            "professional_skills": resume.professional_skills,
-            "soft_skills": resume.soft_skills,
-            "tools_and_software": resume.tools_and_software,
+            "professional_skills": _get_val(resume, "professional_skills", []),
+            "soft_skills": _get_val(resume, "soft_skills", []),
+            "tools_and_software": _get_val(resume, "tools_and_software", []),
             "projects": proj_list,
             "certifications": cert_list,
             "professional_qualifications": prof_qual_list,
             "candidate_inputs": candidate_inputs,
             "preferences": search_preferences,
             "search_preferences": search_preferences,
-            "languages": resume.languages,
-            "areas_of_interest": resume.areas_of_interest,
-            "core_strengths": resume.core_strengths,
-            "awards": resume.awards,
-            "publications": resume.publications,
-            "custom_sections": resume.custom_sections,
-            "field_provenance": resume.field_provenance or {},
+            "languages": _get_val(resume, "languages", []),
+            "areas_of_interest": _get_val(resume, "areas_of_interest", []),
+            "core_strengths": _get_val(resume, "core_strengths", []),
+            "awards": _get_val(resume, "awards", []),
+            "publications": _get_val(resume, "publications", []),
+            "custom_sections": _get_val(resume, "custom_sections", {}),
+            "field_provenance": _get_val(resume, "field_provenance") or {},
             "resume_metadata": {
-                "source_file": Path(resume.file_path).name if resume.file_path else "",
-                "file_hash": resume.file_hash,
-                "file_format": resume.file_format,
-                "extraction_timestamp": resume.parsed_timestamp or datetime.now(timezone.utc).isoformat(),
+                "source_file": Path(_get_val(resume, "file_path", "")).name if _get_val(resume, "file_path") else "",
+                "file_hash": _get_val(resume, "file_hash", ""),
+                "file_format": _get_val(resume, "file_format", "pdf"),
+                "extraction_timestamp": _get_val(resume, "parsed_timestamp") or datetime.now(timezone.utc).isoformat(),
             },
         }
         return profile_data
@@ -441,7 +499,7 @@ class ProfileUpdater:
     ) -> Dict[str, Any]:
         """Merges parsed resume into candidate profile without overwriting protected fields."""
         updated = copy.deepcopy(current_profile)
-        new_prof = self.build_profile_dict(resume)
+        new_prof = self.build_profile_dict(resume, existing_profile=current_profile)
         diff = self.diff_profile_with_resume(current_profile, resume)
 
         field_provenance = updated.setdefault("field_provenance", {})
@@ -590,7 +648,12 @@ class ProfileUpdater:
         curr_rec = self.db.get_user_candidate_profile(user_id)
         if not curr_rec:
             # First profile creation for this user
-            profile_data = self.build_profile_dict(parsed)
+            profile_data = self.build_profile_dict(parsed, existing_profile=None)
+            user_rec = self.db.get_user_by_id(user_id)
+            if user_rec and user_rec.get("email"):
+                profile_data.setdefault("personal", {})["email"] = user_rec["email"]
+                if "personal_info" in profile_data:
+                    profile_data["personal_info"]["email"] = user_rec["email"]
             saved = self.db.save_user_candidate_profile(user_id, profile_data)
             logger.info("Created initial candidate profile for user %d (Snapshot v%d)", user_id, saved["version"])
             return saved["profile_data"]
@@ -599,6 +662,11 @@ class ProfileUpdater:
             updated_profile = self.apply_approved_sync(
                 current_profile, parsed, approved_fields, override_protected
             )
+            user_rec = self.db.get_user_by_id(user_id)
+            if user_rec and user_rec.get("email"):
+                updated_profile.setdefault("personal", {})["email"] = user_rec["email"]
+                if "personal_info" in updated_profile:
+                    updated_profile["personal_info"]["email"] = user_rec["email"]
             saved = self.db.save_user_candidate_profile(user_id, updated_profile)
             logger.info("Updated candidate profile for user %d to version %d", user_id, saved["version"])
             return saved["profile_data"]

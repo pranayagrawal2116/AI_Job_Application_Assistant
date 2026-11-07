@@ -40,34 +40,10 @@ def trigger_discovery(
     background_tasks: BackgroundTasks = None,
     auth_ctx=Depends(get_current_user_and_session),
 ):
-    """Triggers candidate-scoped job discovery in the background."""
-    user_id, session = auth_ctx
-    service = DashboardService.get_instance()
-
-    # Check if a discovery run is already in progress
-    active_run = service.db.get_active_discovery_run(user_id)
-    if active_run:
-        return {
-            "status": "already_running",
-            "message": "A discovery run is already in progress for your profile.",
-            "run_id": active_run["id"],
-        }
-
-    # Resolve roles and locations
-    roles = req.roles if req else None
-    locations = req.locations if req else None
-
-    # Run in background
-    if background_tasks is not None:
-        background_tasks.add_task(_background_discovery_task, user_id, roles, locations)
-        return {
-            "status": "started",
-            "message": "Discovery initiated. Searching permitted sources and computing personalized matches.",
-        }
-    else:
-        # Fallback sync
-        result = service.run_candidate_discovery(user_id=user_id, roles=roles, locations=locations)
-        return result
+    """Triggers candidate-scoped job discovery in the background (delegates to canonical jobs discovery)."""
+    from backend.api.routers.jobs import trigger_jobs_discovery, JobsDiscoveryRequest
+    job_req = JobsDiscoveryRequest(roles=req.roles if req else None, locations=req.locations if req else None)
+    return trigger_jobs_discovery(req=job_req, background_tasks=background_tasks, auth_ctx=auth_ctx)
 
 
 @router.get("/status")

@@ -179,9 +179,13 @@ export interface DiscoveryRun {
   triggered_by?: string;
   target_roles?: string[];
   target_locations?: string[];
-  jobs_discovered: number;
-  jobs_evaluated: number;
-  errors_count: number;
+  jobs_discovered?: number;
+  jobs_evaluated?: number;
+  jobs_found?: number;
+  jobs_saved?: number;
+  duplicates_skipped?: number;
+  errors_count?: number;
+  error_message?: string;
   log_summary?: string;
   created_at: string;
   completed_at?: string;
@@ -201,14 +205,16 @@ export interface JobMatchExplanation {
   job_id: number;
   company_name: string;
   job_title: string;
-  match_score: number;
-  match_classification: string;
-  is_eligible: boolean;
-  score_breakdown: Record<string, any>;
-  matching_skills: string[];
-  missing_skills: string[];
+  is_evaluated?: boolean;
+  match_score?: number | null;
+  match_classification?: string;
+  is_eligible?: boolean | null;
+  eligibility_status?: string;
+  score_breakdown?: Record<string, any>;
+  matching_skills?: string[];
+  missing_skills?: string[];
   explanation: string;
-  disqualification_reasons: string[];
+  disqualification_reasons?: string[];
 }
 
 export interface ApplicationItem {

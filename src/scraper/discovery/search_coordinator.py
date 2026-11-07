@@ -161,9 +161,9 @@ class SearchCoordinator:
             comp_name = clean_payload.company_name or ""
             j_title = clean_payload.job_title or ""
 
-            # Atomic Deduplication Check (Normalized URL & Company+Title composite)
+            # Atomic Deduplication Check (Normalized URL & Company+Title+Location composite)
             is_dup, existing_id, dup_reason = self.db.check_is_duplicate(
-                norm_url, comp_name, j_title
+                norm_url, comp_name, j_title, clean_payload.location
             )
             if is_dup:
                 summary.duplicates_skipped += 1

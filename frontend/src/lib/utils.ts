@@ -5,11 +5,13 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
-export function formatScore(score: number): string {
+export function formatScore(score?: number | null): string {
+  if (score === null || score === undefined) return 'Not Evaluated';
   return `${Math.round(score)}%`;
 }
 
-export function getScoreColor(score: number): string {
+export function getScoreColor(score?: number | null): string {
+  if (score === null || score === undefined) return 'text-slate-500 bg-slate-100 border-slate-200';
   if (score >= 85) return 'text-emerald-600 bg-emerald-50 border-emerald-200';
   if (score >= 70) return 'text-blue-600 bg-blue-50 border-blue-200';
   if (score >= 50) return 'text-amber-600 bg-amber-50 border-amber-200';

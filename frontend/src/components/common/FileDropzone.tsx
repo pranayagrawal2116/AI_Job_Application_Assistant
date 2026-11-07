@@ -147,7 +147,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
       }}
       aria-label="Upload document dropzone"
     >
-      {/* Native file input overlay for universal browser & Safari compatibility */}
+      {/* Hidden native file input triggered programmatically */}
       <input
         ref={fileInputRef}
         type="file"
@@ -156,20 +156,20 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
         accept={accept}
         disabled={disabled || isLoading}
         onChange={handleInputChange}
-        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10"
+        className="hidden"
         tabIndex={-1}
         aria-hidden="true"
       />
 
       {isLoading ? (
-        <div className="flex flex-col items-center justify-center py-2">
+        <div className="flex flex-col items-center justify-center py-2 pointer-events-none">
           <LoadingSpinner size={32} className="text-brand-600 mb-3" />
           <p className="text-xs sm:text-sm font-semibold text-slate-800">{loadingText}</p>
           <p className="text-[11px] text-slate-400 mt-1">Please wait while we parse your document</p>
         </div>
       ) : selectedFile ? (
         <div className="flex items-center justify-between p-3 sm:p-4 rounded-xl bg-white border border-slate-200 shadow-sm max-w-md mx-auto text-left">
-          <div className="flex items-center gap-3 min-w-0">
+          <div className="flex items-center gap-3 min-w-0 pointer-events-none">
             <div className="w-10 h-10 rounded-xl bg-brand-50 border border-brand-100 flex items-center justify-center text-brand-600 shrink-0">
               <FileText size={20} />
             </div>
@@ -184,7 +184,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
           </div>
 
           <div className="flex items-center gap-2 shrink-0 ml-3">
-            <span className="text-[10px] font-semibold text-brand-600 bg-brand-50 px-2 py-0.5 rounded-full border border-brand-100">
+            <span className="text-[10px] font-semibold text-brand-600 bg-brand-50 px-2 py-0.5 rounded-full border border-brand-100 pointer-events-none">
               Change
             </span>
             {onClearFile && (
@@ -196,7 +196,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
                   onClearFile();
                   if (fileInputRef.current) fileInputRef.current.value = '';
                 }}
-                className="relative z-20 p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors"
+                className="relative z-20 p-1 rounded-lg text-slate-400 hover:text-rose-600 hover:bg-rose-50 transition-colors pointer-events-auto"
                 title="Remove file"
               >
                 <X size={16} />
@@ -205,7 +205,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
           </div>
         </div>
       ) : (
-        <div className="flex flex-col items-center justify-center py-2">
+        <div className="flex flex-col items-center justify-center py-2 pointer-events-none">
           <div
             className={`w-14 h-14 rounded-2xl flex items-center justify-center mb-3 transition-transform ${
               isDragging

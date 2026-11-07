@@ -1493,8 +1493,17 @@ class DatabaseManager:
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_discovery_runs_user_status ON discovery_runs(user_id, status)")
-        # Cleanly mark stale in-memory runs from prior server process as FAILED
-        cursor.execute("UPDATE discovery_runs SET status = 'FAILED', error_message = 'Interrupted by server restart' WHERE status = 'RUNNING'")
+        cursor.execute("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_discovery_runs_active_user 
+            ON discovery_runs(user_id) 
+            WHERE status IN ('PENDING', 'RUNNING')
+        """)
+        # Cleanly mark stale in-memory or interrupted runs from prior server process as FAILED
+        cursor.execute("""
+            UPDATE discovery_runs 
+            SET status = 'FAILED', error_message = 'Interrupted by server restart. You can safely retry discovery.' 
+            WHERE status IN ('PENDING', 'RUNNING')
+        """)
         logger.info("discovery_runs migration checked successfully.")
 
     def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
@@ -2281,9 +2290,13 @@ class DatabaseManager:
     # -------------------------------------------------------------------------
 
     def check_is_duplicate(
-        self, job_url: str, company_name: str, job_title: str
+        self,
+        job_url: str,
+        company_name: str,
+        job_title: str,
+        location: Optional[str] = None,
     ) -> Tuple[bool, Optional[int], Optional[str]]:
-        """Checks whether a job already exists by URL or (company_name, job_title).
+        """Checks whether a job already exists by URL or (company_name, job_title, location).
 
         Returns:
             Tuple of (is_duplicate: bool, existing_job_id: Optional[int], duplicate_reason: Optional[str])
@@ -2300,18 +2313,35 @@ class DatabaseManager:
                 if row:
                     return (True, row["id"], f"Normalized URL match: {normalized_url}")
 
-            # 2. Check composite (company_name, job_title)
+            # 2. Check composite (company_name, job_title) with location differentiation
             norm_company, norm_title = generate_company_title_key(company_name, job_title)
-            cursor.execute(
-                """
-                SELECT id FROM jobs
-                WHERE LOWER(TRIM(company_name)) = ? AND LOWER(TRIM(job_title)) = ?
-                """,
-                (norm_company, norm_title),
-            )
-            row = cursor.fetchone()
-            if row:
-                return (True, row["id"], f"Company and Title match: '{company_name}' - '{job_title}'")
+            norm_loc = location.lower().strip() if location else ""
+
+            if norm_loc:
+                cursor.execute(
+                    """
+                    SELECT id, location FROM jobs
+                    WHERE LOWER(TRIM(company_name)) = ? AND LOWER(TRIM(job_title)) = ?
+                    """,
+                    (norm_company, norm_title),
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    existing_loc = (row["location"] or "").lower().strip()
+                    # If existing has matching location or either is unspecified, treat as duplicate
+                    if existing_loc == norm_loc or not existing_loc:
+                        return (True, row["id"], f"Company, Title and Location match: '{company_name}' - '{job_title}' ({location})")
+            else:
+                cursor.execute(
+                    """
+                    SELECT id FROM jobs
+                    WHERE LOWER(TRIM(company_name)) = ? AND LOWER(TRIM(job_title)) = ?
+                    """,
+                    (norm_company, norm_title),
+                )
+                row = cursor.fetchone()
+                if row:
+                    return (True, row["id"], f"Company and Title match: '{company_name}' - '{job_title}'")
 
         return (False, None, None)
 
@@ -7485,19 +7515,54 @@ class DatabaseManager:
         target_roles: List[str],
         target_locations: List[str],
     ) -> Dict[str, Any]:
-        """Creates a new PENDING discovery run record for a candidate."""
+        """Creates a new PENDING discovery run record for a candidate.
+
+        Enforces atomic concurrency locking: raises DuplicateDiscoveryRunError if an active
+        run (PENDING or RUNNING) already exists for this user.
+        """
+        from src.database.exceptions import DuplicateDiscoveryRunError
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            # Pre-check active run
+            cursor.execute(
+                "SELECT id FROM discovery_runs WHERE user_id = ? AND status IN ('PENDING', 'RUNNING')",
+                (user_id,),
+            )
+            active = cursor.fetchone()
+            if active:
+                raise DuplicateDiscoveryRunError(user_id=user_id, active_run_id=active[0])
+
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO discovery_runs (user_id, status, target_roles_json, target_locations_json, started_at)
+                    VALUES (?, 'PENDING', ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (user_id, json.dumps(target_roles), json.dumps(target_locations)),
+                )
+                run_id = cursor.lastrowid
+                cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
+                return dict(cursor.fetchone())
+            except sqlite3.IntegrityError:
+                cursor.execute(
+                    "SELECT id FROM discovery_runs WHERE user_id = ? AND status IN ('PENDING', 'RUNNING')",
+                    (user_id,),
+                )
+                act = cursor.fetchone()
+                raise DuplicateDiscoveryRunError(user_id=user_id, active_run_id=act[0] if act else None)
+
+    def recover_interrupted_discovery_runs(self) -> int:
+        """Recovers lingering PENDING or RUNNING discovery runs on server startup by marking them as FAILED."""
         with self.transaction() as conn:
             cursor = conn.cursor()
             cursor.execute(
                 """
-                INSERT INTO discovery_runs (user_id, status, target_roles_json, target_locations_json, started_at)
-                VALUES (?, 'PENDING', ?, ?, CURRENT_TIMESTAMP)
-                """,
-                (user_id, json.dumps(target_roles), json.dumps(target_locations)),
+                UPDATE discovery_runs
+                SET status = 'FAILED', error_message = 'Interrupted by server restart. You can safely retry discovery.'
+                WHERE status IN ('PENDING', 'RUNNING')
+                """
             )
-            run_id = cursor.lastrowid
-            cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
-            return dict(cursor.fetchone())
+            return cursor.rowcount
 
     def get_active_discovery_run(self, user_id: int) -> Optional[Dict[str, Any]]:
         """Returns currently active PENDING or RUNNING discovery run for the user."""
@@ -7511,6 +7576,17 @@ class DatabaseManager:
                 """,
                 (user_id,),
             )
+            row = cursor.fetchone()
+            return dict(row) if row else None
+
+    def get_discovery_run(self, run_id: int, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+        """Retrieves a discovery run by ID, optionally scoped to a user."""
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            if user_id is not None:
+                cursor.execute("SELECT * FROM discovery_runs WHERE id = ? AND user_id = ?", (run_id, user_id))
+            else:
+                cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
             row = cursor.fetchone()
             return dict(row) if row else None
 
