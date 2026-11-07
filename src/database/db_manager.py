@@ -26,6 +26,7 @@ from src.database.exceptions import (
     InvalidStatusTransitionError,
     JobDescriptionNotFoundError,
     JobNotFoundError,
+    KeyRevokedError,
     MigrationPreflightError,
     ResumeInUseError,
     ResumeNotFoundError,
@@ -130,9 +131,11 @@ class DatabaseManager:
         db_path: Union[str, Path] = DEFAULT_DB_PATH,
         schema_path: Union[str, Path] = DEFAULT_SCHEMA_PATH,
         session_manager: Optional[Any] = None,
+        service_authenticator: Optional[Any] = None,
     ):
         self.db_path = str(db_path)
         self.schema_path = Path(schema_path)
+        self.service_authenticator = service_authenticator
 
         from src.security.session_manager import SessionManager
         if session_manager is not None:
@@ -161,6 +164,10 @@ class DatabaseManager:
         if hasattr(sm, "register_db_manager"):
             sm.register_db_manager(self)
         return sm
+
+    def set_service_authenticator(self, authenticator: Optional[Any]) -> None:
+        """Configures the authoritative ServiceAuthenticationProvider for attestation persistence."""
+        self.service_authenticator = authenticator
 
     def get_connection(self, timeout: Optional[float] = None) -> sqlite3.Connection:
         """Creates and configures a new SQLite connection."""
@@ -3261,15 +3268,26 @@ class DatabaseManager:
         """Records a signing key revocation in SQLite (delegates to revoke_signing_key_approvals)."""
         return self.revoke_signing_key_approvals(key_id=key_id, reason=reason)
 
+    def revoke_signing_key(
+        self,
+        key_id: str,
+        reason: str = "EMERGENCY_KEY_REVOCATION",
+    ) -> int:
+        """Alias for record_key_revocation."""
+        return self.record_key_revocation(key_id=key_id, reason=reason)
+
     def is_key_revoked(self, key_id: str) -> bool:
         """Checks if a signing key has been revoked in SQLite."""
         if not key_id:
             return False
         clean_key = key_id.strip()
-        with self.connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM revoked_signing_keys WHERE key_id = ?", (clean_key,))
-            return cursor.fetchone() is not None
+        try:
+            with self.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM revoked_signing_keys WHERE key_id = ?", (clean_key,))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            raise SecurityAuthorizationError(f"Database revocation query failure checking revoked key '{clean_key}': {e}") from e
 
     def record_principal_revocation(
         self,
@@ -3306,10 +3324,13 @@ class DatabaseManager:
         clean_p = principal_id.strip()
         if not clean_p:
             return True
-        with self.connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?", (clean_p,))
-            return cursor.fetchone() is not None
+        try:
+            with self.connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?", (clean_p,))
+                return cursor.fetchone() is not None
+        except Exception as e:
+            raise SecurityAuthorizationError(f"Database revocation query failure checking revoked principal '{clean_p}': {e}") from e
 
     def get_revoked_principals(self) -> Set[str]:
         """Returns all revoked attesting principal IDs from SQLite."""
@@ -5769,16 +5790,19 @@ class DatabaseManager:
     ) -> int:
         """Records an authoritative independent evidence attestation for a historical job description.
 
-        Enforces Phase 9.1.2.8 Part D:
+        Enforces Phase 9.1.2.11 Contracts:
         - Requires a VerifiedLegacyEvidence instance produced by LegacyEvidenceVerifier.verify().
-        - Persists strictly the authenticated principal bound into verified_evidence.attested_by.
-        - If attesting_principal is passed, requires exact equality (attesting_principal == verified_evidence.attested_by).
-        - Rejects candidate identities, unverified references, and revoked principals.
+        - In production, requires a genuine provider-bound AuthenticatedMigrationPrincipal context.
+        - Persists strictly the authenticated principal matching verified_evidence.
+        - Revalidates principal against the authoritative ServiceAuthenticationProvider.
+        - Eliminates TOCTOU revocation races by performing revocation checks and insertion
+          within a single atomic write transaction (BEGIN IMMEDIATE) or caller write cursor.
         """
         from src.security.legacy_evidence_verifier import (
             VerifiedLegacyEvidence,
             AuthenticatedMigrationPrincipal,
             get_default_evidence_trust_store,
+            _AUTH_TOKEN,
         )
 
         if not isinstance(verified_evidence, VerifiedLegacyEvidence):
@@ -5788,74 +5812,132 @@ class DatabaseManager:
                 "produced by LegacyEvidenceVerifier.verify()."
             )
 
+        app_env = getattr(self, "app_env", None) or os.environ.get("APP_ENV", "development").strip().lower()
+        is_production_like = app_env in ("production", "staging", "qa")
+
+        # In production, attesting_principal is mandatory and must not be a string
+        if is_production_like:
+            if attesting_principal is None:
+                raise SecurityAuthorizationError(
+                    "Missing authenticated service context: attesting_principal is required in production."
+                )
+            if self.service_authenticator is None:
+                raise SecurityAuthorizationError(
+                    "No trusted service authenticator configured: cannot persist attestation in production."
+                )
+            if isinstance(attesting_principal, str):
+                raise SecurityAuthorizationError(
+                    "Caller-supplied principal strings are rejected as authentication proof in production. "
+                    "An AuthenticatedMigrationPrincipal context is required."
+                )
+            if not isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
+                raise SecurityAuthorizationError(
+                    f"Invalid attesting_principal type '{type(attesting_principal).__name__}'. "
+                    "An AuthenticatedMigrationPrincipal context is required."
+                )
+
         verified_principal = (verified_evidence.attested_by or "").strip()
         if not verified_principal:
             raise SecurityAuthorizationError("Verified evidence lacks mandatory attested_by principal.")
 
-        # Candidate user cannot self-attest
-        if (
-            verified_principal in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user")
-            or verified_principal.startswith("candidate_")
-        ):
-            raise SecurityAuthorizationError(
-                f"Candidate user '{verified_principal}' cannot self-attest own source as historical evidence."
-            )
+        clean_p_id: str = ""
 
-        # Enforce exact equality if attesting_principal is provided
-        if attesting_principal is not None:
-            if isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
-                if not attesting_principal.is_authenticated:
-                    raise SecurityAuthorizationError(
-                        f"Migration principal '{attesting_principal.principal_id}' is not authenticated."
-                    )
-                if attesting_principal.is_revoked:
-                    raise SecurityAuthorizationError(
-                        f"Migration principal '{attesting_principal.principal_id}' has been revoked."
-                    )
-                now_utc = datetime.now(timezone.utc)
-                if attesting_principal.expires_at is not None and attesting_principal.expires_at <= now_utc:
-                    raise SecurityAuthorizationError(
-                        f"Principal credential for '{attesting_principal.principal_id}' has expired."
-                    )
-                passed_principal = attesting_principal.principal_id.strip()
-            elif isinstance(attesting_principal, str):
-                app_env = os.environ.get("APP_ENV", "development").strip().lower()
-                if app_env in ("production", "staging", "qa"):
-                    raise SecurityAuthorizationError(
-                        "Caller-supplied principal strings are rejected as authentication proof in production. "
-                        "An AuthenticatedMigrationPrincipal context is required."
-                    )
-                passed_principal = attesting_principal.strip()
-            else:
+        if isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
+            if attesting_principal._token is not _AUTH_TOKEN:
+                raise SecurityAuthorizationError("Tampered or unverified AuthenticatedMigrationPrincipal context.")
+
+            # Check expiry
+            now_utc = datetime.now(timezone.utc)
+            if attesting_principal.expires_at is not None and attesting_principal.expires_at <= now_utc:
                 raise SecurityAuthorizationError(
-                    f"Invalid attesting_principal type '{type(attesting_principal).__name__}'."
+                    f"Principal credential for '{attesting_principal.principal_id}' has expired."
                 )
 
-            if passed_principal != verified_principal:
+            # Check scope
+            if "legacy_migration" not in attesting_principal.scopes:
                 raise SecurityAuthorizationError(
-                    f"Attesting principal mismatch: passed principal '{passed_principal}' does not match "
+                    f"Principal '{attesting_principal.principal_id}' lacks legacy_migration authorization scope."
+                )
+
+            # Clean principal ID
+            clean_p_id = attesting_principal.principal_id.strip()
+
+            # Prevent candidate user self-attestation
+            if (
+                clean_p_id in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user")
+                or clean_p_id.startswith("user_")
+                or clean_p_id.startswith("candidate_")
+            ):
+                raise SecurityAuthorizationError(
+                    f"Candidate user '{clean_p_id}' cannot self-attest own source as historical evidence."
+                )
+
+            # Strict equality with verified evidence attested_by
+            if clean_p_id != verified_principal:
+                raise SecurityAuthorizationError(
+                    f"Attesting principal mismatch: passed principal '{clean_p_id}' does not match "
                     f"verified evidence principal '{verified_principal}'. Attestation misattribution is strictly prohibited."
                 )
 
-        # Verify principal is authorized and unrevoked
+            # Context provenance comparison against verified_evidence
+            if hasattr(verified_evidence, "attesting_principal_id") and verified_evidence.attesting_principal_id:
+                if clean_p_id != verified_evidence.attesting_principal_id.strip():
+                    raise SecurityAuthorizationError("Evidence created by one provider cannot be persisted under another provider's context.")
+            if hasattr(verified_evidence, "provider_instance_id") and verified_evidence.provider_instance_id:
+                if verified_evidence.provider_instance_id != attesting_principal._provider_instance_id:
+                    raise SecurityAuthorizationError("Evidence created by one provider cannot be persisted under another provider's context.")
+            if hasattr(verified_evidence, "credential_id") and verified_evidence.credential_id:
+                if verified_evidence.credential_id != attesting_principal.credential_id:
+                    raise SecurityAuthorizationError("Verified evidence credential_id does not match attesting principal context.")
+            if is_production_like and (not getattr(verified_evidence, "provider_instance_id", None) or not getattr(verified_evidence, "credential_id", None)):
+                raise SecurityAuthorizationError("Old verified evidence without current authentication provenance cannot be persisted in production.")
+
+        elif isinstance(attesting_principal, str):
+            if is_production_like:
+                raise SecurityAuthorizationError(
+                    "Caller-supplied principal strings are rejected as authentication proof in production. "
+                    "An AuthenticatedMigrationPrincipal context is required."
+                )
+            clean_p_id = attesting_principal.strip()
+            if not clean_p_id:
+                raise SecurityAuthorizationError("Attesting principal is required and cannot be empty.")
+            if clean_p_id != verified_principal:
+                raise SecurityAuthorizationError(
+                    f"Attesting principal mismatch: passed principal '{clean_p_id}' does not match "
+                    f"verified evidence principal '{verified_principal}'. Attestation misattribution is strictly prohibited."
+                )
+            if (
+                clean_p_id in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user")
+                or clean_p_id.startswith("candidate_")
+            ):
+                raise SecurityAuthorizationError(
+                    f"Candidate user '{clean_p_id}' cannot self-attest own source as historical evidence."
+                )
+        elif attesting_principal is None:
+            if is_production_like:
+                raise SecurityAuthorizationError(
+                    "Missing authenticated service context: attesting_principal is required in production."
+                )
+            clean_p_id = verified_principal
+            if (
+                clean_p_id in (f"user_{verified_evidence.user_id}", str(verified_evidence.user_id), "candidate_user")
+                or clean_p_id.startswith("candidate_")
+            ):
+                raise SecurityAuthorizationError(
+                    f"Candidate user '{clean_p_id}' cannot self-attest own source as historical evidence."
+                )
+        else:
+            raise SecurityAuthorizationError(
+                f"Invalid attesting_principal type '{type(attesting_principal).__name__}'."
+            )
+
+        # Trust store authorization check
         trust_store = kwargs.get("trust_store") or get_default_evidence_trust_store()
         if trust_store is not None:
-            if not trust_store.is_attesting_principal_trusted(verified_principal):
+            if not trust_store.is_attesting_principal_trusted(clean_p_id):
                 raise SecurityAuthorizationError(
-                    f"Attesting principal '{verified_principal}' is not authorized in trust store or has been revoked."
+                    f"Attesting principal '{clean_p_id}' is not authorized in trust store or has been revoked."
                 )
-
-        try:
-            is_rev = self.is_principal_revoked(verified_principal)
-        except Exception as e:
-            raise SecurityAuthorizationError(
-                f"Database revocation query failure for principal '{verified_principal}': {e}"
-            ) from e
-
-        if is_rev:
-            raise SecurityAuthorizationError(
-                f"Attesting principal '{verified_principal}' has been revoked in database."
-            )
 
         sql = """
             INSERT INTO legacy_evidence_attestations (
@@ -5868,30 +5950,78 @@ class DatabaseManager:
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
-            verified_evidence.user_id,
-            verified_evidence.job_description_id,
-            verified_evidence.evidence_type,
-            verified_evidence.evidence_reference_id,
-            verified_evidence.source_snapshot_hash,
-            verified_evidence.evidence_artifact_hash,
-            verified_evidence.evidence_payload_hash,
-            verified_evidence.issuer_id,
-            verified_evidence.key_id,
-            verified_evidence.signature_algorithm,
-            verified_evidence.evidence_signature,
-            verified_evidence.migration_boundary,
-            verified_principal,
-            verified_evidence.verified_at,
+            getattr(verified_evidence, "user_id", None),
+            getattr(verified_evidence, "job_description_id", None),
+            getattr(verified_evidence, "evidence_type", None),
+            getattr(verified_evidence, "evidence_reference_id", None),
+            getattr(verified_evidence, "source_snapshot_hash", None),
+            getattr(verified_evidence, "evidence_artifact_hash", None),
+            getattr(verified_evidence, "evidence_payload_hash", None),
+            getattr(verified_evidence, "issuer_id", None),
+            getattr(verified_evidence, "key_id", None),
+            getattr(verified_evidence, "signature_algorithm", None),
+            getattr(verified_evidence, "evidence_signature", None),
+            getattr(verified_evidence, "migration_boundary", None),
+            clean_p_id,
+            getattr(verified_evidence, "verified_at", None),
             details,
         )
+
+        def _execute_atomic_attestation(cur: sqlite3.Cursor) -> int:
+            # 0. Atomic revalidation via configured service authenticator directly on this write cursor
+            if self.service_authenticator is not None and isinstance(attesting_principal, AuthenticatedMigrationPrincipal):
+                self.service_authenticator.validate_principal(attesting_principal, cursor=cur)
+
+            # 1. Atomic principal revocation check directly on write cursor
+            try:
+                cur.execute(
+                    "SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?",
+                    (clean_p_id,),
+                )
+                if cur.fetchone() is not None:
+                    raise SecurityAuthorizationError(
+                        f"Attesting principal '{clean_p_id}' has been revoked in database."
+                    )
+            except SecurityAuthorizationError:
+                raise
+            except Exception as e:
+                raise SecurityAuthorizationError(
+                    f"Database revocation query failure for principal '{clean_p_id}': {e}"
+                ) from e
+
+            # 2. Atomic signing key revocation check directly on write cursor
+            keys_to_check = set()
+            if getattr(verified_evidence, "key_id", None):
+                keys_to_check.add(str(verified_evidence.key_id).strip())
+            if isinstance(attesting_principal, AuthenticatedMigrationPrincipal) and attesting_principal.credential_key_id:
+                keys_to_check.add(str(attesting_principal.credential_key_id).strip())
+
+            for clean_key in keys_to_check:
+                if clean_key:
+                    try:
+                        cur.execute(
+                            "SELECT 1 FROM revoked_signing_keys WHERE key_id = ?",
+                            (clean_key,),
+                        )
+                        if cur.fetchone() is not None:
+                            raise KeyRevokedError(f"Signing key '{clean_key}' has been revoked in database.")
+                    except (SecurityAuthorizationError, KeyRevokedError):
+                        raise
+                    except Exception as e:
+                        raise SecurityAuthorizationError(
+                            f"Database revocation query failure for key '{clean_key}': {e}"
+                        ) from e
+
+            # 3. Insert attestation on write cursor
+            cur.execute(sql, params)
+            return cur.lastrowid
+
         if cursor:
-            cursor.execute(sql, params)
-            return cursor.lastrowid
+            return _execute_atomic_attestation(cursor)
         else:
             with self.immediate_transaction() as conn:
                 cur = conn.cursor()
-                cur.execute(sql, params)
-                return cur.lastrowid
+                return _execute_atomic_attestation(cur)
 
     def get_legacy_evidence_attestation(
         self,

@@ -17,9 +17,12 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import hmac
 import json
+import math
 import os
 from pathlib import Path
+import secrets
 import threading
+import types
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 import uuid
 
@@ -101,13 +104,15 @@ def resolve_app_env() -> str:
 class AuthenticatedMigrationPrincipal:
     """Represents a verified service identity authorized to verify and attest historical legacy evidence.
 
-    Security Invariant (Phase 9.1.2.10):
+    Security Invariant (Phase 9.1.2.11):
     - Cannot be directly constructed by callers or manufactured with unverified Boolean flags.
     - Can ONLY be issued by ServiceAuthenticationProvider after authenticating genuine credentials.
     - Strictly bound to issuing ServiceAuthenticationProvider instance via _provider_instance_id and _provider_sentinel.
-    - Bound to 'legacy_migration' authorization scope.
+    - Must possess non-empty credential_id and credential_key_id matching authoritative issuance record.
+    - Strictly bound to 'legacy_migration' authorization scope (no generic 'all' super-scope).
     - Principal type must be strictly 'service'.
     - Must have explicit issued_at and expires_at; credential lifetime enforced.
+    - Metadata is defensively copied and immutable.
     - Candidate users are strictly prohibited from holding this context.
     """
 
@@ -123,6 +128,7 @@ class AuthenticatedMigrationPrincipal:
     credential_id: Optional[str] = None
     credential_key_id: Optional[str] = None
     principal_type: str = "service"
+    signature_algorithm: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -140,25 +146,44 @@ class AuthenticatedMigrationPrincipal:
             raise SecurityAuthorizationError(
                 f"Invalid principal_type '{self.principal_type}'. Only 'service' principal_type is authorized for migration principals."
             )
-        if "legacy_migration" not in self.scopes and "all" not in self.scopes:
+        if "legacy_migration" not in self.scopes:
             raise SecurityAuthorizationError(f"Principal '{clean_id}' lacks legacy_migration authorization scope.")
 
         now_utc = datetime.now(timezone.utc)
         if self.expires_at is None:
             raise SecurityAuthorizationError(f"Authenticated migration principal '{clean_id}' missing mandatory expiration timestamp.")
+        if isinstance(self.expires_at, bool):
+            raise SecurityAuthorizationError(f"Invalid 'expires_at' for '{clean_id}': must be datetime.")
         if self.expires_at <= now_utc:
             raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' has expired.")
         if self.issued_at is None:
             raise SecurityAuthorizationError(f"Authenticated migration principal '{clean_id}' missing mandatory issued_at timestamp.")
+        if isinstance(self.issued_at, bool):
+            raise SecurityAuthorizationError(f"Invalid 'issued_at' for '{clean_id}': must be datetime.")
         if self.issued_at > now_utc + timedelta(seconds=60):
             raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' issued in the future.")
         if self.expires_at <= self.issued_at:
             raise SecurityAuthorizationError(f"Principal credential for '{clean_id}' has non-positive lifetime (exp <= iat).")
 
+        if not self.credential_id or not isinstance(self.credential_id, str) or not self.credential_id.strip():
+            raise SecurityAuthorizationError("Authenticated migration principal missing mandatory credential_id.")
+        if not self.credential_key_id or not isinstance(self.credential_key_id, str) or not self.credential_key_id.strip():
+            raise SecurityAuthorizationError("Authenticated migration principal missing mandatory credential_key_id.")
+
+        if isinstance(self.metadata, dict):
+            object.__setattr__(self, "metadata", types.MappingProxyType(dict(self.metadata)))
+
     @property
     def is_authenticated(self) -> bool:
         """Always True because instances can only be minted by ServiceAuthenticationProvider."""
         return True
+
+    @property
+    def is_expired(self) -> bool:
+        """Returns True if the principal credential has reached or passed its expiration timestamp."""
+        if self.expires_at is None:
+            return True
+        return self.expires_at <= datetime.now(timezone.utc)
 
     @property
     def is_revoked(self) -> bool:
@@ -193,6 +218,16 @@ class VerifiedLegacyEvidence:
     evidence_signature: str
     verified_at: str
     attested_by: str
+    # Authenticated context provenance (Phase 9.1.2.11):
+    attesting_principal_id: str = ""
+    provider_instance_id: str = ""
+    credential_id: str = ""
+    credential_key_id: str = ""
+    issuer: str = ""
+    audience: str = ""
+    scopes: Tuple[str, ...] = field(default_factory=tuple)
+    issued_at: str = ""
+    expires_at: str = ""
 
     def __post_init__(self) -> None:
         if self._token is not _VERIFICATION_TOKEN:
@@ -241,6 +276,12 @@ class ServiceAuthenticationProvider:
             raise SecurityAuthorizationError(
                 f"Authoritative DatabaseManager is mandatory for ServiceAuthenticationProvider in '{self.app_env}'."
             )
+
+        if self.db_manager is not None:
+            if hasattr(self.db_manager, "set_service_authenticator"):
+                self.db_manager.set_service_authenticator(self)
+            elif hasattr(self.db_manager, "service_authenticator"):
+                self.db_manager.service_authenticator = self
 
         if trusted_issuers:
             for iss in trusted_issuers:
@@ -486,14 +527,26 @@ class ServiceAuthenticationProvider:
                 raise SecurityAuthorizationError(f"Untrusted service credential issuer '{clean_iss}'.")
 
         aud = payload.get("aud")
-        if not aud:
+        if aud is None or isinstance(aud, bool):
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'aud' claim.")
         if isinstance(aud, str):
-            aud_list = [aud]
+            clean_aud_val = aud.strip()
+            if not clean_aud_val:
+                raise SecurityAuthorizationError("Service credential 'aud' cannot be empty or whitespace.")
+            aud_list = [clean_aud_val]
         elif isinstance(aud, (list, tuple)):
-            aud_list = [str(x) for x in aud]
+            if len(aud) == 0:
+                raise SecurityAuthorizationError("Service credential 'aud' list cannot be empty.")
+            aud_list = []
+            for item in aud:
+                if isinstance(item, bool) or not isinstance(item, str):
+                    raise SecurityAuthorizationError("Invalid 'aud' item in service credential: all items must be strings.")
+                clean_item = item.strip()
+                if not clean_item:
+                    raise SecurityAuthorizationError("Invalid 'aud' item in service credential: empty string is prohibited.")
+                aud_list.append(clean_item)
         else:
-            raise SecurityAuthorizationError("Service credential 'aud' must be a string or list of strings.")
+            raise SecurityAuthorizationError("Service credential 'aud' must be a non-empty string or list of non-empty strings.")
         if self.expected_audience not in aud_list:
             raise SecurityAuthorizationError(
                 f"Service credential audience '{aud}' does not match expected audience '{self.expected_audience}'."
@@ -511,16 +564,32 @@ class ServiceAuthenticationProvider:
         if ptype != "service":
             raise SecurityAuthorizationError(f"Invalid principal_type '{ptype}' in service credential: strictly 'service' required.")
 
-        raw_scopes = payload.get("scope") or payload.get("scopes")
-        if not raw_scopes:
+        raw_scopes = payload.get("scope") if "scope" in payload else payload.get("scopes")
+        if raw_scopes is None or isinstance(raw_scopes, bool):
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'scope' claim.")
         if isinstance(raw_scopes, str):
-            scopes = tuple(raw_scopes.split())
+            clean_scope_str = raw_scopes.strip()
+            if not clean_scope_str:
+                raise SecurityAuthorizationError("Service credential 'scope' claim cannot be empty.")
+            scopes_tokens = clean_scope_str.split()
+            if not scopes_tokens:
+                raise SecurityAuthorizationError("Service credential 'scope' claim contains no scopes.")
+            scopes = tuple(scopes_tokens)
         elif isinstance(raw_scopes, (list, tuple)):
-            scopes = tuple(str(s) for s in raw_scopes)
+            if len(raw_scopes) == 0:
+                raise SecurityAuthorizationError("Service credential 'scope' list cannot be empty.")
+            parsed_scopes = []
+            for s in raw_scopes:
+                if isinstance(s, bool) or not isinstance(s, str):
+                    raise SecurityAuthorizationError("Invalid 'scope' item in service credential: all items must be strings.")
+                clean_s = s.strip()
+                if not clean_s:
+                    raise SecurityAuthorizationError("Invalid 'scope' item in service credential: empty scope entry is prohibited.")
+                parsed_scopes.append(clean_s)
+            scopes = tuple(parsed_scopes)
         else:
-            raise SecurityAuthorizationError("Invalid 'scope' claim format in service credential.")
-        if "legacy_migration" not in scopes and "all" not in scopes:
+            raise SecurityAuthorizationError("Invalid 'scope' claim format in service credential: must be string or list of strings.")
+        if "legacy_migration" not in scopes:
             raise SecurityAuthorizationError("Service credential lacks mandatory 'legacy_migration' authorization scope.")
 
         now_ts = datetime.now(timezone.utc).timestamp()
@@ -528,9 +597,11 @@ class ServiceAuthenticationProvider:
         iat = payload.get("iat")
         if iat is None:
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'iat' claim.")
-        if isinstance(iat, bool) or not isinstance(iat, (int, float)):
-            raise SecurityAuthorizationError("Invalid 'iat' timestamp in service credential: must be numeric.")
+        if isinstance(iat, bool) or not isinstance(iat, (int, float)) or math.isnan(iat) or math.isinf(iat):
+            raise SecurityAuthorizationError("Invalid 'iat' timestamp in service credential: must be a finite numeric value.")
         iat_float = float(iat)
+        if iat_float < 0 or iat_float > 253402300799:
+            raise SecurityAuthorizationError("Invalid 'iat' timestamp in service credential: out of range.")
         if iat_float > now_ts + 60:
             raise SecurityAuthorizationError("Service credential issued in the future.")
         issued_at_dt = datetime.fromtimestamp(iat_float, tz=timezone.utc)
@@ -538,9 +609,11 @@ class ServiceAuthenticationProvider:
         exp = payload.get("exp")
         if exp is None:
             raise SecurityAuthorizationError("Service credential payload missing mandatory 'exp' claim.")
-        if isinstance(exp, bool) or not isinstance(exp, (int, float)):
-            raise SecurityAuthorizationError("Invalid 'exp' timestamp in service credential: must be numeric.")
+        if isinstance(exp, bool) or not isinstance(exp, (int, float)) or math.isnan(exp) or math.isinf(exp):
+            raise SecurityAuthorizationError("Invalid 'exp' timestamp in service credential: must be a finite numeric value.")
         exp_float = float(exp)
+        if exp_float < 0 or exp_float > 253402300799:
+            raise SecurityAuthorizationError("Invalid 'exp' timestamp in service credential: out of range.")
         if exp_float <= now_ts:
             raise SecurityAuthorizationError(f"Service credential has expired (exp={exp_float}).")
         if exp_float <= iat_float:
@@ -551,9 +624,10 @@ class ServiceAuthenticationProvider:
 
         nbf = payload.get("nbf")
         if nbf is not None:
-            if isinstance(nbf, bool) or not isinstance(nbf, (int, float)):
-                raise SecurityAuthorizationError("Invalid 'nbf' timestamp in service credential: must be numeric.")
-            if now_ts < float(nbf) - 60:
+            if isinstance(nbf, bool) or not isinstance(nbf, (int, float)) or math.isnan(nbf) or math.isinf(nbf):
+                raise SecurityAuthorizationError("Invalid 'nbf' timestamp in service credential: must be a finite numeric value.")
+            nbf_float = float(nbf)
+            if now_ts < nbf_float - 60:
                 raise SecurityAuthorizationError("Service credential is not yet valid (nbf).")
 
         if self.db_manager and hasattr(self.db_manager, "is_principal_revoked"):
@@ -565,16 +639,47 @@ class ServiceAuthenticationProvider:
                 raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
 
         jti = payload.get("jti")
-        token_jti = str(jti).strip() if jti else f"jti_{uuid.uuid4().hex}"
+        if jti is not None:
+            if isinstance(jti, bool) or not isinstance(jti, str):
+                raise SecurityAuthorizationError("Invalid 'jti' in service credential: must be a non-empty string.")
+            token_jti = jti.strip()
+            if not token_jti:
+                raise SecurityAuthorizationError("Invalid 'jti' in service credential: cannot be empty or whitespace.")
+        else:
+            token_jti = f"jti_{secrets.token_hex(16)}"
 
         with self._lock:
-            self._issued_credentials[token_jti] = {
-                "principal_id": clean_sub,
-                "credential_key_id": clean_kid,
-                "issuer": clean_iss,
-                "exp": exp_float,
-                "iat": iat_float,
-            }
+            if token_jti in self._issued_credentials:
+                existing = self._issued_credentials[token_jti]
+                if (
+                    existing.get("principal_id") != clean_sub
+                    or existing.get("credential_key_id") != clean_kid
+                    or existing.get("issuer") != clean_iss
+                    or existing.get("audience") != self.expected_audience
+                    or existing.get("scopes") != scopes
+                    or existing.get("principal_type") != ptype
+                    or existing.get("issued_at") != issued_at_dt
+                    or existing.get("expires_at") != expires_at_dt
+                    or existing.get("provider_instance_id") != self._provider_id
+                    or existing.get("signature_algorithm") != alg
+                ):
+                    raise SecurityAuthorizationError(
+                        f"Duplicate credential identifier '{token_jti}' with conflicting claims is rejected."
+                    )
+            else:
+                self._issued_credentials[token_jti] = {
+                    "credential_id": token_jti,
+                    "principal_id": clean_sub,
+                    "credential_key_id": clean_kid,
+                    "issuer": clean_iss,
+                    "audience": self.expected_audience,
+                    "scopes": scopes,
+                    "principal_type": ptype,
+                    "issued_at": issued_at_dt,
+                    "expires_at": expires_at_dt,
+                    "provider_instance_id": self._provider_id,
+                    "signature_algorithm": alg,
+                }
 
         return AuthenticatedMigrationPrincipal(
             _token=_AUTH_TOKEN,
@@ -589,19 +694,21 @@ class ServiceAuthenticationProvider:
             credential_id=token_jti,
             credential_key_id=clean_kid,
             principal_type=ptype,
+            signature_algorithm=alg,
         )
 
-    def validate_principal(self, principal: Any) -> None:
+    def validate_principal(self, principal: Any, cursor: Optional[Any] = None) -> None:
         """Validates that an AuthenticatedMigrationPrincipal was minted by this exact provider instance and remains valid.
 
         Enforces:
         1. Correct type (AuthenticatedMigrationPrincipal) and non-tampered _token.
         2. Provider instance binding (_provider_instance_id == self._provider_id and _provider_sentinel is self._provider_sentinel).
-        3. Valid credential tracking in _issued_credentials if jti/credential_id present.
-        4. Credential lifetime (expires_at > now_utc, issued_at <= now_utc + 60s).
-        5. Principal identity non-empty, non-candidate, not revoked in DB or trust store.
-        6. Signing key used remains registered in this provider and not revoked.
-        7. Authorized scope and principal_type == 'service'.
+        3. Mandatory non-empty credential_id and credential_key_id.
+        4. Complete, unconditional verification against authoritative issuance record in _issued_credentials.
+        5. Credential lifetime (expires_at > now_utc, issued_at <= now_utc + 60s).
+        6. Principal identity non-empty, non-candidate, not revoked in DB or trust store.
+        7. Signing key used remains registered in this provider and not revoked.
+        8. Authorized scope strictly 'legacy_migration' and principal_type == 'service'.
         """
         if not isinstance(principal, AuthenticatedMigrationPrincipal):
             raise SecurityAuthorizationError(
@@ -617,16 +724,53 @@ class ServiceAuthenticationProvider:
                 "Principal context was minted by an unauthorized or independent ServiceAuthenticationProvider instance. "
                 "Cross-provider credential reuse is strictly prohibited."
             )
+
+        if not principal.credential_id or not isinstance(principal.credential_id, str) or not principal.credential_id.strip():
+            raise SecurityAuthorizationError("Principal missing mandatory credential_id.")
+
+        if not principal.credential_key_id or not isinstance(principal.credential_key_id, str) or not principal.credential_key_id.strip():
+            raise SecurityAuthorizationError("Principal missing mandatory credential_key_id.")
+
+        clean_cred_id = principal.credential_id.strip()
+        clean_key_id = principal.credential_key_id.strip()
+
+        with self._lock:
+            record = self._issued_credentials.get(clean_cred_id)
+            if record is None:
+                raise SecurityAuthorizationError(
+                    f"Principal credential ID '{clean_cred_id}' is not registered or was never issued by this provider."
+                )
+
+            # Unconditional comparison of all security-relevant claims against authoritative issuance record
+            if principal.principal_id != record.get("principal_id"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (principal_id mismatch).")
+            if clean_key_id != record.get("credential_key_id"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (credential_key_id mismatch).")
+            if principal.issuer != record.get("issuer"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (issuer mismatch).")
+            if principal.audience != record.get("audience"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (audience mismatch).")
+            if tuple(principal.scopes) != tuple(record.get("scopes", ())):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (scopes mismatch).")
+            if principal.principal_type != record.get("principal_type") or principal.principal_type != "service":
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (principal_type mismatch).")
+            if principal.issued_at != record.get("issued_at"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (issued_at mismatch).")
+            if principal.expires_at != record.get("expires_at"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (expires_at mismatch).")
+            if principal._provider_instance_id != record.get("provider_instance_id"):
+                raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (provider_instance_id mismatch).")
+            if principal.signature_algorithm is not None and record.get("signature_algorithm") is not None:
+                if principal.signature_algorithm != record.get("signature_algorithm"):
+                    raise SecurityAuthorizationError("Tampered principal context claims do not match issued record (signature_algorithm mismatch).")
+
         clean_sub = principal.principal_id.strip()
         if not clean_sub:
             raise SecurityAuthorizationError("Principal ID cannot be empty.")
         if clean_sub in ("candidate_user",) or clean_sub.startswith("user_") or clean_sub.startswith("candidate_"):
             raise SecurityAuthorizationError(f"Candidate user '{clean_sub}' cannot be an authenticated service principal.")
 
-        if principal.principal_type != "service":
-            raise SecurityAuthorizationError(f"Invalid principal_type '{principal.principal_type}'. Expected 'service'.")
-
-        if "legacy_migration" not in principal.scopes and "all" not in principal.scopes:
+        if "legacy_migration" not in principal.scopes:
             raise SecurityAuthorizationError(f"Principal '{clean_sub}' lacks 'legacy_migration' authorization scope.")
 
         now_utc = datetime.now(timezone.utc)
@@ -635,32 +779,56 @@ class ServiceAuthenticationProvider:
         if principal.issued_at is None or principal.issued_at > now_utc + timedelta(seconds=60):
             raise SecurityAuthorizationError(f"Principal credential for '{clean_sub}' was issued in the future.")
 
-        if principal.credential_id:
-            with self._lock:
-                record = self._issued_credentials.get(principal.credential_id)
-                if record is not None:
-                    if record.get("principal_id") != clean_sub or record.get("credential_key_id") != principal.credential_key_id:
-                        raise SecurityAuthorizationError("Tampered principal context claims do not match issued record.")
+        with self._lock:
+            if clean_key_id not in self._trusted_keys:
+                raise SecurityAuthorizationError(
+                    f"Credential signing key '{clean_key_id}' is no longer registered in service provider."
+                )
 
-        if principal.credential_key_id:
-            with self._lock:
-                if principal.credential_key_id not in self._trusted_keys:
+        if cursor is not None:
+            try:
+                cursor.execute(
+                    "SELECT 1 FROM revoked_signing_keys WHERE key_id = ?",
+                    (clean_key_id,),
+                )
+                if cursor.fetchone() is not None:
+                    raise KeyRevokedError(clean_key_id)
+            except (SecurityAuthorizationError, KeyRevokedError):
+                raise
+            except Exception as e:
+                raise SecurityAuthorizationError(
+                    f"Database revocation query failure for key '{clean_key_id}': {e}"
+                ) from e
+
+            try:
+                cursor.execute(
+                    "SELECT 1 FROM revoked_attesting_principals WHERE principal_id = ?",
+                    (clean_sub,),
+                )
+                if cursor.fetchone() is not None:
                     raise SecurityAuthorizationError(
-                        f"Credential signing key '{principal.credential_key_id}' is no longer registered in service provider."
+                        f"Attesting principal '{clean_sub}' has been revoked in database."
                     )
+            except (SecurityAuthorizationError, KeyRevokedError):
+                raise
+            except Exception as e:
+                raise SecurityAuthorizationError(
+                    f"Database revocation query failure for principal '{clean_sub}': {e}"
+                ) from e
+        else:
             if self.db_manager and hasattr(self.db_manager, "is_key_revoked"):
-                if self.db_manager.is_key_revoked(principal.credential_key_id):
-                    raise KeyRevokedError(principal.credential_key_id)
+                if self.db_manager.is_key_revoked(clean_key_id):
+                    raise KeyRevokedError(clean_key_id)
             if self.trust_store and hasattr(self.trust_store, "is_key_revoked"):
-                if self.trust_store.is_key_revoked(principal.credential_key_id):
-                    raise KeyRevokedError(principal.credential_key_id)
+                if self.trust_store.is_key_revoked(clean_key_id):
+                    raise KeyRevokedError(clean_key_id)
 
-        if self.db_manager and hasattr(self.db_manager, "is_principal_revoked"):
-            if self.db_manager.is_principal_revoked(clean_sub):
-                raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
-        if self.trust_store and hasattr(self.trust_store, "is_principal_revoked"):
-            if self.trust_store.is_principal_revoked(clean_sub):
-                raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
+            if self.db_manager and hasattr(self.db_manager, "is_principal_revoked"):
+                if self.db_manager.is_principal_revoked(clean_sub):
+                    raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
+            if self.trust_store and hasattr(self.trust_store, "is_principal_revoked"):
+                if self.trust_store.is_principal_revoked(clean_sub):
+                    raise SecurityAuthorizationError(f"Migration principal '{clean_sub}' has been revoked.")
 
     @classmethod
     def mint_service_token(
@@ -669,18 +837,23 @@ class ServiceAuthenticationProvider:
         signing_key: Union[str, bytes, Any],
         key_id: str,
         issuer: str,
-        audience: str = "legacy_migration",
-        scopes: Optional[List[str]] = None,
+        audience: Any = "legacy_migration",
+        scopes: Any = None,
         ttl_seconds: int = 3600,
         algorithm: str = "EdDSA",
-        principal_type: str = "service",
-        jti: Optional[str] = None,
+        principal_type: Any = "service",
+        jti: Any = None,
+        include_jti: bool = True,
+        iat: Any = None,
+        exp: Any = None,
+        nbf: Any = None,
+        extra_claims: Optional[Dict[str, Any]] = None,
     ) -> str:
         clean_p = (principal_id or "").strip()
         now_ts = int(datetime.now(timezone.utc).timestamp())
-        exp_ts = now_ts + ttl_seconds
-        scopes_list = scopes or ["legacy_migration"]
-        token_id = jti or str(uuid.uuid4())
+        iat_val = now_ts if iat is None else iat
+        exp_val = now_ts + ttl_seconds if exp is None else exp
+        scopes_list = scopes if scopes is not None else ["legacy_migration"]
 
         header = {"alg": algorithm, "typ": "JWT", "kid": key_id}
         payload = {
@@ -689,10 +862,17 @@ class ServiceAuthenticationProvider:
             "sub": clean_p,
             "principal_type": principal_type,
             "scope": scopes_list,
-            "iat": now_ts,
-            "exp": exp_ts,
-            "jti": token_id,
+            "iat": iat_val,
+            "exp": exp_val,
         }
+        if include_jti and jti is not False:
+            payload["jti"] = jti if jti is not None else str(uuid.uuid4())
+        elif jti is not None and jti is not False:
+            payload["jti"] = jti
+        if nbf is not None:
+            payload["nbf"] = nbf
+        if extra_claims:
+            payload.update(extra_claims)
 
         header_b64 = base64.urlsafe_b64encode(json.dumps(header).encode("utf-8")).rstrip(b"=").decode("utf-8")
         payload_b64 = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).rstrip(b"=").decode("utf-8")
@@ -750,6 +930,8 @@ def create_test_authenticated_principal(
         )
     else:
         provider.register_trusted_key(key_id, pub, algorithm="Ed25519")
+        with provider._lock:
+            provider._trusted_issuers.add(issuer)
 
     token = provider.mint_service_token(
         principal_id=principal_id,
@@ -761,7 +943,6 @@ def create_test_authenticated_principal(
         ttl_seconds=ttl_seconds,
         algorithm="EdDSA",
     )
-    return provider.authenticate(token)
     return provider.authenticate(token)
 
 
@@ -1423,7 +1604,12 @@ class LegacyEvidenceVerifier:
         self.trust_store = trust_store or get_default_evidence_trust_store() or LegacyEvidenceTrustStore(db_manager=db_manager)
         self.resolver = resolver or get_default_evidence_resolver()
         self.db_manager = db_manager
-        self.service_authenticator = service_authenticator
+        self._service_authenticator = service_authenticator
+        if self.db_manager is not None and self._service_authenticator is not None:
+            if hasattr(self.db_manager, "set_service_authenticator"):
+                self.db_manager.set_service_authenticator(self._service_authenticator)
+            elif hasattr(self.db_manager, "service_authenticator"):
+                self.db_manager.service_authenticator = self._service_authenticator
 
         is_production_like = (
             self.app_env in ("production", "staging", "qa")
@@ -1454,6 +1640,19 @@ class LegacyEvidenceVerifier:
             self.require_authenticated_context = require_authenticated_context
         else:
             self.require_authenticated_context = False
+
+    @property
+    def service_authenticator(self) -> Optional[Any]:
+        return self._service_authenticator
+
+    @service_authenticator.setter
+    def service_authenticator(self, provider: Optional[Any]) -> None:
+        self._service_authenticator = provider
+        if self.db_manager is not None and provider is not None:
+            if hasattr(self.db_manager, "set_service_authenticator"):
+                self.db_manager.set_service_authenticator(provider)
+            elif hasattr(self.db_manager, "service_authenticator"):
+                self.db_manager.service_authenticator = provider
 
     def set_resolver(self, resolver: Optional[LegacyEvidenceResolver]) -> None:
         self.resolver = resolver
@@ -1568,6 +1767,7 @@ class LegacyEvidenceVerifier:
             evidence_signature=stored_sig,
             verified_at=datetime.now(timezone.utc).isoformat(),
             attested_by=clean_principal,
+            attesting_principal_id=clean_principal,
         )
 
     def verify(
@@ -1622,6 +1822,7 @@ class LegacyEvidenceVerifier:
             )
 
         # 2. Attesting principal authorization & authenticated context verification (Phase 9.1.2.10)
+        auth_principal_obj: Optional[AuthenticatedMigrationPrincipal] = None
         if attesting_principal is None:
             raise SecurityAuthorizationError("Missing authenticated service context: attesting_principal is required.")
 
@@ -1638,6 +1839,9 @@ class LegacyEvidenceVerifier:
                 now_utc = datetime.now(timezone.utc)
                 if attesting_principal.expires_at is not None and attesting_principal.expires_at <= now_utc:
                     raise SecurityAuthorizationError(f"Principal credential for '{attesting_principal.principal_id}' has expired.")
+                if "legacy_migration" not in attesting_principal.scopes:
+                    raise SecurityAuthorizationError(f"Principal '{attesting_principal.principal_id}' lacks legacy_migration authorization scope.")
+            auth_principal_obj = attesting_principal
             clean_principal = attesting_principal.principal_id.strip()
         elif isinstance(attesting_principal, str):
             clean_str = attesting_principal.strip()
@@ -1646,6 +1850,7 @@ class LegacyEvidenceVerifier:
 
             if self.service_authenticator and "." in clean_str:
                 auth_p = self.service_authenticator.authenticate(clean_str)
+                auth_principal_obj = auth_p
                 clean_principal = auth_p.principal_id.strip()
             elif is_production_like or effective_require_context:
                 raise SecurityAuthorizationError(
@@ -1849,6 +2054,15 @@ class LegacyEvidenceVerifier:
             evidence_signature=signature,
             verified_at=verified_at,
             attested_by=clean_principal,
+            attesting_principal_id=auth_principal_obj.principal_id if auth_principal_obj else clean_principal,
+            provider_instance_id=auth_principal_obj._provider_instance_id if auth_principal_obj else "",
+            credential_id=auth_principal_obj.credential_id or "" if auth_principal_obj else "",
+            credential_key_id=auth_principal_obj.credential_key_id or "" if auth_principal_obj else "",
+            issuer=auth_principal_obj.issuer if auth_principal_obj else "",
+            audience=auth_principal_obj.audience if auth_principal_obj else "",
+            scopes=tuple(auth_principal_obj.scopes) if auth_principal_obj else (),
+            issued_at=auth_principal_obj.issued_at.isoformat() if auth_principal_obj and auth_principal_obj.issued_at else "",
+            expires_at=auth_principal_obj.expires_at.isoformat() if auth_principal_obj and auth_principal_obj.expires_at else "",
         )
 
     def verify_attestation(

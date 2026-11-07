@@ -922,6 +922,37 @@ When interacting with the browser via Playwright MCP:
     - Verified all 1,753 repository test cases pass (100%).
     - 0 pyflakes errors, 0 ruff errors.
     - Updated `docs/PHASE_9_1_2_9_IMPLEMENTATION_REPORT.md` and authored comprehensive report in `docs/PHASE_9_1_2_10_IMPLEMENTATION_REPORT.md`.
+- [x] **Architecture v2.1.1 Phase 9.1.2.11: Issued Credential Registry Integrity & Atomic Attestation Persistence Closure** (Complete)
+  - Authoritative In-Memory Credential Registry:
+    - `ServiceAuthenticationProvider` maintains an immutable, thread-safe record of all 11 security-relevant metadata claims for every issued service credential.
+    - Claims verified: `principal_id`, `provider_instance_id`, `credential_id` (`jti`), `credential_key_id`, `issuer`, `audience`, `scopes`, `issued_at`, `expires_at`, `principal_type`, `signature_algorithm`.
+  - Comprehensive Claim Validation & Tamper Defense:
+    - `validate_principal(principal, cursor=None)` unconditionally validates all 11 claims against the issuance registry record, failing closed if absent or mismatched.
+    - Mitigates in-memory tampering via `dataclasses.replace` or `object.__setattr__` by re-verifying against the internal registry.
+    - Defensively copies and wraps `metadata` in immutable `types.MappingProxyType`.
+  - Credential ID (`jti`) Uniqueness & Collision Defense:
+    - Enforced uniqueness of `credential_id` (`jti`) within `ServiceAuthenticationProvider`.
+    - Idempotent resolution for identical claim sets; rejection with `SecurityAuthorizationError` on conflicting claims without overwriting existing registry records.
+  - Mandatory Provider-Bound Principal Persistence Contract:
+    - `DatabaseManager.record_legacy_evidence_attestation()` in production strictly requires an `AuthenticatedMigrationPrincipal` minted by the configured `ServiceAuthenticationProvider`.
+    - Caller-supplied strings are rejected as authentication proof.
+    - Verifies context provenance against `VerifiedLegacyEvidence` (`attesting_principal_id`, `provider_instance_id`, `credential_id`).
+  - Atomic Write-Cursor Revocation & Persistence:
+    - Atomically performs principal revocation and signing key revocation queries on the write transaction cursor (`cur`) inside `immediate_transaction()` before inserting the attestation record, completely eliminating TOCTOU race windows.
+    - Supports caller-supplied write cursor without spawning nested connections or separate read connections (`self.connection()`).
+    - Database query or schema failures during revocation checks fail closed with `SecurityAuthorizationError`.
+  - Strict Authorization Scopes & Claim Typing:
+    - Mandates explicit `"legacy_migration"` scope, eliminating implicit `"all"` super-scope.
+    - Validates `aud` and `scope` as strings or flat sequences of non-empty strings, rejecting nested lists or non-string elements.
+    - Enforces finite numeric `iat`, `exp`, `nbf` timestamps, rejecting boolean flags (`bool`), `NaN`, or `±inf`.
+  - Production No-Provider Invariant:
+    - In production, absence of a configured `ServiceAuthenticationProvider` denies all legacy exceptions and attestation persistence requests fail closed.
+  - Dedicated Test Suite & Verification:
+    - Authored 72 dedicated tests in `tests/test_phase_9_1_2_11_credential_registry_and_atomic_attestation.py` across 7 requirement categories (72/72 passing, 100%).
+    - Verified all 507 Phase 9 test cases pass (100%).
+    - Verified all 1,825 repository test cases pass (100%).
+    - 0 pyflakes errors, 0 ruff errors.
+    - Published comprehensive implementation report in `docs/PHASE_9_1_2_11_IMPLEMENTATION_REPORT.md`.
 
 ---
 

@@ -79,7 +79,7 @@ When `provider.authenticate()` mints an `AuthenticatedMigrationPrincipal`, it in
 2. `principal._provider_instance_id == self._provider_id`.
 3. `principal._provider_sentinel is self._provider_sentinel`.
 4. If either fails: `raise SecurityAuthorizationError("Principal context was minted by an unauthorized or independent ServiceAuthenticationProvider instance. Cross-provider credential reuse is strictly prohibited.")`.
-5. Tracking check against internal `_issued_credentials` to detect object attribute tampering via `object.__setattr__`.
+5. Tracking check against internal `_issued_credentials` to detect object attribute tampering via `object.__setattr__`. (Note: Authoritatively finalized in Phase 9.1.2.11 with 11-field metadata validation, collision defense, and atomic write-cursor revocation verification).
 6. Credential lifetime (`expires_at > now_utc` and `issued_at <= now_utc + 60s`).
 7. Authorized scope (`legacy_migration`) and `principal_type == 'service'`.
 8. Signing key (`credential_key_id`) remains registered in provider and is not revoked in database or trust store.
