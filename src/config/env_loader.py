@@ -40,6 +40,14 @@ INSECURE_PLACEHOLDER_SUBSTRINGS: Set[str] = {
 # Default development pepper from auth.py that must be rejected in production
 DEFAULT_DEV_PEPPER = "6f8e7d6c5b4a392817263544556677889900aabbccddeeff0011223344556677"
 
+# Substrings indicating forbidden web roots or frontend public asset directories
+FORBIDDEN_STORAGE_SUBSTRINGS: List[str] = [
+    "inetpub/wwwroot",
+    "deploy/iis",
+    "frontend/dist",
+    "frontend/public",
+]
+
 
 class ProductionConfigurationError(ValueError, RuntimeError):
     """Raised when production configuration fails preflight validation."""
@@ -196,6 +204,7 @@ def _check_hex_secret(name: str, value: Optional[str]) -> KeyValidationStatus:
 def validate_production_configuration(
     env_dict: Optional[Dict[str, str]] = None,
     enforce: bool = True,
+    expected_data_dir: Optional[str | Path] = None,
 ) -> ProductionValidationReport:
     """Validates the effective production configuration against strict production standards.
 
@@ -204,12 +213,14 @@ def validate_production_configuration(
     - Required 256-bit hex signing and authentication secrets
     - Cryptographic key separation (no duplicate secret reuse across subsystems)
     - Rotation key configuration integrity
-    - Absolute persistent storage paths on dedicated drives
+    - Absolute persistent storage paths on dedicated drives outside web root
+    - Storage path alignment with dedicated data directory (if specified)
     - Strict human-in-the-loop and anti-automation governance flags
 
     Args:
         env_dict: Optional dictionary of environment variables (defaults to os.environ).
         enforce: If True and APP_ENV == "production", raises ProductionConfigurationError on failure.
+        expected_data_dir: Optional root directory that storage paths must reside within.
 
     Returns:
         ProductionValidationReport detailing validation outcomes.
@@ -342,6 +353,23 @@ def validate_production_configuration(
             report.is_valid = False
             continue
 
+        # Phase C.0.1: Check for forbidden web root or frontend directory substrings
+        norm_p = clean_path.replace("\\", "/").lower()
+        for forbidden in FORBIDDEN_STORAGE_SUBSTRINGS:
+            if forbidden in norm_p:
+                report.errors.append(
+                    f"{p_name} ('{clean_path}') must not be located inside web root or frontend directory ('{forbidden}')."
+                )
+                report.is_valid = False
+
+        if expected_data_dir:
+            exp_norm = str(expected_data_dir).strip().replace("\\", "/").rstrip("/").lower()
+            if not norm_p.startswith(exp_norm):
+                report.errors.append(
+                    f"{p_name} ('{clean_path}') is not rooted under expected data directory '{expected_data_dir}'."
+                )
+                report.is_valid = False
+
         # Check directory existence or creatability on native platform
         can_check_fs = (os.name == "nt") or (not bool(re.match(r"^[a-zA-Z]:[\\/]", clean_path)))
 
@@ -408,3 +436,58 @@ def validate_production_configuration(
         )
 
     return report
+
+
+def validate_storage_paths_alignment(
+    env_dict: Optional[Dict[str, str]] = None,
+    expected_data_dir: Optional[str | Path] = None,
+) -> List[str]:
+    """Validates that all configured persistent storage paths are outside web roots
+    and optionally aligned with the dedicated data root directory.
+
+    Args:
+        env_dict: Optional dictionary of environment variables (defaults to os.environ).
+        expected_data_dir: Optional root directory that all storage paths must reside within.
+
+    Returns:
+        List of error descriptions (empty if all paths are valid).
+    """
+    env = env_dict if env_dict is not None else os.environ
+    errors: List[str] = []
+
+    path_configs = [
+        ("DATABASE_PATH", env.get("DATABASE_PATH") or env.get("SQLITE_DB_PATH")),
+        ("USER_STORAGE_BASE", env.get("USER_STORAGE_BASE") or env.get("USER_DATA_DIR")),
+        ("BACKUP_DIR", env.get("BACKUP_DIR")),
+        ("EXPORTS_DIR", env.get("EXPORTS_DIR")),
+    ]
+
+    exp_norm = str(expected_data_dir).strip().replace("\\", "/").rstrip("/").lower() if expected_data_dir else None
+
+    for p_name, p_val in path_configs:
+        if not p_val or not str(p_val).strip():
+            errors.append(f"{p_name} is not explicitly configured.")
+            continue
+
+        clean_path = str(p_val).strip()
+        p_obj = Path(clean_path)
+
+        is_abs = p_obj.is_absolute() or bool(re.match(r"^[a-zA-Z]:[\\/]", clean_path))
+        if not is_abs:
+            errors.append(f"{p_name} must be an absolute path (got '{clean_path}').")
+            continue
+
+        norm_p = clean_path.replace("\\", "/").lower()
+        for forbidden in FORBIDDEN_STORAGE_SUBSTRINGS:
+            if forbidden in norm_p:
+                errors.append(
+                    f"{p_name} ('{clean_path}') must not be located inside web root or frontend directory ('{forbidden}')."
+                )
+
+        if exp_norm and not norm_p.startswith(exp_norm):
+            errors.append(
+                f"{p_name} ('{clean_path}') is not rooted under expected data directory '{expected_data_dir}'."
+            )
+
+    return errors
+

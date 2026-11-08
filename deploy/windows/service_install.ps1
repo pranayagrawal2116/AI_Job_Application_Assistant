@@ -21,7 +21,9 @@ param(
     [string]$DataDir = "D:\AIJobAssistantData",
     [string]$PythonExe = "C:\Program Files\Python311\python.exe",
     [string]$ServiceName = "AIJobAssistant",
-    [string]$EnvFile = ""
+    [string]$EnvFile = "",
+    [string]$ServiceAccount = "NT AUTHORITY\NetworkService",
+    [switch]$ForceReinstall
 )
 
 $ErrorActionPreference = "Stop"
@@ -110,13 +112,16 @@ if (-not (Test-Path $EnvFile)) {
     Write-Error "CRITICAL: Production configuration file '$EnvFile' not found.`nCreate it from .env.production.example and run: python scripts/generate_production_secrets.py --write-env"
 }
 
-# Run Python validation check before registering service
+# Run Python validation check before registering service, verifying alignment with DataDir
 $preflightScript = @"
 import sys
 try:
-    from src.config.env_loader import load_production_env, validate_production_configuration
+    from src.config.env_loader import load_production_env, validate_production_configuration, validate_storage_paths_alignment
     load_production_env(r'$EnvFile')
-    validate_production_configuration()
+    validate_production_configuration(expected_data_dir=r'$DataDir')
+    align_errors = validate_storage_paths_alignment(expected_data_dir=r'$DataDir')
+    if align_errors:
+        raise ValueError("; ".join(align_errors))
     print("CONFIG_PREFLIGHT_OK")
 except Exception as exc:
     print(f"CONFIG_PREFLIGHT_ERROR:{exc}", file=sys.stderr)
@@ -150,35 +155,71 @@ foreach ($d in $dirs) {
     }
 }
 
-Write-Host "      Configuring NTFS ACL permissions on $DataDir..." -ForegroundColor Yellow
+Write-Host "      Configuring NTFS ACL permissions on $DataDir and $EnvFile..." -ForegroundColor Yellow
 try {
     icacls $DataDir /grant "NT AUTHORITY\SYSTEM:(OI)(CI)F" /T /Q | Out-Null
-    icacls $DataDir /grant "NT AUTHORITY\NETWORK SERVICE:(OI)(CI)M" /T /Q | Out-Null
-    Write-Host "      [OK] ACL permissions configured successfully." -ForegroundColor Green
+    icacls $DataDir /grant "$($ServiceAccount):(OI)(CI)M" /T /Q | Out-Null
+    icacls $DataDir /deny "IIS_IUSRS:(OI)(CI)F" /Q 2>$null | Out-Null
+    icacls $DataDir /deny "IUSR:(OI)(CI)F" /Q 2>$null | Out-Null
+    Write-Host "      [OK] ACL permissions on DataDir configured successfully." -ForegroundColor Green
 } catch {
-    Write-Warning "      Could not configure ACLs automatically: $_"
+    Write-Warning "      Could not configure ACLs on DataDir automatically: $_"
+}
+
+if (Test-Path $EnvFile) {
+    try {
+        icacls $EnvFile /inheritance:r /grant "NT AUTHORITY\SYSTEM:F" "BUILTIN\Administrators:F" "$($ServiceAccount):R" /Q 2>$null | Out-Null
+        Write-Host "      [OK] Strict ACL permissions set on $EnvFile." -ForegroundColor Green
+    } catch {
+        Write-Warning "      Could not set ACL permissions on $EnvFile: $_"
+    }
 }
 
 # -----------------------------------------------------------------------------
-# SERVICE REGISTRATION & INSTALLATION
+# SERVICE REGISTRATION & INSTALLATION (SAFE IN-PLACE UPDATE & ROLLBACK CAPTURE)
 # -----------------------------------------------------------------------------
-Write-Host "`nStopping and removing existing service registration if present..." -ForegroundColor Yellow
 $existingService = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
-if ($existingService) {
-    Write-Host "Found existing service '$ServiceName'. Stopping and removing..." -ForegroundColor Yellow
-    & $nssmPath stop $ServiceName 2>$null
-    Start-Sleep -Seconds 2
-    & $nssmPath remove $ServiceName confirm
-    Write-Host "[OK] Removed prior service registration." -ForegroundColor Green
-}
-
-Write-Host "Registering Windows Service '$ServiceName' via NSSM..." -ForegroundColor Cyan
+$priorConfig = $null
 $appArgs = "-m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --workers 1 --env-file `"$EnvFile`""
 
-& $nssmPath install $ServiceName $PythonExe $appArgs
+if ($existingService) {
+    Write-Host "`nExisting service '$ServiceName' detected. Capturing current configuration for rollback..." -ForegroundColor Cyan
+    $priorConfig = @{
+        Application = (& $nssmPath get $ServiceName Application 2>$null)
+        AppDirectory = (& $nssmPath get $ServiceName AppDirectory 2>$null)
+        AppParameters = (& $nssmPath get $ServiceName AppParameters 2>$null)
+        AppStdout = (& $nssmPath get $ServiceName AppStdout 2>$null)
+        AppStderr = (& $nssmPath get $ServiceName AppStderr 2>$null)
+        ObjectName = (& $nssmPath get $ServiceName ObjectName 2>$null)
+    }
+
+    if ($ForceReinstall) {
+        Write-Host "ForceReinstall requested: stopping and removing prior registration..." -ForegroundColor Yellow
+        & $nssmPath stop $ServiceName 2>$null
+        Start-Sleep -Seconds 2
+        & $nssmPath remove $ServiceName confirm
+        & $nssmPath install $ServiceName $PythonExe $appArgs
+    } else {
+        Write-Host "Updating service configuration in-place without deregistration..." -ForegroundColor Cyan
+        & $nssmPath stop $ServiceName 2>$null
+        Start-Sleep -Seconds 1
+        & $nssmPath set $ServiceName Application $PythonExe
+        & $nssmPath set $ServiceName AppParameters $appArgs
+    }
+} else {
+    Write-Host "Registering fresh Windows Service '$ServiceName' via NSSM..." -ForegroundColor Cyan
+    & $nssmPath install $ServiceName $PythonExe $appArgs
+}
+
 & $nssmPath set $ServiceName AppDirectory $InstallDir
 & $nssmPath set $ServiceName Description "Universal AI Job Application Assistant (FastAPI ASGI on 127.0.0.1:8000 behind IIS 10)"
 & $nssmPath set $ServiceName Start SERVICE_AUTO_START
+
+# Service Identity (Least Privilege)
+if ($ServiceAccount) {
+    Write-Host "Configuring service identity to: $ServiceAccount" -ForegroundColor Cyan
+    & $nssmPath set $ServiceName ObjectName $ServiceAccount
+}
 
 # Log rotation: 10 MB limit per log, keep archive
 & $nssmPath set $ServiceName AppStdout "$DataDir\logs\app.log"
@@ -192,7 +233,7 @@ $appArgs = "-m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --worke
 & $nssmPath set $ServiceName AppExit Default Restart
 
 # -----------------------------------------------------------------------------
-# START SERVICE & HEALTH VERIFICATION
+# START SERVICE & HEALTH VERIFICATION (WITH ROLLBACK)
 # -----------------------------------------------------------------------------
 Write-Host "`nStarting Windows Service '$ServiceName'..." -ForegroundColor Cyan
 & $nssmPath start $ServiceName
@@ -226,7 +267,21 @@ if ($isHealthy) {
     Write-Host " Persistent Logs: $DataDir\logs" -ForegroundColor Green
     Write-Host " SQLite Database: $DataDir\database\job_assistant.db" -ForegroundColor Green
     Write-Host " Worker Model:   Single Worker (--workers 1)" -ForegroundColor Green
+    Write-Host " Service Account: $ServiceAccount" -ForegroundColor Green
     Write-Host "======================================================================" -ForegroundColor Green
 } else {
-    Write-Error "CRITICAL: Service health check failed after $maxAttempts attempts.`nInspect logs at '$DataDir\logs\app_error.log' for startup failure diagnostics."
+    Write-Warning "CRITICAL: Service health check failed after $maxAttempts attempts!"
+    if ($priorConfig -and $priorConfig.Application) {
+        Write-Warning "Attempting automatic rollback to prior service configuration..."
+        & $nssmPath stop $ServiceName 2>$null
+        & $nssmPath set $ServiceName Application $priorConfig.Application
+        & $nssmPath set $ServiceName AppDirectory $priorConfig.AppDirectory
+        & $nssmPath set $ServiceName AppParameters $priorConfig.AppParameters
+        if ($priorConfig.AppStdout) { & $nssmPath set $ServiceName AppStdout $priorConfig.AppStdout }
+        if ($priorConfig.AppStderr) { & $nssmPath set $ServiceName AppStderr $priorConfig.AppStderr }
+        if ($priorConfig.ObjectName) { & $nssmPath set $ServiceName ObjectName $priorConfig.ObjectName }
+        & $nssmPath start $ServiceName 2>$null
+        Write-Warning "Prior service configuration restored."
+    }
+    Write-Error "CRITICAL: Service installation / update aborted. Inspect '$DataDir\logs\app_error.log' for diagnostic details."
 }

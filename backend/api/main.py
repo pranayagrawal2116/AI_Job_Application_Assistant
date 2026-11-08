@@ -31,14 +31,11 @@ logger = setup_logger("API")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Initialize backend singleton on startup
-    logger.info("Initializing DashboardService and DatabaseManager...")
-    service = DashboardService.get_instance()
-
+    # 1. Resolve APP_ENV
     app_env = os.environ.get("APP_ENV", "development").lower()
     app.state.app_env = app_env
 
-    # Phase C.0: Production configuration validation
+    # 2. Phase C.0.1: Production configuration validation BEFORE database or backend initialization
     if app_env == "production":
         try:
             validate_production_configuration()
@@ -54,13 +51,17 @@ async def lifespan(app: FastAPI):
         app.state.config_ready = True
         app.state.config_error = None
 
-    # Ensure nested storage directories exist
+    # 3. Initialize backend singleton on startup (only after configuration is confirmed valid)
+    logger.info("Initializing DashboardService and DatabaseManager...")
+    service = DashboardService.get_instance()
+
+    # 4. Ensure nested storage directories exist for persistent storage
     if hasattr(service.db, "db_path") and service.db.db_path != ":memory:":
         base = Path(service.db.db_path).parent.parent
         for d in [base / "users", base / "exports", base / "storage" / "backups"]:
             d.mkdir(parents=True, exist_ok=True)
 
-    # Phase B.3.3: Startup recovery of interrupted PENDING/RUNNING discovery runs
+    # 5. Phase B.3.3: Startup recovery of interrupted PENDING/RUNNING discovery runs
     try:
         recovered = service.db.recover_interrupted_discovery_runs()
         if recovered > 0:

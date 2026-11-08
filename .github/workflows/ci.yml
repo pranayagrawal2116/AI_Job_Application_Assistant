@@ -63,4 +63,52 @@ jobs:
         env:
           MOCK_DISCOVERY_ADAPTERS: "1"
         run: |
-          python -m pytest -v tests/test_phase_b_4_dashboard.py tests/test_browser_acceptance_phase_b_4.py tests/test_phase_b_3_3_recovery_and_matching.py tests/test_phase_b_3_2_acceptance.py tests/test_career_role_inferencer.py tests/test_discovery.py tests/test_personalized_discovery.py tests/test_universal_resume_intelligence.py tests/test_migration_phase5_1_1.py tests/test_migration_quarantine.py tests/test_phase7_1_1_integrity_corrections.py tests/test_phase7_1_2_final_safety.py tests/test_application_tailoring.py tests/test_preparer.py tests/test_resume_parser.py
+          python -m pytest -v tests/test_production_configuration.py tests/test_phase_b_4_dashboard.py tests/test_browser_acceptance_phase_b_4.py tests/test_phase_b_3_3_recovery_and_matching.py tests/test_phase_b_3_2_acceptance.py tests/test_career_role_inferencer.py tests/test_discovery.py tests/test_personalized_discovery.py tests/test_universal_resume_intelligence.py tests/test_migration_phase5_1_1.py tests/test_migration_quarantine.py tests/test_phase7_1_1_integrity_corrections.py tests/test_phase7_1_2_final_safety.py tests/test_application_tailoring.py tests/test_preparer.py tests/test_resume_parser.py
+
+  windows-validation:
+    name: Windows Deployment & PowerShell Script Validation
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Validate PowerShell Deployment Scripts (AST Syntax Check)
+        shell: powershell
+        run: |
+          $scripts = @(
+            "deploy\windows\service_install.ps1",
+            "deploy\windows\run_app.ps1",
+            "deploy\windows\backup_database.ps1"
+          )
+          $failed = $false
+          foreach ($s in $scripts) {
+            Write-Host "Validating syntax of $s..."
+            $tokens = $null
+            $errors = $null
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile($s, [ref]$tokens, [ref]$errors)
+            if ($errors.Count -gt 0) {
+              Write-Error "Syntax errors detected in $s : $errors"
+              $failed = $true
+            } else {
+              Write-Host "[OK] $s syntax is valid."
+            }
+          }
+          if ($failed) {
+            exit 1
+          }
+
+      - name: Run Production Configuration & Windows Deployment Tests
+        run: |
+          python -m pytest tests/test_production_configuration.py -v

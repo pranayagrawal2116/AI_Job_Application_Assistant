@@ -388,17 +388,20 @@ class DashboardService:
                 enable_evaluation=False,
             )
 
-            # 5. Personalized Matching against candidate's primary resume for run-associated jobs
-            newly_scored = 0
-            if primary_resume:
-                relevant_ids = set()
-                for saved_item in summary.saved_jobs:
-                    if saved_item.get("id"):
-                        relevant_ids.add(saved_item["id"])
-                for dup_id in getattr(summary, "duplicate_job_ids", []):
-                    if dup_id:
-                        relevant_ids.add(dup_id)
+            # 5. Record candidate-associated discovered jobs and run personalized matching
+            relevant_ids = set()
+            for saved_item in summary.saved_jobs:
+                if saved_item.get("id"):
+                    relevant_ids.add(saved_item["id"])
+            for dup_id in getattr(summary, "duplicate_job_ids", []):
+                if dup_id:
+                    relevant_ids.add(dup_id)
 
+            if relevant_ids:
+                self.db.record_candidate_discovered_jobs(user_id, list(relevant_ids), discovery_run_id=run_id)
+
+            newly_scored = 0
+            if primary_resume and relevant_ids:
                 for job_id in relevant_ids:
                     try:
                         self.run_match_evaluation(

@@ -62,8 +62,12 @@ tests/fixtures/candidate_profile_fixture.json
 
 # Application Database & SQLite Data
 data/storage/*.db
+data/storage/*.db-shm
+data/storage/*.db-wal
 data/storage/*.sqlite
 data/storage/*.sqlite3
+*.db-shm
+*.db-wal
 !data/storage/README.md
 
 # Exports & Generated Reports

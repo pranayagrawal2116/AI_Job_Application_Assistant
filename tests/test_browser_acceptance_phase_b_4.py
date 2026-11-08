@@ -272,21 +272,42 @@ class TestIsolatedBrowserAcceptance(unittest.TestCase):
 
             # Advance to Step 2
             page.click('button:has-text("Continue to Resume Upload")')
-            file_input = page.wait_for_selector('input[type="file"]', state="attached", timeout=6000)
+            page.wait_for_selector('input[type="file"]', state="attached", timeout=6000)
 
-            # A. Test Invalid File Extension (.exe)
-            file_input.set_input_files(str(self.invalid_file_path))
+            # A. Test Drag-and-Drop Dragenter / Dragover / Dragleave events
+            dropzone = page.locator('div[role="button"][aria-label="Upload document dropzone"]')
+            self.assertTrue(dropzone.is_visible())
+            dropzone.dispatch_event('dragenter')
+            page.wait_for_timeout(100)
+            dropzone.dispatch_event('dragover')
+            page.wait_for_timeout(100)
+            dropzone.dispatch_event('dragleave')
+            page.wait_for_timeout(100)
+
+            # B. Test Native File Chooser: Invalid File Extension (.exe)
+            with page.expect_file_chooser() as fc_info_invalid:
+                page.locator('input[type="file"]').click()
+            fc_invalid = fc_info_invalid.value
+            self.assertFalse(fc_invalid.is_multiple())
+            fc_invalid.set_files(str(self.invalid_file_path))
             page.wait_for_selector('text=Only PDF or DOCX documents are supported.', timeout=4000)
             self.assertTrue(page.locator('text=Only PDF or DOCX documents are supported.').is_visible())
 
-            # B. Test Oversized Document (> 10MB)
-            file_input.set_input_files(str(self.oversized_file_path))
+            # C. Test Native File Chooser: Oversized Document (> 10MB)
+            with page.expect_file_chooser() as fc_info_oversized:
+                page.locator('input[type="file"]').click()
+            fc_oversized = fc_info_oversized.value
+            fc_oversized.set_files(str(self.oversized_file_path))
             page.wait_for_selector('text=File size exceeds 10 MB limit', timeout=4000)
             self.assertTrue(page.locator('text=File size exceeds 10 MB limit').is_visible())
 
-            # C. Test Valid File Selection & Clear
-            file_input.set_input_files(str(self.acca_pdf_path))
+            # D. Test Native File Chooser: Valid File Selection & Clear
+            with page.expect_file_chooser() as fc_info_valid:
+                page.locator('input[type="file"]').click()
+            fc_valid = fc_info_valid.value
+            fc_valid.set_files(str(self.acca_pdf_path))
             page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=4000)
+            self.assertTrue(page.locator('text=synthetic_acca_resume.pdf').is_visible())
 
             # Click Clear (X) button
             clear_btn = page.locator('button[data-clear-btn="true"], button[title="Remove file"]')
@@ -295,14 +316,17 @@ class TestIsolatedBrowserAcceptance(unittest.TestCase):
             page.wait_for_timeout(300)
             self.assertTrue(page.locator('text=Click to browse or drag and drop').is_visible())
 
-            # D. Re-select the exact same file (testing file input reset)
-            file_input.set_input_files(str(self.acca_pdf_path))
+            # E. Re-select the exact same file via File Chooser (testing file input reset and reuse)
+            with page.expect_file_chooser() as fc_info_reselect:
+                page.locator('input[type="file"]').click()
+            fc_info_reselect.value.set_files(str(self.acca_pdf_path))
             page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=4000)
             self.assertTrue(page.locator('text=synthetic_acca_resume.pdf').is_visible())
 
-            # E. Perform actual upload and verify transition to Step 3
+            # F. Perform actual upload and verify transition to Step 3
             page.click('button:has-text("Upload & Parse")')
             page.wait_for_selector('text=Step 3 of 3', timeout=12000)
+            self.assertTrue(page.locator('text=Step 3 of 3').is_visible())
             self.assertTrue(page.locator('text=Step 3 of 3').is_visible())
 
         except Exception:

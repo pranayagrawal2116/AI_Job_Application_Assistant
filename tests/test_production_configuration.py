@@ -94,6 +94,19 @@ class TestProductionConfigurationValidation:
         with pytest.raises(ValueError, match="is not valid JSON"):
             validate_production_configuration(env_dict, enforce=True)
 
+    @pytest.mark.anyio
+    async def test_fastapi_lifespan_aborts_before_service_on_invalid_production(self, monkeypatch):
+        """Verifies lifespan ordering: production config validation fails closed before service or DB setup."""
+        from backend.api.main import app, lifespan
+
+        monkeypatch.setenv("APP_ENV", "production")
+        monkeypatch.delenv("SESSION_SECRET_KEY", raising=False)
+
+        with pytest.raises(RuntimeError, match="Production configuration validation failed"):
+            async with lifespan(app):
+                pass
+
+
 
 class TestDynamicStoragePaths:
     """Verifies that database and storage managers resolve environment paths dynamically."""
@@ -312,11 +325,102 @@ class TestPowerShellDeploymentScriptsIntegrity:
         assert "PRAGMA integrity_check" in content
         assert "INTEGRITY_CHECK_FAILED" in content
 
-    def test_iis_web_config_enforces_10mb_and_https_redirect(self):
+    def test_iis_web_config_enforces_12mb_multipart_headroom_and_https_redirect(self):
         config_path = Path(__file__).resolve().parent.parent / "deploy" / "iis" / "web.config"
         assert config_path.exists()
         content = config_path.read_text(encoding="utf-8")
 
-        assert 'maxAllowedContentLength="10485760"' in content
+        # 12 MB (12582912 bytes) ceiling for multipart headers while application enforces 10 MB file cap
+        assert 'maxAllowedContentLength="12582912"' in content
         assert "HTTP to HTTPS Redirect" in content
         assert "HTTP_X_FORWARDED_PROTO" in content
+
+    def test_web_root_and_frontend_exclusion_validation(self):
+        from src.config.env_loader import validate_storage_paths_alignment
+        env_dict = _make_valid_production_secrets()
+
+        # Database path placed within IIS web root must be rejected
+        env_dict["DATABASE_PATH"] = r"C:\inetpub\wwwroot\job_assistant.db"
+        with pytest.raises(ValueError, match="must not be located inside web root or frontend directory"):
+            validate_production_configuration(env_dict, enforce=True)
+
+        errs = validate_storage_paths_alignment(env_dict)
+        assert any("inetpub/wwwroot" in e for e in errs)
+
+        # Storage placed inside frontend/dist must be rejected
+        env_dict["DATABASE_PATH"] = r"D:\AIJobAssistantData\database\job_assistant.db"
+        env_dict["USER_STORAGE_BASE"] = r"C:\Apps\AI_Job_Application_Assistant\frontend\dist\users"
+        with pytest.raises(ValueError, match="must not be located inside web root or frontend directory"):
+            validate_production_configuration(env_dict, enforce=True)
+
+    def test_storage_paths_alignment_with_expected_data_dir(self):
+        from src.config.env_loader import validate_storage_paths_alignment
+        env_dict = _make_valid_production_secrets()
+
+        # With all paths under D:\AIJobAssistantData, alignment succeeds
+        report = validate_production_configuration(env_dict, enforce=True, expected_data_dir=r"D:\AIJobAssistantData")
+        assert report.is_valid is True
+        errs = validate_storage_paths_alignment(env_dict, expected_data_dir=r"D:\AIJobAssistantData")
+        assert len(errs) == 0
+
+        # Pointing one path to a different drive (e.g. C:\OtherData) fails alignment
+        env_dict["BACKUP_DIR"] = r"C:\OtherData\backups"
+        with pytest.raises(ValueError, match="is not rooted under expected data directory"):
+            validate_production_configuration(env_dict, enforce=True, expected_data_dir=r"D:\AIJobAssistantData")
+
+        misaligned_errs = validate_storage_paths_alignment(env_dict, expected_data_dir=r"D:\AIJobAssistantData")
+        assert len(misaligned_errs) == 1
+        assert "BACKUP_DIR" in misaligned_errs[0]
+
+    def test_candidate_discovery_metrics_strictly_isolated_from_evaluations(self, tmp_path):
+        """Verifies that running match evaluations on catalog jobs does NOT falsely increase jobs_discovered_for_user."""
+        db_path = tmp_path / "metrics_isolation.db"
+        db = DatabaseManager(db_path=str(db_path))
+
+        with db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("INSERT INTO users (email, password_hash, password_salt, full_name) VALUES ('iso@example.com', 'h', 's', 'Iso User')")
+            user_id = cursor.lastrowid
+
+        from src.database.models import Job
+        job_1 = Job(
+            platform="LinkedIn",
+            company_name="Company A",
+            job_title="Role A",
+            job_url="https://example.com/job/a",
+            job_description="Desc A",
+        )
+        saved_1 = db.insert_job(job_1)
+
+        job_2 = Job(
+            platform="Indeed",
+            company_name="Company B",
+            job_title="Role B",
+            job_url="https://example.com/job/b",
+            job_description="Desc B",
+        )
+        saved_2 = db.insert_job(job_2)
+
+        # Associate only job_1 with candidate discovery
+        db.record_candidate_discovered_jobs(user_id, [saved_1.id])
+
+        # Evaluate match results for BOTH job_1 and job_2 (e.g. manually imported job_2)
+        with db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO match_results (user_id, job_id, match_score, match_classification, eligibility_status, score_breakdown, explanation)
+                VALUES (?, ?, 90.0, 'Excellent match', 'ELIGIBLE', '{}', 'Test'),
+                       (?, ?, 80.0, 'Good match', 'ELIGIBLE', '{}', 'Test')
+                """,
+                (user_id, saved_1.id, user_id, saved_2.id),
+            )
+
+        metrics = db.get_candidate_matching_metrics(user_id)
+        # Total catalog is 2
+        assert metrics["total_catalog_jobs"] == 2
+        # Evaluated matches count is 2
+        assert metrics["evaluated_matches_count"] == 2
+        # But discovered jobs for this user must strictly remain 1!
+        assert metrics["jobs_discovered_for_user"] == 1
+

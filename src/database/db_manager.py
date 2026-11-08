@@ -7598,7 +7598,7 @@ class DatabaseManager:
             evaluated_count = row["evaluated_count"] if row else 0
             eligible_count = row["eligible_count"] if row else 0
 
-            # 4. Phase C.0: Unique candidate discovered jobs
+            # 4. Phase C.0.1: Unique candidate discovered jobs
             cursor.execute(
                 "SELECT COUNT(DISTINCT job_id) FROM candidate_discovered_jobs WHERE user_id = ?",
                 (user_id,)
@@ -7606,12 +7606,9 @@ class DatabaseManager:
             row = cursor.fetchone()
             unique_candidate_discovered = row[0] if row else 0
 
-            # User discovered count is max of unique candidate discovered and evaluated jobs
-            user_discovered = max(unique_candidate_discovered, evaluated_count)
-
             return {
                 "total_catalog_jobs": int(total_catalog),
-                "jobs_discovered_for_user": int(user_discovered),
+                "jobs_discovered_for_user": int(unique_candidate_discovered),
                 "total_discovery_occurrences": int(total_discovery_occurrences),
                 "evaluated_matches_count": int(evaluated_count),
                 "eligible_matches_count": int(eligible_count),
