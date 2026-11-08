@@ -76,6 +76,8 @@ if ($EnvFile) {
 }
 
 # 3. Strict Preflight Validation (Fail-Closed Enforcement)
+$isDev = if ($Dev) { "True" } else { "False" }
+
 if ($ResolvedEnvFile) {
     Write-Host "Validating configuration from: $ResolvedEnvFile..." -ForegroundColor Cyan
     $preflightScript = @"
@@ -83,9 +85,19 @@ import os, sys
 try:
     from src.config.env_loader import load_production_env, validate_production_configuration
     load_production_env(r'$ResolvedEnvFile')
-    app_env = os.environ.get("APP_ENV", "development").strip().lower()
-    if app_env == "production":
+    app_env = os.environ.get("APP_ENV", "").strip().lower()
+    is_dev_mode = $isDev
+
+    if not is_dev_mode:
+        if app_env != "production":
+            raise ValueError(
+                f"Normal launch requires APP_ENV=production. Detected APP_ENV='{app_env}'. "
+                "To run in local development mode with a non-production .env, pass the -Dev switch."
+            )
         validate_production_configuration(enforce=True)
+    else:
+        if app_env == "production":
+            validate_production_configuration(enforce=True)
     print(f"PREFLIGHT_OK|{app_env}")
 except Exception as exc:
     print(f"PREFLIGHT_FAIL|{exc}", file=sys.stderr)

@@ -250,21 +250,29 @@ class TestIsolatedBrowserAcceptance(unittest.TestCase):
             browser.close()
 
     # -------------------------------------------------------------------------
-    # TEST 3: INTERACTIVE FILE DROPZONE & VALIDATIONS
+    # TEST 3: INTERACTIVE FILE DROPZONE & VALIDATIONS (CHROMIUM & WEBKIT)
     # -------------------------------------------------------------------------
-    def test_scenario_3_file_dropzone_and_validations(self):
-        """Scenario 3: Tests click-to-upload, clear selection, re-selection, invalid type, and size limits."""
-        browser = self.playwright.chromium.launch(headless=True)
+    def _run_dropzone_and_upload_suite(self, browser_type: str = "chromium"):
+        """Runs complete file upload acceptance suite:
+        - Test A: Visible dropzone click & native file chooser (expect_file_chooser)
+        - Test C: Clear selection & re-selection of the exact same file
+        - Test B: Genuine browser DataTransfer drag-and-drop with File objects
+        - Test B: Format (.exe) and oversized (>10MB) validation rejections
+        - Final: Upload & Parse transition to Onboarding Step 3
+        """
+        import base64
+        launcher = getattr(self.playwright, browser_type)
+        browser = launcher.launch(headless=True)
         context = browser.new_context()
-        page = self._setup_page_with_reporting(context, "scenario_3_dropzone")
+        page = self._setup_page_with_reporting(context, f"scenario_3_dropzone_{browser_type}")
 
         try:
             timestamp = int(time.time() * 1000)
-            email = f"dropzone.{timestamp}@example.com"
+            email = f"dropzone.{browser_type}.{timestamp}@example.com"
 
             # Register and navigate to Onboarding Step 2
             page.goto(f"{self.base_url}/register")
-            page.fill('input[type="text"]', "Dropzone Tester")
+            page.fill('input[type="text"]', f"Dropzone Tester {browser_type.upper()}")
             page.fill('input[type="email"]', email)
             page.fill('input[type="password"]', "Password123!")
             page.click('button[type="submit"]')
@@ -272,61 +280,93 @@ class TestIsolatedBrowserAcceptance(unittest.TestCase):
 
             # Advance to Step 2
             page.click('button:has-text("Continue to Resume Upload")')
-            page.wait_for_selector('input[type="file"]', state="attached", timeout=6000)
+            dropzone = page.wait_for_selector(
+                '[data-testid="file-dropzone"], div[role="button"][aria-label="Upload document dropzone"]',
+                state="visible",
+                timeout=6000,
+            )
 
-            # A. Test Drag-and-Drop Dragenter / Dragover / Dragleave events
-            dropzone = page.locator('div[role="button"][aria-label="Upload document dropzone"]')
-            self.assertTrue(dropzone.is_visible())
-            dropzone.dispatch_event('dragenter')
-            page.wait_for_timeout(100)
-            dropzone.dispatch_event('dragover')
-            page.wait_for_timeout(100)
-            dropzone.dispatch_event('dragleave')
-            page.wait_for_timeout(100)
-
-            # B. Test Native File Chooser: Invalid File Extension (.exe)
-            with page.expect_file_chooser() as fc_info_invalid:
-                page.locator('input[type="file"]').click()
-            fc_invalid = fc_info_invalid.value
-            self.assertFalse(fc_invalid.is_multiple())
-            fc_invalid.set_files(str(self.invalid_file_path))
-            page.wait_for_selector('text=Only PDF or DOCX documents are supported.', timeout=4000)
-            self.assertTrue(page.locator('text=Only PDF or DOCX documents are supported.').is_visible())
-
-            # C. Test Native File Chooser: Oversized Document (> 10MB)
-            with page.expect_file_chooser() as fc_info_oversized:
-                page.locator('input[type="file"]').click()
-            fc_oversized = fc_info_oversized.value
-            fc_oversized.set_files(str(self.oversized_file_path))
-            page.wait_for_selector('text=File size exceeds 10 MB limit', timeout=4000)
-            self.assertTrue(page.locator('text=File size exceeds 10 MB limit').is_visible())
-
-            # D. Test Native File Chooser: Valid File Selection & Clear
-            with page.expect_file_chooser() as fc_info_valid:
-                page.locator('input[type="file"]').click()
-            fc_valid = fc_info_valid.value
-            fc_valid.set_files(str(self.acca_pdf_path))
-            page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=4000)
+            # -------------------------------------------------------------
+            # TEST A: Visible Click-to-Upload via expect_file_chooser()
+            # Strictly clicks visible dropzone element, not internal input
+            # -------------------------------------------------------------
+            with page.expect_file_chooser() as fc_info:
+                dropzone.click()
+            file_chooser = fc_info.value
+            self.assertFalse(file_chooser.is_multiple())
+            file_chooser.set_files(str(self.acca_pdf_path))
+            page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=5000)
             self.assertTrue(page.locator('text=synthetic_acca_resume.pdf').is_visible())
 
-            # Click Clear (X) button
+            # -------------------------------------------------------------
+            # TEST C: Clear selection & Re-select the exact same file
+            # -------------------------------------------------------------
             clear_btn = page.locator('button[data-clear-btn="true"], button[title="Remove file"]')
             self.assertTrue(clear_btn.first.is_visible())
             clear_btn.first.click()
             page.wait_for_timeout(300)
             self.assertTrue(page.locator('text=Click to browse or drag and drop').is_visible())
 
-            # E. Re-select the exact same file via File Chooser (testing file input reset and reuse)
+            # Re-select the exact same file again to confirm input reset
             with page.expect_file_chooser() as fc_info_reselect:
-                page.locator('input[type="file"]').click()
+                dropzone.click()
             fc_info_reselect.value.set_files(str(self.acca_pdf_path))
-            page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=4000)
+            page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=5000)
             self.assertTrue(page.locator('text=synthetic_acca_resume.pdf').is_visible())
 
-            # F. Perform actual upload and verify transition to Step 3
+            # Clear again to test browser drag-and-drop
+            clear_btn.first.click()
+            page.wait_for_timeout(300)
+
+            # -------------------------------------------------------------
+            # TEST B: Actual Drag-and-Drop via Browser DataTransfer Events
+            # -------------------------------------------------------------
+            js_dispatch_drop = """
+            async ([selector, filename, base64Data, mimeType]) => {
+                const dropzone = document.querySelector(selector);
+                if (!dropzone) throw new Error('Target dropzone not found: ' + selector);
+                
+                const binary = atob(base64Data);
+                const bytes = new Uint8Array(binary.length);
+                for (let i = 0; i < binary.length; i++) {
+                    bytes[i] = binary.charCodeAt(i);
+                }
+                
+                const file = new File([bytes], filename, { type: mimeType });
+                const dt = new DataTransfer();
+                dt.items.add(file);
+                
+                dropzone.dispatchEvent(new DragEvent('dragenter', { dataTransfer: dt, bubbles: true, cancelable: true }));
+                dropzone.dispatchEvent(new DragEvent('dragover', { dataTransfer: dt, bubbles: true, cancelable: true }));
+                dropzone.dispatchEvent(new DragEvent('drop', { dataTransfer: dt, bubbles: true, cancelable: true }));
+            }
+            """
+
+            # B.1: Drag-and-Drop Invalid File Extension (.exe)
+            invalid_b64 = base64.b64encode(b"MZfakeexecutablebytes").decode("ascii")
+            page.evaluate(js_dispatch_drop, ['[data-testid="file-dropzone"]', 'malicious.exe', invalid_b64, 'application/x-msdownload'])
+            page.wait_for_selector('text=Only PDF or DOCX documents are supported.', timeout=4000)
+            self.assertTrue(page.locator('text=Only PDF or DOCX documents are supported.').is_visible())
+
+            # B.2: Drag-and-Drop Oversized Document (> 10MB)
+            oversized_bytes = b"%PDF-1.4\n" + (b"0" * (10500000))
+            oversized_b64 = base64.b64encode(oversized_bytes).decode("ascii")
+            page.evaluate(js_dispatch_drop, ['[data-testid="file-dropzone"]', 'oversized_test.pdf', oversized_b64, 'application/pdf'])
+            page.wait_for_selector('text=File size exceeds 10 MB limit', timeout=4000)
+            self.assertTrue(page.locator('text=File size exceeds 10 MB limit').is_visible())
+
+            # B.3: Drag-and-Drop Valid PDF Document
+            valid_bytes = self.acca_pdf_path.read_bytes()
+            valid_b64 = base64.b64encode(valid_bytes).decode("ascii")
+            page.evaluate(js_dispatch_drop, ['[data-testid="file-dropzone"]', 'synthetic_acca_resume.pdf', valid_b64, 'application/pdf'])
+            page.wait_for_selector('text=synthetic_acca_resume.pdf', timeout=5000)
+            self.assertTrue(page.locator('text=synthetic_acca_resume.pdf').is_visible())
+
+            # -------------------------------------------------------------
+            # Progression: Upload & Parse and verify Onboarding Step 3
+            # -------------------------------------------------------------
             page.click('button:has-text("Upload & Parse")')
             page.wait_for_selector('text=Step 3 of 3', timeout=12000)
-            self.assertTrue(page.locator('text=Step 3 of 3').is_visible())
             self.assertTrue(page.locator('text=Step 3 of 3').is_visible())
 
         except Exception:
@@ -335,6 +375,14 @@ class TestIsolatedBrowserAcceptance(unittest.TestCase):
         finally:
             context.close()
             browser.close()
+
+    def test_scenario_3_file_dropzone_and_validations(self):
+        """Scenario 3 (Chromium): Tests visible click, re-selection, browser DataTransfer drag-and-drop, and size/type validations."""
+        self._run_dropzone_and_upload_suite(browser_type="chromium")
+
+    def test_scenario_3_file_dropzone_and_validations_webkit(self):
+        """Scenario 3 (WebKit): Tests visible click, re-selection, browser DataTransfer drag-and-drop on WebKit engine."""
+        self._run_dropzone_and_upload_suite(browser_type="webkit")
 
     # -------------------------------------------------------------------------
     # TEST 4: GENUINE DISCOVERY RECOVERY TEST (SERVER RESTART WHILE RUNNING)

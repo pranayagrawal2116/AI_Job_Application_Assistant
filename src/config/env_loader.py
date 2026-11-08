@@ -49,6 +49,96 @@ FORBIDDEN_STORAGE_SUBSTRINGS: List[str] = [
 ]
 
 
+def canonicalize_path_components(path: str | Path) -> tuple[str, List[str]]:
+    """Canonicalizes a Windows or POSIX path into (root_specifier, list_of_lowercase_parts),
+    resolving '.' and '..' segments logically without requiring filesystem access.
+    """
+    raw = str(path).strip()
+    if not raw:
+        return "", []
+
+    # Detect Windows drive letter (e.g. C:\ or c:/)
+    win_drive = re.match(r"^([a-zA-Z]):[\\/](.*)", raw)
+    if win_drive:
+        root_spec = win_drive.group(1).upper() + ":\\"
+        remainder = win_drive.group(2)
+        sep = re.compile(r"[\\/]+")
+    elif raw.startswith(r"\\") or raw.startswith("//"):
+        # UNC path \\server\share\...
+        unc_match = re.match(r"^[\\/]{2}([^\\/]+)[\\/]([^\\/]+)(?:[\\/](.*))?", raw)
+        if unc_match:
+            root_spec = f"\\\\{unc_match.group(1).lower()}\\{unc_match.group(2).lower()}\\"
+            remainder = unc_match.group(3) or ""
+            sep = re.compile(r"[\\/]+")
+        else:
+            root_spec = "\\\\"
+            remainder = raw.lstrip("\\/")
+            sep = re.compile(r"[\\/]+")
+    elif raw.startswith("/") or raw.startswith("\\"):
+        root_spec = "/"
+        remainder = raw.lstrip("/\\")
+        sep = re.compile(r"[\\/]+")
+    else:
+        root_spec = ""
+        remainder = raw
+        sep = re.compile(r"[\\/]+")
+
+    raw_segments = [s for s in sep.split(remainder) if s]
+    parts: List[str] = []
+    for s in raw_segments:
+        s_clean = s.strip()
+        if not s_clean or s_clean == ".":
+            continue
+        if s_clean == "..":
+            if parts and parts[-1] != "..":
+                parts.pop()
+            else:
+                parts.append("..")
+        else:
+            parts.append(s_clean.lower())
+
+    return root_spec, parts
+
+
+def is_forbidden_path(parts: List[str]) -> tuple[bool, str]:
+    """Detects whether path parts intersect with forbidden web root or frontend directory sequences."""
+    forbidden_sequences = [
+        (["inetpub", "wwwroot"], "IIS web root (inetpub/wwwroot)"),
+        (["deploy", "iis"], "IIS deployment configuration (deploy/iis)"),
+        (["frontend", "dist"], "frontend distribution bundle (frontend/dist)"),
+        (["frontend", "public"], "frontend public assets (frontend/public)"),
+    ]
+    for seq, desc in forbidden_sequences:
+        seq_len = len(seq)
+        for i in range(len(parts) - seq_len + 1):
+            if parts[i : i + seq_len] == seq:
+                return True, desc
+    return False, ""
+
+
+def is_path_contained_in_root(child: str | Path, root: str | Path) -> bool:
+    """Returns True if and only if child is logically contained within root.
+    Handles Windows drive letters, case-insensitivity, canonical component hierarchy,
+    and prevents traversal escapes.
+    """
+    c_root, c_parts = canonicalize_path_components(child)
+    r_root, r_parts = canonicalize_path_components(root)
+
+    if not c_root or not r_root:
+        return False
+
+    if c_root.upper() != r_root.upper():
+        return False
+
+    if ".." in c_parts or ".." in r_parts:
+        return False
+
+    if len(c_parts) < len(r_parts):
+        return False
+
+    return c_parts[: len(r_parts)] == r_parts
+
+
 class ProductionConfigurationError(ValueError, RuntimeError):
     """Raised when production configuration fails preflight validation."""
     pass
@@ -353,20 +443,25 @@ def validate_production_configuration(
             report.is_valid = False
             continue
 
-        # Phase C.0.1: Check for forbidden web root or frontend directory substrings
-        norm_p = clean_path.replace("\\", "/").lower()
-        for forbidden in FORBIDDEN_STORAGE_SUBSTRINGS:
-            if forbidden in norm_p:
-                report.errors.append(
-                    f"{p_name} ('{clean_path}') must not be located inside web root or frontend directory ('{forbidden}')."
-                )
-                report.is_valid = False
+        # Phase C.0.2: Component-aware canonical containment & forbidden location checks
+        _, c_parts = canonicalize_path_components(clean_path)
+        is_bad, bad_reason = is_forbidden_path(c_parts)
+        if is_bad:
+            report.errors.append(
+                f"{p_name} ('{clean_path}') must not be located inside {bad_reason}."
+            )
+            report.is_valid = False
+
+        if ".." in c_parts:
+            report.errors.append(
+                f"{p_name} ('{clean_path}') contains illegal relative directory traversal (..)."
+            )
+            report.is_valid = False
 
         if expected_data_dir:
-            exp_norm = str(expected_data_dir).strip().replace("\\", "/").rstrip("/").lower()
-            if not norm_p.startswith(exp_norm):
+            if not is_path_contained_in_root(clean_path, expected_data_dir):
                 report.errors.append(
-                    f"{p_name} ('{clean_path}') is not rooted under expected data directory '{expected_data_dir}'."
+                    f"{p_name} ('{clean_path}') is not canonically contained within expected data directory '{expected_data_dir}'."
                 )
                 report.is_valid = False
 
@@ -462,8 +557,6 @@ def validate_storage_paths_alignment(
         ("EXPORTS_DIR", env.get("EXPORTS_DIR")),
     ]
 
-    exp_norm = str(expected_data_dir).strip().replace("\\", "/").rstrip("/").lower() if expected_data_dir else None
-
     for p_name, p_val in path_configs:
         if not p_val or not str(p_val).strip():
             errors.append(f"{p_name} is not explicitly configured.")
@@ -477,17 +570,20 @@ def validate_storage_paths_alignment(
             errors.append(f"{p_name} must be an absolute path (got '{clean_path}').")
             continue
 
-        norm_p = clean_path.replace("\\", "/").lower()
-        for forbidden in FORBIDDEN_STORAGE_SUBSTRINGS:
-            if forbidden in norm_p:
-                errors.append(
-                    f"{p_name} ('{clean_path}') must not be located inside web root or frontend directory ('{forbidden}')."
-                )
+        # Phase C.0.2: Component-aware canonical containment & forbidden location checks
+        _, c_parts = canonicalize_path_components(clean_path)
+        is_bad, bad_reason = is_forbidden_path(c_parts)
+        if is_bad:
+            errors.append(f"{p_name} ('{clean_path}') must not be located inside {bad_reason}.")
 
-        if exp_norm and not norm_p.startswith(exp_norm):
-            errors.append(
-                f"{p_name} ('{clean_path}') is not rooted under expected data directory '{expected_data_dir}'."
-            )
+        if ".." in c_parts:
+            errors.append(f"{p_name} ('{clean_path}') contains illegal relative directory traversal (..).")
+
+        if expected_data_dir:
+            if not is_path_contained_in_root(clean_path, expected_data_dir):
+                errors.append(
+                    f"{p_name} ('{clean_path}') is not canonically contained within expected data directory '{expected_data_dir}'."
+                )
 
     return errors
 

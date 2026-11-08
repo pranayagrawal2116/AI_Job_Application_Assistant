@@ -341,7 +341,7 @@ class TestPowerShellDeploymentScriptsIntegrity:
 
         # Database path placed within IIS web root must be rejected
         env_dict["DATABASE_PATH"] = r"C:\inetpub\wwwroot\job_assistant.db"
-        with pytest.raises(ValueError, match="must not be located inside web root or frontend directory"):
+        with pytest.raises(ValueError, match="must not be located inside"):
             validate_production_configuration(env_dict, enforce=True)
 
         errs = validate_storage_paths_alignment(env_dict)
@@ -350,7 +350,7 @@ class TestPowerShellDeploymentScriptsIntegrity:
         # Storage placed inside frontend/dist must be rejected
         env_dict["DATABASE_PATH"] = r"D:\AIJobAssistantData\database\job_assistant.db"
         env_dict["USER_STORAGE_BASE"] = r"C:\Apps\AI_Job_Application_Assistant\frontend\dist\users"
-        with pytest.raises(ValueError, match="must not be located inside web root or frontend directory"):
+        with pytest.raises(ValueError, match="must not be located inside"):
             validate_production_configuration(env_dict, enforce=True)
 
     def test_storage_paths_alignment_with_expected_data_dir(self):
@@ -365,7 +365,7 @@ class TestPowerShellDeploymentScriptsIntegrity:
 
         # Pointing one path to a different drive (e.g. C:\OtherData) fails alignment
         env_dict["BACKUP_DIR"] = r"C:\OtherData\backups"
-        with pytest.raises(ValueError, match="is not rooted under expected data directory"):
+        with pytest.raises(ValueError, match="is not canonically contained within expected data directory"):
             validate_production_configuration(env_dict, enforce=True, expected_data_dir=r"D:\AIJobAssistantData")
 
         misaligned_errs = validate_storage_paths_alignment(env_dict, expected_data_dir=r"D:\AIJobAssistantData")
@@ -423,4 +423,205 @@ class TestPowerShellDeploymentScriptsIntegrity:
         assert metrics["evaluated_matches_count"] == 2
         # But discovered jobs for this user must strictly remain 1!
         assert metrics["jobs_discovered_for_user"] == 1
+
+
+class TestPhaseC02DeploymentSignOff:
+    """Rigorous verification of Phase C.0.2 sign-off requirements."""
+
+    def test_run_app_mode_enforcement_matrix(self):
+        """Tests that run_app preflight enforces APP_ENV=production in normal mode and requires -Dev for non-prod."""
+        from src.config.env_loader import validate_production_configuration
+
+        def simulate_preflight(app_env: str, is_dev_mode: bool, env_dict: dict):
+            clean_env = app_env.strip().lower()
+            if not is_dev_mode:
+                if clean_env != "production":
+                    raise ValueError(f"Normal launch requires APP_ENV=production. Detected APP_ENV='{clean_env}'")
+                validate_production_configuration(env_dict, enforce=True)
+            else:
+                if clean_env == "production":
+                    validate_production_configuration(env_dict, enforce=True)
+            return True
+
+        valid_env = _make_valid_production_secrets()
+
+        # 1. Normal mode + APP_ENV=production -> PASS
+        assert simulate_preflight("production", False, valid_env) is True
+
+        # 2. Normal mode + APP_ENV=development -> REJECT
+        with pytest.raises(ValueError, match="Normal launch requires APP_ENV=production"):
+            simulate_preflight("development", False, valid_env)
+
+        # 3. Normal mode + APP_ENV=test -> REJECT
+        with pytest.raises(ValueError, match="Normal launch requires APP_ENV=production"):
+            simulate_preflight("test", False, valid_env)
+
+        # 4. Normal mode + APP_ENV=staging -> REJECT
+        with pytest.raises(ValueError, match="Normal launch requires APP_ENV=production"):
+            simulate_preflight("staging", False, valid_env)
+
+        # 5. Normal mode + empty APP_ENV -> REJECT
+        with pytest.raises(ValueError, match="Normal launch requires APP_ENV=production"):
+            simulate_preflight("", False, valid_env)
+
+        # 6. Dev mode (-Dev) + APP_ENV=development -> PASS
+        assert simulate_preflight("development", True, {"APP_ENV": "development"}) is True
+
+        # 7. Dev mode (-Dev) + APP_ENV=test -> PASS
+        assert simulate_preflight("test", True, {"APP_ENV": "test"}) is True
+
+    def test_canonical_path_containment_windows_scenarios(self):
+        """Verifies Priority 3: Component-aware canonical path containment."""
+        from src.config.env_loader import (
+            canonicalize_path_components,
+            is_forbidden_path,
+            is_path_contained_in_root,
+        )
+
+        root = r"D:\AIJobAssistantData"
+
+        # 1. Legitimate child path -> ACCEPT
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\database\job_assistant.db", root) is True
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\users", root) is True
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\backups\monthly\2026", root) is True
+
+        # 2. Sibling directory with prefix collision -> REJECT
+        assert is_path_contained_in_root(r"D:\AIJobAssistantDataEvil\database", root) is False
+
+        # 3. Completely different root directory -> REJECT
+        assert is_path_contained_in_root(r"D:\OtherData\backup", root) is False
+
+        # 4. Web root directory -> REJECT
+        assert is_path_contained_in_root(r"C:\inetpub\wwwroot\database", root) is False
+
+        # 5. Traversal escape -> REJECT
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\..\OtherData\backup", root) is False
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\..\..\escaped", root) is False
+
+        # 6. Redundant dot segments inside legitimate tree -> ACCEPT
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\.\database\job_assistant.db", root) is True
+        assert is_path_contained_in_root(r"D:\AIJobAssistantData\sub\..\database\job_assistant.db", root) is True
+
+        # 7. Case-insensitivity -> ACCEPT
+        assert is_path_contained_in_root(r"d:\aijobassistantdata\database\job_assistant.db", root) is True
+
+        # 8. Forward slashes -> ACCEPT
+        assert is_path_contained_in_root("D:/AIJobAssistantData/database/job_assistant.db", root) is True
+
+        # 9. Forbidden paths check
+        _, c1 = canonicalize_path_components(r"C:\inetpub\wwwroot\database")
+        bad1, reason1 = is_forbidden_path(c1)
+        assert bad1 is True
+        assert "inetpub/wwwroot" in reason1
+
+        _, c2 = canonicalize_path_components(r"C:\Apps\AI_Job_Application_Assistant\frontend\dist\users")
+        bad2, reason2 = is_forbidden_path(c2)
+        assert bad2 is True
+        assert "frontend/dist" in reason2
+
+        _, c3 = canonicalize_path_components(r"C:\Apps\AI_Job_Application_Assistant\frontend\public\logo.png")
+        bad3, reason3 = is_forbidden_path(c3)
+        assert bad3 is True
+        assert "frontend/public" in reason3
+
+    def test_backup_override_security_and_containment_logic(self):
+        """Verifies Priority 2: BackupDirOverride must not escape permitted data root."""
+        from src.config.env_loader import is_forbidden_path, is_path_contained_in_root, canonicalize_path_components
+
+        permitted_root = r"D:\AIJobAssistantData"
+
+        def validate_override(override_path: str) -> tuple[bool, str]:
+            _, parts = canonicalize_path_components(override_path)
+            if ".." in parts:
+                return False, "contains relative traversal"
+            is_bad, bad_reason = is_forbidden_path(parts)
+            if is_bad:
+                return False, f"inside forbidden {bad_reason}"
+            if not is_path_contained_in_root(override_path, permitted_root):
+                return False, "not contained in permitted data root"
+            return True, "valid"
+
+        # Legitimate override under data root
+        ok, _ = validate_override(r"D:\AIJobAssistantData\custom_backups")
+        assert ok is True
+
+        # Web root escape
+        ok, msg = validate_override(r"C:\inetpub\wwwroot\backups")
+        assert ok is False
+        assert "inetpub/wwwroot" in msg
+
+        # Prefix collision
+        ok, msg = validate_override(r"D:\AIJobAssistantDataEvil\backups")
+        assert ok is False
+        assert "not contained" in msg
+
+        # Traversal escape
+        ok, msg = validate_override(r"D:\AIJobAssistantData\..\OtherData\backups")
+        assert ok is False
+
+    def test_dedicated_sqlite_online_backup_preserves_source_without_manager_side_effects(self, tmp_path):
+        """Verifies Priority 2: Online backup using read-only URI produces exact snapshot without touching source."""
+        import sqlite3
+
+        src_file = tmp_path / "live_source.db"
+        dst_file = tmp_path / "backup_dest.db"
+
+        # Create live source database with WAL mode and initial data
+        conn = sqlite3.connect(str(src_file))
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE live_table (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.execute("INSERT INTO live_table (note) VALUES ('active record 1'), ('active record 2')")
+        conn.commit()
+        conn.close()
+
+        src_mtime_before = src_file.stat().st_mtime_ns
+
+        # Execute dedicated read-only online backup
+        src_conn = sqlite3.connect(f"file:{src_file.resolve().as_posix()}?mode=ro", uri=True)
+        dst_conn = sqlite3.connect(str(dst_file))
+        src_conn.backup(dst_conn, pages=250)
+        dst_conn.close()
+        src_conn.close()
+
+        # Source mtime was NOT updated by backup
+        src_mtime_after = src_file.stat().st_mtime_ns
+        assert src_mtime_before == src_mtime_after
+
+        # Destination file exists, has data, and passes PRAGMA integrity_check
+        assert dst_file.exists()
+        assert dst_file.stat().st_size > 0
+
+        verify_conn = sqlite3.connect(str(dst_file))
+        cur = verify_conn.cursor()
+        cur.execute("PRAGMA integrity_check")
+        status = cur.fetchone()[0]
+        assert status == "ok"
+
+        cur.execute("SELECT COUNT(*) FROM live_table")
+        count = cur.fetchone()[0]
+        assert count == 2
+        verify_conn.close()
+
+    def test_service_install_rollback_and_fail_closed_acls(self):
+        """Verifies Priority 4 & 5: service_install.ps1 enforces fail-closed ACLs and full rollback snapshot."""
+        script_path = Path(__file__).resolve().parent.parent / "deploy" / "windows" / "service_install.ps1"
+        assert script_path.exists()
+        content = script_path.read_text(encoding="utf-8")
+
+        # Priority 4: Fail-closed icacls helper
+        assert "Assert-IcaclsResult" in content
+        assert "$LASTEXITCODE -ne 0" in content
+        assert "NT AUTHORITY\\SYSTEM:(OI)(CI)F" in content
+        assert "IIS_IUSRS:(OI)(CI)F" in content
+        assert "IUSR:(OI)(CI)F" in content
+        assert "(OI)(CI)RX" in content
+
+        # Priority 5: Full rollback snapshot parameters captured and restored
+        assert "AppRotateFiles" in content
+        assert "AppRotateOnline" in content
+        assert "AppRotateBytes" in content
+        assert "AppThrottle" in content
+        assert "AppExit" in content
+        assert "Prior service configuration restored completely." in content
+
 

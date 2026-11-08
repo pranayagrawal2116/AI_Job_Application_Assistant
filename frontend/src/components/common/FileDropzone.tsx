@@ -123,6 +123,9 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
     if ((e.target as HTMLElement).closest('[data-clear-btn]')) {
       return;
     }
+    if (e.target === fileInputRef.current) {
+      return;
+    }
     if (!disabled && !isLoading && fileInputRef.current) {
       fileInputRef.current.click();
     }
@@ -130,11 +133,12 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
 
   return (
     <div
-      onClick={selectedFile ? handleClick : undefined}
+      onClick={handleClick}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
+      data-testid="file-dropzone"
       className={`relative border-2 border-dashed rounded-2xl p-6 sm:p-8 text-center transition-all cursor-pointer select-none overflow-hidden ${
         disabled || isLoading
           ? 'opacity-60 cursor-not-allowed bg-slate-50 border-slate-200'

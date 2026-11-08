@@ -74,7 +74,13 @@ import os, sys, sqlite3
 from pathlib import Path
 
 # Step 1: Explicitly load production environment
-from src.config.env_loader import load_production_env, validate_production_configuration
+from src.config.env_loader import (
+    load_production_env,
+    validate_production_configuration,
+    canonicalize_path_components,
+    is_forbidden_path,
+    is_path_contained_in_root,
+)
 env_path = r'$ResolvedEnvFile'
 load_production_env(env_path)
 
@@ -102,7 +108,14 @@ if not source_path.exists():
     print(f"CRITICAL: Source database '{source_db}' does not exist on disk.", file=sys.stderr)
     sys.exit(1)
 
-# Step 5: Resolve effective BACKUP_DIR
+# Verify source path containment & forbidden location
+_, src_parts = canonicalize_path_components(source_db)
+is_bad_src, bad_src_reason = is_forbidden_path(src_parts)
+if is_bad_src:
+    print(f"CRITICAL: Source database path is within forbidden {bad_src_reason}.", file=sys.stderr)
+    sys.exit(1)
+
+# Step 5: Resolve and strictly validate effective BACKUP_DIR and BackupDirOverride
 env_backup_dir = os.environ.get("BACKUP_DIR")
 if not env_backup_dir:
     print("CRITICAL: BACKUP_DIR is not configured in environment.", file=sys.stderr)
@@ -110,26 +123,56 @@ if not env_backup_dir:
 
 backup_dir_override = r'$BackupDirOverride'.strip()
 effective_backup_dir = backup_dir_override if backup_dir_override else env_backup_dir
-dest_dir_path = Path(effective_backup_dir)
 
+# Permitted data root is derived from parent of configured BACKUP_DIR
+env_backup_root, env_backup_parts = canonicalize_path_components(env_backup_dir)
+if not env_backup_parts:
+    print("CRITICAL: Invalid BACKUP_DIR structure.", file=sys.stderr)
+    sys.exit(1)
+permitted_data_root = env_backup_root + "\\".join(env_backup_parts[:-1]) if len(env_backup_parts) > 1 else env_backup_root
+
+# Validate effective backup dir against containment, traversals, and forbidden locations
+_, b_parts = canonicalize_path_components(effective_backup_dir)
+if ".." in b_parts:
+    print(f"CRITICAL: Backup directory '{effective_backup_dir}' contains illegal relative directory traversal (..).", file=sys.stderr)
+    sys.exit(1)
+
+is_bad_b, bad_b_reason = is_forbidden_path(b_parts)
+if is_bad_b:
+    print(f"CRITICAL: Backup directory '{effective_backup_dir}' must not be located inside {bad_b_reason}.", file=sys.stderr)
+    sys.exit(1)
+
+if not is_path_contained_in_root(effective_backup_dir, permitted_data_root):
+    print(f"CRITICAL: Backup destination '{effective_backup_dir}' must remain canonically contained within permitted data root '{permitted_data_root}'.", file=sys.stderr)
+    sys.exit(1)
+
+dest_dir_path = Path(effective_backup_dir)
 try:
     dest_dir_path.mkdir(parents=True, exist_ok=True)
 except Exception as exc:
     print(f"CRITICAL: Cannot access or create backup directory '{effective_backup_dir}': {exc}", file=sys.stderr)
     sys.exit(1)
 
-# Step 6: Perform atomic online backup using DatabaseManager
-from src.database.db_manager import DatabaseManager
-db = DatabaseManager(db_path=str(source_path))
+# Step 6: Dedicated SQLite online backup using read-only source connection
+# Completely avoids DatabaseManager.__init__ DDL/migration side effects on live production DB.
+target_backup_file = dest_dir_path / f"backup_job_assistant_{'$timestamp'}.db"
 
-if str(db.db_path) != str(source_path):
-    print(f"CRITICAL: DatabaseManager resolved '{db.db_path}' which does not match DATABASE_PATH '{source_path}'.", file=sys.stderr)
+try:
+    src_abs = Path(source_path).resolve().as_posix()
+    src_conn = sqlite3.connect(f"file:{src_abs}?mode=ro", uri=True, timeout=30.0)
+    dst_conn = sqlite3.connect(str(target_backup_file), timeout=30.0)
+
+    # Perform atomic online backup with WAL awareness in 250-page chunks
+    src_conn.backup(dst_conn, pages=250)
+
+    dst_conn.close()
+    src_conn.close()
+except Exception as backup_exc:
+    print(f"CRITICAL: SQLite online backup API failed: {backup_exc}", file=sys.stderr)
     sys.exit(1)
 
-target_backup_file = dest_dir_path / f"backup_job_assistant_{'$timestamp'}.db"
-backup_path = db.backup_database(backup_path=str(target_backup_file))
-
 # Step 7: Independent SQLite integrity check & verification
+backup_path = str(target_backup_file)
 if not os.path.exists(backup_path):
     print(f"CRITICAL: Backup file was not created at '{backup_path}'.", file=sys.stderr)
     sys.exit(2)

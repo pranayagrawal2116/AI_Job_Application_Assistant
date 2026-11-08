@@ -155,25 +155,34 @@ foreach ($d in $dirs) {
     }
 }
 
-Write-Host "      Configuring NTFS ACL permissions on $DataDir and $EnvFile..." -ForegroundColor Yellow
-try {
-    icacls $DataDir /grant "NT AUTHORITY\SYSTEM:(OI)(CI)F" /T /Q | Out-Null
-    icacls $DataDir /grant "$($ServiceAccount):(OI)(CI)M" /T /Q | Out-Null
-    icacls $DataDir /deny "IIS_IUSRS:(OI)(CI)F" /Q 2>$null | Out-Null
-    icacls $DataDir /deny "IUSR:(OI)(CI)F" /Q 2>$null | Out-Null
-    Write-Host "      [OK] ACL permissions on DataDir configured successfully." -ForegroundColor Green
-} catch {
-    Write-Warning "      Could not configure ACLs on DataDir automatically: $_"
-}
+Write-Host "      Configuring NTFS ACL permissions on $DataDir, $InstallDir, and $EnvFile..." -ForegroundColor Yellow
 
-if (Test-Path $EnvFile) {
-    try {
-        icacls $EnvFile /inheritance:r /grant "NT AUTHORITY\SYSTEM:F" "BUILTIN\Administrators:F" "$($ServiceAccount):R" /Q 2>$null | Out-Null
-        Write-Host "      [OK] Strict ACL permissions set on $EnvFile." -ForegroundColor Green
-    } catch {
-        Write-Warning "      Could not set ACL permissions on $EnvFile: $_"
+function Assert-IcaclsResult([string]$commandDesc, [scriptblock]$action) {
+    & $action
+    if ($LASTEXITCODE -ne 0) {
+        Write-Error "CRITICAL: NTFS ACL configuration failed during '$commandDesc' (Exit code: $LASTEXITCODE). Installation aborted."
+        exit 1
     }
 }
+
+Assert-IcaclsResult "Grant SYSTEM full control on DataDir" { icacls $DataDir /grant "NT AUTHORITY\SYSTEM:(OI)(CI)F" /T /Q }
+Assert-IcaclsResult "Grant $ServiceAccount modify on DataDir" { icacls $DataDir /grant "$($ServiceAccount):(OI)(CI)M" /T /Q }
+Assert-IcaclsResult "Deny IIS_IUSRS on DataDir" { icacls $DataDir /deny "IIS_IUSRS:(OI)(CI)F" /Q }
+Assert-IcaclsResult "Deny IUSR on DataDir" { icacls $DataDir /deny "IUSR:(OI)(CI)F" /Q }
+Assert-IcaclsResult "Grant $ServiceAccount read-and-execute on InstallDir" { icacls $InstallDir /grant "$($ServiceAccount):(OI)(CI)RX" /Q }
+
+if (Test-Path $EnvFile) {
+    Assert-IcaclsResult "Strict ACL on EnvFile" { icacls $EnvFile /inheritance:r /grant "NT AUTHORITY\SYSTEM:F" "BUILTIN\Administrators:F" "$($ServiceAccount):R" /Q }
+}
+
+# Post-configuration ACL verification
+Write-Host "      Verifying effective NTFS ACL state..." -ForegroundColor Cyan
+$aclEnv = (icacls $EnvFile 2>$null) -join "`n"
+if ($aclEnv -match "IIS_IUSRS" -or $aclEnv -match "\bIUSR\b") {
+    Write-Error "CRITICAL: Security boundary violated: IIS web worker identity found in effective permissions for '$EnvFile'!"
+    exit 1
+}
+Write-Host "      [OK] NTFS ACL state strictly verified. IIS worker access forbidden." -ForegroundColor Green
 
 # -----------------------------------------------------------------------------
 # SERVICE REGISTRATION & INSTALLATION (SAFE IN-PLACE UPDATE & ROLLBACK CAPTURE)
@@ -183,29 +192,28 @@ $priorConfig = $null
 $appArgs = "-m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --workers 1 --env-file `"$EnvFile`""
 
 if ($existingService) {
-    Write-Host "`nExisting service '$ServiceName' detected. Capturing current configuration for rollback..." -ForegroundColor Cyan
+    Write-Host "`nExisting service '$ServiceName' detected. Capturing full configuration snapshot for rollback..." -ForegroundColor Cyan
     $priorConfig = @{
         Application = (& $nssmPath get $ServiceName Application 2>$null)
         AppDirectory = (& $nssmPath get $ServiceName AppDirectory 2>$null)
         AppParameters = (& $nssmPath get $ServiceName AppParameters 2>$null)
         AppStdout = (& $nssmPath get $ServiceName AppStdout 2>$null)
         AppStderr = (& $nssmPath get $ServiceName AppStderr 2>$null)
+        AppRotateFiles = (& $nssmPath get $ServiceName AppRotateFiles 2>$null)
+        AppRotateOnline = (& $nssmPath get $ServiceName AppRotateOnline 2>$null)
+        AppRotateBytes = (& $nssmPath get $ServiceName AppRotateBytes 2>$null)
         ObjectName = (& $nssmPath get $ServiceName ObjectName 2>$null)
+        Start = (& $nssmPath get $ServiceName Start 2>$null)
+        Description = (& $nssmPath get $ServiceName Description 2>$null)
+        AppThrottle = (& $nssmPath get $ServiceName AppThrottle 2>$null)
+        AppExit = (& $nssmPath get $ServiceName AppExit 2>$null)
     }
 
-    if ($ForceReinstall) {
-        Write-Host "ForceReinstall requested: stopping and removing prior registration..." -ForegroundColor Yellow
-        & $nssmPath stop $ServiceName 2>$null
-        Start-Sleep -Seconds 2
-        & $nssmPath remove $ServiceName confirm
-        & $nssmPath install $ServiceName $PythonExe $appArgs
-    } else {
-        Write-Host "Updating service configuration in-place without deregistration..." -ForegroundColor Cyan
-        & $nssmPath stop $ServiceName 2>$null
-        Start-Sleep -Seconds 1
-        & $nssmPath set $ServiceName Application $PythonExe
-        & $nssmPath set $ServiceName AppParameters $appArgs
-    }
+    Write-Host "Updating service configuration in-place without deregistration..." -ForegroundColor Cyan
+    & $nssmPath stop $ServiceName 2>$null
+    Start-Sleep -Seconds 1
+    & $nssmPath set $ServiceName Application $PythonExe
+    & $nssmPath set $ServiceName AppParameters $appArgs
 } else {
     Write-Host "Registering fresh Windows Service '$ServiceName' via NSSM..." -ForegroundColor Cyan
     & $nssmPath install $ServiceName $PythonExe $appArgs
@@ -274,14 +282,26 @@ if ($isHealthy) {
     if ($priorConfig -and $priorConfig.Application) {
         Write-Warning "Attempting automatic rollback to prior service configuration..."
         & $nssmPath stop $ServiceName 2>$null
-        & $nssmPath set $ServiceName Application $priorConfig.Application
-        & $nssmPath set $ServiceName AppDirectory $priorConfig.AppDirectory
-        & $nssmPath set $ServiceName AppParameters $priorConfig.AppParameters
+        $svcCheck = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+        if (-not $svcCheck) {
+            & $nssmPath install $ServiceName $priorConfig.Application $priorConfig.AppParameters
+        } else {
+            & $nssmPath set $ServiceName Application $priorConfig.Application
+            & $nssmPath set $ServiceName AppParameters $priorConfig.AppParameters
+        }
+        if ($priorConfig.AppDirectory) { & $nssmPath set $ServiceName AppDirectory $priorConfig.AppDirectory }
         if ($priorConfig.AppStdout) { & $nssmPath set $ServiceName AppStdout $priorConfig.AppStdout }
         if ($priorConfig.AppStderr) { & $nssmPath set $ServiceName AppStderr $priorConfig.AppStderr }
+        if ($priorConfig.AppRotateFiles) { & $nssmPath set $ServiceName AppRotateFiles $priorConfig.AppRotateFiles }
+        if ($priorConfig.AppRotateOnline) { & $nssmPath set $ServiceName AppRotateOnline $priorConfig.AppRotateOnline }
+        if ($priorConfig.AppRotateBytes) { & $nssmPath set $ServiceName AppRotateBytes $priorConfig.AppRotateBytes }
         if ($priorConfig.ObjectName) { & $nssmPath set $ServiceName ObjectName $priorConfig.ObjectName }
+        if ($priorConfig.Start) { & $nssmPath set $ServiceName Start $priorConfig.Start }
+        if ($priorConfig.Description) { & $nssmPath set $ServiceName Description $priorConfig.Description }
+        if ($priorConfig.AppThrottle) { & $nssmPath set $ServiceName AppThrottle $priorConfig.AppThrottle }
+        if ($priorConfig.AppExit) { & $nssmPath set $ServiceName AppExit $priorConfig.AppExit }
         & $nssmPath start $ServiceName 2>$null
-        Write-Warning "Prior service configuration restored."
+        Write-Warning "Prior service configuration restored completely."
     }
     Write-Error "CRITICAL: Service installation / update aborted. Inspect '$DataDir\logs\app_error.log' for diagnostic details."
 }
