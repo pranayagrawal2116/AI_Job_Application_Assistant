@@ -22,7 +22,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
   id = 'file-upload-input',
   onFileSelect,
   onError,
-  accept = '.pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword',
+  accept = '.pdf,.docx,.doc,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,application/msword',
   maxSizeBytes = 10 * 1024 * 1024, // 10 MB
   disabled = false,
   isLoading = false,
@@ -38,12 +38,15 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const validateAndSelectFile = (file: File) => {
+    if (!file) return;
+
     // Validate format
     const name = file.name.toLowerCase();
     const isPdf = name.endsWith('.pdf') || file.type === 'application/pdf';
     const isDocx =
       name.endsWith('.docx') ||
       name.endsWith('.doc') ||
+      file.type.includes('word') ||
       file.type === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
       file.type === 'application/msword';
 
@@ -64,7 +67,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
     onFileSelect(file);
   };
 
-  const handleDragEnter = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDragEnter = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault();
     e.stopPropagation();
     dragCounter.current += 1;
@@ -73,14 +76,16 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
     }
   };
 
-  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDragOver = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault();
     e.stopPropagation();
     e.dataTransfer.dropEffect = 'copy';
-    setIsDragging(true);
+    if (!isDragging) {
+      setIsDragging(true);
+    }
   };
 
-  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDragLeave = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault();
     e.stopPropagation();
     dragCounter.current -= 1;
@@ -90,7 +95,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
     }
   };
 
-  const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
+  const handleDrop = (e: React.DragEvent<HTMLElement>) => {
     e.preventDefault();
     e.stopPropagation();
     dragCounter.current = 0;
@@ -125,7 +130,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
 
   return (
     <div
-      onClick={handleClick}
+      onClick={selectedFile ? handleClick : undefined}
       onDragEnter={handleDragEnter}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
@@ -147,7 +152,7 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
       }}
       aria-label="Upload document dropzone"
     >
-      {/* Hidden native file input triggered programmatically */}
+      {/* Native file input overlay: directly receives click & drop gestures across the entire dropzone */}
       <input
         ref={fileInputRef}
         type="file"
@@ -156,9 +161,17 @@ export const FileDropzone: React.FC<FileDropzoneProps> = ({
         accept={accept}
         disabled={disabled || isLoading}
         onChange={handleInputChange}
-        className="hidden"
-        tabIndex={-1}
-        aria-hidden="true"
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={
+          selectedFile || isLoading || disabled
+            ? 'hidden'
+            : 'absolute inset-0 w-full h-full opacity-0 cursor-pointer z-10'
+        }
+        tabIndex={selectedFile ? -1 : 0}
+        aria-label={title}
       />
 
       {isLoading ? (
