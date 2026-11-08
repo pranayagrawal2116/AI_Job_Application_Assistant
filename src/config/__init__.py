@@ -6,11 +6,12 @@ from typing import Any, Dict
 import yaml
 
 from src.utils.logger import setup_logger
+from src.config.env_loader import load_production_env, validate_production_configuration
 
 logger = setup_logger("ConfigLoader")
 
-# Base project paths
-BASE_DIR = Path(__file__).resolve().parent.parent
+# Base project paths (two levels up from src/config/ is root)
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 CONFIG_DIR = BASE_DIR / "config"
 DATA_DIR = BASE_DIR / "data"
 PROFILE_DIR = DATA_DIR / "profile"
@@ -111,3 +112,15 @@ class AppConfig:
 # Default singleton instance for easy import
 config = AppConfig()
 
+__all__ = [
+    "BASE_DIR",
+    "CONFIG_DIR",
+    "DATA_DIR",
+    "PROFILE_DIR",
+    "AppConfig",
+    "config",
+    "load_yaml",
+    "load_json",
+    "load_production_env",
+    "validate_production_configuration",
+]

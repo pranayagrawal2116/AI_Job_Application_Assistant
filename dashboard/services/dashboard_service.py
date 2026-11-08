@@ -4,6 +4,7 @@ from datetime import date, datetime
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import pandas as pd
 
@@ -55,10 +56,12 @@ class DashboardService:
         self.matcher = JobMatcher(db_manager=self.db)
         self.coordinator = SearchCoordinator(db_manager=self.db, job_matcher=self.matcher)
         self.url_resolver = url_resolver
-        from src.security.file_security import DEFAULT_USER_STORAGE_BASE, FileSecurityValidator
-        self.storage_base_dir = (
-            Path(storage_base_dir).resolve() if storage_base_dir else DEFAULT_USER_STORAGE_BASE.resolve()
-        )
+        from src.security.file_security import get_default_user_storage_base, FileSecurityValidator
+        if storage_base_dir:
+            clean_s = str(storage_base_dir).strip()
+            self.storage_base_dir = Path(clean_s) if re.match(r"^[a-zA-Z]:[\\/]", clean_s) else Path(clean_s).resolve()
+        else:
+            self.storage_base_dir = get_default_user_storage_base()
         self.file_validator = FileSecurityValidator(base_storage_dir=self.storage_base_dir)
 
     def _resolve_url(self, hostname: str, port: int) -> List[str]:

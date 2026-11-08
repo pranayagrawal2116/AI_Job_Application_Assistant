@@ -114,12 +114,36 @@ def get_dashboard_summary(auth_ctx=Depends(get_current_user_and_session)):
                 "priority": "MEDIUM",
             }
     elif candidate_category == "professionally_qualified":
-        role_label = top_role or "accounting & finance"
+        # Check inferred domain from factual credentials
+        inferred_domain = inferencer.infer_career_domain(profile_data)
+        domain_label = inferred_domain.get("domain_label")
+        roles_label = inferred_domain.get("suggested_roles_label")
+
+        if top_role:
+            title = f"Explore {top_role} opportunities"
+            desc = (
+                f"Review {eligible_matches_count} verified opportunities matching your professional qualifications and domain expertise."
+                if eligible_matches_count > 0
+                else f"Discover {top_role} roles tailored to your verified qualifications."
+            )
+        elif domain_label and roles_label:
+            title = f"Explore {domain_label} opportunities"
+            desc = (
+                f"Review {eligible_matches_count} verified opportunities matching your professional qualifications and domain expertise."
+                if eligible_matches_count > 0
+                else f"Discover {roles_label} roles tailored to your verified qualifications."
+            )
+        else:
+            title = "Explore opportunities based on your verified profile"
+            desc = (
+                f"Review {eligible_matches_count} verified opportunities matching your verified qualifications."
+                if eligible_matches_count > 0
+                else "Discover verified opportunities matching your profile credentials and career background."
+            )
+
         recommended_action = {
-            "title": f"Explore {role_label} opportunities",
-            "description": f"Review {eligible_matches_count} verified opportunities matching your professional qualifications and domain expertise."
-            if eligible_matches_count > 0
-            else "Discover finance, tax, and audit roles tailored to your verified qualifications.",
+            "title": title,
+            "description": desc,
             "cta_label": "Explore Jobs",
             "cta_url": "/jobs",
             "priority": "NORMAL",
@@ -145,8 +169,8 @@ def get_dashboard_summary(auth_ctx=Depends(get_current_user_and_session)):
         }
     else:
         recommended_action = {
-            "title": "Explore relevant opportunities",
-            "description": "Discover career opportunities matching your verified skills, education, and career preferences.",
+            "title": "Explore opportunities based on your verified profile",
+            "description": "Discover verified opportunities matching your profile credentials and career background.",
             "cta_label": "Find Jobs",
             "cta_url": "/jobs",
             "priority": "NORMAL",

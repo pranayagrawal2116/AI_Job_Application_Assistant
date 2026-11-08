@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 from typing import Any, Dict, Generator, List, Optional, Set, Tuple, Union
 
@@ -69,24 +70,45 @@ from src.utils.logger import setup_logger
 logger = setup_logger("DatabaseManager")
 
 DEFAULT_SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
-_env_db_path = os.environ.get("DATABASE_PATH") or os.environ.get("SQLITE_DB_PATH")
-DEFAULT_DB_PATH = (
-    Path(_env_db_path).resolve()
-    if _env_db_path
-    else (Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "job_assistant.db")
-)
-_env_exports_dir = os.environ.get("EXPORTS_DIR")
-DEFAULT_EXPORTS_DIR = (
-    Path(_env_exports_dir).resolve()
-    if _env_exports_dir
-    else (Path(__file__).resolve().parent.parent.parent / "data" / "exports")
-)
-_env_backup_dir = os.environ.get("BACKUP_DIR")
-DEFAULT_BACKUP_DIR = (
-    Path(_env_backup_dir).resolve()
-    if _env_backup_dir
-    else (Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "backups")
-)
+
+
+def get_default_db_path() -> Path:
+    """Dynamically resolves the database path from environment or default local location."""
+    env_val = os.environ.get("DATABASE_PATH") or os.environ.get("SQLITE_DB_PATH")
+    if env_val:
+        clean = str(env_val).strip()
+        if re.match(r"^[a-zA-Z]:[\\/]", clean):
+            return Path(clean)
+        return Path(clean).resolve()
+    return Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "job_assistant.db"
+
+
+def get_default_exports_dir() -> Path:
+    """Dynamically resolves the exports directory from environment or default local location."""
+    env_val = os.environ.get("EXPORTS_DIR")
+    if env_val:
+        clean = str(env_val).strip()
+        if re.match(r"^[a-zA-Z]:[\\/]", clean):
+            return Path(clean)
+        return Path(clean).resolve()
+    return Path(__file__).resolve().parent.parent.parent / "data" / "exports"
+
+
+def get_default_backup_dir() -> Path:
+    """Dynamically resolves the backup directory from environment or default local location."""
+    env_val = os.environ.get("BACKUP_DIR")
+    if env_val:
+        clean = str(env_val).strip()
+        if re.match(r"^[a-zA-Z]:[\\/]", clean):
+            return Path(clean)
+        return Path(clean).resolve()
+    return Path(__file__).resolve().parent.parent.parent / "data" / "storage" / "backups"
+
+
+# Module-level defaults for backward compatibility
+DEFAULT_DB_PATH = get_default_db_path()
+DEFAULT_EXPORTS_DIR = get_default_exports_dir()
+DEFAULT_BACKUP_DIR = get_default_backup_dir()
 
 
 ALLOWED_TRANSITIONS: Dict[str, List[str]] = {
@@ -220,15 +242,15 @@ class DatabaseManager:
 
     def __init__(
         self,
-        db_path: Union[str, Path] = DEFAULT_DB_PATH,
+        db_path: Optional[Union[str, Path]] = None,
         schema_path: Union[str, Path] = DEFAULT_SCHEMA_PATH,
         session_manager: Optional[Any] = None,
         service_authenticator: Optional[Any] = None,
     ):
-        self.db_path = str(db_path)
+        self.db_path = str(db_path) if db_path is not None else str(get_default_db_path())
         self.schema_path = Path(schema_path)
-        self.exports_dir = Path(DEFAULT_EXPORTS_DIR)
-        self.backup_dir = Path(DEFAULT_BACKUP_DIR)
+        self.exports_dir = Path(get_default_exports_dir())
+        self.backup_dir = Path(get_default_backup_dir())
         self._service_authenticator: Optional[Any] = None
         if service_authenticator is not None:
             self.set_service_authenticator(service_authenticator)
@@ -1504,7 +1526,30 @@ class DatabaseManager:
         disc_cols = {r["name"]: dict(r) for r in cursor.fetchall()}
         if "total_discovered" not in disc_cols:
             cursor.execute("ALTER TABLE discovery_runs ADD COLUMN total_discovered INTEGER DEFAULT 0")
-        logger.info("discovery_runs migration checked successfully.")
+
+        # Phase C.0: candidate_discovered_jobs table to track unique candidate-to-job associations
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS candidate_discovered_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                discovery_run_id INTEGER REFERENCES discovery_runs(id) ON DELETE SET NULL,
+                discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(user_id, job_id)
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_candidate_discovered_user ON candidate_discovered_jobs(user_id)")
+        try:
+            cursor.execute("""
+                INSERT OR IGNORE INTO candidate_discovered_jobs (user_id, job_id, discovered_at)
+                SELECT DISTINCT user_id, job_id, evaluated_at
+                FROM match_results
+                WHERE user_id IS NOT NULL AND job_id IS NOT NULL
+            """)
+        except Exception as e:
+            logger.debug("Backfill candidate_discovered_jobs note: %s", e)
+
+        logger.info("discovery_runs and candidate_discovered_jobs migration checked successfully.")
 
     def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
         """Migrates applications and lifecycle tables to Phase 7 universal architecture.
@@ -7533,10 +7578,10 @@ class DatabaseManager:
             row = cursor.fetchone()
             total_catalog = row[0] if row else 0
 
-            # 2. Total discovered across user's discovery runs
+            # 2. Total discovery occurrences across user's discovery runs
             cursor.execute("SELECT COALESCE(SUM(total_discovered), 0) FROM discovery_runs WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
-            discovered_runs = row[0] if row else 0
+            total_discovery_occurrences = row[0] if row else 0
 
             # 3. Candidate-specific evaluated matches count (distinct jobs)
             cursor.execute(
@@ -7553,15 +7598,52 @@ class DatabaseManager:
             evaluated_count = row["evaluated_count"] if row else 0
             eligible_count = row["eligible_count"] if row else 0
 
-            # User discovered count is max of discovery run items and evaluated jobs
-            user_discovered = max(discovered_runs, evaluated_count)
+            # 4. Phase C.0: Unique candidate discovered jobs
+            cursor.execute(
+                "SELECT COUNT(DISTINCT job_id) FROM candidate_discovered_jobs WHERE user_id = ?",
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            unique_candidate_discovered = row[0] if row else 0
+
+            # User discovered count is max of unique candidate discovered and evaluated jobs
+            user_discovered = max(unique_candidate_discovered, evaluated_count)
 
             return {
                 "total_catalog_jobs": int(total_catalog),
                 "jobs_discovered_for_user": int(user_discovered),
+                "total_discovery_occurrences": int(total_discovery_occurrences),
                 "evaluated_matches_count": int(evaluated_count),
                 "eligible_matches_count": int(eligible_count),
             }
+
+    def record_candidate_discovered_jobs(
+        self,
+        user_id: int,
+        job_ids: List[int],
+        discovery_run_id: Optional[int] = None,
+    ) -> int:
+        """Associates newly discovered or matched jobs with a candidate user.
+
+        Uses INSERT OR IGNORE to guarantee idempotency and uniqueness per candidate.
+        Returns the number of new associations recorded.
+        """
+        if not job_ids:
+            return 0
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            inserted = 0
+            for jid in set(job_ids):
+                cursor.execute(
+                    """
+                    INSERT OR IGNORE INTO candidate_discovered_jobs (user_id, job_id, discovery_run_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    (user_id, jid, discovery_run_id),
+                )
+                if cursor.rowcount > 0:
+                    inserted += 1
+            return inserted
 
     # -------------------------------------------------------------------------
     # DISCOVERY RUNS PERSISTENCE & LIFECYCLE

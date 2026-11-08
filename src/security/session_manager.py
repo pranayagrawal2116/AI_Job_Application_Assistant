@@ -48,7 +48,7 @@ class KeyRotationManager:
         if initial_secret:
             secret_bytes = self._coerce_bytes(initial_secret)
         else:
-            env_secret = os.environ.get("ACTION_TICKET_SECRET_KEY")
+            env_secret = os.environ.get("SESSION_SECRET_KEY") or os.environ.get("ACTION_TICKET_SECRET_KEY")
             if env_secret:
                 secret_bytes = self._coerce_bytes(env_secret)
             else:
@@ -236,7 +236,7 @@ class SessionManager:
         if server_secret:
             self._rotation_keys[self._active_key_id] = server_secret
         else:
-            env_secret = os.environ.get("ACTION_TICKET_SECRET_KEY")
+            env_secret = os.environ.get("SESSION_SECRET_KEY") or os.environ.get("ACTION_TICKET_SECRET_KEY")
             app_env = os.environ.get("APP_ENV", "development").lower()
 
             if env_secret:
@@ -248,14 +248,14 @@ class SessionManager:
 
                 if len(secret_bytes) < 32:
                     raise SecurityAuthorizationError(
-                        f"ACTION_TICKET_SECRET_KEY has insufficient entropy ({len(secret_bytes)} bytes < 32 bytes required)."
+                        f"Session signing secret has insufficient entropy ({len(secret_bytes)} bytes < 32 bytes required)."
                     )
                 self._rotation_keys[self._active_key_id] = secret_bytes
             elif app_env in ("development", "test"):
                 logger.info("Using ephemeral 256-bit test secret for SessionManager.")
                 self._rotation_keys[self._active_key_id] = secrets.token_bytes(32)
             else:
-                raise SecurityAuthorizationError("ACTION_TICKET_SECRET_KEY must be configured in production environment.")
+                raise SecurityAuthorizationError("SESSION_SECRET_KEY or ACTION_TICKET_SECRET_KEY must be configured in production environment.")
 
         # 2. Load additional rotation keys if provided in environment
         if rotation_keys:

@@ -552,18 +552,23 @@ def trigger_jobs_discovery(
                 max_results_per_source=5,
                 enable_evaluation=False,
             )
-            # Evaluate personalized scores for candidate strictly against all unique jobs discovered (newly saved + existing duplicates)
+            # Identify all relevant unique job IDs from this discovery run
+            relevant_ids = set()
+            for saved_item in summary.saved_jobs:
+                if saved_item.get("id"):
+                    relevant_ids.add(saved_item["id"])
+            for dup_id in getattr(summary, "duplicate_job_ids", []):
+                if dup_id:
+                    relevant_ids.add(dup_id)
+
+            # Record candidate-to-job association to prevent repeated discovery runs from inflating metrics
+            if relevant_ids:
+                service.db.record_candidate_discovered_jobs(user_id, list(relevant_ids), discovery_run_id=run_id)
+
+            # Evaluate personalized scores for candidate strictly against all unique jobs discovered
             resumes = service.get_user_resumes(user_id)
             prim = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
-            if prim:
-                relevant_ids = set()
-                for saved_item in summary.saved_jobs:
-                    if saved_item.get("id"):
-                        relevant_ids.add(saved_item["id"])
-                for dup_id in getattr(summary, "duplicate_job_ids", []):
-                    if dup_id:
-                        relevant_ids.add(dup_id)
-
+            if prim and relevant_ids:
                 for job_id_to_eval in relevant_ids:
                     try:
                         service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job_id_to_eval)

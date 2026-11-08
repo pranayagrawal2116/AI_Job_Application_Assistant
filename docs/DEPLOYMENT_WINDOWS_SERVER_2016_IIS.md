@@ -101,7 +101,14 @@ Copy the production template:
 Copy-Item .env.production.example .env
 ```
 
-Generate unique 256-bit cryptographically secure hex keys for each secret:
+Generate cryptographically secure, unique 256-bit hexadecimal keys for all mandatory production secrets using the automated secrets generator:
+
+```powershell
+# Automatically populate .env with freshly generated 256-bit keys
+python scripts/generate_production_secrets.py --write-env
+```
+
+Alternatively, generate individual keys via the command line:
 
 ```powershell
 python -c "import secrets; print('SESSION_SECRET_KEY=' + secrets.token_hex(32))"
@@ -111,7 +118,7 @@ python -c "import secrets; print('ACTION_TICKET_SECRET_KEY=' + secrets.token_hex
 python -c "import secrets; print('SECURITY_SCAN_SIGNING_KEY=' + secrets.token_hex(32))"
 ```
 
-Open `C:\Apps\AI_Job_Application_Assistant\.env` in Notepad and insert the generated keys. Ensure the following paths are configured:
+Open `C:\Apps\AI_Job_Application_Assistant\.env` and verify the persistent production storage paths:
 
 ```ini
 APP_ENV=production
@@ -121,6 +128,17 @@ DATABASE_PATH=D:\AIJobAssistantData\database\job_assistant.db
 USER_STORAGE_BASE=D:\AIJobAssistantData\users
 BACKUP_DIR=D:\AIJobAssistantData\backups
 EXPORTS_DIR=D:\AIJobAssistantData\exports
+
+# Strict safety and human-in-the-loop flags
+ALLOW_AUTOMATED_SUBMISSION=false
+RESPECT_ROBOTS_TXT=true
+HEADLESS=true
+```
+
+To run preflight configuration verification manually before installing the service:
+
+```powershell
+python -c "from src.config.env_loader import load_production_env, validate_production_configuration; load_production_env(); validate_production_configuration(); print('CONFIGURATION_VALIDATED_SUCCESSFULLY')"
 ```
 
 ---
@@ -176,7 +194,12 @@ Get-Service -Name AIJobAssistant
 1. In **IIS Manager**, create a new Web Site or select the existing `Default Web Site`.
 2. Point the Physical Path to `C:\Apps\AI_Job_Application_Assistant\deploy\iis` (or copy `deploy\iis\web.config` into your designated IIS site root).
 3. Bind an SSL/TLS Certificate to Port 443 (HTTPS) on your public domain (e.g., `careers-assistant.yourdomain.com`).
-4. Ensure Port 8000 is **NOT** exposed on the public Windows Firewall. Only Port 80 and Port 443 should be allowed externally.
+4. **Configure Allowed Server Variables in IIS:**
+   In IIS Manager, select the site or server, open **URL Rewrite**, click **View Server Variables...** in the Actions pane, and add:
+   - `HTTP_X_FORWARDED_FOR`
+   - `HTTP_X_FORWARDED_PROTO`
+   - `HTTP_X_FORWARDED_HOST`
+5. Ensure Port 8000 is **NOT** exposed on the public Windows Firewall. Only Port 80 and Port 443 should be allowed externally.
 
 ---
 
@@ -186,12 +209,27 @@ Get-Service -Name AIJobAssistant
 1. **Local Health Probe:**
    ```powershell
    Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health"
-   # Returns: {"status":"healthy","version":"2.1.1","framework":"FastAPI + React SaaS","discovery_subsystem":{"ready":true,"recovery_error":null},"single_worker_mode":true}
+   # Returns:
+   # {
+   #   "status": "healthy",
+   #   "version": "2.1.1",
+   #   "framework": "FastAPI + React SaaS",
+   #   "environment": {
+   #     "app_env": "production",
+   #     "database_connected": true,
+   #     "persistent_storage_ready": true,
+   #     "database_path": "D:\\AIJobAssistantData\\database\\job_assistant.db",
+   #     "storage_base": "D:\\AIJobAssistantData\\users",
+   #     "db_error": null
+   #   },
+   #   "configuration_subsystem": {"ready": true, "error": null},
+   #   "discovery_subsystem": {"ready": true, "recovery_error": null},
+   #   "single_worker_mode": true
+   # }
    ```
 2. **External Reverse-Proxy Probe:**
    ```powershell
    Invoke-RestMethod -Uri "https://careers-assistant.yourdomain.com/api/health"
-   # Returns: {"status":"healthy", ...}
    ```
 
 #### Service Control Commands
@@ -210,32 +248,33 @@ Start-Service -Name AIJobAssistant
 ```
 
 #### Scheduled Daily Backups
-To schedule automated daily database backups at 02:00 AM:
+To schedule automated daily database backups at 02:00 AM with SQLite integrity verification:
 
 ```powershell
 $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-ExecutionPolicy Bypass -File C:\Apps\AI_Job_Application_Assistant\deploy\windows\backup_database.ps1"
 $trigger = New-ScheduledTaskTrigger -Daily -At 2am
-Register-ScheduledTask -Action $action -Trigger $trigger -TaskName "AIJobAssistant_DailyBackup" -Description "Atomic SQLite online database backup" -User "NT AUTHORITY\SYSTEM"
+Register-ScheduledTask -Action $action -Trigger $trigger -TaskName "AIJobAssistant_DailyBackup" -Description "Atomic SQLite online database backup with PRAGMA integrity_check" -User "NT AUTHORITY\SYSTEM"
 ```
 
 ---
 
 ### 5. Troubleshooting & FAQ
 
-#### Q: The browser shows "Connecting..." or "Please wait..." and never loads.
-- **Cause:** WebSocket connection is failing through the IIS reverse proxy.
+#### Q: Service fails to start with "CONFIG_PREFLIGHT_ERROR" during service_install.ps1.
+- **Cause:** One or more production secrets in `.env` are still placeholder strings, have insufficient entropy, or match each other.
 - **Solution:**
-  1. Verify the IIS WebSocket Protocol feature is installed:
-     ```powershell
-     Get-WindowsFeature Web-WebSockets
-     ```
-  2. Verify that `deploy/iis/web.config` contains the WebSocket rewrite rule (`HTTP_UPGRADE = websocket`).
-  3. Ensure ARR Server Proxy settings have **WebSockets** enabled.
+  Run the automated secret generator:
+  ```powershell
+  python scripts/generate_production_secrets.py --write-env
+  ```
+  Then re-run `deploy/windows/service_install.ps1`.
 
 #### Q: Large resume or document upload fails with HTTP 413 or "Request Entity Too Large".
 - **Cause:** IIS request size ceiling is exceeded.
-- **Solution:** `deploy/iis/web.config` specifies `<requestLimits maxAllowedContentLength="31457280" />` (30 MB). Ensure this matches or exceeds `.streamlit/config.toml` `maxUploadSize = 25`.
+- **Solution:** `deploy/iis/web.config` specifies `<requestLimits maxAllowedContentLength="10485760" />` (10 MB). The application enforces a strict 10 MB file cap. Resumes or job description documents exceeding 10 MB must be compressed or trimmed by the candidate.
 
 #### Q: Database is locked error (`sqlite3.OperationalError: database is locked`).
-- **Cause:** SQLite database stored on a shared network drive (SMB/CIFS) rather than local storage.
-- **Solution:** Strictly store the SQLite database on local physical drives (`D:\AIJobAssistantData\database\job_assistant.db`), never on network shares.
+- **Cause:** Multiple worker processes configured or SQLite database stored on a shared network drive (SMB/CIFS) rather than local storage.
+- **Solution:**
+  1. Strictly store the SQLite database on local physical drives (`D:\AIJobAssistantData\database\job_assistant.db`), never on network shares.
+  2. Verify that Uvicorn is launched with `--workers 1`. Multiple workers must not access SQLite concurrently.

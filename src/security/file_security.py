@@ -42,12 +42,18 @@ logger = setup_logger("FileSecurity")
 MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 MAX_UNCOMPRESSED_DOCX_BYTES = 50 * 1024 * 1024  # 50 MB zip decompression ceiling
 MAX_CONFIRMATION_IMAGE_PIXELS = 25_000_000  # 25 megapixels safe decompression ceiling
-_env_user_storage = os.environ.get("USER_STORAGE_BASE") or os.environ.get("USER_DATA_DIR")
-DEFAULT_USER_STORAGE_BASE = (
-    Path(_env_user_storage).resolve()
-    if _env_user_storage
-    else (Path(__file__).resolve().parent.parent.parent / "data" / "users")
-)
+def get_default_user_storage_base() -> Path:
+    """Dynamically resolves the candidate user storage directory from environment or default local location."""
+    env_val = os.environ.get("USER_STORAGE_BASE") or os.environ.get("USER_DATA_DIR")
+    if env_val:
+        clean = str(env_val).strip()
+        if re.match(r"^[a-zA-Z]:[\\/]", clean):
+            return Path(clean)
+        return Path(clean).resolve()
+    return Path(__file__).resolve().parent.parent.parent / "data" / "users"
+
+
+DEFAULT_USER_STORAGE_BASE = get_default_user_storage_base()
 
 PDF_MAGIC = b"%PDF-"
 DOCX_MAGIC = b"PK\x03\x04"
@@ -66,7 +72,7 @@ class FileSecurityValidator:
     """Validates document security, structural integrity, and isolated filesystem persistence."""
 
     def __init__(self, base_storage_dir: Path | None = None):
-        self.base_storage_dir = Path(base_storage_dir) if base_storage_dir else DEFAULT_USER_STORAGE_BASE
+        self.base_storage_dir = Path(base_storage_dir) if base_storage_dir else get_default_user_storage_base()
 
     def get_candidate_storage_root(self, user_id: int) -> Path:
         """Returns the isolated private root directory for a candidate (data/users/<user_id>/)."""

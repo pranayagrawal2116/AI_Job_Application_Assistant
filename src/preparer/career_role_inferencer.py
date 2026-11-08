@@ -782,3 +782,116 @@ class CareerRoleInferencer:
             "missing_sections": missing_sections,
             "is_application_ready": total_score >= 80,
         }
+
+    def infer_career_domain(self, data: Any) -> Dict[str, Any]:
+        """Infers the candidate's professional domain based strictly on factual credentials and degrees.
+
+        Never defaults to finance, accounting, or AI/ML without empirical evidence.
+        Recognized domains:
+            - accounting_finance: ACCA, CA, CPA, CMA, Tax, Audit, Accounting
+            - healthcare: MBBS, MD, Physician, Nurse, Clinical, Medical, BDS, Pharmacist
+            - legal: Bar, LLB, LLM, Attorney, Lawyer, Legal Counsel, Juris Doctor
+            - investment_risk: CFA, FRM, Portfolio Management, Risk Manager
+            - project_management: PMP, PMI, Prince2, Scrum Master, Agile Coach
+            - engineering_tech: Computer Science, Software, Engineering, Data Science, AI
+        """
+        norm = self._normalize_input(data)
+
+        # Check credentials, certifications, degrees, headlines, and work experience
+        certs = norm.get("certifications", []) + norm.get("professional_qualifications", [])
+        edus = norm.get("education", [])
+        exps = norm.get("work_experience", [])
+        headline = (norm.get("headline") or norm.get("professional_headline") or "").lower()
+
+        evidence_texts: List[str] = [headline]
+        for c in certs:
+            evidence_texts.append(str(c.get("name", "") if isinstance(c, dict) else c).lower())
+        for e in edus:
+            evidence_texts.append((e.get("degree") or "").lower())
+            evidence_texts.append((e.get("field_of_study") or e.get("major") or "").lower())
+        for x in exps:
+            evidence_texts.append((x.get("job_title") or "").lower())
+
+        combined_text = " ".join(evidence_texts)
+
+        domain_definitions = [
+            {
+                "id": "accounting_finance",
+                "label": "Accounting & Finance",
+                "roles_label": "accounting, audit, and tax",
+                "patterns": [
+                    r"\bacca\b", r"\bcpa\b", r"\bca\b", r"\bchartered accountant\b",
+                    r"\bcma\b", r"\btax\b", r"\baudit\b", r"\baccounting\b",
+                    r"\bcost accountant\b", r"\bfinancial reporting\b", r"\bstatutory audit\b"
+                ],
+            },
+            {
+                "id": "healthcare",
+                "label": "Healthcare & Medicine",
+                "roles_label": "clinical and healthcare",
+                "patterns": [
+                    r"\bmbbs\b", r"\bmd\b", r"\bm\.d\.\b", r"\bphysician\b",
+                    r"\bnurse\b", r"\brn\b", r"\bregistered nurse\b", r"\bclinical\b",
+                    r"\bmedical\b", r"\bsurgeon\b", r"\bbds\b", r"\bpharmacist\b",
+                    r"\bpharmd\b", r"\bhealthcare\b"
+                ],
+            },
+            {
+                "id": "legal",
+                "label": "Legal & Compliance",
+                "roles_label": "legal and compliance",
+                "patterns": [
+                    r"\bbar\b", r"\bllb\b", r"\bllm\b", r"\battorney\b",
+                    r"\blawyer\b", r"\blegal counsel\b", r"\bjuris doctor\b",
+                    r"\bjd\b", r"\badvocate\b", r"\bcompliance officer\b", r"\blitigation\b"
+                ],
+            },
+            {
+                "id": "investment_risk",
+                "label": "Investment & Risk",
+                "roles_label": "investment and risk management",
+                "patterns": [
+                    r"\bcfa\b", r"\bfrm\b", r"\bchartered financial analyst\b",
+                    r"\bfinancial risk manager\b", r"\bportfolio manager\b",
+                    r"\bequity research\b", r"\brisk analyst\b", r"\bhedge fund\b"
+                ],
+            },
+            {
+                "id": "project_management",
+                "label": "Project Management",
+                "roles_label": "project and program management",
+                "patterns": [
+                    r"\bpmp\b", r"\bpmi\b", r"\bprince2\b", r"\bscrum master\b",
+                    r"\bcsm\b", r"\bagile coach\b", r"\bprogram manager\b"
+                ],
+            },
+            {
+                "id": "engineering_tech",
+                "label": "Engineering & Technology",
+                "roles_label": "software engineering and technology",
+                "patterns": [
+                    r"\bsoftware engineer\b", r"\bcomputer science\b",
+                    r"\bsoftware developer\b", r"\bdata scientist\b",
+                    r"\bmachine learning\b", r"\bb\.tech\b", r"\bm\.tech\b",
+                    r"\belectrical engineering\b", r"\bmechanical engineering\b",
+                    r"\bcivil engineering\b"
+                ],
+            },
+        ]
+
+        for d in domain_definitions:
+            matched_pats = [p for p in d["patterns"] if re.search(p, combined_text, re.IGNORECASE)]
+            if matched_pats:
+                return {
+                    "domain": d["id"],
+                    "domain_label": d["label"],
+                    "suggested_roles_label": d["roles_label"],
+                    "supporting_patterns": matched_pats,
+                }
+
+        return {
+            "domain": None,
+            "domain_label": None,
+            "suggested_roles_label": None,
+            "supporting_patterns": [],
+        }
