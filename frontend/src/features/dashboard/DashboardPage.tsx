@@ -62,14 +62,14 @@ export const DashboardPage: React.FC = () => {
           <div className="max-w-xl">
             <span className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-white/10 text-white/90 text-xs font-semibold backdrop-blur-md mb-3 border border-white/10">
               <Sparkles size={13} className="text-brand-300" />
-              Candidate Command Center
+              <span>Candidate Command Center{summary?.category_label ? ` · ${summary.category_label}` : ''}</span>
             </span>
             <h1 className="text-2xl sm:text-3xl font-extrabold tracking-tight">
               Good day, {user?.full_name || 'Candidate'}
             </h1>
             <p className="mt-1.5 text-sm text-slate-300 leading-relaxed">
-              You have <strong className="text-white">{summary?.total_opportunities || 0}</strong> active
-              job opportunities matching your career criteria.
+              You have <strong className="text-white">{summary?.eligible_matches_count ?? summary?.eligible_opportunities ?? 0}</strong> verified
+              eligible opportunities ({summary?.total_catalog_jobs ?? summary?.total_opportunities ?? 0} active in catalogue).
             </p>
           </div>
 
@@ -102,7 +102,11 @@ export const DashboardPage: React.FC = () => {
             <div>
               <p className="text-xs font-bold text-white">Profile Readiness</p>
               <p className="text-[11px] text-slate-300 mt-0.5">
-                {completeness >= 80 ? 'Application Ready' : 'Needs more details'}
+                {completeness >= 80
+                  ? 'Application Ready'
+                  : summary?.missing_sections && summary.missing_sections.length > 0
+                  ? `Pending: ${summary.missing_sections[0]}`
+                  : 'Needs more details'}
               </p>
               <Link
                 to="/profile"
@@ -268,7 +272,9 @@ export const DashboardPage: React.FC = () => {
                   </div>
                   <div className="text-left">
                     <p className="text-xs font-bold text-slate-800">Find Jobs</p>
-                    <p className="text-[11px] text-slate-400">Search 55+ opportunities</p>
+                    <p className="text-[11px] text-slate-400">
+                      Explore {summary?.total_catalog_jobs || 50}+ opportunities
+                    </p>
                   </div>
                 </div>
                 <ArrowRight size={14} className="text-slate-400 group-hover:text-brand-600" />

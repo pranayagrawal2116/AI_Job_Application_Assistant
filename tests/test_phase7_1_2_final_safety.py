@@ -443,34 +443,38 @@ class TestMigrationLockOrderingAndPreflightRollback(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_preflight_failure_aborts_and_rolls_back_cleanly(self):
-        """If preflight fails (e.g. applications with NULL user_id), transaction rolls back cleanly."""
+        """If preflight fails (e.g. cross-user resume references), transaction rolls back cleanly."""
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, password_hash TEXT, full_name TEXT)")
         cursor.execute("INSERT INTO users VALUES (1, 'alice@example.com', 'h1', 'Alice')")
+        cursor.execute("INSERT INTO users VALUES (2, 'bob@example.com', 'h2', 'Bob')")
+        cursor.execute("CREATE TABLE resumes (id INTEGER PRIMARY KEY, user_id INTEGER, filename TEXT)")
+        cursor.execute("INSERT INTO resumes VALUES (10, 2, 'bobs_resume.pdf')")
         cursor.execute("""
             CREATE TABLE applications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
+                resume_id INTEGER,
                 company_name TEXT NOT NULL,
                 job_title TEXT NOT NULL,
                 status TEXT
             )
         """)
-        # Insert corrupted application with NULL user_id
-        cursor.execute("INSERT INTO applications (id, user_id, company_name, job_title, status) VALUES (1, NULL, 'CorruptCorp', 'Engineer', 'DRAFT')")
+        # Insert cross-user application where Alice references Bob's resume
+        cursor.execute("INSERT INTO applications (id, user_id, resume_id, company_name, job_title, status) VALUES (1, 1, 10, 'CorruptCorp', 'Engineer', 'DRAFT')")
         conn.commit()
         conn.close()
 
-        # DatabaseManager initialization must fail preflight check 1
+        # DatabaseManager initialization must fail preflight check
         with self.assertRaises(MigrationPreflightError) as ctx:
             DatabaseManager(self.db_path)
-        self.assertIn("NULL user_id", str(ctx.exception))
+        self.assertIn("resumes owned by another user", str(ctx.exception))
 
         # Confirm the database remained un-migrated and unmodified
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM applications WHERE user_id IS NULL")
+        cursor.execute("SELECT COUNT(*) FROM applications WHERE resume_id = 10")
         self.assertEqual(cursor.fetchone()[0], 1)
         # Temporary v7 table must not exist
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='applications_v7'")

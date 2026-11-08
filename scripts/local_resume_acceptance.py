@@ -52,8 +52,8 @@ def run_acca_assertions(parser: ResumeParser, inferencer: CareerRoleInferencer, 
         ("4. LinkedIn profile URL extracted", bool(parsed.linkedin_url and "linkedin.com/in/" in parsed.linkedin_url)),
         ("5. Education extracted (>= 2 degrees/qualifications)", len(parsed.education) >= 2),
         ("6. BBA degree recognized", any("bba" in e.degree.lower() for e in parsed.education)),
-        ("7. BBA CGPA verified", any(e.cgpa is not None and e.cgpa > 7.0 for e in parsed.education if "bba" in e.degree.lower())),
-        ("8. Secondary/HSC qualification percentage verified", any(e.percentage is not None and e.percentage > 85.0 for e in parsed.education)),
+        ("7. BBA CGPA verified (~7.69)", any(e.cgpa is not None and abs(e.cgpa - 7.69) <= 0.15 for e in parsed.education if "bba" in e.degree.lower())),
+        ("8. Secondary/HSC qualification percentage verified (~93.8%)", any(e.percentage is not None and abs(e.percentage - 93.8) <= 0.6 for e in parsed.education)),
         ("9. ACCA professional qualification recognized", any("acca" in c.name.lower() for c in parsed.certifications)),
         ("10. Work Experience entries extracted (>= 2)", len(parsed.work_experience) >= 2),
         ("11. ACCA PER records extracted (>= 4)", len(parsed.per_experience) >= 4),
@@ -86,7 +86,7 @@ def run_cse_assertions(parser: ResumeParser, inferencer: CareerRoleInferencer, p
         ("3. Academic institution recognized (MIT WPU / University)", any("mit" in e.institution.lower() or "university" in e.institution.lower() for e in parsed.education)),
         ("4. B.Tech Computer Science and Engineering degree recognized", any("b.tech" in e.degree.lower() or "computer science" in (e.major or "").lower() for e in parsed.education)),
         ("5. AI and Data Science specialization verified", any("artificial intelligence" in (e.major or "").lower() or "data science" in (e.major or "").lower() for e in parsed.education)),
-        ("6. Academic CGPA verified (>= 7.5)", any(e.cgpa is not None and e.cgpa >= 7.5 for e in parsed.education)),
+        ("6. Academic CGPA verified (~7.6)", any(e.cgpa is not None and abs(e.cgpa - 7.6) <= 0.15 for e in parsed.education)),
         ("7. Expected graduation year verified (2028)", any(e.expected_graduation_year == 2028 for e in parsed.education)),
         ("8. Work experience extracted", len(parsed.work_experience) >= 1),
         ("9. Technical projects extracted", len(parsed.projects) >= 1),
@@ -114,7 +114,7 @@ def main():
     engine_inferencer = CareerRoleInferencer()
 
     print("\n" + "=" * 75)
-    print("JOBFLOW AI — PHASE B.3.3 LOCAL RESUME ACCEPTANCE TEST SUITE")
+    print("JOBFLOW AI — PHASE B.4 LOCAL RESUME ACCEPTANCE TEST SUITE")
     print("=" * 75)
 
     if args.synthetic:
@@ -197,8 +197,8 @@ def main():
     print("\nMODE: Real Reference Resume Document Acceptance")
     acca_hash = compute_file_hash(acca_path)
     cse_hash = compute_file_hash(cse_path)
-    print(f"  [PROVENANCE] ACCA Reference File: {acca_path.name} | SHA-256: {acca_hash[:16]}...{acca_hash[-8:]}")
-    print(f"  [PROVENANCE] CSE Reference File:  {cse_path.name}  | SHA-256: {cse_hash[:16]}...{cse_hash[-8:]}")
+    print(f"  [PROVENANCE] ACCA Reference Document | SHA-256: {acca_hash[:16]}...{acca_hash[-8:]}")
+    print(f"  [PROVENANCE] CSE Reference Document  | SHA-256: {cse_hash[:16]}...{cse_hash[-8:]}")
 
     print("\n[TEST A] Evaluating Real ACCA Reference Document...")
     acca_ok, acca_assertions = run_acca_assertions(engine_parser, engine_inferencer, acca_path)

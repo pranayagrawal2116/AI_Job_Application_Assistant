@@ -52,8 +52,8 @@ Phase B.3.3 solidifies JobFlow AI's discovery data pipeline, background executio
 ### 3.1 Local Resume Acceptance CLI Results
 ```
 MODE: Real Reference Resume Document Acceptance
-  [PROVENANCE] ACCA Reference File: Pranjali Agrawal Resume.pdf | SHA-256: 9f996517398427fa...b2227490
-  [PROVENANCE] CSE Reference File:  Pranay_Agrawal_Resume.pdf  | SHA-256: 823c5c666be6fe05...19fbde7d
+  [PROVENANCE] ACCA Reference File: ACCA_REFERENCE_DOCUMENT | SHA-256: 9f996517398427fa...b2227490
+  [PROVENANCE] CSE Reference File:  CSE_REFERENCE_DOCUMENT  | SHA-256: 823c5c666be6fe05...19fbde7d
 
 [TEST A] Evaluating Real ACCA Reference Document...
   [PASS] 1. Candidate identity extracted

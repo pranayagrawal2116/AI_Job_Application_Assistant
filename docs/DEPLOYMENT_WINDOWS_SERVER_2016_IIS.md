@@ -125,21 +125,28 @@ EXPORTS_DIR=D:\AIJobAssistantData\exports
 
 ---
 
-#### Step 3.5: Configure Streamlit
-The repository already provides `.streamlit/config.toml` pre-configured for production:
-- `headless = true`
-- `address = "127.0.0.1"`
-- `port = 8501`
-- `enableCORS = true`
-- `enableXsrfProtection = true`
-- `maxUploadSize = 25`
+#### Step 3.5: Build React Frontend & Verify Single-Worker Execution
+The modern SaaS interface uses React + TypeScript + Vite, served directly by FastAPI from `frontend/dist`.
+Before running in production, build the static assets:
+
+```powershell
+Set-Location C:\Apps\AI_Job_Application_Assistant\frontend
+npm ci
+npm run build
+Set-Location C:\Apps\AI_Job_Application_Assistant
+```
+
+> [!IMPORTANT]
+> **Single-Worker Constraint (`--workers 1`):**
+> JobFlow AI utilizes an embedded SQLite database engine with atomic WAL mode and in-process background worker execution for resume extraction and job discovery.
+> Multiple Uvicorn worker processes must NOT be configured. Running more than 1 worker will cause concurrency conflicts during startup discovery recovery and multi-tenant locking. Exactly one worker (`--workers 1`) is officially supported and enforced in `service_install.ps1`.
 
 To test the application interactively before registering the Windows service:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\windows\run_app.ps1
 ```
-Open a browser on the server and navigate to `http://127.0.0.1:8501`. Once verified, press `Ctrl+C` to stop.
+Open a browser on the server and navigate to `http://127.0.0.1:8000/api/health`. Once verified, press `Ctrl+C` to stop.
 
 ---
 
@@ -153,7 +160,7 @@ powershell -ExecutionPolicy Bypass -File .\deploy\windows\service_install.ps1
 This automated script performs:
 1. Directory creation on `D:\AIJobAssistantData\` (`database`, `users`, `backups`, `logs`, `exports`).
 2. Setting NTFS permissions so `SYSTEM` and `NETWORK SERVICE` have full control.
-3. Registering the service `AIJobAssistant` with automatic startup (`SERVICE_AUTO_START`).
+3. Registering the service `AIJobAssistant` running `python -m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --workers 1` with automatic startup (`SERVICE_AUTO_START`).
 4. Configuring automatic log rotation at 10 MB per log in `D:\AIJobAssistantData\logs\`.
 5. Starting the service.
 
@@ -169,7 +176,7 @@ Get-Service -Name AIJobAssistant
 1. In **IIS Manager**, create a new Web Site or select the existing `Default Web Site`.
 2. Point the Physical Path to `C:\Apps\AI_Job_Application_Assistant\deploy\iis` (or copy `deploy\iis\web.config` into your designated IIS site root).
 3. Bind an SSL/TLS Certificate to Port 443 (HTTPS) on your public domain (e.g., `careers-assistant.yourdomain.com`).
-4. Ensure Port 8501 is **NOT** exposed on the public Windows Firewall. Only Port 80 and Port 443 should be allowed externally.
+4. Ensure Port 8000 is **NOT** exposed on the public Windows Firewall. Only Port 80 and Port 443 should be allowed externally.
 
 ---
 
@@ -178,13 +185,13 @@ Get-Service -Name AIJobAssistant
 #### Health Check Verification
 1. **Local Health Probe:**
    ```powershell
-   Invoke-RestMethod -Uri "http://127.0.0.1:8501/_stcore/health"
-   # Returns: ok
+   Invoke-RestMethod -Uri "http://127.0.0.1:8000/api/health"
+   # Returns: {"status":"healthy","version":"2.1.1","framework":"FastAPI + React SaaS","discovery_subsystem":{"ready":true,"recovery_error":null},"single_worker_mode":true}
    ```
 2. **External Reverse-Proxy Probe:**
    ```powershell
-   Invoke-RestMethod -Uri "https://careers-assistant.yourdomain.com/_stcore/health"
-   # Returns: ok
+   Invoke-RestMethod -Uri "https://careers-assistant.yourdomain.com/api/health"
+   # Returns: {"status":"healthy", ...}
    ```
 
 #### Service Control Commands

@@ -1483,6 +1483,10 @@ class DashboardService:
 
         return counts
 
+    def get_candidate_dashboard_metrics(self, user_id: int) -> Dict[str, Any]:
+        """Returns candidate-scoped matching metrics without global catalog score contamination."""
+        return self.db.get_candidate_matching_metrics(user_id)
+
     def get_candidate_application_match_detail(
         self,
         application_id: int,

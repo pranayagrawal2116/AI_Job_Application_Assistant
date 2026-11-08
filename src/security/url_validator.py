@@ -58,6 +58,9 @@ EXTRA_BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),          # IPv6 Link-Local
 ]
 
+# RFC 6052 Well-Known Prefix for IPv4/IPv6 translation (NAT64 / DNS64)
+NAT64_WELL_KNOWN_PREFIX = ipaddress.IPv6Network("64:ff9b::/96")
+
 
 class URLSafetyValidator:
     """Validates destination safety against SSRF and private network access."""
@@ -81,6 +84,14 @@ class URLSafetyValidator:
         # Controlled test IP bypass for integration testing
         if cls._test_allowed_ips and str(ip) in cls._test_allowed_ips:
             return False
+
+        # RFC 6052 NAT64 Well-Known Prefix (64:ff9b::/96)
+        # Python standard library sets is_reserved=True for 64:ff9b::/96.
+        # On networks with DNS64/NAT64, public IPv4 addresses are synthesized
+        # under this prefix. Extract and evaluate the embedded IPv4 address.
+        if isinstance(ip, ipaddress.IPv6Address) and ip in NAT64_WELL_KNOWN_PREFIX:
+            embedded_v4 = ipaddress.IPv4Address(ip.packed[-4:])
+            return cls.is_ip_private_or_restricted(embedded_v4)
 
         # Check global routability first
         if not ip.is_global:

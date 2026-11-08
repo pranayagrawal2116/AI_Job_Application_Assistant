@@ -1633,13 +1633,27 @@ class DatabaseManager:
             except Exception:
                 pass
 
-            cursor.execute("""
-                SELECT id, job_id, job_description_id, user_id, resume_id,
-                       company_name, job_title, status, application_source,
-                       external_application_url, target_role, employment_type,
-                       location, salary_range, application_deadline, date_prepared,
-                       date_submitted, resume_used, cover_letter_reference, notes,
-                       is_archived, created_at, updated_at
+            select_cols = []
+            for col in [
+                "id", "job_id", "job_description_id", "user_id", "resume_id",
+                "company_name", "job_title", "status", "application_source",
+                "external_application_url", "target_role", "employment_type",
+                "location", "salary_range", "application_deadline", "date_prepared",
+                "date_submitted", "resume_used", "cover_letter_reference", "notes",
+                "is_archived", "created_at", "updated_at"
+            ]:
+                if col in app_cols:
+                    select_cols.append(col)
+                elif col == "company_name":
+                    select_cols.append("COALESCE((SELECT company_name FROM jobs WHERE jobs.id = applications.job_id), 'Unknown') AS company_name")
+                elif col == "job_title":
+                    select_cols.append("COALESCE((SELECT job_title FROM jobs WHERE jobs.id = applications.job_id), 'Role') AS job_title")
+                else:
+                    select_cols.append(f"NULL AS {col}")
+            select_clause = ", ".join(select_cols)
+
+            cursor.execute(f"""
+                SELECT {select_clause}
                 FROM applications
                 WHERE user_id IS NULL OR user_id NOT IN (SELECT id FROM users)
             """)
@@ -7504,6 +7518,50 @@ class DatabaseManager:
                 if mr.job_id is not None and mr.job_id not in results:
                     results[mr.job_id] = mr
             return results
+
+    def get_candidate_matching_metrics(self, user_id: int) -> Dict[str, int]:
+        """Calculates candidate-specific matching and catalog metrics.
+
+        Strictly scopes match and eligibility metrics to MatchResult records evaluated
+        for the given candidate user_id, completely avoiding leakage of global Job catalog scores.
+        """
+        with self.connection() as conn:
+            cursor = conn.cursor()
+
+            # 1. Total shared catalog listings
+            cursor.execute("SELECT COUNT(*) FROM jobs")
+            row = cursor.fetchone()
+            total_catalog = row[0] if row else 0
+
+            # 2. Total discovered across user's discovery runs
+            cursor.execute("SELECT COALESCE(SUM(total_discovered), 0) FROM discovery_runs WHERE user_id = ?", (user_id,))
+            row = cursor.fetchone()
+            discovered_runs = row[0] if row else 0
+
+            # 3. Candidate-specific evaluated matches count (distinct jobs)
+            cursor.execute(
+                """
+                SELECT 
+                    COUNT(DISTINCT job_id) as evaluated_count,
+                    COUNT(DISTINCT CASE WHEN eligibility_status = 'ELIGIBLE' THEN job_id END) as eligible_count
+                FROM match_results
+                WHERE user_id = ? AND job_id IS NOT NULL
+                """,
+                (user_id,)
+            )
+            row = cursor.fetchone()
+            evaluated_count = row["evaluated_count"] if row else 0
+            eligible_count = row["eligible_count"] if row else 0
+
+            # User discovered count is max of discovery run items and evaluated jobs
+            user_discovered = max(discovered_runs, evaluated_count)
+
+            return {
+                "total_catalog_jobs": int(total_catalog),
+                "jobs_discovered_for_user": int(user_discovered),
+                "evaluated_matches_count": int(evaluated_count),
+                "eligible_matches_count": int(eligible_count),
+            }
 
     # -------------------------------------------------------------------------
     # DISCOVERY RUNS PERSISTENCE & LIFECYCLE

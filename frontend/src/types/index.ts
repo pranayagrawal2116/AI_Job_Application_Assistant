@@ -15,20 +15,33 @@ export interface AuthResponse {
 
 export interface DashboardSummary {
   profile_completeness: number;
+  candidate_category?: string;
+  category_label?: string;
+  evidence_breakdown?: Record<string, number>;
+  missing_sections?: string[];
   resume_count: number;
   total_opportunities: number;
+  total_catalog_jobs?: number;
+  jobs_discovered_for_user?: number;
+  evaluated_matches_count?: number;
   eligible_opportunities: number;
+  eligible_matches_count?: number;
   saved_count: number;
+  saved_jobs_count?: number;
   preparing_count: number;
   review_count: number;
+  awaiting_review_count?: number;
   submitted_count: number;
   interview_count: number;
+  applications_in_progress?: number;
   pending_follow_ups: number;
+  pending_follow_ups_count?: number;
   recommended_action: {
     title: string;
     description: string;
     cta_label: string;
     cta_url: string;
+    priority?: string;
   };
 }
 

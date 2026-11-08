@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from pydantic import BaseModel
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
@@ -471,9 +471,19 @@ class JobsDiscoveryRequest(BaseModel):
 def trigger_jobs_discovery(
     req: Optional[JobsDiscoveryRequest] = None,
     background_tasks: BackgroundTasks = None,
+    request: Request = None,
     auth_ctx=Depends(get_current_user_and_session),
 ):
     """Initiates non-blocking background job discovery and returns run identifier immediately."""
+    if request:
+        discovery_ready = getattr(request.app.state, "discovery_ready", True)
+        if not discovery_ready:
+            rec_err = getattr(request.app.state, "discovery_recovery_error", "Unknown startup recovery error")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Discovery subsystem degraded due to startup recovery failure ({rec_err}). Please inspect database lock or restart the server.",
+            )
+
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
 

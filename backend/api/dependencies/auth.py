@@ -1,15 +1,5 @@
 """Authentication dependency for FastAPI endpoints."""
 
-from typing import Optional, Tuple
-from fastapi import Cookie, Header, HTTPException, status
-from src.security.session_manager import SessionManager
-from dashboard.services.dashboard_service import DashboardService
-from src.database.exceptions import SecurityAuthorizationError, InvalidSessionError
-
-
-"""Authentication dependency for FastAPI endpoints."""
-
-import os
 import hmac
 from typing import Optional, Tuple
 from fastapi import Cookie, Header, HTTPException, Request, status

@@ -42,8 +42,12 @@ async def lifespan(app: FastAPI):
             logger.warning("Recovered %d interrupted discovery run(s) on server startup.", recovered)
         else:
             logger.info("Startup recovery: Zero interrupted discovery runs found.")
+        app.state.discovery_ready = True
+        app.state.discovery_recovery_error = None
     except Exception as e:
-        logger.error("Failed to recover interrupted discovery runs on startup: %s", e)
+        logger.critical("Failed to recover interrupted discovery runs on startup: %s", e)
+        app.state.discovery_ready = False
+        app.state.discovery_recovery_error = str(e)
 
     yield
     logger.info("FastAPI application shutdown.")
@@ -86,13 +90,26 @@ app.include_router(settings.router)
 
 
 @app.get("/api/health")
-def health_check():
-    """Health check endpoint for reverse proxy monitoring."""
-    return {
-        "status": "healthy",
-        "version": "2.1.1",
-        "framework": "FastAPI + React SaaS",
-    }
+def health_check(request: Request):
+    """Health check endpoint for reverse proxy and service readiness monitoring."""
+    discovery_ready = getattr(request.app.state, "discovery_ready", True)
+    recovery_error = getattr(request.app.state, "discovery_recovery_error", None)
+
+    is_healthy = discovery_ready
+    status_code = 200 if is_healthy else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "status": "healthy" if is_healthy else "degraded",
+            "version": "2.1.1",
+            "framework": "FastAPI + React SaaS",
+            "discovery_subsystem": {
+                "ready": discovery_ready,
+                "recovery_error": recovery_error,
+            },
+            "single_worker_mode": True,
+        },
+    )
 
 
 # Mount built frontend if available (Production & IIS deployment mode)

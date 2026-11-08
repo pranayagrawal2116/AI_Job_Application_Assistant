@@ -2,16 +2,16 @@ name: CI & Regression Pipeline
 
 on:
   push:
-    branches: [ main ]
+    branches: [ main, "feat/**" ]
   pull_request:
-    branches: [ main ]
+    branches: [ main, "feat/**" ]
 
 permissions:
   contents: read
 
 jobs:
   test:
-    name: Lint & Test Suite (Python ${{ matrix.python-version }})
+    name: Lint, Build & Test Suite (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,22 +22,45 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Frontend Dependencies & Build
+        run: |
+          cd frontend
+          npm ci
+          npm run build
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
           cache: 'pip'
 
-      - name: Install dependencies
+      - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
           pip install pyflakes ruff pytest
 
+      - name: Install Playwright Browsers
+        run: |
+          python -m playwright install --with-deps chromium webkit
+
       - name: Run code quality linter (ruff)
         run: |
-          ruff check dashboard/ src/ tests/
+          ruff check backend/ dashboard/ src/ tests/ scripts/
+
+      - name: Run synthetic resume acceptance validation
+        run: |
+          python scripts/local_resume_acceptance.py --synthetic
 
       - name: Run comprehensive test suite (pytest)
+        env:
+          MOCK_DISCOVERY_ADAPTERS: "1"
         run: |
-          python -m pytest -v
+          python -m pytest -v tests/test_phase_b_4_dashboard.py tests/test_browser_acceptance_phase_b_4.py tests/test_phase_b_3_3_recovery_and_matching.py tests/test_phase_b_3_2_acceptance.py tests/test_career_role_inferencer.py tests/test_discovery.py tests/test_personalized_discovery.py tests/test_universal_resume_intelligence.py tests/test_migration_phase5_1_1.py tests/test_migration_quarantine.py tests/test_phase7_1_1_integrity_corrections.py tests/test_phase7_1_2_final_safety.py tests/test_application_tailoring.py tests/test_preparer.py tests/test_resume_parser.py

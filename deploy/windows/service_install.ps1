@@ -105,7 +105,7 @@ if ($existingService) {
 
 # 7. Install Windows Service with NSSM
 Write-Host "Installing Windows Service '$ServiceName'..." -ForegroundColor Cyan
-$appArgs = "-m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000"
+$appArgs = "-m uvicorn backend.api.main:app --host 127.0.0.1 --port 8000 --workers 1"
 
 & $nssmPath install $ServiceName $PythonExe $appArgs
 & $nssmPath set $ServiceName AppDirectory $InstallDir

@@ -756,9 +756,11 @@ def generate_persona_docx(persona_id: str) -> bytes:
     # Education
     doc.add_heading("Education", level=1)
     for edu in p["education"]:
+        score_str = f"CGPA: {edu['cgpa']}" if edu.get("cgpa") else (f"{edu['percentage']}%" if edu.get("percentage") else "")
+        grad_yr = edu.get("expected_graduation_year") or edu.get("graduation_year", "")
         doc.add_paragraph(
-            f"{edu['degree']} in {edu['major']}\n"
-            f"{edu['institution']} | Class of {edu['expected_graduation_year']} | CGPA: {edu['cgpa']}"
+            f"{edu.get('degree', '')} in {edu.get('major', '')}\n"
+            f"{edu.get('institution', '')} | Class of {grad_yr} | {score_str}".strip(" |")
         )
 
     # Experience

@@ -2,7 +2,7 @@
 
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from dashboard.services.dashboard_service import DashboardService
@@ -38,12 +38,13 @@ def _background_discovery_task(user_id: int, roles: Optional[List[str]], locatio
 def trigger_discovery(
     req: Optional[TriggerDiscoveryRequest] = None,
     background_tasks: BackgroundTasks = None,
+    request: Request = None,
     auth_ctx=Depends(get_current_user_and_session),
 ):
     """Triggers candidate-scoped job discovery in the background (delegates to canonical jobs discovery)."""
     from backend.api.routers.jobs import trigger_jobs_discovery, JobsDiscoveryRequest
     job_req = JobsDiscoveryRequest(roles=req.roles if req else None, locations=req.locations if req else None)
-    return trigger_jobs_discovery(req=job_req, background_tasks=background_tasks, auth_ctx=auth_ctx)
+    return trigger_jobs_discovery(req=job_req, background_tasks=background_tasks, request=request, auth_ctx=auth_ctx)
 
 
 @router.get("/status")

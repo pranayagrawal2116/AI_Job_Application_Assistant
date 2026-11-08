@@ -1086,12 +1086,12 @@ class ResumeParser:
             return []
 
         date_pat = re.compile(
-            r'(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?,?\s+\d{4}|\d{4})\s*(?:-|–|—|to)\s*(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?,?\s+\d{4}|\d{4}|Present|Current)|\b\d+\s+(?:month|mo|year|yr)s?\b',
+            r'(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?,?\s+\d{4}|\d{4}(?:[/-]\d{1,2})?)\s*(?:-|–|—|to)\s*(?:(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?,?\s+\d{4}|\d{4}(?:[/-]\d{1,2})?|Present|Current)|\b\d+\s+(?:month|mo|year|yr)s?\b',
             re.IGNORECASE,
         )
         title_keywords = [
             "associate", "auditor", "executive", "manager", "engineer", "developer",
-            "lead", "director", "specialist", "coordinator", "analyst", "intern",
+            "lead", "director", "specialist", "coordinator", "analyst", "intern", "trainee",
             "officer", "accountant", "consultant", "supervisor", "controller",
             "doctor", "nurse", "attorney", "counsel", "architect", "designer",
             "cardiologist", "physician", "educator", "teacher", "professor",
@@ -1121,7 +1121,8 @@ class ResumeParser:
                 continue
 
             first_word = lower_l.split()[0].rstrip(":,") if lower_l.split() else ""
-            is_action_verb = first_word in action_verbs
+            has_delim = any(d in clean_l for d in ["|", " — "])
+            is_action_verb = (first_word in action_verbs) and not has_delim
             is_bullet = line.startswith(("-", "•", "*", "→", "►", "–")) and not ("|" in line or date_pat.search(line))
 
             # Dedicated duration / period line
@@ -1152,9 +1153,20 @@ class ResumeParser:
                 rem_line = (clean_l[:d_match.start()] + " " + clean_l[d_match.end():]).strip()
 
             rem_lower = rem_line.lower()
-            has_delim = any(d in clean_l for d in ["|", " — "])
             has_company = any(re.search(r"\b" + re.escape(ci) + r"\b", rem_lower) for ci in company_indicators)
             has_title = any(re.search(r"\b" + re.escape(kw) + r"\b", rem_lower) for kw in title_keywords)
+
+            # Check if this line is purely dates/duration for the preceding role header
+            if current and not current.duration and d_match and not has_title and not has_company and not has_delim:
+                current.duration = clean_l
+                s_part, e_part = split_date_range(clean_l)
+                if s_part:
+                    current.start_date = s_part
+                if e_part:
+                    current.end_date = e_part
+                    if "present" in e_part.lower() or "current" in e_part.lower():
+                        current.is_current = True
+                continue
 
             is_tech_line = lower_l.startswith(("systems:", "tools:", "technologies:", "environment:", "tech stack:"))
 
@@ -1165,8 +1177,9 @@ class ResumeParser:
 
             if is_header:
                 # Continuation check: company on line 2 after title on line 1
+                clean_rem = re.sub(r"^[\s•*–—\-→⇒►|:]+|[\s:–—|#*]+$", "", rem_line).strip()
                 if current and current.job_title and not current.employer and (has_company or not has_title):
-                    current.employer = rem_line
+                    current.employer = clean_rem
                     if dur and not current.duration:
                         current.duration = dur
                         s_part, e_part = split_date_range(dur)
@@ -1179,7 +1192,7 @@ class ResumeParser:
                     continue
                 elif current and current.job_title and current.employer and has_company and not has_title:
                     current.job_title = current.job_title + " | " + current.employer
-                    current.employer = rem_line
+                    current.employer = clean_rem
                     if dur and not current.duration:
                         current.duration = dur
                         s_part, e_part = split_date_range(dur)
@@ -1198,15 +1211,22 @@ class ResumeParser:
                 job_title = ""
                 employer = ""
                 for p in parts:
-                    p_low = p.lower()
+                    val = re.sub(r"^[\s•*–—\-→⇒►|:]+|[\s:–—|#*]+$", "", p).strip()
+                    if not val:
+                        continue
+                    p_low = val.lower()
+                    p_val = val.title() if val.isupper() else val
                     if any(re.search(r"\b" + re.escape(kw) + r"\b", p_low) for kw in title_keywords) and not job_title:
-                        job_title = p.title() if p.isupper() else p
+                        job_title = p_val
                     elif any(re.search(r"\b" + re.escape(ci) + r"\b", p_low) for ci in company_indicators) and not employer:
-                        employer = p.title() if p.isupper() else p
+                        employer = p_val
                     elif not job_title:
-                        job_title = p.title() if p.isupper() else p
+                        job_title = p_val
                     elif not employer:
-                        employer = p.title() if p.isupper() else p
+                        employer = p_val
+
+                job_title = re.sub(r"^[\s•*–—\-→⇒►|:]+|[\s:–—|#*]+$", "", job_title).strip()
+                employer = re.sub(r"^[\s•*–—\-→⇒►|:]+|[\s:–—|#*]+$", "", employer).strip()
 
                 current = ExperienceEntry(
                     job_title=job_title,

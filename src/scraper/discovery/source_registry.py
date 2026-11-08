@@ -74,8 +74,29 @@ class SourceRegistry:
         return statuses
 
     @classmethod
+    def create_mock(cls, access_monitor: Optional[AccessMonitor] = None) -> "SourceRegistry":
+        """Creates registry populated with deterministic mock adapters for hermetic testing."""
+        from src.scraper.adapters.mock_discovery_adapter import MockDiscoveryAdapter
+
+        reg = cls(access_monitor=access_monitor)
+        mon = reg.monitor
+
+        reg.register(MockDiscoveryAdapter(source_id="internshala", name="Internshala (Mock)", access_monitor=mon), enabled=True)
+        reg.register(MockDiscoveryAdapter(source_id="company_careers", name="Company Careers (Mock)", access_monitor=mon), enabled=True)
+        reg.register(MockDiscoveryAdapter(source_id="linkedin", name="LinkedIn (Mock)", access_monitor=mon), enabled=True)
+        reg.register(MockDiscoveryAdapter(source_id="indeed", name="Indeed (Mock)", access_monitor=mon), enabled=True)
+        reg.register(MockDiscoveryAdapter(source_id="naukri", name="Naukri (Mock)", access_monitor=mon), enabled=True)
+
+        return reg
+
+    @classmethod
     def create_default(cls, access_monitor: Optional[AccessMonitor] = None) -> "SourceRegistry":
-        """Creates registry populated with default production adapters."""
+        """Creates registry populated with default production adapters, or mock adapters in test mode."""
+        import os
+
+        if os.getenv("MOCK_DISCOVERY_ADAPTERS", "").lower() in ("1", "true", "yes"):
+            return cls.create_mock(access_monitor=access_monitor)
+
         reg = cls(access_monitor=access_monitor)
         mon = reg.monitor
 

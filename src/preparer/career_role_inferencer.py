@@ -589,3 +589,196 @@ class CareerRoleInferencer:
                 supporting_skills=list(skills) if skills else [],
                 confidence=confidence,
             )
+
+    def classify_candidate(self, data: Any) -> str:
+        """Classifies a candidate into an empirical career category without unverified assumptions.
+
+        Returns one of:
+            - 'professionally_qualified': Holds statutory/professional credential (ACCA, CPA, CFA, Bar, MD, PhD, etc.)
+            - 'student': Currently enrolled in higher education with future graduation year
+            - 'fresher': Recent graduate or < 12 months experience without senior/statutory licenses
+            - 'experienced_professional': >= 12 months verified experience or senior role
+            - 'general_candidate': Insufficient profile data to determine category
+        """
+        norm = self._normalize_input(data)
+
+        # 1. Statutory certifications or professional credentials
+        certs = norm.get("certifications", []) + norm.get("professional_qualifications", [])
+        for cert in certs:
+            c_str = str(cert.get("name", "") if isinstance(cert, dict) else cert).lower()
+            if any(p in c_str for p in ["acca", "cpa", "cfa", "bar", "m.d.", "md", "ph.d", "phd", "pmp", "bcba", "registered nurse", "board-certified", "architect", "mbbs"]):
+                return "professionally_qualified"
+
+        # Check education degrees for professional qualifications (e.g. "ACCA Member")
+        for edu in norm.get("education", []):
+            deg = (edu.get("degree") or "").lower()
+            if any(p in deg for p in ["acca", "cpa", "cfa", "bar", "m.d.", "mbbs"]):
+                return "professionally_qualified"
+
+        # 2. Total experience months and senior keywords
+        exps = norm.get("work_experience", [])
+        total_months = 0
+        for exp in exps:
+            dur = exp.get("duration") or ""
+            m_mo = re.search(r"(\d+)\s*(?:month|mo)", dur, re.IGNORECASE)
+            if m_mo:
+                total_months += int(m_mo.group(1))
+            m_yr = re.search(r"(\d+)\s*(?:year|yr)", dur, re.IGNORECASE)
+            if m_yr:
+                total_months += int(m_yr.group(1)) * 12
+
+        senior_keywords = [
+            "director", "vp", "vice president", "attending",
+            "chief", "partner", "chair", "executive", "senior", "counsel",
+            "cardiologist", "physician", "surgeon", "fellow", "consultant", "head",
+        ]
+        headline = (norm.get("headline") or norm.get("professional_headline") or "").lower()
+        if any(re.search(r"\b" + kw + r"\b", headline) for kw in senior_keywords):
+            return "experienced_professional"
+        for exp in exps:
+            title = (exp.get("job_title") or "").lower()
+            if any(re.search(r"\b" + kw + r"\b", title) for kw in senior_keywords):
+                return "experienced_professional"
+
+        current_year = datetime.now(timezone.utc).year
+
+        # 3. Check enrolled student (future graduation year) vs recent graduate
+        has_future_grad = False
+        has_recent_grad = False
+        has_any_edu = False
+        for edu in norm.get("education", []):
+            has_any_edu = True
+            exp_grad_yr = edu.get("expected_graduation_year")
+            grad_yr = edu.get("graduation_year")
+            if exp_grad_yr:
+                try:
+                    yr = int(str(exp_grad_yr).strip())
+                    if yr > current_year:
+                        has_future_grad = True
+                    elif yr >= current_year - 2:
+                        has_recent_grad = True
+                except Exception:
+                    pass
+            elif grad_yr:
+                try:
+                    yr = int(str(grad_yr).strip())
+                    if yr > current_year:
+                        has_future_grad = True
+                    elif yr >= current_year - 2:
+                        has_recent_grad = True
+                except Exception:
+                    pass
+
+        if has_future_grad and total_months < 24:
+            return "student"
+
+        # 4. Experienced professional check
+        if total_months >= 12:
+            return "experienced_professional"
+
+        # 5. Fresher check
+        if has_recent_grad or (has_any_edu and total_months == 0) or (total_months < 12 and (norm.get("projects") or norm.get("education"))):
+            return "fresher"
+
+        if not has_any_edu and not exps and not norm.get("skills"):
+            return "general_candidate"
+
+        return "fresher" if total_months < 12 else "experienced_professional"
+
+    def calculate_profile_completeness(self, data: Any, resumes_count: int = 0) -> Dict[str, Any]:
+        """Calculates fair, non-penalizing profile completeness (0-100) based on candidate classification.
+
+        Students and freshers are not penalized for lacking employment history if they have project/practical evidence.
+        Professionally qualified candidates are credited for their professional credentials.
+        """
+        norm = self._normalize_input(data)
+        category = self.classify_candidate(norm)
+
+        category_labels = {
+            "student": "Student",
+            "fresher": "Recent Graduate / Fresher",
+            "professionally_qualified": "Professionally Qualified Candidate",
+            "experienced_professional": "Experienced Professional",
+            "general_candidate": "Candidate",
+        }
+
+        # 1. Personal Info (20 pts)
+        personal = norm.get("personal", {}) or norm.get("personal_info", {})
+        has_name = bool(personal.get("full_name") or norm.get("full_name"))
+        has_contact = bool(personal.get("email") or personal.get("phone") or norm.get("email") or norm.get("phone"))
+        personal_pts = 20 if (has_name and has_contact) else (10 if has_name else 0)
+
+        # 2. Education (20 pts)
+        edus = norm.get("education", [])
+        edu_pts = 20 if edus and len(edus) > 0 else 0
+
+        # 3. Skills (20 pts)
+        tech_skills = norm.get("technical_skills") or []
+        prof_skills = norm.get("professional_skills") or []
+        flat_skills = norm.get("skills") or []
+        total_skills = len(tech_skills) + len(prof_skills) + len(flat_skills)
+        skills_pts = 20 if total_skills > 0 else 0
+
+        # 4. Resume availability (20 pts)
+        resume_pts = 20 if resumes_count > 0 else 0
+
+        # 5. Career / Practical Evidence (20 pts)
+        exps = norm.get("work_experience", [])
+        projs = norm.get("projects", [])
+        certs = norm.get("certifications", []) + norm.get("professional_qualifications", [])
+
+        has_exp = bool(exps and len(exps) > 0)
+        has_projs = bool(projs and len(projs) > 0)
+        has_certs = bool(certs and len(certs) > 0)
+
+        career_pts = 0
+        missing_sections = []
+
+        if category in ("student", "fresher"):
+            # Satisfied if projects OR work_experience present
+            if has_projs or has_exp:
+                career_pts = 20
+            else:
+                missing_sections.append("Projects or Practical Experience")
+        elif category == "professionally_qualified":
+            # Satisfied if professional_qualifications/certifications OR work_experience present
+            if has_certs or has_exp:
+                career_pts = 20
+            else:
+                missing_sections.append("Professional Qualifications or Experience")
+        elif category == "experienced_professional":
+            if has_exp:
+                career_pts = 20
+            else:
+                missing_sections.append("Work Experience")
+        else:
+            if has_exp or has_projs or has_certs:
+                career_pts = 20
+            else:
+                missing_sections.append("Experience or Projects")
+
+        if personal_pts < 20:
+            missing_sections.append("Contact Details")
+        if edu_pts == 0:
+            missing_sections.append("Education")
+        if skills_pts == 0:
+            missing_sections.append("Skills")
+        if resume_pts == 0:
+            missing_sections.append("Resume Upload")
+
+        total_score = min(100, personal_pts + edu_pts + skills_pts + resume_pts + career_pts)
+
+        return {
+            "completeness_score": total_score,
+            "candidate_category": category,
+            "category_label": category_labels.get(category, "Candidate"),
+            "evidence_breakdown": {
+                "personal_info": personal_pts,
+                "education": edu_pts,
+                "skills": skills_pts,
+                "resume_uploaded": resume_pts,
+                "career_evidence": career_pts,
+            },
+            "missing_sections": missing_sections,
+            "is_application_ready": total_score >= 80,
+        }

@@ -24,5 +24,5 @@ if (-not $pyCmd) {
 }
 
 # Run FastAPI ASGI server (serves REST API and React SPA from frontend/dist)
-Write-Host "Running: python -m uvicorn backend.api.main:app --host $Address --port $Port" -ForegroundColor Green
-& python -m uvicorn backend.api.main:app --host $Address --port $Port
+Write-Host "Running: python -m uvicorn backend.api.main:app --host $Address --port $Port --workers 1" -ForegroundColor Green
+& python -m uvicorn backend.api.main:app --host $Address --port $Port --workers 1
