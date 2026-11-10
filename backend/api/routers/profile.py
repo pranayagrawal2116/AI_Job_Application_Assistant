@@ -168,6 +168,16 @@ async def upload_resume(
                     sync_status = "FAILED"
                     sync_error = str(sync_err)
 
+            # Re-verify and recover security scan under current active signing key if needed
+            try:
+                service.recover_unverifiable_resume_scan(
+                    user_id=user_id,
+                    resume_id=existing_dict["id"],
+                    recovery_reason="Explicit candidate resume re-upload",
+                )
+            except Exception as rec_err:
+                logger.warning("Scan recovery on re-upload non-fatal error: %s", rec_err)
+
             return ResumeResponse(
                 id=existing_dict["id"],
                 user_id=existing_dict["user_id"],
@@ -238,3 +248,29 @@ def sync_resume_to_profile(
         )
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Sync failed: {str(e)}")
+
+
+@router.post("/resumes/{resume_id}/recover-scan")
+def recover_resume_scan(
+    resume_id: int,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Explicit authorized recovery of an unverifiable historical resume scan whose signing key was lost."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    try:
+        result = service.recover_unverifiable_resume_scan(
+            user_id=user_id,
+            resume_id=resume_id,
+            recovery_reason="Direct candidate scan recovery request",
+        )
+        return {
+            "status": "ok",
+            "message": "Resume security scan successfully re-established with current active signing key.",
+            "classification": result.classification,
+            "risk_score": result.risk_score,
+            "resume_id": resume_id,
+            "version_num": result.source_version,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))

@@ -21,17 +21,16 @@ from backend.api.schemas.applications import (
     FollowUpResponse,
     IssueTicketResponse,
     PreparationStateResponse,
-    PreparedPacketResponse,
     ScreeningQuestionsRequest,
     TailorResumeRequest,
 )
 from src.database.exceptions import (
     ApplicationNotFoundError,
     CrossUserAccessError,
-    JobDescriptionNotFoundError,
     QuarantinedSourceError,
     ResumeIntegrityError,
-    ResumeNotFoundError,
+    ScanSignatureMismatchError,
+    ScanVerificationKeyUnavailableError,
     SecurityAuthorizationError,
     ValidationError,
 )
@@ -165,7 +164,7 @@ def update_application_status(
     service = DashboardService.get_instance()
     
     try:
-        app = service.transition_application_status(
+        service.transition_application_status(
             application_id=app_id,
             session_id=session.session_id,
             new_status=req.status,
@@ -428,6 +427,19 @@ def tailor_resume(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     except ApplicationNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Application #{app_id} not found.")
+    except ScanVerificationKeyUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Your resume's previous security scan cannot currently be verified because its historical signing key is unavailable. "
+                "Your uploaded document is preserved. Please restore the original signing key or re-upload the resume to establish a new verified scan."
+            ),
+        )
+    except ScanSignatureMismatchError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Resume integrity verification failed. Document generation has been blocked because the stored security record could not be verified.",
+        )
     except (ResumeIntegrityError, QuarantinedSourceError, SecurityAuthorizationError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValidationError as e:
@@ -438,6 +450,48 @@ def tailor_resume(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Resume tailoring encountered an unexpected internal error (Correlation ID: {correlation_id}).",
         )
+
+
+@router.post("/{app_id}/recover-resume-scan")
+def recover_application_resume_scan(
+    app_id: int,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Explicit authorized recovery of an unverifiable historical resume scan whose signing key was lost."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    app = service.get_candidate_application(
+        application_id=app_id,
+        session_id=session.session_id,
+        client_user_id=user_id,
+    )
+    selected_res_meta, res_id = _resolve_application_resume(
+        service=service,
+        user_id=user_id,
+        app=app,
+        req_resume_id=None,
+    )
+    if not res_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No resume associated with application.")
+
+    active_ver = selected_res_meta.get("active_version", 1) if selected_res_meta else 1
+    try:
+        result = service.recover_unverifiable_resume_scan(
+            user_id=user_id,
+            resume_id=res_id,
+            version_num=active_ver,
+            recovery_reason=f"Authorized recovery from Application #{app_id}",
+        )
+        return {
+            "status": "ok",
+            "message": "Resume security scan successfully re-established with current active signing key.",
+            "classification": result.classification,
+            "risk_score": result.risk_score,
+            "resume_id": res_id,
+            "version_num": active_ver,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
 
 
 @router.post("/{app_id}/cover-letter")
@@ -498,6 +552,19 @@ def generate_cover_letter(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     except ApplicationNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Application #{app_id} not found.")
+    except ScanVerificationKeyUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Your resume's previous security scan cannot currently be verified because its historical signing key is unavailable. "
+                "Your uploaded document is preserved. Please restore the original signing key or re-upload the resume to establish a new verified scan."
+            ),
+        )
+    except ScanSignatureMismatchError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Resume integrity verification failed. Document generation has been blocked because the stored security record could not be verified.",
+        )
     except (ResumeIntegrityError, QuarantinedSourceError, SecurityAuthorizationError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValidationError as e:
@@ -602,6 +669,19 @@ def answer_screening_questions(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied.")
     except ApplicationNotFoundError:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Application #{app_id} not found.")
+    except ScanVerificationKeyUnavailableError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Your resume's previous security scan cannot currently be verified because its historical signing key is unavailable. "
+                "Your uploaded document is preserved. Please restore the original signing key or re-upload the resume to establish a new verified scan."
+            ),
+        )
+    except ScanSignatureMismatchError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Resume integrity verification failed. Document generation has been blocked because the stored security record could not be verified.",
+        )
     except (ResumeIntegrityError, QuarantinedSourceError, SecurityAuthorizationError) as e:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
     except ValidationError as e:

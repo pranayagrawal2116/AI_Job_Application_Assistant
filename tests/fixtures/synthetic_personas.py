@@ -5,7 +5,7 @@ Provides helpers to generate genuine in-memory DOCX and PDF documents for testin
 """
 
 import io
-from typing import Any, Dict, List
+from typing import Any, Dict
 from docx import Document
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
@@ -836,7 +836,9 @@ def generate_persona_pdf(persona_id: str) -> bytes:
         c.drawString(50, y, f"{edu['institution']}")
         y -= 12
         c.setFont("Helvetica", 9)
-        c.drawString(50, y, f"{edu['degree']} in {edu['major']} | Graduation: {edu['expected_graduation_year']} | CGPA: {edu['cgpa']}")
+        grade_str = f" | CGPA: {edu['cgpa']}" if "cgpa" in edu else (f" | Percentage: {edu['percentage']}%" if "percentage" in edu else "")
+        grad_year = edu.get("expected_graduation_year", edu.get("graduation_year", ""))
+        c.drawString(50, y, f"{edu.get('degree', '')} in {edu.get('major', '')} | Graduation: {grad_year}{grade_str}")
         y -= 20
 
     # Experience

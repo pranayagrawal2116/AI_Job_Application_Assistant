@@ -3373,6 +3373,23 @@ class DashboardService:
             user_base_dir=self.storage_base_dir,
         )
 
+    def recover_unverifiable_resume_scan(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: Optional[int] = None,
+        recovery_reason: str = "Historical signing key unavailable",
+    ):
+        """Authoritatively recovers an unverifiable historical resume scan whose signing key was lost."""
+        from src.security.security_preflight import SecurityPreflightManager
+        preflight = SecurityPreflightManager(db_manager=self.db, file_validator=self.file_validator)
+        return preflight.recover_unverifiable_resume_scan(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=version_num,
+            recovery_reason=recovery_reason,
+        )
+
     def generate_tailored_resume(
         self,
         user_id: int,

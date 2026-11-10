@@ -15,6 +15,8 @@ from src.database.exceptions import (
     CrossUserAccessError,
     JobDescriptionNotFoundError,
     QuarantinedSourceError,
+    ScanSignatureMismatchError,
+    ScanVerificationKeyUnavailableError,
     SecurityAuthorizationError,
     ValidationError,
 )
@@ -726,6 +728,211 @@ class SecurityPreflightManager:
             override_reason=override_reason,
             threat_count=threat_count,
             summary=f"Quarantined resume inspected under candidate audit review (Override: {has_override}).",
+        )
+
+    def recover_unverifiable_resume_scan(
+        self,
+        user_id: int,
+        resume_id: int,
+        version_num: Optional[int] = None,
+        recovery_reason: str = "Historical signing key unavailable",
+    ) -> PreflightCheckResult:
+        """Executes an authorized append-only scan recovery for an authentic resume whose historical key is lost.
+
+        Enforces:
+        1. JIT independent verification of physical binary (ownership, exact version, file hash, size, format).
+        2. Strict validation that existing scan failure is VERIFICATION_KEY_UNAVAILABLE (fails closed on signature tampering).
+        3. Preserves original scan record untouched (append-only in SQLite).
+        4. Preserves sticky quarantine (quarantined resumes remain quarantined).
+        5. Performs fresh prompt injection scan on verified source text.
+        6. Signs new scan with current active durable key.
+        7. Persists new scan row and verifies it immediately.
+        """
+        # 1. Authoritative JIT binary verification
+        verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=self.file_validator)
+        v_res = verifier.verify_and_load_resume(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=version_num,
+            fresh_parse=True,
+        )
+
+        target_ver = v_res.version_num
+        target_hash = v_res.file_hash
+        res_size = v_res.file_size_bytes
+        res_format = v_res.file_format
+
+        # 2. Check existing scan to verify this is genuinely an unavailable historical key situation
+        existing_scan = self.db.get_latest_security_scan(
+            user_id=user_id,
+            source_type="resume",
+            source_id=resume_id,
+            source_version=target_ver,
+        )
+
+        was_quarantined = False
+        if existing_scan:
+            was_quarantined = (existing_scan.classification == ScanClassification.QUARANTINED)
+            scan_dict = {
+                "id": existing_scan.id,
+                "user_id": existing_scan.user_id,
+                "source_type": existing_scan.source_type,
+                "source_id": existing_scan.source_id,
+                "source_version": existing_scan.source_version,
+                "source_hash": existing_scan.source_hash,
+                "snapshot_hash": existing_scan.snapshot_hash,
+                "scanner_version": existing_scan.scanner_version,
+                "policy_version": existing_scan.policy_version,
+                "risk_score": existing_scan.risk_score,
+                "classification": existing_scan.classification,
+                "threats_detected_json": existing_scan.threats_detected_json,
+                "key_id": existing_scan.key_id,
+                "hmac_signature": existing_scan.hmac_signature,
+                "scanned_at": existing_scan.scanned_at,
+                "source_binary_hash": getattr(existing_scan, "source_binary_hash", None),
+                "source_binary_size_bytes": getattr(existing_scan, "source_binary_size_bytes", None),
+                "source_binary_format": getattr(existing_scan, "source_binary_format", None),
+                "manifest_version": getattr(existing_scan, "manifest_version", "v1"),
+            }
+            try:
+                self.signer.verify_scan_record(
+                    expected_user_id=user_id,
+                    expected_source_type="resume",
+                    expected_source_id=resume_id,
+                    expected_source_version=target_ver,
+                    expected_source_hash=target_hash,
+                    expected_snapshot_hash=None,
+                    scan_row=scan_dict,
+                    expected_source_binary_hash=target_hash,
+                    expected_source_binary_size_bytes=res_size,
+                    expected_source_binary_format=res_format,
+                )
+                logger.info("Resume #%d v%d scan #%d is already valid; no recovery needed.", resume_id, target_ver, existing_scan.id)
+                return self.check_resume_security(user_id=user_id, resume_id=resume_id, version_num=target_ver, verified_resume=v_res)
+            except ScanVerificationKeyUnavailableError:
+                logger.info(
+                    "Resume #%d v%d scan #%d verification key '%s' is unavailable. Proceeding with authorized recovery.",
+                    resume_id, target_ver, existing_scan.id, existing_scan.key_id,
+                )
+            except ScanSignatureMismatchError as e:
+                raise SecurityAuthorizationError(
+                    f"Cannot recover scan for Resume #{resume_id} v{target_ver}: "
+                    f"Signature mismatch detected on scan #{existing_scan.id} with available key. "
+                    "Integrity violation cannot be bypassed."
+                ) from e
+
+        # 3. Fresh scan on verified text
+        text_to_scan = v_res.raw_text if hasattr(v_res, "raw_text") and v_res.raw_text else ""
+        if not text_to_scan:
+            facts = v_res.parsed_resume
+            facts_dict = facts.to_dict() if hasattr(facts, "to_dict") and callable(facts.to_dict) else (facts if isinstance(facts, dict) else {})
+            parts = []
+            if hasattr(facts, "raw_text") and facts.raw_text:
+                parts.append(str(facts.raw_text))
+            if isinstance(facts_dict, dict):
+                if facts_dict.get("summary"):
+                    parts.append(str(facts_dict["summary"]))
+                if facts_dict.get("skills") and isinstance(facts_dict["skills"], (list, tuple)):
+                    parts.extend(str(s) for s in facts_dict["skills"])
+                if facts_dict.get("work_experience") and isinstance(facts_dict["work_experience"], list):
+                    for exp in facts_dict["work_experience"]:
+                        if isinstance(exp, dict) and exp.get("description"):
+                            parts.append(str(exp["description"]))
+            text_to_scan = " ".join(parts)
+
+        scan_result = self.detector.scan(text_to_scan)
+
+        # 4. Sticky quarantine enforcement
+        if was_quarantined:
+            logger.warning("Sticky quarantine enforced on recovered scan for Resume #%d v%d.", resume_id, target_ver)
+            from dataclasses import replace
+            scan_result = replace(scan_result, classification=ScanClassification.QUARANTINED)
+
+        # 5. Sign with current active durable key
+        manifest, sig, key_id = self.signer.sign_scan_result(
+            user_id=user_id,
+            source_type="resume",
+            source_id=resume_id,
+            source_version=target_ver,
+            source_hash=target_hash,
+            snapshot_hash=None,
+            scan_result=scan_result,
+            manifest_version="v2",
+            source_binary_hash=target_hash,
+            source_binary_size_bytes=res_size,
+            source_binary_format=res_format,
+        )
+
+        threats_dicts = [t.to_dict() for t in scan_result.threats_detected]
+
+        # 6. Persist new append-only scan record
+        new_scan = self.db.save_security_scan(
+            user_id=user_id,
+            source_type="resume",
+            source_id=resume_id,
+            source_version=target_ver,
+            source_hash=target_hash,
+            snapshot_hash=None,
+            scanner_version=scan_result.engine_version,
+            policy_version=scan_result.policy_version,
+            risk_score=scan_result.risk_score,
+            classification=scan_result.classification,
+            threats_detected=threats_dicts,
+            key_id=key_id,
+            hmac_signature=sig,
+            scanned_at=manifest["scanned_at"],
+            source_binary_hash=target_hash,
+            source_binary_size_bytes=res_size,
+            source_binary_format=res_format,
+            manifest_version="v2",
+        )
+
+        # 7. Immediately verify new scan record
+        new_scan_dict = {
+            "id": new_scan.id,
+            "user_id": new_scan.user_id,
+            "source_type": new_scan.source_type,
+            "source_id": new_scan.source_id,
+            "source_version": new_scan.source_version,
+            "source_hash": new_scan.source_hash,
+            "snapshot_hash": new_scan.snapshot_hash,
+            "scanner_version": new_scan.scanner_version,
+            "policy_version": new_scan.policy_version,
+            "risk_score": new_scan.risk_score,
+            "classification": new_scan.classification,
+            "threats_detected_json": new_scan.threats_detected_json,
+            "key_id": new_scan.key_id,
+            "hmac_signature": new_scan.hmac_signature,
+            "scanned_at": new_scan.scanned_at,
+            "source_binary_hash": getattr(new_scan, "source_binary_hash", None),
+            "source_binary_size_bytes": getattr(new_scan, "source_binary_size_bytes", None),
+            "source_binary_format": getattr(new_scan, "source_binary_format", None),
+            "manifest_version": getattr(new_scan, "manifest_version", "v2"),
+        }
+        self.signer.verify_scan_record(
+            expected_user_id=user_id,
+            expected_source_type="resume",
+            expected_source_id=resume_id,
+            expected_source_version=target_ver,
+            expected_source_hash=target_hash,
+            expected_snapshot_hash=None,
+            scan_row=new_scan_dict,
+            expected_source_binary_hash=target_hash,
+            expected_source_binary_size_bytes=res_size,
+            expected_source_binary_format=res_format,
+        )
+
+        logger.info(
+            "Successfully recovered scan for Resume #%d v%d (User #%d) with new Scan #%d (Key ID: %s, Reason: %s).",
+            resume_id, target_ver, user_id, new_scan.id, key_id, recovery_reason,
+        )
+
+        return self.check_resume_security(
+            user_id=user_id,
+            resume_id=resume_id,
+            version_num=target_ver,
+            target_action="candidate_review",
+            verified_resume=v_res,
         )
 
     # -------------------------------------------------------------------------

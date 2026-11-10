@@ -36,6 +36,9 @@ venv.bak/
 .env.local
 *.env
 *.secret
+*.key
+data/.security/*
+!data/.security/README.md
 
 # Candidate Resumes & Private Personal Documents
 data/resumes/*

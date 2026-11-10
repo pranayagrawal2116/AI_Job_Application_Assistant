@@ -1,6 +1,6 @@
 """Custom exceptions for the SQLite database, security, and authentication engine."""
 
-from typing import Optional
+from typing import Any, Dict, Optional
 
 
 class DatabaseError(Exception):
@@ -152,14 +152,16 @@ class InvalidTicketError(SecurityAuthorizationError):
 
 
 class KeyRevokedError(SecurityAuthorizationError):
-    """Raised when an action ticket was signed with a revoked or retired HMAC key."""
+    """Raised when an action ticket or security scan was signed with a revoked or retired HMAC key."""
 
-    def __init__(self, key_id: str):
-        super().__init__(
-            f"Action ticket signed with revoked or unknown key '{key_id}'. "
+    def __init__(self, key_id: str, message: Optional[str] = None):
+        msg = message or (
+            f"Action ticket or security scan signed with revoked key '{key_id}'. "
             f"Key rotation in effect. Fresh candidate authorization required."
         )
+        super().__init__(msg)
         self.key_id = key_id
+        self.failure_category = "KEY_REVOKED"
 
 
 class TokenExpiredError(SecurityAuthorizationError):
@@ -194,6 +196,7 @@ class CrossUserAccessError(SecurityAuthorizationError):
         self.user_id = user_id
         self.target_user_id = target_user_id
         self.resource = resource
+        self.failure_category = "CROSS_USER_ACCESS"
 
 
 # -------------------------------------------------------------------------
@@ -335,6 +338,69 @@ class QuarantinedSourceError(SecurityPreflightError):
         self.source_id = source_id
         self.classification = classification
         self.risk_score = risk_score
+
+
+# -----------------------------------------------------------------------------
+# PHASE 9.1.2 & C.0.5: SECURITY SCAN VERIFICATION & HMAC EXCEPTIONS
+# -----------------------------------------------------------------------------
+
+class SecurityScanVerificationError(SecurityAuthorizationError):
+    """Base exception for security scan verification failures with precise failure categorization."""
+
+    def __init__(
+        self,
+        message: str,
+        failure_category: str,
+        scan_id: Optional[int] = None,
+        details: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.failure_category = failure_category
+        self.scan_id = scan_id
+        self.details = details or {}
+
+
+class ScanVerificationKeyUnavailableError(SecurityScanVerificationError):
+    """Raised when the HMAC key required to verify a historical security scan is missing or unknown."""
+
+    def __init__(self, key_id: str, scan_id: Optional[int] = None, message: Optional[str] = None):
+        msg = message or f"Security scan verification key '{key_id}' is unknown or unavailable."
+        super().__init__(msg, failure_category="VERIFICATION_KEY_UNAVAILABLE", scan_id=scan_id, details={"key_id": key_id})
+        self.key_id = key_id
+
+
+class ScanSignatureMismatchError(SecurityScanVerificationError):
+    """Raised when an HMAC signature does not match the canonical manifest despite an available key (tampering/integrity failure)."""
+
+    def __init__(self, scan_id: Optional[int] = None, message: Optional[str] = None):
+        msg = message or (
+            f"Cryptographic signature verification failed for scan record #{scan_id}. "
+            "The scan record has been tampered with or modified."
+        )
+        super().__init__(msg, failure_category="SIGNATURE_MISMATCH", scan_id=scan_id)
+
+
+class ScanSourceHashMismatchError(SecurityScanVerificationError):
+    """Raised when the source hash in the scan record does not match the expected source hash."""
+
+    def __init__(self, expected_hash: str, actual_hash: str, scan_id: Optional[int] = None):
+        msg = f"Source hash discrepancy: current source hash '{expected_hash}' does not match scanned hash '{actual_hash}'."
+        super().__init__(msg, failure_category="SOURCE_HASH_MISMATCH", scan_id=scan_id, details={"expected": expected_hash, "actual": actual_hash})
+
+
+class ScanBinaryMetadataMismatchError(SecurityScanVerificationError):
+    """Raised when binary metadata (hash, size, format) does not match the scanned record."""
+
+    def __init__(self, message: str, scan_id: Optional[int] = None):
+        super().__init__(message, failure_category="BINARY_METADATA_MISMATCH", scan_id=scan_id)
+
+
+class ScanManifestVersionError(SecurityScanVerificationError):
+    """Raised when a scan record has an unsupported or invalid manifest version."""
+
+    def __init__(self, manifest_version: Any, scan_id: Optional[int] = None):
+        msg = f"Stored scan record #{scan_id} has unsupported manifest_version '{manifest_version}'."
+        super().__init__(msg, failure_category="UNSUPPORTED_MANIFEST_VERSION", scan_id=scan_id, details={"manifest_version": manifest_version})
 
 
 # -----------------------------------------------------------------------------

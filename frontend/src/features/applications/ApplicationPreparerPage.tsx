@@ -39,6 +39,7 @@ export const ApplicationPreparerPage: React.FC = () => {
   // Preparation Data States
   const [tailoredResume, setTailoredResume] = useState<any>(null);
   const [isTailoringResume, setIsTailoringResume] = useState(false);
+  const [isRecoveringScan, setIsRecoveringScan] = useState(false);
 
   const [coverLetterText, setCoverLetterText] = useState('');
   const [coverLetterTone, setCoverLetterTone] = useState('Professional & Direct');
@@ -157,6 +158,19 @@ export const ApplicationPreparerPage: React.FC = () => {
       setErrorMsg(err.message || 'Resume tailoring failed.');
     } finally {
       setIsTailoringResume(false);
+    }
+  };
+
+  const handleRecoverScan = async () => {
+    setIsRecoveringScan(true);
+    setErrorMsg(null);
+    try {
+      const res = await api.recoverResumeScan(appId);
+      setSuccessMsg(res.message || 'Security scan verified and updated with active key. You can now generate your tailored resume.');
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Failed to re-verify security scan.');
+    } finally {
+      setIsRecoveringScan(false);
     }
   };
 
@@ -364,9 +378,20 @@ export const ApplicationPreparerPage: React.FC = () => {
       </div>
 
       {errorMsg && (
-        <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center gap-2">
-          <AlertTriangle size={16} />
-          <span>{errorMsg}</span>
+        <div className="p-4 rounded-xl bg-rose-50 border border-rose-200 text-rose-700 text-xs flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <AlertTriangle size={16} className="shrink-0" />
+            <span>{errorMsg}</span>
+          </div>
+          {errorMsg.includes('signing key is unavailable') && (
+            <button
+              onClick={handleRecoverScan}
+              disabled={isRecoveringScan}
+              className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 disabled:opacity-50 text-white font-medium rounded-lg text-xs transition-colors shrink-0 shadow-sm"
+            >
+              {isRecoveringScan ? 'Re-verifying...' : 'Re-verify Security Scan'}
+            </button>
+          )}
         </div>
       )}
 

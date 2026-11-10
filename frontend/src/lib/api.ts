@@ -269,6 +269,12 @@ class ApiClient {
     });
   }
 
+  async recoverResumeScan(id: number): Promise<any> {
+    return this.request(`/applications/${id}/recover-resume-scan`, {
+      method: 'POST',
+    });
+  }
+
   async generateCoverLetter(
     id: number,
     dataOrTone?: string | { tone?: string; custom_instructions?: string; resume_id?: number },
