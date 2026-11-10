@@ -441,7 +441,17 @@ def tailor_resume(
             detail="Resume integrity verification failed. Document generation has been blocked because the stored security record could not be verified.",
         )
     except (ResumeIntegrityError, QuarantinedSourceError, SecurityAuthorizationError) as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        err_msg = str(e)
+        if "APP_ENV" in err_msg:
+            logger.critical("Runtime environment misconfiguration in application action: %s", err_msg)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Application configuration is incomplete. The backend environment has not been configured correctly. "
+                    "Please contact the application administrator."
+                ),
+            )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=err_msg)
     except ValidationError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception as e:
@@ -566,7 +576,17 @@ def generate_cover_letter(
             detail="Resume integrity verification failed. Document generation has been blocked because the stored security record could not be verified.",
         )
     except (ResumeIntegrityError, QuarantinedSourceError, SecurityAuthorizationError) as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        err_msg = str(e)
+        if "APP_ENV" in err_msg:
+            logger.critical("Runtime environment misconfiguration in application action: %s", err_msg)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Application configuration is incomplete. The backend environment has not been configured correctly. "
+                    "Please contact the application administrator."
+                ),
+            )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=err_msg)
     except ValidationError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception as e:
@@ -683,7 +703,17 @@ def answer_screening_questions(
             detail="Resume integrity verification failed. Document generation has been blocked because the stored security record could not be verified.",
         )
     except (ResumeIntegrityError, QuarantinedSourceError, SecurityAuthorizationError) as e:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+        err_msg = str(e)
+        if "APP_ENV" in err_msg:
+            logger.critical("Runtime environment misconfiguration in application action: %s", err_msg)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=(
+                    "Application configuration is incomplete. The backend environment has not been configured correctly. "
+                    "Please contact the application administrator."
+                ),
+            )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=err_msg)
     except ValidationError as e:
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e))
     except Exception as e:

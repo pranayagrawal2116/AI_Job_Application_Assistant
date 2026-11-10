@@ -194,18 +194,39 @@ def find_env_file(explicit_path: Optional[str | Path] = None) -> Optional[Path]:
     1. Explicit path argument.
     2. ENV_FILE environment variable.
     3. Project root .env.
+
+    Never falls back to .env.example or sample template files.
     """
     if explicit_path:
         p = Path(explicit_path).resolve()
+        if p.name.endswith(".example"):
+            logger.warning("Ignoring example environment file '%s'; .env.example cannot be used as an active environment.", p)
+            return None
         if p.is_file():
             return p
-        return p
+        return None
 
     env_var_path = os.environ.get("ENV_FILE")
-    if env_var_path:
-        p = Path(env_var_path).resolve()
+    if env_var_path and str(env_var_path).strip():
+        p = Path(env_var_path.strip())
+        if not p.is_absolute():
+            p_cwd = (Path.cwd() / p).resolve()
+            p_root = (get_project_root() / p).resolve()
+            if p_cwd.is_file():
+                p = p_cwd
+            elif p_root.is_file():
+                p = p_root
+            else:
+                p = p.resolve()
+        else:
+            p = p.resolve()
+
+        if p.name.endswith(".example"):
+            logger.warning("Ignoring example environment file in ENV_FILE '%s'.", p)
+            return None
         if p.is_file():
             return p
+        return None
 
     root_env = get_project_root() / ".env"
     if root_env.is_file():

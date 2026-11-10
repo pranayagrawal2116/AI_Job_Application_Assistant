@@ -65,42 +65,8 @@ DEFAULT_AUTHORIZED_ATTESTING_PRINCIPALS: frozenset[str] = frozenset()
 _VERIFICATION_TOKEN = object()
 _AUTH_TOKEN = object()
 
-
-def resolve_app_env() -> str:
-    """Authoritatively resolves and validates the application execution environment.
-
-    Contract (Phase 9.1.2.9 Section 5.1):
-    - production / prod -> 'production' (Ed25519 asymmetric only)
-    - staging -> 'staging' (Ed25519 asymmetric only)
-    - qa -> 'qa' (Ed25519 asymmetric only)
-    - development / dev -> 'development' (Permissive policy permitted)
-    - test -> 'test' (Permissive policy permitted)
-    - missing / empty / whitespace / unknown -> raises SecurityAuthorizationError (fails closed)
-    """
-    raw_env = os.environ.get("APP_ENV")
-    if raw_env is None:
-        raise SecurityAuthorizationError(
-            "APP_ENV environment variable is missing. Application security policy fails closed."
-        )
-    clean_env = raw_env.strip()
-    if not clean_env:
-        raise SecurityAuthorizationError(
-            "APP_ENV environment variable is empty or whitespace. Application security policy fails closed."
-        )
-    normalized = clean_env.lower()
-    if normalized in ("production", "prod"):
-        return "production"
-    if normalized == "staging":
-        return "staging"
-    if normalized == "qa":
-        return "qa"
-    if normalized in ("development", "dev"):
-        return "development"
-    if normalized == "test":
-        return "test"
-    raise SecurityAuthorizationError(
-        f"Unrecognized or untrusted APP_ENV '{raw_env}'. Application security policy fails closed."
-    )
+# Re-export authoritative environment resolution (Phase C.0.6)
+from src.config.runtime_environment import resolve_app_env
 
 
 # Central injectable UTC clock provider (Phase 9.1.2.12 Part F, Phase 9.1.2.13 Part A, Phase 9.1.2.14 Part D)

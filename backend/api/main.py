@@ -6,6 +6,7 @@ from pathlib import Path
 
 # Phase C.0: Load environment before importing/instantiating application components
 from src.config.env_loader import load_production_env, validate_production_configuration
+from src.config.runtime_environment import resolve_app_env
 load_production_env()
 
 from fastapi import FastAPI, Request
@@ -31,9 +32,20 @@ logger = setup_logger("API")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 1. Resolve APP_ENV
-    app_env = os.environ.get("APP_ENV", "development").lower()
-    app.state.app_env = app_env
+    # 1. Authoritative environment resolution (fail fast)
+    try:
+        app_env = resolve_app_env()
+        os.environ["APP_ENV"] = app_env
+        app.state.app_env = app_env
+        app.state.config_ready = True
+        app.state.config_error = None
+        logger.info("Authoritative application environment resolved: '%s'", app_env)
+    except Exception as e:
+        logger.critical("Application environment resolution failed at startup: %s", e)
+        app.state.app_env = None
+        app.state.config_ready = False
+        app.state.config_error = str(e)
+        raise RuntimeError(f"Application environment resolution failed: {e}") from e
 
     # 2. Phase C.0.1: Production configuration validation BEFORE database or backend initialization
     if app_env == "production":
@@ -126,11 +138,11 @@ app.include_router(settings.router)
 @app.get("/api/health")
 def health_check(request: Request):
     """Health check endpoint for reverse proxy and service readiness monitoring."""
-    config_ready = getattr(request.app.state, "config_ready", True)
+    config_ready = getattr(request.app.state, "config_ready", False)
     config_error = getattr(request.app.state, "config_error", None)
-    discovery_ready = getattr(request.app.state, "discovery_ready", True)
+    discovery_ready = getattr(request.app.state, "discovery_ready", False)
     recovery_error = getattr(request.app.state, "discovery_recovery_error", None)
-    app_env = getattr(request.app.state, "app_env", os.environ.get("APP_ENV", "development").lower())
+    app_env = getattr(request.app.state, "app_env", None)
 
     service = DashboardService.get_instance()
     db_connected = True
@@ -146,7 +158,7 @@ def health_check(request: Request):
     storage_base = str(getattr(service, "storage_base_dir", ""))
     persistent_storage_ready = Path(storage_base).exists() if storage_base and storage_base != ":memory:" else True
 
-    is_healthy = discovery_ready and config_ready and db_connected
+    is_healthy = bool(discovery_ready and config_ready and db_connected and app_env)
     status_code = 200 if is_healthy else 503
     return JSONResponse(
         status_code=status_code,
@@ -158,8 +170,8 @@ def health_check(request: Request):
                 "app_env": app_env,
                 "database_connected": db_connected,
                 "persistent_storage_ready": persistent_storage_ready,
-                "database_path": db_path,
-                "storage_base": storage_base,
+                "database_path": Path(db_path).name if db_path and app_env == "production" else db_path,
+                "storage_base": Path(storage_base).name if storage_base and app_env == "production" else storage_base,
                 "db_error": db_error,
             },
             "configuration_subsystem": {

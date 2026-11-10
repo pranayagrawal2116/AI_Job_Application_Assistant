@@ -66,7 +66,18 @@ class SecurityPreflightManager:
         self.signer = SecurityScanSigner(key_manager=self.key_manager)
         self.detector = detector or PromptInjectionDetector()
         self.file_validator = file_validator
-        self.evidence_verifier = evidence_verifier or LegacyEvidenceVerifier(db_manager=db_manager)
+        self._evidence_verifier = evidence_verifier
+
+    @property
+    def evidence_verifier(self) -> LegacyEvidenceVerifier:
+        """Lazily initializes LegacyEvidenceVerifier when required for legacy JD evidence verification (Phase C.0.6)."""
+        if self._evidence_verifier is None:
+            self._evidence_verifier = LegacyEvidenceVerifier(db_manager=self.db)
+        return self._evidence_verifier
+
+    @evidence_verifier.setter
+    def evidence_verifier(self, verifier: Optional[LegacyEvidenceVerifier]) -> None:
+        self._evidence_verifier = verifier
 
     # -------------------------------------------------------------------------
     # JOB DESCRIPTION PREFLIGHT
