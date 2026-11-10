@@ -56,9 +56,9 @@ export interface JobItem {
   required_skills: string[];
   eligibility_criteria?: string;
   application_deadline?: string;
-  match_score: number;
-  match_classification: string;
-  is_eligible: boolean;
+  match_score?: number | null;
+  match_classification?: string;
+  is_eligible?: boolean | null;
   platform: string;
   work_arrangement: string;
   internship_duration: string;
@@ -68,6 +68,7 @@ export interface JobItem {
   missing_skills?: string[];
   match_explanation?: string;
   score_breakdown?: Record<string, any>;
+  is_pending_evaluation?: boolean;
 }
 
 export interface ResumeItem {
@@ -218,6 +219,14 @@ export interface DiscoveryStatus {
   target_roles: string[];
   target_locations: string[];
   auto_discover_enabled: boolean;
+  has_primary_resume?: boolean;
+  primary_resume_id?: number | null;
+  resume_fingerprint?: string | null;
+  career_domain?: string | null;
+  candidate_category?: string | null;
+  completed_for_current_resume?: boolean;
+  role_source?: string | null;
+  inference_confidence?: number;
 }
 
 export interface JobMatchExplanation {

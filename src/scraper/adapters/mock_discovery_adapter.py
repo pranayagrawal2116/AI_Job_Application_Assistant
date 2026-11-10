@@ -125,7 +125,11 @@ class MockDiscoveryAdapter(BaseAdapter):
             )
             results.append(payload)
 
-        self.monitor.record_success(self.name)
+        if self.monitor:
+            try:
+                self.monitor.record_success(self.name, self.base_url)
+            except TypeError:
+                self.monitor.record_success(self.name)
         return results
 
     def fetch_job_details(self, job_url: str) -> Optional[ExtractedJobPayload]:

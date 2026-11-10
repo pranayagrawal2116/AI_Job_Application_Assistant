@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { DiscoveryStatus, InferredRole, JobItem, JobMatchExplanation } from '@/types';
@@ -7,6 +7,7 @@ import { Badge } from '@/components/common/Badge';
 import { Modal } from '@/components/common/Modal';
 import { FileDropzone } from '@/components/common/FileDropzone';
 import { formatScore, getScoreColor } from '@/lib/utils';
+import { JobCardSkeletonGrid } from './JobCardSkeleton';
 import {
   Search,
   Bookmark,
@@ -32,12 +33,24 @@ import {
   AlertTriangle,
 } from 'lucide-react';
 
+type FeedState =
+  | 'initial_loading'
+  | 'no_resume_uploaded'
+  | 'discovering'
+  | 'ready_with_jobs'
+  | 'empty_no_matches'
+  | 'partial_discovery'
+  | 'discovery_failed';
+
 export const JobsPage: React.FC = () => {
   const navigate = useNavigate();
 
   const [activeTab, setActiveTab] = useState<'all' | 'saved' | 'add'>('all');
   const [jobs, setJobs] = useState<JobItem[]>([]);
   const [isLoading, setIsLoading] = useState(true);
+  const [feedState, setFeedState] = useState<FeedState>('initial_loading');
+  const [discoveryError, setDiscoveryError] = useState<string | null>(null);
+  const initialWorkflowStartedRef = useRef(false);
 
   // Discovery engine state & suggested career paths
   const [discoveryStatus, setDiscoveryStatus] = useState<DiscoveryStatus | null>(null);
@@ -69,7 +82,7 @@ export const JobsPage: React.FC = () => {
   const [jdError, setJdError] = useState<string | null>(null);
   const [jdSuccess, setJdSuccess] = useState<string | null>(null);
 
-  const fetchJobs = async () => {
+  const loadJobsInternal = async () => {
     setIsLoading(true);
     try {
       const data = await api.getJobs({
@@ -79,25 +92,32 @@ export const JobsPage: React.FC = () => {
         only_eligible: onlyEligible || undefined,
         min_score: minScore > 0 ? minScore : undefined,
         saved_only: activeTab === 'saved',
-        recommended_only: true,
+        recommended_only: !searchTerm && activeTab !== 'saved',
       });
       setJobs(data);
+      if (data.length > 0) {
+        setFeedState((prev) => (prev === 'partial_discovery' ? 'partial_discovery' : 'ready_with_jobs'));
+      } else {
+        setFeedState('empty_no_matches');
+      }
     } catch (e) {
       console.error('Failed to fetch jobs:', e);
+      setFeedState('empty_no_matches');
     } finally {
       setIsLoading(false);
     }
   };
 
-  const pollDiscoveryRun = async (runId: number) => {
-    const startTime = Date.now();
-    const TIMEOUT_MS = 60000; // 60s timeout
+  const pollDiscoveryRun = (runId: number) => {
+    setIsTriggeringDiscovery(true);
+    const pollInterval = 2000;
 
     const checkStatus = async () => {
       try {
         const run = await api.getDiscoveryRun(runId);
         if (!run) {
           setIsTriggeringDiscovery(false);
+          await loadJobsInternal();
           return;
         }
 
@@ -110,46 +130,43 @@ export const JobsPage: React.FC = () => {
             `Discovery completed! Found ${found} opportunities (${saved} new saved, ${skipped} duplicates skipped).`
           );
           await loadDiscoveryMeta();
-          await fetchJobs();
+          await loadJobsInternal();
           return;
         }
 
         if (run.status === 'PARTIAL') {
           setIsTriggeringDiscovery(false);
+          setFeedState('partial_discovery');
           const found = run.total_discovered ?? run.jobs_found ?? ((run.new_jobs_saved ?? 0) + (run.duplicates_skipped ?? 0));
           const saved = run.new_jobs_saved ?? run.jobs_saved ?? 0;
           const skipped = run.duplicates_skipped ?? 0;
           setDiscoveryNotification(
-            `Discovery finished with partial results (${saved} saved of ${found} found, ${skipped} duplicates skipped). Some sources were restricted or rate-limited.`
+            `Discovery finished with partial results (${saved} saved of ${found} found, ${skipped} duplicates skipped). Some external sources were restricted.`
           );
           await loadDiscoveryMeta();
-          await fetchJobs();
+          await loadJobsInternal();
           return;
         }
 
         if (run.status === 'FAILED') {
           setIsTriggeringDiscovery(false);
+          setFeedState('discovery_failed');
           const err = run.error_message || 'Discovery failed. Please try again.';
+          setDiscoveryError(err);
           setDiscoveryNotification(`Discovery error: ${err}`);
           await loadDiscoveryMeta();
           return;
         }
 
-        if (Date.now() - startTime > TIMEOUT_MS) {
-          setIsTriggeringDiscovery(false);
-          setDiscoveryNotification('Discovery is still running in the background. Check back in a moment.');
-          await loadDiscoveryMeta();
-          return;
-        }
-
-        setTimeout(checkStatus, 2000);
+        // Run still in progress, continue polling
+        setTimeout(checkStatus, pollInterval);
       } catch (err: any) {
         console.warn('Error polling discovery run:', err);
-        setIsTriggeringDiscovery(false);
+        setTimeout(checkStatus, 3000);
       }
     };
 
-    setTimeout(checkStatus, 2000);
+    setTimeout(checkStatus, pollInterval);
   };
 
   const loadDiscoveryMeta = async () => {
@@ -159,37 +176,100 @@ export const JobsPage: React.FC = () => {
       if (statusRes.suggested_roles && statusRes.suggested_roles.length > 0) {
         setSuggestedRoles(statusRes.suggested_roles);
       }
+      return statusRes;
+    } catch (e) {
+      return null;
+    }
+  };
 
-      // Check if an active run is ongoing and resume polling
+  const initPageWorkflow = async () => {
+    setFeedState('initial_loading');
+    setIsLoading(true);
+    try {
+      const statusRes = await loadDiscoveryMeta();
+      if (!statusRes) {
+        await loadJobsInternal();
+        return;
+      }
+
+      if (statusRes.has_primary_resume === false) {
+        setFeedState('no_resume_uploaded');
+        setIsLoading(false);
+        return;
+      }
+
       if (statusRes.active_run && (statusRes.active_run.status === 'PENDING' || statusRes.active_run.status === 'RUNNING')) {
+        setFeedState('discovering');
         setIsTriggeringDiscovery(true);
         setDiscoveryNotification('Resuming active background discovery run...');
         pollDiscoveryRun(statusRes.active_run.id);
-      } else if (statusRes.latest_run?.status === 'FAILED') {
-        const msg = statusRes.latest_run.error_message || '';
-        if (msg.toLowerCase().includes('restart') || msg.toLowerCase().includes('interrupted')) {
-          setDiscoveryNotification('A previous discovery run was interrupted by a server restart. You can safely retry discovery now.');
+        return;
+      }
+
+      if (statusRes.completed_for_current_resume) {
+        if (
+          statusRes.latest_run?.status === 'PARTIAL' ||
+          (statusRes.latest_run?.restricted_count && statusRes.latest_run.restricted_count > 0)
+        ) {
+          setFeedState('partial_discovery');
         }
+        await loadJobsInternal();
+        return;
+      }
+
+      if (statusRes.latest_run?.status === 'FAILED') {
+        const msg = statusRes.latest_run.error_message || 'A previous discovery run failed.';
+        setDiscoveryError(msg);
+        setFeedState('discovery_failed');
+        setIsLoading(false);
+        return;
+      }
+
+      // First visit for this resume: automatically trigger discovery
+      setFeedState('discovering');
+      setIsTriggeringDiscovery(true);
+      setDiscoveryNotification('Initiating personalized job discovery based on your resume...');
+      try {
+        const res = await api.triggerDiscovery();
+        if (res.run_id) {
+          pollDiscoveryRun(res.run_id);
+        } else {
+          await loadJobsInternal();
+        }
+      } catch (triggerErr: any) {
+        console.error('Auto discovery trigger error:', triggerErr);
+        setDiscoveryError(triggerErr.message || 'Discovery could not be started.');
+        setFeedState('discovery_failed');
+        setIsTriggeringDiscovery(false);
+        setIsLoading(false);
       }
     } catch (e) {
-      // Fallback
+      console.error('Initial page workflow failure:', e);
+      await loadJobsInternal();
     }
   };
 
   useEffect(() => {
-    if (activeTab !== 'add') {
-      fetchJobs();
-    }
-  }, [activeTab, arrangement, platform, onlyEligible, minScore, selectedRoleFilter]);
+    if (initialWorkflowStartedRef.current) return;
+    initialWorkflowStartedRef.current = true;
+    initPageWorkflow();
+  }, []);
 
   useEffect(() => {
-    loadDiscoveryMeta();
-  }, []);
+    if (activeTab === 'add') return;
+    if (
+      feedState !== 'initial_loading' &&
+      feedState !== 'no_resume_uploaded' &&
+      feedState !== 'discovering'
+    ) {
+      loadJobsInternal();
+    }
+  }, [activeTab, arrangement, platform, onlyEligible, minScore, selectedRoleFilter]);
 
   const handleSearchSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setSelectedRoleFilter(null);
-    fetchJobs();
+    loadJobsInternal();
   };
 
   const handleToggleShortlist = async (jobId: number) => {
@@ -235,6 +315,10 @@ export const JobsPage: React.FC = () => {
 
   const handleTriggerDiscovery = async () => {
     setIsTriggeringDiscovery(true);
+    setDiscoveryError(null);
+    if (jobs.length === 0) {
+      setFeedState('discovering');
+    }
     setDiscoveryNotification('Initiating job discovery across supported platforms...');
     try {
       const res = await api.triggerDiscovery();
@@ -246,12 +330,16 @@ export const JobsPage: React.FC = () => {
         setDiscoveryNotification(res.message || 'Discovery started.');
         await loadDiscoveryMeta();
         setTimeout(() => {
-          fetchJobs();
+          loadJobsInternal();
           setIsTriggeringDiscovery(false);
-        }, 3000);
+        }, 1500);
       }
     } catch (err: any) {
+      setDiscoveryError(err.message || 'Failed to trigger discovery.');
       setDiscoveryNotification(err.message || 'Failed to trigger discovery.');
+      if (jobs.length === 0) {
+        setFeedState('discovery_failed');
+      }
       setIsTriggeringDiscovery(false);
     }
   };
@@ -674,18 +762,93 @@ export const JobsPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Job Cards Grid */}
-          {isLoading ? (
-            <div className="py-20 flex justify-center">
-              <LoadingSpinner size={32} />
+          {/* Partial Discovery Notice Banner */}
+          {feedState === 'partial_discovery' && (
+            <div
+              data-testid="partial-discovery-banner"
+              className="mb-5 p-4 rounded-2xl bg-amber-50/80 border border-amber-200 text-amber-900 flex items-start gap-3"
+            >
+              <Info size={18} className="text-amber-600 shrink-0 mt-0.5" />
+              <div className="text-xs">
+                <span className="font-bold block mb-0.5">Partial Discovery Notice</span>
+                <span>
+                  Some external job platforms were temporarily restricted or rate-limited. Displaying
+                  verified opportunities from accessible sources.
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* Job Cards Grid / Skeletons / Empty States */}
+          {(feedState === 'initial_loading' || (feedState === 'discovering' && jobs.length === 0) || (isLoading && jobs.length === 0)) ? (
+            <JobCardSkeletonGrid count={6} />
+          ) : feedState === 'no_resume_uploaded' ? (
+            <div
+              data-testid="no-resume-state"
+              className="py-16 px-6 text-center bg-white rounded-3xl border border-slate-200/80 shadow-xs max-w-xl mx-auto my-6"
+            >
+              <div className="w-14 h-14 mx-auto mb-4 bg-brand-50 rounded-2xl flex items-center justify-center text-brand-600 border border-brand-100">
+                <Upload size={28} />
+              </div>
+              <h3 className="text-lg font-bold text-slate-900 mb-2">
+                Upload your resume to discover opportunities
+              </h3>
+              <p className="text-xs text-slate-500 mb-6 leading-relaxed">
+                JobFlow AI matches jobs specifically to your verified education, work experience,
+                and domain qualifications. Upload your primary resume in your profile to start discovery.
+              </p>
+              <button
+                type="button"
+                data-testid="go-to-profile-btn"
+                onClick={() => navigate('/profile')}
+                className="px-5 py-2.5 rounded-xl bg-brand-600 hover:bg-brand-700 text-white font-semibold text-xs shadow-md shadow-brand-500/20 transition-all inline-flex items-center gap-2 cursor-pointer"
+              >
+                <Sparkles size={14} />
+                <span>Go to My Profile</span>
+              </button>
+            </div>
+          ) : feedState === 'discovery_failed' && jobs.length === 0 ? (
+            <div
+              data-testid="discovery-failed-state"
+              className="py-12 px-6 text-center bg-white rounded-3xl border border-rose-200 shadow-xs max-w-xl mx-auto my-6"
+            >
+              <div className="w-12 h-12 mx-auto mb-3 bg-rose-50 rounded-2xl flex items-center justify-center text-rose-600 border border-rose-100">
+                <AlertTriangle size={24} />
+              </div>
+              <h3 className="text-base font-bold text-slate-900 mb-1">Discovery Encountered an Issue</h3>
+              <p className="text-xs text-rose-700 mb-4">
+                {discoveryError || 'Unable to complete opportunity search at this time.'}
+              </p>
+              <button
+                type="button"
+                data-testid="retry-discovery-btn"
+                onClick={handleTriggerDiscovery}
+                className="px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs shadow-xs transition-all inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw size={13} />
+                <span>Retry Discovery</span>
+              </button>
             </div>
           ) : jobs.length === 0 ? (
-            <div className="py-16 text-center text-slate-400 bg-white rounded-3xl border border-slate-200">
+            <div
+              data-testid="empty-jobs-state"
+              className="py-16 text-center text-slate-400 bg-white rounded-3xl border border-slate-200"
+            >
               <Building2 size={36} className="mx-auto mb-2 text-slate-300" />
               <p className="text-sm font-bold text-slate-700">No opportunities found</p>
               <p className="text-xs text-slate-400 mt-1">
-                Try loosening your filters or adding a job manually.
+                {searchTerm
+                  ? 'Try loosening your filters or search keywords.'
+                  : 'Discovery completed with no direct matches. Try adjusting target roles or refreshing.'}
               </p>
+              <button
+                type="button"
+                onClick={handleTriggerDiscovery}
+                className="mt-4 px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold text-xs transition-colors inline-flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw size={12} />
+                <span>Refresh Search</span>
+              </button>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
@@ -698,13 +861,19 @@ export const JobsPage: React.FC = () => {
                     {/* Card Top: Match Score & Bookmark */}
                     <div className="flex items-center justify-between gap-2 mb-3">
                       <div className="flex items-center gap-2">
-                        <span
-                          className={`px-2.5 py-1 rounded-full text-xs font-extrabold border ${getScoreColor(
-                            job.match_score
-                          )}`}
-                        >
-                          {formatScore(job.match_score)} Match
-                        </span>
+                        {job.match_score != null ? (
+                          <span
+                            className={`px-2.5 py-1 rounded-full text-xs font-extrabold border ${getScoreColor(
+                              job.match_score
+                            )}`}
+                          >
+                            {formatScore(job.match_score)} Match
+                          </span>
+                        ) : (
+                          <span className="px-2.5 py-1 rounded-full text-xs font-semibold border border-slate-200 bg-slate-50 text-slate-500">
+                            Score Pending
+                          </span>
+                        )}
                         {job.is_eligible === true ? (
                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded-full border border-emerald-200">
                             <CheckCircle2 size={12} />
@@ -718,6 +887,11 @@ export const JobsPage: React.FC = () => {
                         ) : (
                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-amber-700 bg-amber-50 px-2 py-0.5 rounded-full border border-amber-200">
                             Pending Evaluation
+                          </span>
+                        )}
+                        {job.source === 'search' && (
+                          <span className="inline-flex items-center text-[10px] font-medium text-slate-500 bg-slate-100 px-2 py-0.5 rounded-full border border-slate-200">
+                            Search
                           </span>
                         )}
                       </div>
@@ -853,13 +1027,19 @@ export const JobsPage: React.FC = () => {
                 </p>
               </div>
               <div className="flex items-center gap-2">
-                <span
-                  className={`px-3 py-1 rounded-full text-xs font-extrabold border ${getScoreColor(
-                    selectedJob.match_score
-                  )}`}
-                >
-                  {formatScore(selectedJob.match_score)} {selectedJob.match_classification ? `(${selectedJob.match_classification})` : ''}
-                </span>
+                {selectedJob.match_score != null ? (
+                  <span
+                    className={`px-3 py-1 rounded-full text-xs font-extrabold border ${getScoreColor(
+                      selectedJob.match_score
+                    )}`}
+                  >
+                    {formatScore(selectedJob.match_score)} {selectedJob.match_classification ? `(${selectedJob.match_classification})` : ''}
+                  </span>
+                ) : (
+                  <span className="px-3 py-1 rounded-full text-xs font-semibold border border-slate-200 bg-slate-50 text-slate-500">
+                    Score Pending
+                  </span>
+                )}
                 {selectedJob.is_eligible === true ? (
                   <Badge variant="success">Eligible</Badge>
                 ) : selectedJob.is_eligible === false ? (

@@ -1526,6 +1526,11 @@ class DatabaseManager:
         disc_cols = {r["name"]: dict(r) for r in cursor.fetchall()}
         if "total_discovered" not in disc_cols:
             cursor.execute("ALTER TABLE discovery_runs ADD COLUMN total_discovered INTEGER DEFAULT 0")
+        if "resume_id" not in disc_cols:
+            cursor.execute("ALTER TABLE discovery_runs ADD COLUMN resume_id INTEGER REFERENCES resumes(id) ON DELETE SET NULL")
+        if "resume_fingerprint" not in disc_cols:
+            cursor.execute("ALTER TABLE discovery_runs ADD COLUMN resume_fingerprint TEXT")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_discovery_runs_user_resume ON discovery_runs(user_id, resume_id, resume_fingerprint)")
 
         # Phase C.0: candidate_discovered_jobs table to track unique candidate-to-job associations
         cursor.execute("""
@@ -1534,11 +1539,20 @@ class DatabaseManager:
                 user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
                 discovery_run_id INTEGER REFERENCES discovery_runs(id) ON DELETE SET NULL,
+                resume_id INTEGER REFERENCES resumes(id) ON DELETE SET NULL,
+                resume_fingerprint TEXT,
                 discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(user_id, job_id)
             )
         """)
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_candidate_discovered_user ON candidate_discovered_jobs(user_id)")
+        cursor.execute("PRAGMA table_info(candidate_discovered_jobs)")
+        cand_cols = {r["name"]: dict(r) for r in cursor.fetchall()}
+        if "resume_id" not in cand_cols:
+            cursor.execute("ALTER TABLE candidate_discovered_jobs ADD COLUMN resume_id INTEGER REFERENCES resumes(id) ON DELETE SET NULL")
+        if "resume_fingerprint" not in cand_cols:
+            cursor.execute("ALTER TABLE candidate_discovered_jobs ADD COLUMN resume_fingerprint TEXT")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_candidate_discovered_user_resume ON candidate_discovered_jobs(user_id, resume_id, resume_fingerprint)")
         try:
             cursor.execute("""
                 INSERT OR IGNORE INTO candidate_discovered_jobs (user_id, job_id, discovered_at)
@@ -7543,17 +7557,33 @@ class DatabaseManager:
         self,
         user_id: int,
         job_ids: List[int],
+        resume_id: Optional[int] = None,
+        resume_file_hash: Optional[str] = None,
     ) -> Dict[int, MatchResult]:
-        """Fetches the latest match result for each job_id for the user."""
+        """Fetches the latest match result for each job_id for the user.
+
+        If resume_id or resume_file_hash is provided, restricts matches to evaluations performed
+        against that specific primary resume, preventing stale cross-resume match scores from leaking.
+        """
         if not job_ids:
             return {}
         q_marks = ",".join("?" for _ in job_ids)
         query = f"""
             SELECT * FROM match_results
             WHERE user_id = ? AND job_id IN ({q_marks})
-            ORDER BY evaluated_at DESC, id DESC
         """
         params: List[Any] = [user_id] + list(job_ids)
+        if resume_id is not None and resume_file_hash is not None:
+            query += " AND (resume_id = ? OR resume_file_hash = ?)"
+            params.extend([resume_id, resume_file_hash])
+        elif resume_id is not None:
+            query += " AND resume_id = ?"
+            params.append(resume_id)
+        elif resume_file_hash is not None:
+            query += " AND resume_file_hash = ?"
+            params.append(resume_file_hash)
+
+        query += " ORDER BY evaluated_at DESC, id DESC"
         with self.connection() as conn:
             cursor = conn.cursor()
             cursor.execute(query, params)
@@ -7619,11 +7649,13 @@ class DatabaseManager:
         user_id: int,
         job_ids: List[int],
         discovery_run_id: Optional[int] = None,
+        resume_id: Optional[int] = None,
+        resume_fingerprint: Optional[str] = None,
     ) -> int:
         """Associates newly discovered or matched jobs with a candidate user.
 
-        Uses INSERT OR IGNORE to guarantee idempotency and uniqueness per candidate.
-        Returns the number of new associations recorded.
+        Uses UPSERT to guarantee idempotency and maintain active discovery run and resume fingerprint.
+        Returns the number of associations recorded or updated.
         """
         if not job_ids:
             return 0
@@ -7633,14 +7665,48 @@ class DatabaseManager:
             for jid in set(job_ids):
                 cursor.execute(
                     """
-                    INSERT OR IGNORE INTO candidate_discovered_jobs (user_id, job_id, discovery_run_id)
-                    VALUES (?, ?, ?)
+                    INSERT INTO candidate_discovered_jobs (user_id, job_id, discovery_run_id, resume_id, resume_fingerprint, discovered_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    ON CONFLICT(user_id, job_id) DO UPDATE SET
+                        discovery_run_id = COALESCE(excluded.discovery_run_id, candidate_discovered_jobs.discovery_run_id),
+                        resume_id = COALESCE(excluded.resume_id, candidate_discovered_jobs.resume_id),
+                        resume_fingerprint = COALESCE(excluded.resume_fingerprint, candidate_discovered_jobs.resume_fingerprint),
+                        discovered_at = CURRENT_TIMESTAMP
                     """,
-                    (user_id, jid, discovery_run_id),
+                    (user_id, jid, discovery_run_id, resume_id, resume_fingerprint),
                 )
                 if cursor.rowcount > 0:
                     inserted += 1
             return inserted
+
+    def get_candidate_discovered_job_ids(
+        self,
+        user_id: int,
+        resume_fingerprint: Optional[str] = None,
+        resume_id: Optional[int] = None,
+        discovery_run_id: Optional[int] = None,
+    ) -> List[int]:
+        """Returns distinct job IDs discovered for a candidate, scoped to resume fingerprint, resume ID or run."""
+        query = """
+            SELECT DISTINCT cdj.job_id
+            FROM candidate_discovered_jobs cdj
+            LEFT JOIN discovery_runs dr ON cdj.discovery_run_id = dr.id
+            WHERE cdj.user_id = ?
+        """
+        params: List[Any] = [user_id]
+        if discovery_run_id is not None:
+            query += " AND cdj.discovery_run_id = ?"
+            params.append(discovery_run_id)
+        elif resume_fingerprint is not None:
+            query += " AND (cdj.resume_fingerprint = ? OR dr.resume_fingerprint = ?)"
+            params.extend([resume_fingerprint, resume_fingerprint])
+        elif resume_id is not None:
+            query += " AND (cdj.resume_id = ? OR dr.resume_id = ?)"
+            params.extend([resume_id, resume_id])
+        with self.connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return [int(r[0]) for r in cursor.fetchall() if r[0] is not None]
 
     # -------------------------------------------------------------------------
     # DISCOVERY RUNS PERSISTENCE & LIFECYCLE
@@ -7651,6 +7717,8 @@ class DatabaseManager:
         user_id: int,
         target_roles: List[str],
         target_locations: List[str],
+        resume_id: Optional[int] = None,
+        resume_fingerprint: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Creates a new PENDING discovery run record for a candidate.
 
@@ -7672,10 +7740,10 @@ class DatabaseManager:
             try:
                 cursor.execute(
                     """
-                    INSERT INTO discovery_runs (user_id, status, target_roles_json, target_locations_json, started_at)
-                    VALUES (?, 'PENDING', ?, ?, CURRENT_TIMESTAMP)
+                    INSERT INTO discovery_runs (user_id, resume_id, resume_fingerprint, status, target_roles_json, target_locations_json, started_at)
+                    VALUES (?, ?, ?, 'PENDING', ?, ?, CURRENT_TIMESTAMP)
                     """,
-                    (user_id, json.dumps(target_roles), json.dumps(target_locations)),
+                    (user_id, resume_id, resume_fingerprint, json.dumps(target_roles), json.dumps(target_locations)),
                 )
                 run_id = cursor.lastrowid
                 cursor.execute("SELECT * FROM discovery_runs WHERE id = ?", (run_id,))
@@ -7729,6 +7797,8 @@ class DatabaseManager:
             "id": row.get("id"),
             "run_id": row.get("id"),
             "user_id": row.get("user_id"),
+            "resume_id": row.get("resume_id"),
+            "resume_fingerprint": row.get("resume_fingerprint"),
             "status": row.get("status"),
             "target_roles": roles,
             "target_locations": locs,
@@ -7776,18 +7846,26 @@ class DatabaseManager:
             row = cursor.fetchone()
             return self.serialize_discovery_run(dict(row)) if row else None
 
-    def get_latest_discovery_run(self, user_id: int) -> Optional[Dict[str, Any]]:
-        """Returns the most recent discovery run for the user."""
+    def get_latest_discovery_run(
+        self,
+        user_id: int,
+        resume_fingerprint: Optional[str] = None,
+        status_in: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Returns the most recent discovery run for the user, optionally filtered by fingerprint and status."""
+        query = "SELECT * FROM discovery_runs WHERE user_id = ?"
+        params: List[Any] = [user_id]
+        if resume_fingerprint is not None:
+            query += " AND resume_fingerprint = ?"
+            params.append(resume_fingerprint)
+        if status_in:
+            q_marks = ",".join("?" for _ in status_in)
+            query += f" AND status IN ({q_marks})"
+            params.extend(status_in)
+        query += " ORDER BY id DESC LIMIT 1"
         with self.connection() as conn:
             cursor = conn.cursor()
-            cursor.execute(
-                """
-                SELECT * FROM discovery_runs
-                WHERE user_id = ?
-                ORDER BY id DESC LIMIT 1
-                """,
-                (user_id,),
-            )
+            cursor.execute(query, params)
             row = cursor.fetchone()
             return self.serialize_discovery_run(dict(row)) if row else None
 

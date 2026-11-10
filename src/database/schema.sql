@@ -217,6 +217,8 @@ CREATE TABLE IF NOT EXISTS match_results (
 CREATE TABLE IF NOT EXISTS discovery_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    resume_id INTEGER REFERENCES resumes(id) ON DELETE SET NULL,
+    resume_fingerprint TEXT,
     status TEXT NOT NULL CHECK(status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'PARTIAL')),
     target_roles_json TEXT NOT NULL DEFAULT '[]',
     target_locations_json TEXT NOT NULL DEFAULT '[]',
@@ -232,6 +234,23 @@ CREATE TABLE IF NOT EXISTS discovery_runs (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_discovery_runs_user_status ON discovery_runs(user_id, status);
+CREATE INDEX IF NOT EXISTS idx_discovery_runs_user_resume ON discovery_runs(user_id, resume_id, resume_fingerprint);
+
+-- ---------------------------------------------------------------------
+-- 7.2 CANDIDATE DISCOVERED JOBS (Candidate-to-Job Associations)
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS candidate_discovered_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    discovery_run_id INTEGER REFERENCES discovery_runs(id) ON DELETE SET NULL,
+    resume_id INTEGER REFERENCES resumes(id) ON DELETE SET NULL,
+    resume_fingerprint TEXT,
+    discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, job_id)
+);
+CREATE INDEX IF NOT EXISTS idx_candidate_discovered_user ON candidate_discovered_jobs(user_id);
+CREATE INDEX IF NOT EXISTS idx_candidate_discovered_user_resume ON candidate_discovered_jobs(user_id, resume_id, resume_fingerprint);
 
 -- ---------------------------------------------------------------------
 -- 8. APPLICATIONS (Multi-User & Composite Ownership)

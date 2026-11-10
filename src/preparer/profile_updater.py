@@ -265,19 +265,36 @@ class ProfileUpdater:
         saved_roles = existing_prefs.get("target_roles")
         saved_locs = existing_prefs.get("target_locations")
         auto_disc = existing_prefs.get("auto_discover_enabled", True)
+        is_user_override = bool(existing_prefs.get("is_user_override") or existing_prefs.get("explicit_user_override"))
 
-        target_roles = (
-            saved_roles
-            if saved_roles and isinstance(saved_roles, list) and len(saved_roles) > 0
-            else [r.role_title if hasattr(r, "role_title") else str(r) for r in inferred_roles[:5]]
+        res_id = getattr(resume, "id", None) or res_dict.get("id") or 0
+        res_hash = getattr(resume, "file_hash", "") or res_dict.get("file_hash", "")
+        current_fingerprint = f"rfp_{res_id}_{res_hash[:16]}" if res_hash else None
+        prev_fingerprint = existing_prefs.get("resume_fingerprint")
+
+        # Automatically inferred roles from a previous resume must NEVER override the new resume
+        is_valid_user_override = is_user_override and (prev_fingerprint == current_fingerprint or prev_fingerprint is None)
+
+        if is_valid_user_override and saved_roles and isinstance(saved_roles, list) and len(saved_roles) > 0:
+            target_roles = saved_roles
+            override_flag = True
+        else:
+            target_roles = [r.role_title if hasattr(r, "role_title") else str(r) for r in inferred_roles[:5]]
+            override_flag = False
+
+        target_locations = (
+            saved_locs
+            if is_valid_user_override and saved_locs and isinstance(saved_locs, list) and len(saved_locs) > 0
+            else inferred_locations
         )
-        target_locations = saved_locs if saved_locs and isinstance(saved_locs, list) and len(saved_locs) > 0 else inferred_locations
 
         search_preferences = {
             "target_roles": target_roles,
             "suggested_roles": [r.to_dict() if hasattr(r, "to_dict") else {"role_title": str(r)} for r in inferred_roles],
             "target_locations": target_locations,
             "auto_discover_enabled": bool(auto_disc),
+            "is_user_override": override_flag,
+            "resume_fingerprint": current_fingerprint,
             "experience_level": existing_prefs.get("experience_level") or ("Student / Fresher" if inferencer._is_student_or_fresher(res_dict) else "Professional"),
         }
 

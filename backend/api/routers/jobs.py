@@ -77,26 +77,87 @@ def list_jobs(
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
     
-    df = service.get_all_jobs_df()
-    if df.empty:
-        return []
-        
-    # Get user's saved/shortlisted jobs
+    # 1. Authoritative candidate career context
+    career_ctx = service.resolve_candidate_career_context(user_id)
+
+    # 2. Get user's saved/shortlisted jobs
     user_apps = service.list_candidate_applications(session_id=session.session_id, client_user_id=user_id, limit=None)
     saved_job_ids = {a.job_id for a in user_apps if a.job_id is not None}
 
-    # Fetch candidate-scoped personalized match results for catalog jobs
-    all_job_ids = [int(r["id"]) for _, r in df.iterrows()]
-    user_matches = service.db.get_user_match_results_for_jobs(user_id=user_id, job_ids=all_job_ids)
-    
+    df = service.get_all_jobs_df()
+    if df.empty:
+        return []
+
+    is_manual_search = bool(search and search.strip())
+
+    if saved_only:
+        df = df[df["id"].isin(saved_job_ids)]
+        if df.empty:
+            return []
+    elif is_manual_search:
+        # Manual search queries catalog across fields without affecting automatic recommendations
+        q = search.lower().strip()
+        skills_str = df["required_skills"].apply(lambda s: " ".join(s) if isinstance(s, list) else str(s or ""))
+        mask = (
+            df["job_title"].str.lower().str.contains(q, na=False) |
+            df["company_name"].str.lower().str.contains(q, na=False) |
+            df["location"].str.lower().str.contains(q, na=False) |
+            skills_str.str.lower().str.contains(q, na=False) |
+            df["job_description"].str.lower().str.contains(q, na=False)
+        )
+        df = df[mask]
+        if df.empty:
+            return []
+    else:
+        # Default Explore Jobs Feed: strictly candidate-scoped to current resume discovery run!
+        if not career_ctx.has_primary_resume:
+            return []
+
+        candidate_job_ids = set(service.db.get_candidate_discovered_job_ids(
+            user_id=user_id,
+            resume_fingerprint=career_ctx.resume_fingerprint,
+        ))
+
+        # Also include any jobs explicitly evaluated for this candidate's primary resume
+        if career_ctx.primary_resume_id:
+            eval_matches = service.db.get_user_match_results(
+                user_id=user_id,
+                resume_id=career_ctx.primary_resume_id,
+            )
+            for m in eval_matches:
+                if m.job_id:
+                    candidate_job_ids.add(m.job_id)
+
+        if not candidate_job_ids:
+            return []
+
+        df = df[df["id"].isin(candidate_job_ids)]
+        if df.empty:
+            return []
+
+    # Fetch candidate-scoped personalized match results strictly for the current primary resume
+    candidate_job_ids_in_df = [int(r["id"]) for _, r in df.iterrows()]
+    user_matches = service.db.get_user_match_results_for_jobs(
+        user_id=user_id,
+        job_ids=candidate_job_ids_in_df,
+        resume_id=career_ctx.primary_resume_id,
+        resume_file_hash=career_ctx.primary_resume_file_hash,
+    )
+
     items: List[JobItemResponse] = []
     for _, row in df.iterrows():
         jid = int(row["id"])
         is_saved = jid in saved_job_ids
-        
-        if saved_only and not is_saved:
-            continue
-            
+
+        job_title = str(row.get("job_title", ""))
+        comp_name = str(row.get("company_name", ""))
+        desc = str(row.get("job_description", "") or "")
+
+        # In default Explore Jobs feed, validate relevance against candidate career domain
+        if not is_manual_search and not saved_only:
+            if not service.is_job_relevant_for_candidate(job_title, desc, career_ctx):
+                continue
+
         # Parse skills
         raw_skills = row.get("required_skills", "")
         skills_list = _normalize_skill_list(raw_skills)
@@ -111,42 +172,39 @@ def list_jobs(
             missing_skills = _normalize_skill_list(user_match.missing_skills)
             explanation = user_match.explanation or ""
             breakdown = _normalize_dict(user_match.score_breakdown)
+            is_pending = False
         else:
-            # Candidate has not been evaluated for this job yet — do NOT substitute global catalog scores
-            score = 0.0
-            eligible = False
-            match_classification = "Not Evaluated"
+            # Candidate has not been evaluated for this job under the current resume yet
+            score = None
+            eligible = None
+            match_classification = "PENDING_EVALUATION"
             matching_skills = []
             missing_skills = []
-            explanation = "Personalized evaluation pending for this candidate."
+            explanation = "Personalized evaluation pending for your current resume."
             breakdown = {}
+            is_pending = True
 
         work_arr = str(row.get("work_arrangement", "Onsite") or "Onsite")
         plat = str(row.get("platform", "Manual") or "Manual")
-        
+
         # Apply filters
         if arrangement and arrangement.lower() not in work_arr.lower():
             continue
         if platform and platform.lower() not in plat.lower():
             continue
-        if min_score is not None and score < min_score:
+        if min_score is not None and (score is None or score < min_score):
             continue
-        if only_eligible and not eligible:
+        if only_eligible and eligible is not True:
             continue
-        if search:
-            q = search.lower()
-            title = str(row.get("job_title", "")).lower()
-            comp = str(row.get("company_name", "")).lower()
-            loc = str(row.get("location", "")).lower()
-            if q not in title and q not in comp and q not in loc:
-                continue
-                
+
+        item_source = "search" if is_manual_search else ("saved" if saved_only else "recommended")
+
         items.append(
             JobItemResponse(
                 id=jid,
-                company_name=str(row.get("company_name", "")),
-                job_title=str(row.get("job_title", "")),
-                job_description=str(row.get("job_description", "") or ""),
+                company_name=comp_name,
+                job_title=job_title,
+                job_description=desc,
                 job_url=str(row.get("job_url", "") or ""),
                 location=str(row.get("location", "") or "India"),
                 stipend=str(row.get("stipend", "") or "Not Disclosed"),
@@ -160,11 +218,12 @@ def list_jobs(
                 work_arrangement=work_arr,
                 internship_duration=str(row.get("internship_duration", "") or "Flexible"),
                 is_shortlisted=is_saved,
-                source="catalog",
+                source=item_source,
                 matching_skills=matching_skills,
                 missing_skills=missing_skills,
                 match_explanation=explanation,
                 score_breakdown=breakdown,
+                is_pending_evaluation=is_pending,
             )
         )
         
@@ -184,7 +243,7 @@ def list_jobs(
 
     # Sort by match_score descending if recommended_only or default sorting
     if recommended_only:
-        items.sort(key=lambda j: j.match_score, reverse=True)
+        items.sort(key=lambda j: (j.match_score if j.match_score is not None else -1.0), reverse=True)
 
     return items
 
@@ -496,38 +555,33 @@ def trigger_jobs_discovery(
             "started_at": active_run.get("started_at") or datetime.now(timezone.utc).isoformat(),
         }
 
+    # 1. Authoritative candidate career context resolution
+    career_ctx = service.resolve_candidate_career_context(user_id)
+    if not career_ctx.has_primary_resume and not (req and req.roles) and not career_ctx.selected_roles:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No primary resume found. Please upload a resume first to initiate personalized discovery.",
+        )
+
     roles = req.roles if req else None
     locations = req.locations if req else None
 
-    # Resolve roles and locations without tech bias
-    prof_rec = service.db.get_user_candidate_profile(user_id)
-    prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
-    prefs = prof_data.get("search_preferences", {}) or prof_data.get("preferences", {})
-
-    target_roles = list(roles) if roles and len(roles) > 0 else list(prefs.get("target_roles", []))
-    target_locations = list(locations) if locations and len(locations) > 0 else list(prefs.get("target_locations", []))
-
-    if not target_roles or not target_locations:
-        resumes = service.get_user_resumes(user_id)
-        if resumes:
-            from src.preparer.career_role_inferencer import CareerRoleInferencer
-            inferencer = CareerRoleInferencer()
-            if not target_roles:
-                inferred = inferencer.infer_roles(prof_data)
-                target_roles = [r.role_title for r in inferred[:5]]
-            if not target_locations:
-                target_locations = inferencer.infer_locations(prof_data)
+    target_roles = list(roles) if roles and len(roles) > 0 else list(career_ctx.selected_roles)
+    target_locations = list(locations) if locations and len(locations) > 0 else list(career_ctx.target_locations)
 
     if not target_roles:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No target roles found. Please upload a resume or configure target roles in your profile first.",
-        )
+        target_roles = ["Specialist", "Associate"]
     if not target_locations:
         target_locations = ["Remote"]
 
     try:
-        run_rec = service.db.create_discovery_run(user_id, target_roles, target_locations)
+        run_rec = service.db.create_discovery_run(
+            user_id=user_id,
+            target_roles=target_roles,
+            target_locations=target_locations,
+            resume_id=career_ctx.primary_resume_id,
+            resume_fingerprint=career_ctx.resume_fingerprint,
+        )
     except Exception as e:
         from src.database.exceptions import DuplicateDiscoveryRunError
         if isinstance(e, DuplicateDiscoveryRunError):
@@ -563,15 +617,42 @@ def trigger_jobs_discovery(
 
             # Record candidate-to-job association to prevent repeated discovery runs from inflating metrics
             if relevant_ids:
-                service.db.record_candidate_discovered_jobs(user_id, list(relevant_ids), discovery_run_id=run_id)
+                service.db.record_candidate_discovered_jobs(
+                    user_id=user_id,
+                    job_ids=list(relevant_ids),
+                    discovery_run_id=run_id,
+                    resume_id=career_ctx.primary_resume_id,
+                    resume_fingerprint=career_ctx.resume_fingerprint,
+                )
 
             # Evaluate personalized scores for candidate strictly against all unique jobs discovered
-            resumes = service.get_user_resumes(user_id)
-            prim = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
-            if prim and relevant_ids:
+            if career_ctx.primary_resume_id and relevant_ids:
+                verified_res = None
+                try:
+                    from src.security.resume_verifier import ResumeIntegrityVerifier
+                    from src.security.file_security import FileSecurityValidator
+
+                    f_val = FileSecurityValidator(base_storage_dir=service.storage_base_dir) if service.storage_base_dir else None
+                    verifier = ResumeIntegrityVerifier(db_manager=service.db, file_validator=f_val)
+                    res_rec = service.db.get_user_resume(career_ctx.primary_resume_id, user_id)
+                    act_ver = res_rec.get("active_version", 1) if res_rec else 1
+                    verified_res = verifier.verify_and_load_resume(
+                        user_id=user_id,
+                        resume_id=career_ctx.primary_resume_id,
+                        version_num=act_ver,
+                        fresh_parse=True,
+                    )
+                except Exception as ver_err:
+                    logger.warning("Pre-verification of resume for batch evaluation failed: %s", ver_err)
+
                 for job_id_to_eval in relevant_ids:
                     try:
-                        service.run_match_evaluation(user_id=user_id, resume_id=prim["id"], job_id=job_id_to_eval)
+                        service.run_match_evaluation(
+                            user_id=user_id,
+                            resume_id=career_ctx.primary_resume_id,
+                            job_id=job_id_to_eval,
+                            verified_resume=verified_res,
+                        )
                     except Exception as eval_err:
                         logger.warning("Personalized evaluation failed for discovered job %s: %s", job_id_to_eval, eval_err)
 
@@ -612,10 +693,31 @@ def get_latest_discovery_run_status(auth_ctx=Depends(get_current_user_and_sessio
     """Retrieves latest discovery run for the candidate."""
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
+    career_ctx = service.resolve_candidate_career_context(user_id)
     latest = service.db.get_latest_discovery_run(user_id)
+    latest_for_current = (
+        service.db.get_latest_discovery_run(user_id, resume_fingerprint=career_ctx.resume_fingerprint)
+        if career_ctx.resume_fingerprint
+        else None
+    )
+    is_completed_current = (
+        latest_for_current is not None and latest_for_current["status"] in ("COMPLETED", "PARTIAL")
+    )
     if not latest:
-        return {"has_run": False, "run": None}
-    return {"has_run": True, "run": latest}
+        return {
+            "has_run": False,
+            "run": None,
+            "has_primary_resume": career_ctx.has_primary_resume,
+            "resume_fingerprint": career_ctx.resume_fingerprint,
+            "completed_for_current_resume": False,
+        }
+    return {
+        "has_run": True,
+        "run": latest,
+        "has_primary_resume": career_ctx.has_primary_resume,
+        "resume_fingerprint": career_ctx.resume_fingerprint,
+        "completed_for_current_resume": is_completed_current,
+    }
 
 
 @router.get("/discovery/{run_id}")

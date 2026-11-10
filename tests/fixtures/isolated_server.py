@@ -41,6 +41,7 @@ class IsolatedTestServer:
         self.storage_base.mkdir(parents=True, exist_ok=True)
 
         self.process: Optional[subprocess.Popen] = None
+        self._server_log_file = None
 
     def start(self, timeout_seconds: float = 12.0) -> None:
         """Starts the FastAPI uvicorn server in a subprocess and waits for /api/health."""
@@ -65,12 +66,14 @@ class IsolatedTestServer:
             "warning",
         ]
 
+        self.server_log_path = self.temp_path / "server.log"
+        self._server_log_file = open(self.server_log_path, "w", encoding="utf-8")
         self.process = subprocess.Popen(
             cmd,
             cwd=str(PROJECT_ROOT),
             env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=self._server_log_file,
+            stderr=subprocess.STDOUT,
         )
 
         # Wait for health endpoint
@@ -100,6 +103,8 @@ class IsolatedTestServer:
                 self.process.kill()
                 self.process.wait(timeout=2.0)
             self.process = None
+        if self._server_log_file and not self._server_log_file.closed:
+            self._server_log_file.close()
 
     def restart(self, timeout_seconds: float = 12.0) -> None:
         """Stops and restarts the server with the exact same database to simulate restarts/recovery."""

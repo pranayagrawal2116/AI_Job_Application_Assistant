@@ -63,6 +63,16 @@ class DashboardService:
         else:
             self.storage_base_dir = get_default_user_storage_base()
         self.file_validator = FileSecurityValidator(base_storage_dir=self.storage_base_dir)
+        from src.preparer.career_context_resolver import CareerContextResolver
+        self.career_resolver = CareerContextResolver(db_manager=self.db)
+
+    def resolve_candidate_career_context(self, user_id: int):
+        """Derives authoritative resume-based career context for an authenticated candidate."""
+        return self.career_resolver.resolve_candidate_career_context(user_id)
+
+    def is_job_relevant_for_candidate(self, job_title: str, job_description: str, career_ctx) -> bool:
+        """Determines if a discovered opportunity is domain-relevant for the candidate."""
+        return self.career_resolver.is_job_relevant(job_title, job_description, career_ctx)
 
     def _resolve_url(self, hostname: str, port: int) -> List[str]:
         """Resolves hostname via injected url_resolver or socket.getaddrinfo with test domain mapping."""
@@ -327,44 +337,16 @@ class DashboardService:
         max_results_per_source: int = 5,
     ) -> Dict[str, Any]:
         """Runs candidate-scoped job discovery, saves jobs, and automatically scores against primary resume."""
-        # 1. Resolve search preferences
-        prof_rec = self.db.get_user_candidate_profile(user_id)
-        prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
-        prefs = prof_data.get("search_preferences", {}) or prof_data.get("preferences", {})
+        # 1. Resolve career context via canonical CareerContextResolver
+        career_ctx = self.resolve_candidate_career_context(user_id)
+        if not career_ctx.has_primary_resume:
+            raise ValueError("No primary resume found for candidate. Please upload a resume first.")
 
-        target_roles = list(roles) if roles and len(roles) > 0 else list(prefs.get("target_roles", []))
-        target_locations = list(locations) if locations and len(locations) > 0 else list(prefs.get("target_locations", []))
-
-        # If still empty, infer dynamically from primary resume
-        resumes = self.get_user_resumes(user_id)
-        primary_resume = next((r for r in resumes if r.get("is_primary")), resumes[0] if resumes else None)
-
-        if (not target_roles or not target_locations) and primary_resume:
-            from src.preparer.career_role_inferencer import CareerRoleInferencer
-            inferencer = CareerRoleInferencer()
-            parsed_data = primary_resume.get("parsed_data")
-            if isinstance(parsed_data, str):
-                try:
-                    parsed_data = json.loads(parsed_data)
-                except Exception:
-                    parsed_data = {}
-            if not target_roles:
-                inferred = inferencer.infer_roles(parsed_data or prof_data)
-                target_roles = [r.role_title for r in inferred[:5]]
-            if not target_locations:
-                target_locations = inferencer.infer_locations(parsed_data or prof_data)
+        target_roles = list(roles) if roles and len(roles) > 0 else career_ctx.selected_roles
+        target_locations = list(locations) if locations and len(locations) > 0 else career_ctx.target_locations
 
         if not target_roles:
-            # Derive role from skills or educational major without assuming software engineering
-            major = ""
-            for edu in prof_data.get("education", []):
-                major = edu.get("major") or edu.get("degree") or ""
-                if major:
-                    break
-            if major:
-                target_roles = [f"{major} Specialist", f"{major} Associate"]
-            else:
-                target_roles = ["Associate", "Specialist"]
+            target_roles = ["Specialist", "Associate"]
         if not target_locations:
             target_locations = ["Remote", "India"]
 
@@ -373,8 +355,14 @@ class DashboardService:
         if active_run:
             return {"status": "ALREADY_RUNNING", "run_id": active_run["id"]}
 
-        # 3. Create run record
-        run_rec = self.db.create_discovery_run(user_id, target_roles, target_locations)
+        # 3. Create run record scoped to resume fingerprint
+        run_rec = self.db.create_discovery_run(
+            user_id=user_id,
+            target_roles=target_roles,
+            target_locations=target_locations,
+            resume_id=career_ctx.primary_resume_id,
+            resume_fingerprint=career_ctx.resume_fingerprint,
+        )
         run_id = run_rec["id"]
         self.db.update_discovery_run(run_id, status="RUNNING")
 
@@ -398,15 +386,21 @@ class DashboardService:
                     relevant_ids.add(dup_id)
 
             if relevant_ids:
-                self.db.record_candidate_discovered_jobs(user_id, list(relevant_ids), discovery_run_id=run_id)
+                self.db.record_candidate_discovered_jobs(
+                    user_id=user_id,
+                    job_ids=list(relevant_ids),
+                    discovery_run_id=run_id,
+                    resume_id=career_ctx.primary_resume_id,
+                    resume_fingerprint=career_ctx.resume_fingerprint,
+                )
 
             newly_scored = 0
-            if primary_resume and relevant_ids:
+            if career_ctx.primary_resume_id and relevant_ids:
                 for job_id in relevant_ids:
                     try:
                         self.run_match_evaluation(
                             user_id=user_id,
-                            resume_id=primary_resume["id"],
+                            resume_id=career_ctx.primary_resume_id,
                             job_id=job_id,
                         )
                         newly_scored += 1
@@ -3243,6 +3237,7 @@ class DashboardService:
         job_description_id: Optional[int] = None,
         job_id: Optional[int] = None,
         scoring_profile_id: Optional[str] = None,
+        verified_resume: Optional[Any] = None,
     ) -> UniversalMatchResult:
         """Executes full universal match evaluation incorporating authenticated user profile and stores immutable record."""
         # 1. Fetch user's active candidate profile
@@ -3258,25 +3253,30 @@ class DashboardService:
         active_version = res_rec.get("active_version", 1) or 1
 
         # 3. JIT Verify Resume Binary before matching (Finding A)
-        from src.security.resume_verifier import ResumeIntegrityVerifier
-        from src.security.file_security import FileSecurityValidator
+        if verified_resume is not None:
+            if getattr(verified_resume, "user_id", None) != user_id or getattr(verified_resume, "resume_id", None) != resume_id:
+                verified_resume = None
 
-        f_val = FileSecurityValidator(base_storage_dir=self.storage_base_dir) if self.storage_base_dir else None
-        verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=f_val)
-        verified_res = verifier.verify_and_load_resume(
-            user_id=user_id,
-            resume_id=resume_id,
-            version_num=active_version,
-            fresh_parse=True,
-        )
+        if verified_resume is None:
+            from src.security.resume_verifier import ResumeIntegrityVerifier
+            from src.security.file_security import FileSecurityValidator
+
+            f_val = FileSecurityValidator(base_storage_dir=self.storage_base_dir) if self.storage_base_dir else None
+            verifier = ResumeIntegrityVerifier(db_manager=self.db, file_validator=f_val)
+            verified_resume = verifier.verify_and_load_resume(
+                user_id=user_id,
+                resume_id=resume_id,
+                version_num=active_version,
+                fresh_parse=True,
+            )
 
         matcher = UniversalMatcher(db_manager=self.db)
         return matcher.evaluate(
             user_id=user_id,
             resume_id=resume_id,
-            resume_version_num=verified_res.version_num,
-            resume_data=verified_res.parsed_resume,
-            verified_resume=verified_res,
+            resume_version_num=verified_resume.version_num,
+            resume_data=verified_resume.parsed_resume,
+            verified_resume=verified_resume,
             profile_data=profile_data,
             candidate_profile_version=candidate_profile_version,
             candidate_profile_hash=candidate_profile_hash,

@@ -106,6 +106,11 @@ class CareerRoleInferencer:
             "category": "Taxation",
             "min_matches": 1,
         },
+        "Tax Associate": {
+            "keywords": ["taxation", "tax compliance", "tax computations", "sa100", "tax returns", "direct tax", "indirect tax", "uk tax"],
+            "category": "Taxation",
+            "min_matches": 1,
+        },
         "Tax Compliance Associate": {
             "keywords": ["tax compliance", "tax computations", "taxation", "sa100", "direct tax", "indirect tax"],
             "category": "Taxation",
@@ -323,6 +328,7 @@ class CareerRoleInferencer:
             c_name = str(cert.get("name", "")).lower() if isinstance(cert, dict) else str(cert).lower()
             if "acca" in c_name or "chartered" in c_name:
                 self._add_or_update_role(inferred, "UK Tax Associate", "ACCA qualification / membership", 0.95)
+                self._add_or_update_role(inferred, "Tax Associate", "ACCA qualification / membership", 0.95)
                 self._add_or_update_role(inferred, "Tax Compliance Associate", "ACCA qualification / membership", 0.95)
                 self._add_or_update_role(inferred, "Accounts Associate", "ACCA qualification / membership", 0.95)
                 self._add_or_update_role(inferred, "Accounts Payable Associate", "ACCA qualification / membership", 0.90)
@@ -866,6 +872,17 @@ class CareerRoleInferencer:
                 ],
             },
             {
+                "id": "mechanical_engineering",
+                "label": "Mechanical & Industrial Engineering",
+                "roles_label": "mechanical engineering and design",
+                "patterns": [
+                    r"\bmechanical engineer\b", r"\bmechanical engineering\b",
+                    r"\bsolidworks\b", r"\bautocad\b", r"\bcatia\b", r"\bansys\b",
+                    r"\bthermodynamics\b", r"\bfinite element\b", r"\bcad designer\b",
+                    r"\bmanufacturing engineer\b"
+                ],
+            },
+            {
                 "id": "engineering_tech",
                 "label": "Engineering & Technology",
                 "roles_label": "software engineering and technology",
@@ -873,8 +890,7 @@ class CareerRoleInferencer:
                     r"\bsoftware engineer\b", r"\bcomputer science\b",
                     r"\bsoftware developer\b", r"\bdata scientist\b",
                     r"\bmachine learning\b", r"\bb\.tech\b", r"\bm\.tech\b",
-                    r"\belectrical engineering\b", r"\bmechanical engineering\b",
-                    r"\bcivil engineering\b"
+                    r"\belectrical engineering\b", r"\bcivil engineering\b"
                 ],
             },
         ]

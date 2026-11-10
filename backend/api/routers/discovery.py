@@ -7,7 +7,6 @@ from pydantic import BaseModel, Field
 
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
-from src.preparer.career_role_inferencer import CareerRoleInferencer
 
 logger = logging.getLogger(__name__)
 
@@ -53,30 +52,38 @@ def get_discovery_status(auth_ctx=Depends(get_current_user_and_session)):
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
 
+    career_ctx = service.resolve_candidate_career_context(user_id)
     active_run = service.db.get_active_discovery_run(user_id)
     latest_run = service.db.get_latest_discovery_run(user_id)
 
-    prof_rec = service.db.get_user_candidate_profile(user_id)
-    prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
-    prefs = prof_data.get("search_preferences", {}) or prof_data.get("preferences", {})
+    latest_run_for_fingerprint = (
+        service.db.get_latest_discovery_run(
+            user_id,
+            resume_fingerprint=career_ctx.resume_fingerprint,
+            status_in=["COMPLETED", "PARTIAL"],
+        )
+        if career_ctx.resume_fingerprint
+        else None
+    )
 
-    # Inferred roles from primary resume
-    suggested_roles = prefs.get("suggested_roles", [])
-    if not suggested_roles:
-        resumes = service.get_user_resumes(user_id)
-        if resumes:
-            inferencer = CareerRoleInferencer()
-            inferred = inferencer.infer_roles(prof_data)
-            suggested_roles = [r.to_dict() for r in inferred]
+    suggested_roles = [r.to_dict() if hasattr(r, "to_dict") else r for r in career_ctx.inferred_roles]
 
     return {
         "is_running": active_run is not None,
         "active_run": active_run,
         "latest_run": latest_run,
         "suggested_roles": suggested_roles,
-        "target_roles": prefs.get("target_roles", [r["role_title"] for r in suggested_roles[:5]]),
-        "target_locations": prefs.get("target_locations", ["Remote", "India"]),
-        "auto_discover_enabled": bool(prefs.get("auto_discover_enabled", True)),
+        "target_roles": career_ctx.selected_roles,
+        "target_locations": career_ctx.target_locations,
+        "auto_discover_enabled": True,
+        "has_primary_resume": career_ctx.has_primary_resume,
+        "primary_resume_id": career_ctx.primary_resume_id,
+        "resume_fingerprint": career_ctx.resume_fingerprint,
+        "career_domain": career_ctx.career_domain,
+        "candidate_category": career_ctx.candidate_category,
+        "completed_for_current_resume": latest_run_for_fingerprint is not None,
+        "role_source": career_ctx.role_source,
+        "inference_confidence": round(career_ctx.inference_confidence, 2),
     }
 
 
@@ -85,17 +92,13 @@ def get_suggested_roles(auth_ctx=Depends(get_current_user_and_session)):
     """Infers and returns empirical search roles dynamically from candidate resume evidence."""
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
-
-    prof_rec = service.db.get_user_candidate_profile(user_id)
-    prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
-
-    inferencer = CareerRoleInferencer()
-    roles = inferencer.infer_roles(prof_data)
-    locations = inferencer.infer_locations(prof_data)
+    career_ctx = service.resolve_candidate_career_context(user_id)
 
     return {
-        "suggested_roles": [r.to_dict() for r in roles],
-        "suggested_locations": locations,
+        "suggested_roles": [r.to_dict() if hasattr(r, "to_dict") else r for r in career_ctx.inferred_roles],
+        "suggested_locations": career_ctx.target_locations,
+        "career_domain": career_ctx.career_domain,
+        "candidate_category": career_ctx.candidate_category,
     }
 
 
@@ -107,6 +110,7 @@ def update_search_preferences(
     """Updates candidate-confirmed search roles, target locations, and discovery settings."""
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
+    career_ctx = service.resolve_candidate_career_context(user_id)
 
     prof_rec = service.db.get_user_candidate_profile(user_id)
     prof_data = prof_rec.get("profile_data", {}) if prof_rec else {}
@@ -115,7 +119,10 @@ def update_search_preferences(
         "target_roles": req.target_roles or [],
         "target_locations": req.target_locations or ["Remote", "India"],
         "auto_discover_enabled": bool(req.auto_discover_enabled),
-        "suggested_roles": prof_data.get("search_preferences", {}).get("suggested_roles", []),
+        "suggested_roles": [r.to_dict() if hasattr(r, "to_dict") else r for r in career_ctx.inferred_roles],
+        "is_user_override": True,
+        "explicit_user_override": True,
+        "resume_fingerprint": career_ctx.resume_fingerprint,
     }
 
     prof_data["search_preferences"] = search_prefs
