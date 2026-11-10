@@ -186,6 +186,7 @@ class UniversalMatchResult:
     recommendations: List[str]
     scoring_explanations: Dict[str, str]
     resume_file_hash: Optional[str] = None
+    resume_fingerprint: Optional[str] = None
     job_snapshot_hash: Optional[str] = None
     resume_id: Optional[int] = None
     resume_version_num: int = 1
@@ -218,6 +219,7 @@ class UniversalMatchResult:
             "recommendations": self.recommendations,
             "scoring_explanations": self.scoring_explanations,
             "resume_file_hash": self.resume_file_hash,
+            "resume_fingerprint": self.resume_fingerprint,
             "job_snapshot_hash": self.job_snapshot_hash,
             "resume_id": self.resume_id,
             "resume_version_num": self.resume_version_num,
@@ -927,8 +929,44 @@ class UniversalSkillMatcher:
             all_job_skills.append((s, False))
 
         if not all_job_skills:
-            # If no skills specified in job description, assign neutral 1.0 ratio and baseline confidence
-            return [], 1.0, 0.7
+            # When no explicit skills enumerated, evaluate candidate skills against role title and domain keywords
+            title_text = (reqs.job_title or "").lower()
+            resp_text = " ".join(reqs.responsibilities).lower()
+            combined_role_text = f"{title_text} {resp_text}"
+
+            role_keywords = set(re.findall(r"\b[a-zA-Z]{3,}\b", combined_role_text))
+            generic_stopwords = {
+                "the", "and", "for", "with", "that", "this", "will", "have", "team", "work",
+                "role", "position", "intern", "internship", "junior", "senior", "lead", "associate",
+                "unit", "pune", "delhi", "mumbai", "india", "remote", "onsite", "hybrid", "division"
+            }
+            significant_keywords = role_keywords - generic_stopwords
+
+            if not significant_keywords:
+                return [], 0.0, 0.4
+
+            cand_skills_normalized = []
+            skill_objs = facts.skills.values() if isinstance(facts.skills, dict) else facts.skills
+            for s in skill_objs:
+                s_name = s.name if hasattr(s, "name") else str(s)
+                cand_skills_normalized.append(normalize_skill_token(s_name))
+
+            cand_skill_words = set()
+            for s in cand_skills_normalized:
+                cand_skill_words.update(re.findall(r"\b[a-zA-Z]{3,}\b", s))
+            for c in facts.certifications:
+                c_name = c.name if hasattr(c, "name") else str(c)
+                cand_skill_words.update(re.findall(r"\b[a-zA-Z]{3,}\b", c_name.lower()))
+            for exp in facts.experience:
+                exp_title = exp.job_title if hasattr(exp, "job_title") else str(exp)
+                cand_skill_words.update(re.findall(r"\b[a-zA-Z]{3,}\b", exp_title.lower()))
+
+            matched_keywords = significant_keywords.intersection(cand_skill_words)
+            if not matched_keywords:
+                return [], 0.0, 0.5
+
+            ratio = min(1.0, len(matched_keywords) / max(1, min(len(significant_keywords), 4)))
+            return [], ratio, 0.65
 
         total_weight = 0.0
         earned_weight = 0.0
@@ -1073,6 +1111,28 @@ class EducationCompatibilityEvaluator:
             "notes": [],
         }
 
+        cand_majors = [e.major.lower() for e in facts.education if e.major] if facts.education else []
+        if facts.education:
+            best_edu = max(facts.education, key=lambda e: e.degree_rank)
+            analysis["highest_candidate_degree"] = f"{best_edu.degree} in {best_edu.major}".strip()
+            analysis["candidate_degree_rank"] = best_edu.degree_rank
+
+        if cand_majors and reqs.job_title:
+            title_lower = reqs.job_title.lower()
+            is_tech_role = any(t in title_lower for t in ["engineer", "developer", "software", "artificial intelligence", "machine learning", "data sci", "genai", "llm"])
+            is_finance_role = any(t in title_lower for t in ["tax", "account", "audit", "finance", "cpa", "acca"])
+            is_tech_cand = any(any(tm in cm for tm in ["computer", "software", "data", "information technology", "ai", "artificial intelligence"]) for cm in cand_majors)
+            is_finance_cand = any(any(fm in cm for fm in ["finance", "accounting", "commerce", "business administration", "economics"]) for cm in cand_majors)
+
+            if is_tech_role and not is_tech_cand and is_finance_cand:
+                analysis["major_match"] = "DISCIPLINE_MISMATCH"
+                analysis["notes"].append(f"Candidate major ({', '.join(cand_majors)}) is in finance/commerce, which does not match technology engineering role discipline.")
+                return analysis, 0.20, 0.85
+            elif is_finance_role and not is_finance_cand and is_tech_cand:
+                analysis["major_match"] = "DISCIPLINE_MISMATCH"
+                analysis["notes"].append(f"Candidate major ({', '.join(cand_majors)}) is in technical field, which does not match accounting/finance role discipline.")
+                return analysis, 0.20, 0.85
+
         if reqs.min_degree_rank == 0 and not reqs.preferred_fields_of_study and reqs.min_gpa is None:
             analysis["notes"].append("No specific formal degree, major, or CGPA cutoff required for this role.")
             return analysis, 1.0, 1.0
@@ -1100,8 +1160,8 @@ class EducationCompatibilityEvaluator:
 
         # Major match
         major_ratio = 1.0
+        cand_majors = [e.major.lower() for e in facts.education if e.major]
         if reqs.preferred_fields_of_study:
-            cand_majors = [e.major.lower() for e in facts.education if e.major]
             matched_major = any(
                 any(p.lower() in cm or cm in p.lower() for p in reqs.preferred_fields_of_study)
                 for cm in cand_majors
@@ -1114,6 +1174,21 @@ class EducationCompatibilityEvaluator:
                 analysis["major_match"] = "RELATED_OR_UNMATCHED"
                 analysis["notes"].append(f"Candidate major ({', '.join(cand_majors)}) does not directly match preferred fields: {', '.join(reqs.preferred_fields_of_study)}.")
                 major_ratio = 0.60
+        elif cand_majors and reqs.job_title:
+            title_lower = reqs.job_title.lower()
+            is_tech_role = any(t in title_lower for t in ["engineer", "developer", "software", "artificial intelligence", "machine learning", "data sci", "genai", "llm"])
+            is_finance_role = any(t in title_lower for t in ["tax", "account", "audit", "finance", "cpa", "acca"])
+            is_tech_cand = any(any(tm in cm for tm in ["computer", "software", "data", "information technology", "ai", "artificial intelligence"]) for cm in cand_majors)
+            is_finance_cand = any(any(fm in cm for fm in ["finance", "accounting", "commerce", "business administration", "economics"]) for cm in cand_majors)
+
+            if is_tech_role and not is_tech_cand and is_finance_cand:
+                analysis["major_match"] = "DISCIPLINE_MISMATCH"
+                analysis["notes"].append(f"Candidate major ({', '.join(cand_majors)}) is in finance/commerce, which does not match technology engineering role discipline.")
+                major_ratio = 0.20
+            elif is_finance_role and not is_finance_cand and is_tech_cand:
+                analysis["major_match"] = "DISCIPLINE_MISMATCH"
+                analysis["notes"].append(f"Candidate major ({', '.join(cand_majors)}) is in technical field, which does not match accounting/finance role discipline.")
+                major_ratio = 0.20
 
         # CGPA Cutoff
         cgpa_ratio = 1.0
@@ -1274,7 +1349,38 @@ class ResponsibilityAlignmentEvaluator:
         reqs: NormalizedJobRequirements,
     ) -> Tuple[float, List[str]]:
         if not reqs.responsibilities:
-            return 1.0, ["General responsibility alignment accepted (no specific duties enumerated in job description)."]
+            title_text = (reqs.job_title or "").lower()
+            role_keywords = set(re.findall(r"\b[a-zA-Z]{3,}\b", title_text))
+            generic_stopwords = {
+                "the", "and", "for", "with", "that", "this", "will", "have", "team", "work",
+                "role", "position", "intern", "internship", "junior", "senior", "lead", "associate",
+                "unit", "pune", "delhi", "mumbai", "india", "remote", "onsite", "hybrid", "division"
+            }
+            significant_keywords = role_keywords - generic_stopwords
+
+            if not significant_keywords:
+                return 0.0, ["No specific duties enumerated in job description and role title is non-specific."]
+
+            candidate_corpus = []
+            for exp in facts.experience:
+                candidate_corpus.extend(exp.responsibilities)
+                candidate_corpus.append(exp.job_title)
+            for proj in facts.projects:
+                candidate_corpus.append(proj.title)
+                candidate_corpus.append(proj.description)
+            skill_objs = facts.skills.values() if isinstance(facts.skills, dict) else facts.skills
+            for s in skill_objs:
+                s_name = s.name if hasattr(s, "name") else str(s)
+                candidate_corpus.append(s_name)
+
+            full_corpus_text = " ".join(candidate_corpus).lower()
+            matched_keywords = [kw for kw in significant_keywords if kw in full_corpus_text]
+
+            if not matched_keywords:
+                return 0.0, [f"Candidate background shows no demonstrated alignment with role title '{reqs.job_title}'."]
+
+            ratio = min(1.0, len(matched_keywords) / max(1, min(len(significant_keywords), 3)))
+            return ratio, [f"Demonstrated role alignment with '{reqs.job_title}' based on verified candidate experience."]
 
         candidate_corpus = []
         for exp in facts.experience:
@@ -1471,6 +1577,12 @@ class UniversalEligibilityEvaluator:
                     ineligible_reasons.append(
                         f"Candidate's confirmed experience ({conf_yrs:.1f} yrs) is demonstrably below mandatory minimum requirement of {min_yrs:.1f} yrs."
                     )
+
+        # 5. Discipline Incompatibility Check
+        if edu_analysis.get("major_match") == "DISCIPLINE_MISMATCH":
+            ineligible_reasons.append(
+                f"Candidate academic discipline ({edu_analysis.get('highest_candidate_degree')}) is incompatible with professional discipline of role."
+            )
 
         # Final Status Decision
         if ineligible_reasons:
@@ -1810,6 +1922,7 @@ class MatchResultPersistenceService:
             explanation=summary_explanation,
             resume_version_num=result.resume_version_num,
             resume_file_hash=result.resume_file_hash,
+            resume_fingerprint=result.resume_fingerprint,
             candidate_profile_version=result.candidate_profile_version,
             candidate_profile_hash=result.candidate_profile_hash,
             job_snapshot_hash=result.job_snapshot_hash,
@@ -2054,6 +2167,10 @@ class UniversalMatcher:
         else:
             match_classification = "Low Match"
 
+        computed_fingerprint = None
+        if resume_id and resume_file_hash:
+            computed_fingerprint = f"rfp_{resume_id}_{resume_file_hash[:16]}"
+
         result = UniversalMatchResult(
             user_id=user_id,
             match_score=overall_score,
@@ -2075,6 +2192,7 @@ class UniversalMatcher:
             recommendations=recs,
             scoring_explanations=explanations,
             resume_file_hash=resume_file_hash,
+            resume_fingerprint=computed_fingerprint,
             job_snapshot_hash=job_snapshot_hash,
             resume_id=resume_id,
             resume_version_num=resume_version_num or 1,

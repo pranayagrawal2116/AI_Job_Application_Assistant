@@ -1483,9 +1483,16 @@ class DashboardService:
 
         return counts
 
-    def get_candidate_dashboard_metrics(self, user_id: int) -> Dict[str, Any]:
+    def get_candidate_dashboard_metrics(
+        self,
+        user_id: int,
+        resume_fingerprint: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Returns candidate-scoped matching metrics without global catalog score contamination."""
-        return self.db.get_candidate_matching_metrics(user_id)
+        if resume_fingerprint is None:
+            career_ctx = self.resolve_candidate_career_context(user_id)
+            resume_fingerprint = career_ctx.resume_fingerprint
+        return self.db.get_candidate_matching_metrics(user_id, resume_fingerprint=resume_fingerprint)
 
     def get_candidate_application_match_detail(
         self,

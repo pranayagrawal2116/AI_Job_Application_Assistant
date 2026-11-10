@@ -511,6 +511,7 @@ class MatchResult:
     resume_id: Optional[int] = None
     resume_version_num: int = 1
     resume_file_hash: Optional[str] = None
+    resume_fingerprint: Optional[str] = None
     candidate_profile_version: int = 1
     candidate_profile_hash: Optional[str] = None
     job_id: Optional[int] = None

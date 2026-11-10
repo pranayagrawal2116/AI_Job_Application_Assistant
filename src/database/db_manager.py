@@ -1553,17 +1553,32 @@ class DatabaseManager:
         if "resume_fingerprint" not in cand_cols:
             cursor.execute("ALTER TABLE candidate_discovered_jobs ADD COLUMN resume_fingerprint TEXT")
         cursor.execute("CREATE INDEX IF NOT EXISTS idx_candidate_discovered_user_resume ON candidate_discovered_jobs(user_id, resume_id, resume_fingerprint)")
+        
+        # Clean up stale candidate_discovered_jobs without an active resume_fingerprint (if table and dependencies exist)
         try:
-            cursor.execute("""
-                INSERT OR IGNORE INTO candidate_discovered_jobs (user_id, job_id, discovered_at)
-                SELECT DISTINCT user_id, job_id, evaluated_at
-                FROM match_results
-                WHERE user_id IS NOT NULL AND job_id IS NOT NULL
-            """)
+            cursor.execute("DELETE FROM candidate_discovered_jobs WHERE resume_fingerprint IS NULL")
         except Exception as e:
-            logger.debug("Backfill candidate_discovered_jobs note: %s", e)
+            logger.debug("Cleanup candidate_discovered_jobs note: %s", e)
 
-        logger.info("discovery_runs and candidate_discovered_jobs migration checked successfully.")
+        # Phase C.0.4: resume_fingerprint column in match_results
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='match_results'")
+        if cursor.fetchone():
+            cursor.execute("PRAGMA table_info(match_results)")
+            mr_cols = {r["name"]: dict(r) for r in cursor.fetchall()}
+            if "resume_fingerprint" not in mr_cols:
+                cursor.execute("ALTER TABLE match_results ADD COLUMN resume_fingerprint TEXT")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_match_results_fingerprint ON match_results(user_id, resume_fingerprint)")
+            # Backfill resume_fingerprint in match_results where resume_id and file_hash are available
+            try:
+                cursor.execute("""
+                    UPDATE match_results
+                    SET resume_fingerprint = 'rfp_' || resume_id || '_' || substr(resume_file_hash, 1, 16)
+                    WHERE resume_id IS NOT NULL AND resume_file_hash IS NOT NULL AND resume_fingerprint IS NULL
+                """)
+            except Exception as e:
+                logger.debug("Backfill match_results resume_fingerprint note: %s", e)
+
+        logger.info("discovery_runs, candidate_discovered_jobs, and match_results migration checked successfully.")
 
     def _migrate_phase7_lifecycle_tables(self, conn: sqlite3.Connection) -> None:
         """Migrates applications and lifecycle tables to Phase 7 universal architecture.
@@ -7402,20 +7417,24 @@ class DatabaseManager:
                     raise JobNotFoundError(result.job_id)
 
             # 5. Insert immutable evaluation record
+            resume_fp = result.resume_fingerprint
+            if not resume_fp and result.resume_id is not None and result.resume_file_hash:
+                resume_fp = f"rfp_{result.resume_id}_{result.resume_file_hash[:16]}"
+
             cursor.execute(
                 """
                 INSERT INTO match_results (
                     user_id, resume_id, job_id, job_description_id,
                     match_score, match_classification, eligibility_status,
                     score_breakdown, explanation,
-                    resume_version_num, resume_file_hash, candidate_profile_version,
+                    resume_version_num, resume_file_hash, resume_fingerprint, candidate_profile_version,
                     candidate_profile_hash,
                     job_snapshot_hash, scoring_profile, scoring_config_version,
                     assessment_confidence, engine_version,
                     matching_skills, related_skills, partial_matches, missing_skills,
                     education_analysis, experience_analysis, certification_analysis,
                     eligibility_reasons, scoring_explanations, recommendations, details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     result.user_id,
@@ -7429,6 +7448,7 @@ class DatabaseManager:
                     result.explanation,
                     result.resume_version_num,
                     result.resume_file_hash,
+                    resume_fp,
                     result.candidate_profile_version,
                     result.candidate_profile_hash,
                     result.job_snapshot_hash,
@@ -7475,13 +7495,17 @@ class DatabaseManager:
         resume_id: Optional[int] = None,
         job_description_id: Optional[int] = None,
         job_id: Optional[int] = None,
+        resume_fingerprint: Optional[str] = None,
         limit: int = 50,
     ) -> List[MatchResult]:
         """Retrieves historical match evaluation results for a user, newest first."""
         query = "SELECT * FROM match_results WHERE user_id = ?"
         params: List[Any] = [user_id]
 
-        if resume_id is not None:
+        if resume_fingerprint is not None:
+            query += " AND resume_fingerprint = ?"
+            params.append(resume_fingerprint)
+        elif resume_id is not None:
             query += " AND resume_id = ?"
             params.append(resume_id)
         if job_description_id is not None:
@@ -7532,6 +7556,7 @@ class DatabaseManager:
             explanation=row["explanation"],
             resume_version_num=row["resume_version_num"] if "resume_version_num" in keys and row["resume_version_num"] is not None else 1,
             resume_file_hash=row["resume_file_hash"] if "resume_file_hash" in keys else None,
+            resume_fingerprint=row["resume_fingerprint"] if "resume_fingerprint" in keys else None,
             candidate_profile_version=row["candidate_profile_version"] if "candidate_profile_version" in keys and row["candidate_profile_version"] is not None else 1,
             candidate_profile_hash=row["candidate_profile_hash"] if "candidate_profile_hash" in keys else None,
             job_snapshot_hash=row["job_snapshot_hash"] if "job_snapshot_hash" in keys else None,
@@ -7559,11 +7584,12 @@ class DatabaseManager:
         job_ids: List[int],
         resume_id: Optional[int] = None,
         resume_file_hash: Optional[str] = None,
+        resume_fingerprint: Optional[str] = None,
     ) -> Dict[int, MatchResult]:
         """Fetches the latest match result for each job_id for the user.
 
-        If resume_id or resume_file_hash is provided, restricts matches to evaluations performed
-        against that specific primary resume, preventing stale cross-resume match scores from leaking.
+        If resume_fingerprint, resume_id, or resume_file_hash is provided, restricts matches to evaluations
+        performed against that specific primary resume, preventing stale cross-resume match scores from leaking.
         """
         if not job_ids:
             return {}
@@ -7573,8 +7599,11 @@ class DatabaseManager:
             WHERE user_id = ? AND job_id IN ({q_marks})
         """
         params: List[Any] = [user_id] + list(job_ids)
-        if resume_id is not None and resume_file_hash is not None:
-            query += " AND (resume_id = ? OR resume_file_hash = ?)"
+        if resume_fingerprint is not None:
+            query += " AND resume_fingerprint = ?"
+            params.append(resume_fingerprint)
+        elif resume_id is not None and resume_file_hash is not None:
+            query += " AND resume_id = ? AND resume_file_hash = ?"
             params.extend([resume_id, resume_file_hash])
         elif resume_id is not None:
             query += " AND resume_id = ?"
@@ -7594,11 +7623,16 @@ class DatabaseManager:
                     results[mr.job_id] = mr
             return results
 
-    def get_candidate_matching_metrics(self, user_id: int) -> Dict[str, int]:
+    def get_candidate_matching_metrics(
+        self,
+        user_id: int,
+        resume_fingerprint: Optional[str] = None,
+    ) -> Dict[str, int]:
         """Calculates candidate-specific matching and catalog metrics.
 
         Strictly scopes match and eligibility metrics to MatchResult records evaluated
-        for the given candidate user_id, completely avoiding leakage of global Job catalog scores.
+        for the given candidate user_id (and optionally active resume_fingerprint),
+        completely avoiding leakage of global Job catalog scores or cross-resume evaluations.
         """
         with self.connection() as conn:
             cursor = conn.cursor()
@@ -7609,30 +7643,54 @@ class DatabaseManager:
             total_catalog = row[0] if row else 0
 
             # 2. Total discovery occurrences across user's discovery runs
-            cursor.execute("SELECT COALESCE(SUM(total_discovered), 0) FROM discovery_runs WHERE user_id = ?", (user_id,))
+            if resume_fingerprint:
+                cursor.execute(
+                    "SELECT COALESCE(SUM(total_discovered), 0) FROM discovery_runs WHERE user_id = ? AND resume_fingerprint = ?",
+                    (user_id, resume_fingerprint),
+                )
+            else:
+                cursor.execute("SELECT COALESCE(SUM(total_discovered), 0) FROM discovery_runs WHERE user_id = ?", (user_id,))
             row = cursor.fetchone()
             total_discovery_occurrences = row[0] if row else 0
 
             # 3. Candidate-specific evaluated matches count (distinct jobs)
-            cursor.execute(
-                """
-                SELECT 
-                    COUNT(DISTINCT job_id) as evaluated_count,
-                    COUNT(DISTINCT CASE WHEN eligibility_status = 'ELIGIBLE' THEN job_id END) as eligible_count
-                FROM match_results
-                WHERE user_id = ? AND job_id IS NOT NULL
-                """,
-                (user_id,)
-            )
+            if resume_fingerprint:
+                cursor.execute(
+                    """
+                    SELECT 
+                        COUNT(DISTINCT job_id) as evaluated_count,
+                        COUNT(DISTINCT CASE WHEN eligibility_status = 'ELIGIBLE' THEN job_id END) as eligible_count
+                    FROM match_results
+                    WHERE user_id = ? AND resume_fingerprint = ? AND job_id IS NOT NULL
+                    """,
+                    (user_id, resume_fingerprint),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT 
+                        COUNT(DISTINCT job_id) as evaluated_count,
+                        COUNT(DISTINCT CASE WHEN eligibility_status = 'ELIGIBLE' THEN job_id END) as eligible_count
+                    FROM match_results
+                    WHERE user_id = ? AND job_id IS NOT NULL
+                    """,
+                    (user_id,),
+                )
             row = cursor.fetchone()
             evaluated_count = row["evaluated_count"] if row else 0
             eligible_count = row["eligible_count"] if row else 0
 
             # 4. Phase C.0.1: Unique candidate discovered jobs
-            cursor.execute(
-                "SELECT COUNT(DISTINCT job_id) FROM candidate_discovered_jobs WHERE user_id = ?",
-                (user_id,)
-            )
+            if resume_fingerprint:
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT job_id) FROM candidate_discovered_jobs WHERE user_id = ? AND resume_fingerprint = ?",
+                    (user_id, resume_fingerprint),
+                )
+            else:
+                cursor.execute(
+                    "SELECT COUNT(DISTINCT job_id) FROM candidate_discovered_jobs WHERE user_id = ?",
+                    (user_id,),
+                )
             row = cursor.fetchone()
             unique_candidate_discovered = row[0] if row else 0
 
@@ -7655,14 +7713,18 @@ class DatabaseManager:
         """Associates newly discovered or matched jobs with a candidate user.
 
         Uses UPSERT to guarantee idempotency and maintain active discovery run and resume fingerprint.
-        Returns the number of associations recorded or updated.
+        Returns the number of new associations recorded (excluding already associated jobs).
         """
         if not job_ids:
             return 0
         with self.transaction() as conn:
             cursor = conn.cursor()
+            cursor.execute("SELECT job_id FROM candidate_discovered_jobs WHERE user_id = ?", (user_id,))
+            existing = {r[0] for r in cursor.fetchall()}
             inserted = 0
             for jid in set(job_ids):
+                if jid not in existing:
+                    inserted += 1
                 cursor.execute(
                     """
                     INSERT INTO candidate_discovered_jobs (user_id, job_id, discovery_run_id, resume_id, resume_fingerprint, discovered_at)
@@ -7675,8 +7737,6 @@ class DatabaseManager:
                     """,
                     (user_id, jid, discovery_run_id, resume_id, resume_fingerprint),
                 )
-                if cursor.rowcount > 0:
-                    inserted += 1
             return inserted
 
     def get_candidate_discovered_job_ids(

@@ -188,6 +188,7 @@ CREATE TABLE IF NOT EXISTS match_results (
     explanation TEXT NOT NULL,
     resume_version_num INTEGER DEFAULT 1,
     resume_file_hash TEXT,
+    resume_fingerprint TEXT,
     candidate_profile_version INTEGER DEFAULT 1,
     candidate_profile_hash TEXT,
     job_snapshot_hash TEXT,
@@ -726,6 +727,7 @@ ON job_descriptions(user_id, supersedes_job_description_id)
 WHERE supersedes_job_description_id IS NOT NULL AND is_active = 1;
 CREATE INDEX IF NOT EXISTS idx_match_results_user ON match_results(user_id);
 CREATE INDEX IF NOT EXISTS idx_match_results_resume ON match_results(user_id, resume_id);
+CREATE INDEX IF NOT EXISTS idx_match_results_fingerprint ON match_results(user_id, resume_fingerprint);
 CREATE INDEX IF NOT EXISTS idx_match_results_jd ON match_results(user_id, job_description_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user ON applications(user_id);
 CREATE INDEX IF NOT EXISTS idx_applications_user_status ON applications(user_id, status);

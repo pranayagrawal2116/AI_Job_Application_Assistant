@@ -246,99 +246,143 @@ class CareerContextResolver:
     def is_job_relevant(self, job_title: str, job_description: str, career_ctx: CandidateCareerContext) -> bool:
         """Determines if a discovered job opportunity aligns with candidate career domain.
 
-        Strictly protects against keyword hallucinations:
-        - Excludes software/AI/ML engineering jobs for accounting, finance, and audit candidates.
-        - Excludes clinical healthcare jobs for non-healthcare candidates.
-        - Excludes corporate law/litigation jobs for non-legal candidates.
-        - Excludes mechanical/hardware engineering jobs for pure software candidates.
+        Strictly protects against cross-industry feed leakage:
+        - Classifies job into canonical industry domains.
+        - Enforces strict cross-domain disqualification when job belongs to an unrelated discipline.
+        - Requires positive alignment with candidate domain, target roles, or verified skills.
         """
         if not career_ctx.has_primary_resume:
             return True
 
-        title_lower = (job_title or "").lower()
-        domain = career_ctx.career_domain
+        title_lower = (job_title or "").lower().strip()
+        domain = career_ctx.career_domain or "general"
 
-        # 1. Negative rules for Accounting & Finance candidates
+        domain_keywords = {
+            "accounting_finance": [
+                r"\btax\b", r"\baudit\b", r"\baccounting\b", r"\baccountant\b", r"\baccounts\b",
+                r"\bbookkeeper\b", r"\bfinancial reporting\b", r"\bstatutory audit\b", r"\btransfer pricing\b",
+                r"\bcorporate finance\b", r"\bbilling\b", r"\baccounts payable\b", r"\baccounts receivable\b",
+                r"\bpayroll\b", r"\bdirect tax\b", r"\bindirect tax\b", r"\bgst\b", r"\bca\b",
+                r"\bacca\b", r"\bcpa\b", r"\bcma\b", r"\bledger\b", r"\brecord to report\b",
+                r"\br2r\b", r"\bfinancial analyst\b", r"\bchartered accountant\b", r"\bfinance\b",
+            ],
+            "software_tech": [
+                r"\bsoftware\b", r"\bdeveloper\b", r"\bengineer\b", r"\bengineering\b", r"\bai\b",
+                r"\bml\b", r"\bai/ml\b", r"\bartificial intelligence\b", r"\bmachine learning\b",
+                r"\bdeep learning\b", r"\bnlp\b", r"\bcomputer vision\b", r"\bdata science\b",
+                r"\bdata scientist\b", r"\bdata engineer\b", r"\bpython developer\b", r"\bjava developer\b",
+                r"\bweb developer\b", r"\bfrontend\b", r"\bbackend\b", r"\bfull stack\b",
+                r"\bdevops\b", r"\bcloud\b", r"\bflutter\b", r"\bgenerative ai\b", r"\bgenai\b",
+                r"\bllm\b", r"\bslm\b", r"\blanguage models\b", r"\bprompt engineer\b", r"\balgorithm\b",
+                r"\bvoice ai\b", r"\bopen-source development\b", r"\bcomputer science\b",
+            ],
+            "creative_writing": [
+                r"\bfiction writer\b", r"\bwriter\b", r"\bnovelist\b", r"\bromance\b", r"\bromantasy\b",
+                r"\bthriller\b", r"\bauthor\b", r"\bscriptwriter\b", r"\bcreative writing\b",
+                r"\bcopywriter\b", r"\bcontent writer\b",
+            ],
+            "education_training": [
+                r"\bcounselor\b", r"\bcounsellor\b", r"\bteacher\b", r"\btutor\b", r"\binstructor\b",
+                r"\blecturer\b", r"\bprofessor\b", r"\badmission counsellor\b", r"\binternship counselor\b",
+                r"\bpedagogy\b",
+            ],
+            "healthcare": [
+                r"\bphysician\b", r"\bdoctor\b", r"\bnurse\b", r"\bnursing\b", r"\bclinical\b",
+                r"\bmedical\b", r"\bhospital\b", r"\bmbbs\b", r"\bmd\b", r"\bsurgeon\b",
+                r"\bpharmacist\b", r"\bpharmacy\b", r"\bpathology\b",
+            ],
+            "legal": [
+                r"\battorney\b", r"\blawyer\b", r"\blegal\b", r"\bcounsel\b", r"\badvocate\b",
+                r"\bparalegal\b", r"\blitigation\b", r"\bcorporate law\b", r"\bcompliance officer\b",
+                r"\bllb\b", r"\bbar\b",
+            ],
+            "mechanical_engineering": [
+                r"\bmechanical engineer\b", r"\bsolidworks\b", r"\bautocad\b", r"\bcatia\b",
+                r"\bansys\b", r"\bthermodynamics\b", r"\bcad designer\b", r"\bmanufacturing engineer\b",
+            ],
+        }
+
+        # Step 1: Detect which domains the job title matches
+        title_domains = set()
+        for dom, pats in domain_keywords.items():
+            if any(re.search(pat, title_lower) for pat in pats):
+                title_domains.add(dom)
+
+        # Step 2: Cross-Domain Disqualification
         if domain in ("accounting_finance", "finance", "audit", "tax"):
-            tech_patterns = [
-                r"\bmachine learning\b",
-                r"\bartificial intelligence\b",
-                r"\bcomputer vision\b",
-                r"\bdeep learning\b",
-                r"\bpython developer\b",
-                r"\bsoftware engineer\b",
-                r"\bfrontend developer\b",
-                r"\bbackend developer\b",
-                r"\bfull stack\b",
-                r"\bmobile app developer\b",
-                r"\bflutter developer\b",
-                r"\bdevops engineer\b",
-                r"\bcloud architect\b",
-            ]
-            for pat in tech_patterns:
-                if re.search(pat, title_lower):
-                    # Check if candidate has computer science or tech skills to support it
-                    has_cs_skills = any(
-                        s in career_ctx.supporting_skills
-                        for s in ["Python", "JavaScript", "React", "Node.js", "Java", "C++"]
-                    )
-                    if not has_cs_skills:
-                        return False
+            # Exclude tech, creative writing, education, healthcare, legal, mechanical if NO finance pattern in title
+            unrelated_domains = {"software_tech", "creative_writing", "education_training", "healthcare", "legal", "mechanical_engineering"}
+            if (title_domains & unrelated_domains) and "accounting_finance" not in title_domains:
+                # Unless candidate has verified CS skills for tech
+                has_cs_skills = any(
+                    s.lower() in [sk.lower() for sk in career_ctx.supporting_skills]
+                    for s in ["Python", "JavaScript", "React", "Node.js", "Java", "C++"]
+                )
+                if not ("software_tech" in title_domains and has_cs_skills):
+                    return False
 
-        # 2. Negative rules for Software & Tech candidates
         elif domain in ("software_tech", "engineering_tech"):
-            unrelated_patterns = [
-                r"\bstaff nurse\b",
-                r"\bcardiologist\b",
-                r"\bphysician\b",
-                r"\bcorporate counsel\b",
-                r"\blegal associate\b",
-                r"\bsttorney\b",
-                r"\bchartered accountant\b",
-                r"\bstatutory audit\b",
-                r"\buk tax associate\b",
-            ]
-            for pat in unrelated_patterns:
-                if re.search(pat, title_lower):
-                    return False
+            # Exclude accounting, clinical healthcare, legal, creative writing if NO tech pattern in title
+            unrelated_domains = {"accounting_finance", "healthcare", "legal", "creative_writing", "education_training"}
+            if (title_domains & unrelated_domains) and "software_tech" not in title_domains:
+                return False
 
-        # 3. Negative rules for Healthcare candidates
         elif domain == "healthcare":
-            unrelated_patterns = [
-                r"\bsoftware engineer\b",
-                r"\bfrontend developer\b",
-                r"\bbackend developer\b",
-                r"\bdevops engineer\b",
-                r"\btax accountant\b",
-                r"\baudit associate\b",
-            ]
-            for pat in unrelated_patterns:
-                if re.search(pat, title_lower):
-                    return False
+            unrelated_domains = {"software_tech", "accounting_finance", "legal", "creative_writing", "mechanical_engineering"}
+            if (title_domains & unrelated_domains) and "healthcare" not in title_domains:
+                return False
 
-        # 4. Negative rules for Legal candidates
         elif domain == "legal":
-            unrelated_patterns = [
-                r"\bsoftware engineer\b",
-                r"\bmachine learning\b",
-                r"\bcardiologist\b",
-                r"\bstaff nurse\b",
-                r"\bmechanical engineer\b",
-            ]
-            for pat in unrelated_patterns:
-                if re.search(pat, title_lower):
-                    return False
+            unrelated_domains = {"software_tech", "healthcare", "accounting_finance", "mechanical_engineering", "creative_writing"}
+            if (title_domains & unrelated_domains) and "legal" not in title_domains:
+                return False
 
-        # 5. Negative rules for Mechanical Engineering candidates
         elif domain == "mechanical_engineering":
-            unrelated_patterns = [
-                r"\bcardiologist\b",
-                r"\bstaff nurse\b",
-                r"\bcorporate counsel\b",
-                r"\buk tax associate\b",
-            ]
-            for pat in unrelated_patterns:
-                if re.search(pat, title_lower):
-                    return False
+            unrelated_domains = {"healthcare", "legal", "accounting_finance", "creative_writing"}
+            if (title_domains & unrelated_domains) and "mechanical_engineering" not in title_domains:
+                return False
 
-        return True
+        # Step 3: Positive Alignment Requirement
+        # A job is positively relevant if:
+        # A) Job title domain matches candidate career domain
+        if domain in ("accounting_finance", "finance", "audit", "tax") and "accounting_finance" in title_domains:
+            return True
+        if domain in ("software_tech", "engineering_tech") and "software_tech" in title_domains:
+            return True
+        if domain == "healthcare" and "healthcare" in title_domains:
+            return True
+        if domain == "legal" and "legal" in title_domains:
+            return True
+        if domain == "mechanical_engineering" and "mechanical_engineering" in title_domains:
+            return True
+
+        # B) Role Title Token Overlap with candidate selected_roles or inferred_roles
+        cand_roles = list(career_ctx.selected_roles) + [
+            (r.role_title if hasattr(r, "role_title") else str(r)) for r in career_ctx.inferred_roles
+        ]
+        title_tokens = set(re.findall(r"\b[a-zA-Z]{3,}\b", title_lower))
+        stopwords = {
+            "the", "and", "for", "with", "that", "this", "will", "have", "team", "work",
+            "role", "position", "intern", "internship", "junior", "senior", "lead", "associate",
+            "unit", "pune", "delhi", "mumbai", "india", "remote", "onsite", "hybrid", "division",
+            "office", "female", "male", "suite", "microsoft", "google", "english", "hindi",
+            "basic", "fluent", "professional", "skills", "tools", "system", "systems", "support",
+            "executive", "coordinator", "general"
+        }
+        sig_title_tokens = title_tokens - stopwords
+
+        for r_title in cand_roles:
+            r_tokens = set(re.findall(r"\b[a-zA-Z]{3,}\b", r_title.lower())) - stopwords
+            if r_tokens and sig_title_tokens.intersection(r_tokens):
+                return True
+
+        # C) Candidate skill keyword overlap with job title
+        cand_skill_tokens = set()
+        for s in career_ctx.supporting_skills:
+            cand_skill_tokens.update(re.findall(r"\b[a-zA-Z]{3,}\b", s.lower()))
+        cand_sig_skills = cand_skill_tokens - stopwords
+        if sig_title_tokens.intersection(cand_sig_skills):
+            return True
+
+        # If not positively matched in domain, role, or skills, reject from personalized feed
+        return False

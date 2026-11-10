@@ -109,7 +109,7 @@ def list_jobs(
         if df.empty:
             return []
     else:
-        # Default Explore Jobs Feed: strictly candidate-scoped to current resume discovery run!
+        # Default Explore Jobs Feed: strictly candidate-scoped to current resume discovery run & evaluations!
         if not career_ctx.has_primary_resume:
             return []
 
@@ -118,15 +118,16 @@ def list_jobs(
             resume_fingerprint=career_ctx.resume_fingerprint,
         ))
 
-        # Also include any jobs explicitly evaluated for this candidate's primary resume
-        if career_ctx.primary_resume_id:
-            eval_matches = service.db.get_user_match_results(
-                user_id=user_id,
-                resume_id=career_ctx.primary_resume_id,
-            )
-            for m in eval_matches:
-                if m.job_id:
-                    candidate_job_ids.add(m.job_id)
+        # Include jobs evaluated specifically for this candidate under active resume
+        evaluated_matches = service.db.get_user_match_results(
+            user_id=user_id,
+            resume_fingerprint=career_ctx.resume_fingerprint,
+            resume_id=career_ctx.primary_resume_id,
+            limit=100,
+        )
+        for m in evaluated_matches:
+            if m.job_id:
+                candidate_job_ids.add(m.job_id)
 
         if not candidate_job_ids:
             return []
@@ -142,6 +143,7 @@ def list_jobs(
         job_ids=candidate_job_ids_in_df,
         resume_id=career_ctx.primary_resume_id,
         resume_file_hash=career_ctx.primary_resume_file_hash,
+        resume_fingerprint=career_ctx.resume_fingerprint,
     )
 
     items: List[JobItemResponse] = []
@@ -606,14 +608,25 @@ def trigger_jobs_discovery(
                 max_results_per_source=5,
                 enable_evaluation=False,
             )
-            # Identify all relevant unique job IDs from this discovery run
-            relevant_ids = set()
+            # Identify all unique job IDs from this discovery run
+            raw_ids = set()
             for saved_item in summary.saved_jobs:
                 if saved_item.get("id"):
-                    relevant_ids.add(saved_item["id"])
+                    raw_ids.add(saved_item["id"])
             for dup_id in getattr(summary, "duplicate_job_ids", []):
                 if dup_id:
-                    relevant_ids.add(dup_id)
+                    raw_ids.add(dup_id)
+
+            # Strictly filter discovered jobs against candidate career domain before associating with candidate
+            # Unless explicit target roles were requested by candidate
+            has_explicit_roles = bool(req and req.roles and len(req.roles) > 0)
+            relevant_ids = set()
+            for jid in raw_ids:
+                job_rec = service.db.get_job_by_id(jid)
+                if not job_rec:
+                    continue
+                if has_explicit_roles or service.is_job_relevant_for_candidate(job_rec.job_title, job_rec.job_description, career_ctx):
+                    relevant_ids.add(jid)
 
             # Record candidate-to-job association to prevent repeated discovery runs from inflating metrics
             if relevant_ids:
