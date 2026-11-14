@@ -7349,14 +7349,16 @@ class DatabaseManager:
 
             with self._authorized_privacy_erasure_scope(conn, user_id):
                 cursor.execute("DELETE FROM application_events WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM security_scan_overrides WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM security_scans WHERE user_id = ?", (user_id,))
+                cursor.execute("DELETE FROM resume_recovery_audit WHERE user_id = ?", (user_id,))
 
-            cursor.execute("DELETE FROM match_results WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM prepared_packets WHERE user_id = ?", (user_id,))
-            cursor.execute("DELETE FROM applications WHERE user_id = ?", (user_id,))
-
-            # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
-            #    applications, application_approvals, password_reset_tokens)
-            cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+                # 3. Delete user row (cascades automatically to resumes, versions, job_descriptions,
+                #    candidate_profiles, application_approvals, password_reset_tokens)
+                cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
             logger.info("Deleted user account data for User #%d with pseudonym '%s'", user_id, pseudonym)
             return True
 
