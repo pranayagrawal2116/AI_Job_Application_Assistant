@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
 from backend.api.schemas.applications import (
@@ -15,6 +15,10 @@ from backend.api.schemas.applications import (
     ApplicationResponse,
     ApplicationStatusUpdateRequest,
     AuthorizePacketRequest,
+    AutofillCompleteRequest,
+    AutofillExecuteBrowserRequest,
+    AutofillPlanRequest,
+    AutofillPlanResponseSchema,
     ConfirmSubmissionRequest,
     CoverLetterRequest,
     FollowUpCreateRequest,
@@ -1300,3 +1304,224 @@ def create_followup(
         scheduled_date=str(fu.follow_up_date),
         is_completed=bool(fu.is_completed),
     )
+
+
+# -----------------------------------------------------------------------------
+# PHASE C.1: EXTERNAL ATS FORM AUTOFILL & BROWSER INTEGRATION ENDPOINTS
+# -----------------------------------------------------------------------------
+
+@router.post("/{app_id}/autofill/plan", response_model=AutofillPlanResponseSchema)
+def prepare_autofill_plan(
+    app_id: int,
+    req: AutofillPlanRequest,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Generates an authorized external ATS form filling plan with candidate facts."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker(db_manager=service.db)
+    try:
+        plan = broker.prepare_autofill_plan(
+            user_id=user_id,
+            application_id=app_id,
+            target_url=req.target_url,
+        )
+        return AutofillPlanResponseSchema(**plan.to_dict())
+    except CrossUserAccessError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except (SecurityAuthorizationError, ValidationError) as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error("Failed to prepare autofill plan for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to prepare autofill plan: {e}")
+
+
+@router.get("/{app_id}/autofill/resume-binary")
+def get_autofill_resume_binary(
+    app_id: int,
+    ticket: str = Query(...),
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Serves the verified resume binary for the authorized form autofill execution."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker(db_manager=service.db)
+    try:
+        raw_bytes, filename, content_type = broker.get_verified_resume_bytes(
+            user_id=user_id,
+            application_id=app_id,
+            ticket=ticket,
+        )
+        return Response(
+            content=raw_bytes,
+            media_type=content_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+            },
+        )
+    except CrossUserAccessError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except SecurityAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except Exception as e:
+        logger.error("Failed to retrieve resume binary for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/{app_id}/autofill/execute-browser")
+def execute_autofill_in_browser(
+    app_id: int,
+    req: AutofillExecuteBrowserRequest,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Executes full external form auto-population via Playwright headless browser."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    from playwright.sync_api import sync_playwright
+
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker(db_manager=service.db)
+
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                viewport={"width": 1280, "height": 900},
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            )
+            page = context.new_page()
+
+            # Target URL
+            target_url = req.target_url
+            if not target_url:
+                with service.db.get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT external_application_url, job_id FROM applications WHERE id = ?", (app_id,))
+                    row = cursor.fetchone()
+                    if row:
+                        target_url = row["external_application_url"]
+                        if not target_url and row["job_id"]:
+                            cursor.execute("SELECT job_url FROM jobs WHERE id = ?", (row["job_id"],))
+                            j = cursor.fetchone()
+                            if j:
+                                target_url = j["job_url"]
+
+            if not target_url:
+                raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No target application URL found.")
+
+            # Navigate to target page
+            page.goto(target_url, timeout=30000, wait_until="domcontentloaded")
+            page.wait_for_timeout(1000)
+
+            # If on Keka jobdetails page, click "Apply for this job" to reach the form
+            apply_btn = page.locator("#apply-job, a[href*='applyjob'], button:has-text('Apply for this job')")
+            if apply_btn.count() > 0 and "/applyjob" not in page.url:
+                logger.info("Found 'Apply for this job' button on page. Navigating to application form.")
+                apply_btn.first.click()
+                page.wait_for_timeout(1000)
+
+            report = broker.execute_playwright_autofill(
+                user_id=user_id,
+                application_id=app_id,
+                page=page,
+                target_url=page.url,
+                timeout_seconds=req.timeout_seconds or 20.0,
+            )
+            browser.close()
+            return report.to_dict()
+    except CrossUserAccessError as e:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=str(e))
+    except SecurityAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.error("Playwright form autofill execution failed for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Browser autofill execution failed: {e}")
+
+
+@router.post("/{app_id}/autofill/complete")
+def record_autofill_completion(
+    app_id: int,
+    req: AutofillCompleteRequest,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Records completion of form auto-population from browser companion or extension."""
+    from src.preparer.form_filling_broker import (
+        ApplicationFormFillingBroker,
+        FormFillExecutionReport,
+        FormFieldResult,
+    )
+    user_id, session = auth_ctx
+    if req.user_id != user_id or req.application_id != app_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-user or mismatched application parameters.")
+
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker(db_manager=service.db)
+
+    field_results = [
+        FormFieldResult(
+            field_name=fr.get("field_name", "Field"),
+            selector=fr.get("selector", ""),
+            field_type=fr.get("field_type", "text"),
+            intended_value=fr.get("intended_value"),
+            actual_value=fr.get("actual_value"),
+            provenance=fr.get("provenance", "EXTRACTED_UNVERIFIED"),
+            status=fr.get("status", "AUTO_FILLED"),
+            error_message=fr.get("error_message"),
+        )
+        for fr in req.field_results
+    ]
+    report = FormFillExecutionReport(
+        execution_id=req.execution_id,
+        application_id=app_id,
+        user_id=user_id,
+        ats_provider=req.ats_provider,
+        target_url=req.target_url,
+        validated_domain=req.validated_domain,
+        resume_uploaded=req.resume_uploaded,
+        resume_id=req.resume_id,
+        resume_version_num=req.resume_version_num,
+        resume_file_hash=req.resume_file_hash,
+        resume_filename=req.resume_filename,
+        ats_parsing_completed=req.ats_parsing_completed,
+        total_fields_detected=req.total_fields_detected,
+        fields_populated_count=req.fields_populated_count,
+        fields_ats_parsed_count=req.fields_ats_parsed_count,
+        fields_preserved_count=req.fields_preserved_count,
+        fields_manual_review_count=req.fields_manual_review_count,
+        fields_unmatched_count=req.fields_unmatched_count,
+        field_results=field_results,
+        anti_automation_detected=req.anti_automation_detected,
+        submission_prevented=True,
+        status=req.status,
+        message=req.message,
+    )
+    audit_event = broker._record_autofill_audit_event(report)
+    return {
+        "status": "ok",
+        "audit_event_id": audit_event.id if audit_event else None,
+        "report": report.to_dict(),
+    }
+
+
+@router.get("/{app_id}/autofill/companion.js")
+def get_companion_script(
+    app_id: int,
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Serves the standalone browser companion script customized for this application."""
+    user_id, session = auth_ctx
+    script_path = Path(__file__).resolve().parent.parent.parent.parent / "src" / "preparer" / "browser_companion" / "jobflow_companion.js"
+    if not script_path.exists():
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Companion script file not found.")
+
+    raw_js = script_path.read_text(encoding="utf-8")
+    config_header = f"window.JOBFLOW_CONFIG = {{ apiBase: '/api', appId: {app_id} }};\n"
+    return Response(
+        content=config_header + raw_js,
+        media_type="application/javascript",
+        headers={"Cache-Control": "no-cache"},
+    )
+

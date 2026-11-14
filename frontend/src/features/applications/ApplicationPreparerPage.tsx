@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { api } from '@/lib/api';
-import { ApplicationItem } from '@/types';
+import { ApplicationItem, FormFillReport, FormFieldResultItem, AutofillPlan } from '@/types';
 import { LoadingSpinner } from '@/components/common/LoadingSpinner';
 import { getStatusBadgeColor } from '@/lib/utils';
 import {
@@ -18,6 +18,11 @@ import {
   Edit3,
   Lock,
   Send,
+  Copy,
+  Check,
+  Globe,
+  Wand2,
+  Layers,
 } from 'lucide-react';
 
 export const ApplicationPreparerPage: React.FC = () => {
@@ -66,6 +71,15 @@ export const ApplicationPreparerPage: React.FC = () => {
   const [isSubmittingConfirm, setIsSubmittingConfirm] = useState(false);
   const [isSubmitted, setIsSubmitted] = useState(false);
 
+  // Phase C.1: External ATS Form Autofill States
+  const [targetFormUrl, setTargetFormUrl] = useState('');
+  const [isAutofilling, setIsAutofilling] = useState(false);
+  const [autofillProgressStep, setAutofillProgressStep] = useState<number>(0);
+  const [autofillReport, setAutofillReport] = useState<FormFillReport | null>(null);
+  const [autofillPlan, setAutofillPlan] = useState<AutofillPlan | null>(null);
+  const [companionCopied, setCompanionCopied] = useState(false);
+  const [editedFieldResults, setEditedFieldResults] = useState<FormFieldResultItem[]>([]);
+
   useEffect(() => {
     const loadAppData = async () => {
       setIsLoading(true);
@@ -78,6 +92,9 @@ export const ApplicationPreparerPage: React.FC = () => {
 
         setApp(application);
         setResumes(userResumes || []);
+        if (application?.external_application_url) {
+          setTargetFormUrl(application.external_application_url);
+        }
 
         // Resolve selected resume
         let resolvedResId: number | null = null;
@@ -264,6 +281,53 @@ export const ApplicationPreparerPage: React.FC = () => {
     } finally {
       setIsSubmittingConfirm(false);
     }
+  };
+
+  // Phase C.1: External ATS Form Autofill Handlers
+  const handleStartBrowserAutofill = async () => {
+    setIsAutofilling(true);
+    setErrorMsg(null);
+    setAutofillProgressStep(1); // 1. Connecting to employer portal
+
+    try {
+      setAutofillProgressStep(2); // 2. Identifying application form & verifying resume
+      const plan = await api.getAutofillPlan(appId, targetFormUrl || undefined);
+      setAutofillPlan(plan);
+
+      setAutofillProgressStep(3); // 3. Uploading resume
+      setAutofillProgressStep(4); // 4. Waiting for resume extraction
+      setAutofillProgressStep(5); // 5. Mapping candidate information
+      setAutofillProgressStep(6); // 6. Populating fields
+      setAutofillProgressStep(7); // 7. Verifying populated information
+
+      const report = await api.executeBrowserAutofill(appId, targetFormUrl || undefined);
+      setAutofillReport(report);
+      setEditedFieldResults(report.field_results || []);
+      setAutofillProgressStep(8); // 8. Ready for candidate review
+      setSuccessMsg(
+        `Form successfully auto-populated! ${report.fields_populated_count} fields filled, ${report.fields_ats_parsed_count} parsed by ATS.`
+      );
+    } catch (err: any) {
+      setErrorMsg(err.message || 'Browser form auto-population failed.');
+      setAutofillProgressStep(0);
+    } finally {
+      setIsAutofilling(false);
+    }
+  };
+
+  const handleCopyBookmarklet = () => {
+    const code = `javascript:(function(){var s=document.createElement('script');s.src='http://127.0.0.1:8000/api/applications/${appId}/autofill/companion.js?t='+Date.now();document.body.appendChild(s);})();`;
+    navigator.clipboard.writeText(code);
+    setCompanionCopied(true);
+    setTimeout(() => setCompanionCopied(false), 3500);
+  };
+
+  const handleUpdateFieldValue = (index: number, val: string) => {
+    setEditedFieldResults((prev) => {
+      const copy = [...prev];
+      copy[index] = { ...copy[index], actual_value: val, status: 'PRESERVED' };
+      return copy;
+    });
   };
 
   const handlePreparePacket = async () => {
@@ -1057,14 +1121,14 @@ export const ApplicationPreparerPage: React.FC = () => {
         </div>
       )}
 
-      {/* ================= STEP 7: MANUAL SUBMISSION CONFIRMATION ================= */}
+      {/* ================= STEP 7: AUTOMATED FORM POPULATION & MANUAL SUBMISSION ================= */}
       {currentStep === 7 && (
         <div className="bg-white rounded-3xl p-6 sm:p-8 border border-slate-200/80 shadow-sm space-y-6">
           <div className="flex items-center justify-between">
             <div>
-              <h2 className="text-lg font-bold text-slate-900">Step 7: Manual Portal Submission Confirmation</h2>
+              <h2 className="text-lg font-bold text-slate-900">Step 7: External Form Auto-Population & Submission</h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Complete your submission on the employer portal and log your confirmation reference.
+                Automatically upload your verified resume and auto-fill employer application forms (Keka, Greenhouse, Lever, etc.).
               </p>
             </div>
             {isSubmitted && (
@@ -1075,32 +1139,236 @@ export const ApplicationPreparerPage: React.FC = () => {
             )}
           </div>
 
-          {/* Portal Link Box */}
-          <div className="p-5 rounded-2xl bg-indigo-50/70 border border-indigo-200 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-            <div>
-              <h4 className="text-xs font-bold text-indigo-900">Employer Application Link</h4>
-              <p className="text-xs text-indigo-700 mt-0.5">
-                Open the official career page, upload your exported documents, and click Submit.
-              </p>
+          {/* Section 1: Employer Portal & Smart Auto-Population */}
+          <div className="p-5 rounded-2xl bg-indigo-50/70 border border-indigo-200 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2">
+                  <Globe size={16} className="text-indigo-600" />
+                  <h4 className="text-xs font-bold text-indigo-900">Employer Application Portal</h4>
+                  <span className="px-2 py-0.5 rounded-md text-[10px] font-semibold bg-indigo-100 text-indigo-800 uppercase tracking-wider">
+                    {autofillPlan?.ats_provider || 'ATS Auto-Detect'}
+                  </span>
+                </div>
+                <p className="text-xs text-indigo-700 mt-1">
+                  Target URL where JobFlow will upload your verified resume and populate candidate fields.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                {targetFormUrl && (
+                  <a
+                    href={targetFormUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2 rounded-xl bg-white border border-indigo-300 text-indigo-700 hover:bg-indigo-50 font-semibold text-xs flex items-center gap-1.5 transition-all"
+                  >
+                    <span>Open in Browser</span>
+                    <ExternalLink size={13} />
+                  </a>
+                )}
+              </div>
             </div>
-            {app.external_application_url ? (
-              <a
-                href={app.external_application_url}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-md shadow-indigo-500/20 flex items-center gap-1.5 transition-all self-start sm:self-center shrink-0"
+
+            <div className="flex flex-col sm:flex-row items-center gap-3">
+              <input
+                type="text"
+                placeholder="https://company.keka.com/careers/applyjob/..."
+                value={targetFormUrl}
+                onChange={(e) => setTargetFormUrl(e.target.value)}
+                className="w-full px-3.5 py-2.5 rounded-xl border border-indigo-200 bg-white text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
+              />
+              <button
+                onClick={handleStartBrowserAutofill}
+                disabled={isAutofilling || !targetFormUrl}
+                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-md shadow-indigo-500/20 flex items-center justify-center gap-2 transition-all shrink-0 disabled:opacity-50"
               >
-                <span>Open Employer Portal</span>
-                <ExternalLink size={14} />
-              </a>
-            ) : (
-              <span className="text-xs text-slate-500">No external URL provided</span>
-            )}
+                {isAutofilling ? (
+                  <>
+                    <LoadingSpinner size={16} />
+                    <span>Auto-Populating Form...</span>
+                  </>
+                ) : (
+                  <>
+                    <Wand2 size={14} />
+                    <span>Auto-Fill Application Form</span>
+                  </>
+                )}
+              </button>
+            </div>
+
+            {/* In-Browser Companion Option */}
+            <div className="pt-2 border-t border-indigo-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+              <span className="text-indigo-800">
+                Applying directly in your personal Chrome/Edge window?
+              </span>
+              <button
+                onClick={handleCopyBookmarklet}
+                className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 flex items-center gap-1.5 self-start sm:self-auto"
+              >
+                {companionCopied ? (
+                  <>
+                    <Check size={13} className="text-emerald-600" />
+                    <span className="text-emerald-700 font-bold">Companion Code Copied!</span>
+                  </>
+                ) : (
+                  <>
+                    <Copy size={13} />
+                    <span>Copy 1-Click Bookmarklet Companion</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
-          {/* Confirmation Checklist */}
+          {/* Progress Stepper (Visible during or after autofill) */}
+          {(isAutofilling || autofillProgressStep > 0) && (
+            <div className="p-5 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
+              <h4 className="text-xs font-bold text-slate-900 flex items-center gap-2">
+                <Layers size={14} className="text-brand-600" />
+                <span>Form Auto-Population Execution Progress</span>
+              </h4>
+
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                {[
+                  { num: 1, title: '1. Connecting to Portal' },
+                  { num: 2, title: '2. Identifying Form & Resume' },
+                  { num: 3, title: '3. Uploading Resume' },
+                  { num: 4, title: '4. ATS Resume Parsing' },
+                  { num: 5, title: '5. Mapping Candidate Facts' },
+                  { num: 6, title: '6. Populating Blank Fields' },
+                  { num: 7, title: '7. Verifying Field Values' },
+                  { num: 8, title: '8. Ready for Review' },
+                ].map((st) => {
+                  const isDone = autofillProgressStep > st.num || (!isAutofilling && autofillProgressStep === 8);
+                  const isAct = autofillProgressStep === st.num && isAutofilling;
+                  return (
+                    <div
+                      key={st.num}
+                      className={`p-2 rounded-lg border flex items-center gap-2 ${
+                        isDone
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : isAct
+                          ? 'bg-blue-50 border-blue-300 text-blue-900 font-bold'
+                          : 'bg-white border-slate-200 text-slate-400'
+                      }`}
+                    >
+                      {isDone ? (
+                        <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
+                      ) : isAct ? (
+                        <LoadingSpinner size={16} />
+                      ) : (
+                        <div className="w-3 h-3 rounded-full border border-slate-300 shrink-0" />
+                      )}
+                      <span className="truncate">{st.title}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Autofill Results Summary & Editable Field Table */}
+          {autofillReport && (
+            <div className="p-5 rounded-2xl bg-white border border-slate-200 space-y-4 shadow-sm">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                <div>
+                  <h4 className="text-xs font-bold text-slate-900 flex items-center gap-2">
+                    <CheckCircle2 size={15} className="text-emerald-600" />
+                    <span>Auto-Population Results & Review</span>
+                  </h4>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Review and verify all populated values below. You can edit any field before final submission.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-emerald-100 text-emerald-800">
+                    {autofillReport.fields_populated_count} Populated
+                  </span>
+                  <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-blue-100 text-blue-800">
+                    {autofillReport.fields_ats_parsed_count} ATS Parsed
+                  </span>
+                  <span className="px-2.5 py-1 rounded-full text-xs font-semibold bg-amber-100 text-amber-800">
+                    {autofillReport.fields_manual_review_count} Requires Review
+                  </span>
+                </div>
+              </div>
+
+              {/* Editable Field Table */}
+              <div className="overflow-x-auto border border-slate-200 rounded-xl">
+                <table className="min-w-full divide-y divide-slate-200 text-xs">
+                  <thead className="bg-slate-50 text-slate-600">
+                    <tr>
+                      <th className="px-3.5 py-2.5 text-left font-semibold">Field Name</th>
+                      <th className="px-3.5 py-2.5 text-left font-semibold">Value on Form (Editable)</th>
+                      <th className="px-3.5 py-2.5 text-left font-semibold">Source / Provenance</th>
+                      <th className="px-3.5 py-2.5 text-left font-semibold">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 bg-white">
+                    {editedFieldResults.map((item, idx) => (
+                      <tr key={idx} className="hover:bg-slate-50/60 transition-colors">
+                        <td className="px-3.5 py-2.5 font-medium text-slate-900 max-w-[180px] truncate" title={item.field_name}>
+                          {item.field_name}
+                        </td>
+                        <td className="px-3.5 py-2.5">
+                          <input
+                            type="text"
+                            value={item.actual_value || ''}
+                            onChange={(e) => handleUpdateFieldValue(idx, e.target.value)}
+                            placeholder={item.status === 'MANUAL_REVIEW' ? 'Requires candidate input' : ''}
+                            className={`w-full px-2.5 py-1.5 rounded-lg border text-xs ${
+                              item.status === 'AUTO_FILLED'
+                                ? 'bg-emerald-50/50 border-emerald-300 text-emerald-950 font-medium'
+                                : item.status === 'ATS_PARSED'
+                                ? 'bg-blue-50/50 border-blue-200 text-blue-950'
+                                : item.status === 'MANUAL_REVIEW'
+                                ? 'bg-amber-50/60 border-amber-300 text-amber-950'
+                                : 'bg-slate-50 border-slate-200 text-slate-800'
+                            }`}
+                          />
+                        </td>
+                        <td className="px-3.5 py-2.5">
+                          <span className="px-2 py-0.5 rounded text-[10px] font-medium bg-slate-100 text-slate-700">
+                            {item.provenance}
+                          </span>
+                        </td>
+                        <td className="px-3.5 py-2.5">
+                          <span
+                            className={`px-2 py-0.5 rounded-full text-[10px] font-bold ${
+                              item.status === 'AUTO_FILLED'
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : item.status === 'ATS_PARSED'
+                                ? 'bg-blue-100 text-blue-800'
+                                : item.status === 'PRESERVED'
+                                ? 'bg-indigo-100 text-indigo-800'
+                                : 'bg-amber-100 text-amber-800'
+                            }`}
+                          >
+                            {item.status.replace('_', ' ')}
+                          </span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Section 2: Strict Human Review & Manual Submission Confirmation */}
           <div className="p-5 rounded-2xl bg-slate-50 border border-slate-200 space-y-4">
-            <h4 className="text-xs font-bold text-slate-900">Log Manual Submission</h4>
+            <div className="flex items-start gap-3 p-3.5 rounded-xl bg-amber-50/80 border border-amber-200 text-amber-900 text-xs leading-relaxed">
+              <AlertTriangle size={16} className="text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <strong>Strict Human-in-the-Loop Protocol:</strong> JobFlow AI will never submit an application autonomously.
+                Please inspect all filled fields on the employer portal, complete any mandatory declarations, and click
+                <strong> Submit Application</strong> personally.
+              </div>
+            </div>
+
+            <h4 className="text-xs font-bold text-slate-900">Log Manual Submission Confirmation</h4>
             <div className="flex items-start gap-3">
               <input
                 type="checkbox"
@@ -1110,7 +1378,7 @@ export const ApplicationPreparerPage: React.FC = () => {
                 className="mt-1 w-4 h-4 rounded text-brand-600 focus:ring-brand-500 cursor-pointer"
               />
               <label htmlFor="submission-confirm" className="text-xs text-slate-700 leading-relaxed cursor-pointer">
-                I have personally navigated to the employer portal and clicked <strong>Submit Application</strong>.
+                I have inspected the populated form on the employer portal and personally clicked <strong>Submit Application</strong>.
               </label>
             </div>
 
@@ -1124,7 +1392,7 @@ export const ApplicationPreparerPage: React.FC = () => {
                   onChange={(e) => setSubmissionChannel(e.target.value)}
                   className="w-full px-3.5 py-2 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none"
                 >
-                  <option value="COMPANY_PORTAL">Employer Career Portal</option>
+                  <option value="COMPANY_PORTAL">Employer Career Portal (Keka / ATS)</option>
                   <option value="LINKEDIN">LinkedIn Easy Apply</option>
                   <option value="INDEED">Indeed Apply</option>
                   <option value="EMAIL">Email Submission</option>
@@ -1138,7 +1406,7 @@ export const ApplicationPreparerPage: React.FC = () => {
                 </label>
                 <input
                   type="text"
-                  placeholder="e.g. APP-94821 or Job Reference ID"
+                  placeholder="e.g. KEKA-94821 or Job Reference ID"
                   value={confirmationRef}
                   onChange={(e) => setConfirmationRef(e.target.value)}
                   className="w-full px-3.5 py-2 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none"
@@ -1152,7 +1420,7 @@ export const ApplicationPreparerPage: React.FC = () => {
               </label>
               <input
                 type="text"
-                placeholder="e.g. Applied via Lever, recruiter name Jane Doe"
+                placeholder="e.g. Applied via Keka ATS, notice period set to 0 days"
                 value={candidateNotes}
                 onChange={(e) => setCandidateNotes(e.target.value)}
                 className="w-full px-3.5 py-2 rounded-xl border border-slate-200 text-xs bg-white focus:outline-none"

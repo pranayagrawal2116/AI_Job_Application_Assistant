@@ -11,6 +11,8 @@ import {
   ApplicationItem,
   FollowUpItem,
   User,
+  AutofillPlan,
+  FormFillReport,
 } from '@/types';
 
 function getCookie(name: string): string | null {
@@ -332,6 +334,32 @@ class ApiClient {
       method: 'POST',
       body: JSON.stringify(data),
     });
+  }
+
+  // Phase C.1: External ATS Form Autofill & Browser Automation
+  async getAutofillPlan(id: number, targetUrl?: string): Promise<AutofillPlan> {
+    return this.request<AutofillPlan>(`/applications/${id}/autofill/plan`, {
+      method: 'POST',
+      body: JSON.stringify({ target_url: targetUrl }),
+    });
+  }
+
+  async executeBrowserAutofill(id: number, targetUrl?: string, timeoutSeconds?: number): Promise<FormFillReport> {
+    return this.request<FormFillReport>(`/applications/${id}/autofill/execute-browser`, {
+      method: 'POST',
+      body: JSON.stringify({ target_url: targetUrl, timeout_seconds: timeoutSeconds || 20.0 }),
+    });
+  }
+
+  async recordAutofillComplete(id: number, report: FormFillReport): Promise<any> {
+    return this.request(`/applications/${id}/autofill/complete`, {
+      method: 'POST',
+      body: JSON.stringify(report),
+    });
+  }
+
+  getAutofillCompanionUrl(id: number): string {
+    return `${this.baseUrl}/applications/${id}/autofill/companion.js`;
   }
 
   async getTimeline(id: number): Promise<any> {

@@ -123,14 +123,20 @@ class FormPrefiller:
         # 1. Authoritative Job Description Security Preflight
         is_persisted_job = False
         if isinstance(job, Job):
-            is_persisted_job = True
+            is_persisted_job = False
         elif hasattr(job, "source_type") or hasattr(job, "snapshot_hash") or hasattr(job, "raw_content"):
             is_persisted_job = bool(job_id)
         elif isinstance(job, dict):
-            if job.get("is_persisted") is True or job.get("source_type") in ("upload", "uploaded", "url", "pasted", "PASTE", "URL", "UPLOAD"):
+            if job.get("job_description_id"):
                 is_persisted_job = True
-            elif job.get("id") and (job.get("user_id") or user_id or self.db):
+                job_id = job.get("job_description_id")
+            elif job.get("source_type") in ("upload", "uploaded", "url", "pasted", "PASTE", "URL", "UPLOAD"):
                 is_persisted_job = True
+            elif job.get("is_persisted") is True or (job.get("id") and (job.get("user_id") or user_id or self.db)):
+                if self.db and uid and self.db.get_job_description(user_id=uid, jd_id=job_id):
+                    is_persisted_job = True
+                else:
+                    is_persisted_job = False
 
         if is_persisted_job:
             if not self.db or not uid:

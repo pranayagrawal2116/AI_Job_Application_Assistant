@@ -285,3 +285,64 @@ export interface TimelineEvent {
   previous_event_hash?: string;
   event_hash?: string;
 }
+
+export interface FormFieldResultItem {
+  field_name: string;
+  selector: string;
+  field_type: string;
+  intended_value?: string | null;
+  actual_value?: string | null;
+  provenance: string;
+  status: 'AUTO_FILLED' | 'ATS_PARSED' | 'PRESERVED' | 'MANUAL_REVIEW' | 'UNMATCHED' | 'ERROR';
+  error_message?: string | null;
+}
+
+export interface AutofillPlan {
+  execution_id: string;
+  application_id: number;
+  user_id: number;
+  company_name: string;
+  job_title: string;
+  target_url: string;
+  validated_domain: string;
+  ats_provider: string;
+  resume_id: number;
+  resume_version_num: number;
+  resume_filename: string;
+  resume_file_size: number;
+  resume_file_format: string;
+  plan_hash: string;
+  action_ticket: string;
+  facts: Record<string, any>;
+  candidate_profile_provenance: Record<string, any>;
+  known_fields_to_fill: Array<Record<string, any>>;
+  safety_message: string;
+}
+
+export interface FormFillReport {
+  execution_id: string;
+  application_id: number;
+  user_id: number;
+  ats_provider: string;
+  target_url: string;
+  validated_domain: string;
+  resume_uploaded: boolean;
+  resume_id: number;
+  resume_version_num: number;
+  resume_file_hash: string;
+  resume_filename: string;
+  ats_parsing_completed: boolean;
+  total_fields_detected: number;
+  fields_populated_count: number;
+  fields_ats_parsed_count: number;
+  fields_preserved_count: number;
+  fields_manual_review_count: number;
+  fields_unmatched_count: number;
+  field_results: FormFieldResultItem[];
+  anti_automation_detected: boolean;
+  submission_prevented: boolean;
+  status: string;
+  message: string;
+  timestamp?: string;
+}
+
