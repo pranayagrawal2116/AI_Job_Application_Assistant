@@ -162,11 +162,12 @@ class AutofillExecuteBrowserRequest(BaseModel):
 
 class AutofillCompleteRequest(BaseModel):
     execution_id: str
-    application_id: int
-    user_id: int
-    ats_provider: str
-    target_url: str
-    validated_domain: str
+    application_id: Optional[int] = None
+    user_id: Optional[int] = None
+    action_ticket: Optional[str] = None
+    ats_provider: str = "universal"
+    target_url: str = ""
+    validated_domain: str = ""
     resume_uploaded: bool = False
     resume_id: int = 0
     resume_version_num: int = 1

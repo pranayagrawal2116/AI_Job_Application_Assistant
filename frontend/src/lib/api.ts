@@ -344,6 +344,10 @@ class ApiClient {
     });
   }
 
+  async getAutofillStatus(id: number, executionId: string): Promise<any> {
+    return this.request(`/applications/${id}/autofill/status?execution_id=${encodeURIComponent(executionId)}`);
+  }
+
   async executeBrowserAutofill(id: number, targetUrl?: string, timeoutSeconds?: number): Promise<FormFillReport> {
     return this.request<FormFillReport>(`/applications/${id}/autofill/execute-browser`, {
       method: 'POST',

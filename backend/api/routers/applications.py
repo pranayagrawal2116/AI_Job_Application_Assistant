@@ -6,10 +6,11 @@ import logging
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, Response
 from dashboard.services.dashboard_service import DashboardService
 from backend.api.dependencies.auth import get_current_user_and_session
+from src.preparer.form_filling_broker import ApplicationFormFillingBroker
 from backend.api.schemas.applications import (
     ApplicationCreateRequest,
     ApplicationResponse,
@@ -1341,16 +1342,28 @@ def prepare_autofill_plan(
 def get_autofill_resume_binary(
     app_id: int,
     ticket: str = Query(...),
-    auth_ctx=Depends(get_current_user_and_session),
+    request: Request = None,
 ):
-    """Serves the verified resume binary for the authorized form autofill execution."""
+    """Serves the verified resume binary for the authorized form autofill execution.
+    Secured by single-use signed action ticket with cryptographic HMAC verification,
+    domain binding, and atomic nonce replay prevention.
+    """
     from src.preparer.form_filling_broker import ApplicationFormFillingBroker
-    user_id, session = auth_ctx
     service = DashboardService.get_instance()
-    broker = ApplicationFormFillingBroker(db_manager=service.db)
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+
+    # 1. Resolve application owner user_id from DB
+    with service.db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM applications WHERE id = ?", (app_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Application #{app_id} not found.")
+        owner_user_id = row["user_id"]
+
     try:
         raw_bytes, filename, content_type = broker.get_verified_resume_bytes(
-            user_id=user_id,
+            user_id=owner_user_id,
             application_id=app_id,
             ticket=ticket,
         )
@@ -1369,6 +1382,37 @@ def get_autofill_resume_binary(
     except Exception as e:
         logger.error("Failed to retrieve resume binary for app #%d: %s", app_id, e)
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.get("/{app_id}/autofill/status")
+def get_autofill_execution_status(
+    app_id: int,
+    execution_id: str = Query(...),
+    auth_ctx=Depends(get_current_user_and_session),
+):
+    """Returns live status of an active autofill execution for UI progress tracking."""
+    user_id, session = auth_ctx
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+    st = broker.get_execution_status(application_id=app_id, execution_id=execution_id)
+    if not st:
+        with service.db.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM application_events WHERE application_id = ? AND event_type = 'EXTERNAL_FORM_AUTOFILLED' ORDER BY id DESC LIMIT 1",
+                (app_id,)
+            )
+            ev = cursor.fetchone()
+            if ev:
+                details = json.loads(ev["details_json"]) if ev["details_json"] else {}
+                return {
+                    "execution_id": execution_id,
+                    "application_id": app_id,
+                    "status": "COMPLETED",
+                    "report": details.get("report") or details,
+                }
+        return {"execution_id": execution_id, "application_id": app_id, "status": "PENDING"}
+    return st
 
 
 @router.post("/{app_id}/autofill/execute-browser")
@@ -1445,7 +1489,7 @@ def execute_autofill_in_browser(
 def record_autofill_completion(
     app_id: int,
     req: AutofillCompleteRequest,
-    auth_ctx=Depends(get_current_user_and_session),
+    request: Request = None,
 ):
     """Records completion of form auto-population from browser companion or extension."""
     from src.preparer.form_filling_broker import (
@@ -1453,12 +1497,29 @@ def record_autofill_completion(
         FormFillExecutionReport,
         FormFieldResult,
     )
-    user_id, session = auth_ctx
-    if req.user_id != user_id or req.application_id != app_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-user or mismatched application parameters.")
-
     service = DashboardService.get_instance()
-    broker = ApplicationFormFillingBroker(db_manager=service.db)
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+
+    # Resolve application owner
+    with service.db.get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM applications WHERE id = ?", (app_id,))
+        row = cursor.fetchone()
+        if not row:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Application #{app_id} not found.")
+        owner_user_id = row["user_id"]
+
+    # Verify authorization
+    ticket = req.action_ticket or (request.headers.get("X-JobFlow-Ticket") if request else None)
+    if not ticket and request and "authorization" in request.headers:
+        auth_hdr = request.headers["authorization"]
+        if auth_hdr.startswith("Bearer "):
+            ticket = auth_hdr[7:].strip()
+
+    if req.application_id and req.application_id != app_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-user or mismatched application parameters.")
+    if req.user_id and req.user_id != owner_user_id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Cross-user or mismatched application parameters.")
 
     field_results = [
         FormFieldResult(
@@ -1476,7 +1537,7 @@ def record_autofill_completion(
     report = FormFillExecutionReport(
         execution_id=req.execution_id,
         application_id=app_id,
-        user_id=user_id,
+        user_id=owner_user_id,
         ats_provider=req.ats_provider,
         target_url=req.target_url,
         validated_domain=req.validated_domain,
@@ -1498,10 +1559,11 @@ def record_autofill_completion(
         status=req.status,
         message=req.message,
     )
-    audit_event = broker._record_autofill_audit_event(report)
+    audit_event = broker.complete_execution(report=report, ticket=ticket)
     return {
+        "success": True,
         "status": "ok",
-        "audit_event_id": audit_event.id if audit_event else None,
+        "audit_event_id": getattr(audit_event, "id", None),
         "report": report.to_dict(),
     }
 
@@ -1509,16 +1571,18 @@ def record_autofill_completion(
 @router.get("/{app_id}/autofill/companion.js")
 def get_companion_script(
     app_id: int,
-    auth_ctx=Depends(get_current_user_and_session),
+    ticket: Optional[str] = Query(None),
+    execution_id: Optional[str] = Query(None),
 ):
     """Serves the standalone browser companion script customized for this application."""
-    user_id, session = auth_ctx
     script_path = Path(__file__).resolve().parent.parent.parent.parent / "src" / "preparer" / "browser_companion" / "jobflow_companion.js"
     if not script_path.exists():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Companion script file not found.")
 
     raw_js = script_path.read_text(encoding="utf-8")
-    config_header = f"window.JOBFLOW_CONFIG = {{ apiBase: '/api', appId: {app_id} }};\n"
+    tkt_val = f"'{ticket}'" if ticket else "null"
+    exec_val = f"'{execution_id}'" if execution_id else "null"
+    config_header = f"window.JOBFLOW_CONFIG = {{ apiBase: 'http://127.0.0.1:8000/api', appId: {app_id}, ticket: {tkt_val}, executionId: {exec_val} }};\n"
     return Response(
         content=config_header + raw_js,
         media_type="application/javascript",

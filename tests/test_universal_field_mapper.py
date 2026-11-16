@@ -183,3 +183,38 @@ class TestUniversalFieldMapper:
         decision = mapper.match_field(element_with_val)
         assert decision.action == "PRESERVE_EXISTING"
         assert decision.intended_value == "Janet"
+
+    def test_professional_and_preference_facts(self):
+        """Verify extraction and matching for professional and preference facts."""
+        profile = {
+            "full_name": "Pranay Agrawal",
+            "work_experience": [
+                {
+                    "company": "Tech Solutions Inc.",
+                    "title": "Lead Software Engineer",
+                    "duration_months": 24,
+                }
+            ],
+            "certifications": [{"name": "AWS Certified Developer"}],
+            "languages": [{"language": "English"}, {"language": "Hindi"}],
+            "search_preferences": {
+                "workplace_type": "Remote",
+                "willing_to_relocate": True,
+            },
+        }
+
+        mapper = UniversalFieldMapper(profile)
+        facts = mapper.facts
+
+        assert facts["current_company"].value == "Tech Solutions Inc."
+        assert facts["current_job_title"].value == "Lead Software Engineer"
+        assert "AWS Certified Developer" in facts["certifications"].value
+        assert "English" in facts["languages"].value
+        assert facts["work_arrangement"].value == "Remote"
+        assert facts["relocation_preference"].value == "Yes"
+
+        # Form target matching
+        company_target = FormFieldTarget(element_id="org", name_attr="org", accessible_label="Current Company")
+        decision = mapper.match_field(company_target)
+        assert decision.action == "FILL"
+        assert decision.intended_value == "Tech Solutions Inc."

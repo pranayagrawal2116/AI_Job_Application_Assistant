@@ -346,3 +346,13 @@ export interface FormFillReport {
   timestamp?: string;
 }
 
+export interface AutofillStatusResponse {
+  execution_id: string;
+  application_id: number;
+  status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'WARNING' | 'BLOCKED' | 'FAILED';
+  stage: string;
+  stage_index: number;
+  updated_at?: string;
+  report?: FormFillReport | null;
+}
+

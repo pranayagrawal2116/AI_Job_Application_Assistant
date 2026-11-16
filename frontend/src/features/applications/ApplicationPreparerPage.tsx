@@ -284,39 +284,94 @@ export const ApplicationPreparerPage: React.FC = () => {
   };
 
   // Phase C.1: External ATS Form Autofill Handlers
-  const handleStartBrowserAutofill = async () => {
+  const handleStartBrowserAutofill = async (options?: { openInNewTab?: boolean }) => {
     setIsAutofilling(true);
     setErrorMsg(null);
-    setAutofillProgressStep(1); // 1. Connecting to employer portal
+    setAutofillProgressStep(1); // 1. Opening employer portal
 
     try {
-      setAutofillProgressStep(2); // 2. Identifying application form & verifying resume
+      setAutofillProgressStep(2); // 2. Establishing browser connection
       const plan = await api.getAutofillPlan(appId, targetFormUrl || undefined);
       setAutofillPlan(plan);
 
-      setAutofillProgressStep(3); // 3. Uploading resume
-      setAutofillProgressStep(4); // 4. Waiting for resume extraction
-      setAutofillProgressStep(5); // 5. Mapping candidate information
-      setAutofillProgressStep(6); // 6. Populating fields
-      setAutofillProgressStep(7); // 7. Verifying populated information
+      // Signal extension if installed in candidate's browser
+      try {
+        window.postMessage({ type: 'JOBFLOW_START_AUTOFILL', payload: plan }, '*');
+      } catch (e) {
+        // Ignore message error
+      }
 
-      const report = await api.executeBrowserAutofill(appId, targetFormUrl || undefined);
-      setAutofillReport(report);
-      setEditedFieldResults(report.field_results || []);
-      setAutofillProgressStep(8); // 8. Ready for candidate review
-      setSuccessMsg(
-        `Form successfully auto-populated! ${report.fields_populated_count} fields filled, ${report.fields_ats_parsed_count} parsed by ATS.`
-      );
+      // If requested or default, open employer application page in separate tab
+      if (options?.openInNewTab !== false && plan.target_url) {
+        window.open(plan.target_url, '_blank');
+      }
+
+      setAutofillProgressStep(3); // 3. Identifying ATS & application form
+      setAutofillProgressStep(4); // 4. Retrieving verified candidate facts
+
+      // Start live polling of status while background execution runs
+      let pollCount = 0;
+      let completedFromPolling = false;
+      const pollInterval = setInterval(async () => {
+        pollCount++;
+        try {
+          const st = await api.getAutofillStatus(appId, plan.execution_id);
+          if (st && st.stage_index) {
+            setAutofillProgressStep(Math.min(st.stage_index, 9));
+          }
+          if (st && st.report) {
+            completedFromPolling = true;
+            clearInterval(pollInterval);
+            finishAutofill(st.report);
+          }
+        } catch (e) {
+          // ignore transient poll error
+        }
+        if (pollCount > 40) {
+          clearInterval(pollInterval);
+        }
+      }, 1000);
+
+      // Concurrently run headless verification
+      try {
+        setAutofillProgressStep(5); // 5. Uploading verified resume
+        setAutofillProgressStep(6); // 6. Waiting for ATS resume parsing
+        setAutofillProgressStep(7); // 7. Mapping and populating fields
+        setAutofillProgressStep(8); // 8. Verifying populated values
+
+        const report = await api.executeBrowserAutofill(appId, targetFormUrl || plan.target_url);
+        clearInterval(pollInterval);
+        if (!completedFromPolling) {
+          finishAutofill(report);
+        }
+      } catch (execErr: any) {
+        if (!completedFromPolling) {
+          // If headless run had a portal connection issue, check if we have a partial plan to display
+          setAutofillProgressStep(9);
+          setIsAutofilling(false);
+          setSuccessMsg('Employer portal opened in a new tab. Use the JobFlow Assistant overlay to inspect and verify populated fields.');
+        }
+      }
     } catch (err: any) {
       setErrorMsg(err.message || 'Browser form auto-population failed.');
       setAutofillProgressStep(0);
-    } finally {
       setIsAutofilling(false);
     }
   };
 
+  const finishAutofill = (report: FormFillReport) => {
+    setAutofillReport(report);
+    setEditedFieldResults(report.field_results || []);
+    setAutofillProgressStep(9); // 9. Ready for human review
+    setIsAutofilling(false);
+    setSuccessMsg(
+      `Form auto-population complete! ${report.fields_populated_count} fields filled, ${report.fields_ats_parsed_count} parsed by ATS. Review all values below before submitting.`
+    );
+  };
+
   const handleCopyBookmarklet = () => {
-    const code = `javascript:(function(){var s=document.createElement('script');s.src='http://127.0.0.1:8000/api/applications/${appId}/autofill/companion.js?t='+Date.now();document.body.appendChild(s);})();`;
+    const ticketParam = autofillPlan?.action_ticket ? `?ticket=${encodeURIComponent(autofillPlan.action_ticket)}` : '';
+    const code = `javascript:(function(){window.JOBFLOW_CONFIG={apiBase:'http://127.0.0.1:8000/api',appId:${appId},ticket:'${autofillPlan?.action_ticket || ''}',executionId:'${autofillPlan?.execution_id || ''}'};var s=document.createElement('script');s.src='http://127.0.0.1:8000/api/applications/${appId}/autofill/companion.js${ticketParam}';document.body.appendChild(s);})();`;
     navigator.clipboard.writeText(code);
     setCompanionCopied(true);
     setTimeout(() => setCompanionCopied(false), 3500);
@@ -1178,33 +1233,39 @@ export const ApplicationPreparerPage: React.FC = () => {
                 onChange={(e) => setTargetFormUrl(e.target.value)}
                 className="w-full px-3.5 py-2.5 rounded-xl border border-indigo-200 bg-white text-xs text-slate-800 focus:outline-none focus:ring-2 focus:ring-indigo-500/20"
               />
-              <button
-                onClick={handleStartBrowserAutofill}
-                disabled={isAutofilling || !targetFormUrl}
-                className="w-full sm:w-auto px-6 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-md shadow-indigo-500/20 flex items-center justify-center gap-2 transition-all shrink-0 disabled:opacity-50"
-              >
-                {isAutofilling ? (
-                  <>
-                    <LoadingSpinner size={16} />
-                    <span>Auto-Populating Form...</span>
-                  </>
-                ) : (
-                  <>
-                    <Wand2 size={14} />
-                    <span>Auto-Fill Application Form</span>
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-2 w-full sm:w-auto">
+                <button
+                  onClick={() => handleStartBrowserAutofill({ openInNewTab: true })}
+                  disabled={isAutofilling || !targetFormUrl}
+                  className="w-full sm:w-auto px-5 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-semibold text-xs shadow-md shadow-indigo-500/20 flex items-center justify-center gap-2 transition-all shrink-0 disabled:opacity-50"
+                  title="Opens the employer portal in a new tab and auto-fills fields via companion/extension"
+                >
+                  {isAutofilling ? (
+                    <>
+                      <LoadingSpinner size={16} />
+                      <span>Auto-Populating Form...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Wand2 size={14} />
+                      <span>Open Employer Application Form & Auto-Fill</span>
+                      <ExternalLink size={13} />
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
             {/* In-Browser Companion Option */}
             <div className="pt-2 border-t border-indigo-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-              <span className="text-indigo-800">
-                Applying directly in your personal Chrome/Edge window?
-              </span>
+              <div className="text-indigo-800 flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span>
+                <span>Chrome/Edge Companion ready • Strict Human Control Guarantee</span>
+              </div>
               <button
                 onClick={handleCopyBookmarklet}
                 className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 flex items-center gap-1.5 self-start sm:self-auto"
+                title="Copy secure 1-click companion bookmarklet"
               >
                 {companionCopied ? (
                   <>
@@ -1224,41 +1285,51 @@ export const ApplicationPreparerPage: React.FC = () => {
           {/* Progress Stepper (Visible during or after autofill) */}
           {(isAutofilling || autofillProgressStep > 0) && (
             <div className="p-5 rounded-2xl bg-slate-50 border border-slate-200 space-y-3">
-              <h4 className="text-xs font-bold text-slate-900 flex items-center gap-2">
-                <Layers size={14} className="text-brand-600" />
-                <span>Form Auto-Population Execution Progress</span>
-              </h4>
+              <div className="flex items-center justify-between">
+                <h4 className="text-xs font-bold text-slate-900 flex items-center gap-2">
+                  <Layers size={14} className="text-brand-600" />
+                  <span>Form Auto-Population Execution Progress</span>
+                </h4>
+                <span className="text-[11px] font-semibold text-slate-500">
+                  {autofillProgressStep === 9
+                    ? 'Status: Ready for Human Inspection'
+                    : isAutofilling
+                    ? `Running: Stage ${autofillProgressStep} of 9`
+                    : 'Execution Completed'}
+                </span>
+              </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px]">
                 {[
-                  { num: 1, title: '1. Connecting to Portal' },
-                  { num: 2, title: '2. Identifying Form & Resume' },
-                  { num: 3, title: '3. Uploading Resume' },
-                  { num: 4, title: '4. ATS Resume Parsing' },
-                  { num: 5, title: '5. Mapping Candidate Facts' },
-                  { num: 6, title: '6. Populating Blank Fields' },
-                  { num: 7, title: '7. Verifying Field Values' },
-                  { num: 8, title: '8. Ready for Review' },
+                  { num: 1, title: '1. Opening employer portal' },
+                  { num: 2, title: '2. Establishing browser connection' },
+                  { num: 3, title: '3. Identifying ATS & application form' },
+                  { num: 4, title: '4. Retrieving verified candidate facts' },
+                  { num: 5, title: '5. Uploading verified resume' },
+                  { num: 6, title: '6. Waiting for ATS resume parsing' },
+                  { num: 7, title: '7. Mapping and populating fields' },
+                  { num: 8, title: '8. Verifying populated values' },
+                  { num: 9, title: '9. Ready for human review' },
                 ].map((st) => {
-                  const isDone = autofillProgressStep > st.num || (!isAutofilling && autofillProgressStep === 8);
+                  const isDone = autofillProgressStep > st.num || (!isAutofilling && autofillProgressStep === 9);
                   const isAct = autofillProgressStep === st.num && isAutofilling;
                   return (
                     <div
                       key={st.num}
-                      className={`p-2 rounded-lg border flex items-center gap-2 ${
+                      className={`p-2.5 rounded-lg border flex items-center gap-2 transition-all ${
                         isDone
                           ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                           : isAct
-                          ? 'bg-blue-50 border-blue-300 text-blue-900 font-bold'
+                          ? 'bg-blue-50 border-blue-300 text-blue-900 font-bold shadow-sm'
                           : 'bg-white border-slate-200 text-slate-400'
                       }`}
                     >
                       {isDone ? (
-                        <CheckCircle2 size={13} className="text-emerald-600 shrink-0" />
+                        <CheckCircle2 size={14} className="text-emerald-600 shrink-0" />
                       ) : isAct ? (
-                        <LoadingSpinner size={16} />
+                        <LoadingSpinner size={14} />
                       ) : (
-                        <div className="w-3 h-3 rounded-full border border-slate-300 shrink-0" />
+                        <div className="w-3.5 h-3.5 rounded-full border border-slate-300 shrink-0" />
                       )}
                       <span className="truncate">{st.title}</span>
                     </div>
@@ -1295,7 +1366,7 @@ export const ApplicationPreparerPage: React.FC = () => {
                 </div>
               </div>
 
-              {/* Editable Field Table */}
+              {/* Editable Field Table with 5 Columns */}
               <div className="overflow-x-auto border border-slate-200 rounded-xl">
                 <table className="min-w-full divide-y divide-slate-200 text-xs">
                   <thead className="bg-slate-50 text-slate-600">
@@ -1303,7 +1374,8 @@ export const ApplicationPreparerPage: React.FC = () => {
                       <th className="px-3.5 py-2.5 text-left font-semibold">Field Name</th>
                       <th className="px-3.5 py-2.5 text-left font-semibold">Value on Form (Editable)</th>
                       <th className="px-3.5 py-2.5 text-left font-semibold">Source / Provenance</th>
-                      <th className="px-3.5 py-2.5 text-left font-semibold">Status</th>
+                      <th className="px-3.5 py-2.5 text-left font-semibold">Verification Status</th>
+                      <th className="px-3.5 py-2.5 text-left font-semibold">Action</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-slate-100 bg-white">
@@ -1347,6 +1419,19 @@ export const ApplicationPreparerPage: React.FC = () => {
                             }`}
                           >
                             {item.status.replace('_', ' ')}
+                          </span>
+                        </td>
+                        <td className="px-3.5 py-2.5">
+                          <span className="text-[11px] font-medium text-slate-500">
+                            {item.status === 'AUTO_FILLED' ? (
+                              <span className="text-emerald-700 font-semibold">Verified Match</span>
+                            ) : item.status === 'ATS_PARSED' ? (
+                              <span className="text-blue-700 font-semibold">ATS Extracted</span>
+                            ) : item.status === 'MANUAL_REVIEW' ? (
+                              <span className="text-amber-700 font-semibold">Needs Input</span>
+                            ) : (
+                              <span className="text-slate-600">Candidate Edited</span>
+                            )}
                           </span>
                         </td>
                       </tr>

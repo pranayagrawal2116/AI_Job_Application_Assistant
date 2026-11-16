@@ -22,6 +22,7 @@ import hashlib
 import json
 from pathlib import Path
 import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
@@ -133,6 +134,10 @@ class AutofillPlanResponse:
 class ApplicationFormFillingBroker:
     """Authoritative execution and coordination broker for employer application forms."""
 
+    _instance: Optional["ApplicationFormFillingBroker"] = None
+    _active_executions: Dict[str, Dict[str, Any]] = {}
+    _execution_lock: threading.Lock = threading.Lock()
+
     def __init__(
         self,
         db_manager: Optional[DatabaseManager] = None,
@@ -142,6 +147,64 @@ class ApplicationFormFillingBroker:
         self.db = db or db_manager or DatabaseManager()
         self.file_validator = file_validator
         self.prefiller = FormPrefiller(db_manager=self.db, file_validator=self.file_validator)
+
+    @classmethod
+    def get_instance(cls, db_manager: Optional[DatabaseManager] = None) -> "ApplicationFormFillingBroker":
+        """Singleton accessor for broker instance."""
+        if cls._instance is None:
+            cls._instance = cls(db_manager=db_manager)
+        return cls._instance
+
+    @classmethod
+    def reset_instance(cls) -> None:
+        """Resets the singleton instance (for clean testing)."""
+        cls._instance = None
+        with cls._execution_lock:
+            cls._active_executions.clear()
+
+    def is_origin_allowed(self, origin: str) -> bool:
+        """Checks if a cross-origin request origin matches an active, authorized execution domain."""
+        if not origin or not isinstance(origin, str):
+            return False
+        clean_origin = origin.strip().lower()
+        if clean_origin.startswith("chrome-extension://") or clean_origin.startswith("moz-extension://"):
+            return True
+
+        parsed = urlparse(clean_origin)
+        host = (parsed.hostname or "").lower()
+        if not host:
+            return False
+
+        now = time.time()
+        with self._execution_lock:
+            # Purge expired executions
+            expired = [k for k, v in self._active_executions.items() if v.get("expires_at", 0) < now]
+            for k in expired:
+                del self._active_executions[k]
+
+            for rec in self._active_executions.values():
+                val_domain = (rec.get("validated_domain") or "").lower()
+                if host == val_domain or host.endswith("." + val_domain):
+                    return True
+        return False
+
+    def get_execution_status(self, application_id: int, execution_id: str) -> Optional[Dict[str, Any]]:
+        """Returns live execution status and report if completed."""
+        with self._execution_lock:
+            rec = self._active_executions.get(execution_id)
+            if not rec or rec.get("application_id") != application_id:
+                return None
+            return {
+                "execution_id": rec["execution_id"],
+                "application_id": rec["application_id"],
+                "user_id": rec["user_id"],
+                "status": rec["status"],
+                "ats_provider": self.identify_ats_provider(rec.get("target_url", "")),
+                "target_url": rec.get("target_url"),
+                "validated_domain": rec.get("validated_domain"),
+                "report": rec.get("report"),
+                "created_at": rec.get("created_at"),
+            }
 
     # -------------------------------------------------------------------------
     # DOMAIN & ATS IDENTIFICATION
@@ -313,14 +376,33 @@ class ApplicationFormFillingBroker:
 
         # Issue ticket using SessionManager
         from src.security.session_manager import SessionManager
-        session_mgr = SessionManager(db_manager=self.db)
+        session_mgr = SessionManager.get_instance()
         action_ticket = session_mgr.create_action_ticket(
             action_type="autofill",
             resource_id=application_id,
             packet_version_hash=plan_hash,
             candidate_id=f"user_{user_id}",
-            ttl_seconds=3600,
+            ttl_seconds=600,
         )
+
+        # Register active execution session
+        now = time.time()
+        with self._execution_lock:
+            self._active_executions[execution_id] = {
+                "execution_id": execution_id,
+                "application_id": application_id,
+                "user_id": user_id,
+                "action_ticket": action_ticket,
+                "plan_hash": plan_hash,
+                "validated_domain": validated_domain,
+                "target_url": effective_url,
+                "resume_id": attachment_ref.resume_id,
+                "resume_file_hash": attachment_ref.file_hash,
+                "status": "READY",
+                "created_at": now,
+                "expires_at": now + 600,
+                "report": None,
+            }
 
         # 8. Known fields list
         known_fields = [asdict(f) for f in form_plan.fields_to_fill]
@@ -364,6 +446,32 @@ class ApplicationFormFillingBroker:
         - Strictly opens binary via FormPrefiller.open_verified_attachment().
         - Returns (file_bytes, filename, content_type).
         """
+        # Verify action ticket cryptographically
+        if not ticket or not isinstance(ticket, str):
+            raise SecurityAuthorizationError("Missing action ticket for resume access.")
+
+        from src.security.session_manager import SessionManager
+        session_mgr = SessionManager.get_instance()
+        ticket_data = session_mgr.verify_action_ticket(
+            ticket_str=ticket,
+            expected_action="autofill",
+            expected_resource_id=application_id,
+        )
+
+        nonce = ticket_data["nonce"]
+        key_id = ticket_data["key_id"]
+
+        # Atomic replay prevention: check if nonce was already consumed
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT nonce FROM consumed_action_nonces WHERE nonce = ?", (nonce,))
+            if cursor.fetchone():
+                raise SecurityAuthorizationError("Action ticket has already been used (replay attempt).")
+            cursor.execute(
+                "INSERT INTO consumed_action_nonces (nonce, key_id, user_id, action_type) VALUES (?, ?, ?, 'autofill_resume_download')",
+                (nonce, key_id, user_id)
+            )
+
         # Load application
         with self.db.get_connection() as conn:
             cursor = conn.cursor()
@@ -742,6 +850,26 @@ class ApplicationFormFillingBroker:
     # -------------------------------------------------------------------------
     # AUDIT TRAIL LOGGING
     # -------------------------------------------------------------------------
+
+    def complete_execution(
+        self,
+        report: FormFillExecutionReport,
+        ticket: Optional[str] = None,
+    ) -> Optional[Any]:
+        """Validates execution report against active registered execution, ensures ticket binding,
+        updates execution state, and records the audit event without changing application status."""
+        execution_id = report.execution_id
+        with self._execution_lock:
+            rec = self._active_executions.get(execution_id)
+            if rec:
+                if rec["application_id"] != report.application_id or rec["user_id"] != report.user_id:
+                    raise SecurityAuthorizationError("Execution report parameter mismatch with active execution.")
+                if ticket and rec["action_ticket"] != ticket:
+                    raise SecurityAuthorizationError("Invalid action ticket for execution.")
+                rec["status"] = "COMPLETED"
+                rec["report"] = report.to_dict()
+
+        return self._record_autofill_audit_event(report)
 
     def _record_autofill_audit_event(self, report: FormFillExecutionReport) -> Optional[Any]:
         """Appends the authoritative EXTERNAL_FORM_AUTOFILLED event to the application timeline."""

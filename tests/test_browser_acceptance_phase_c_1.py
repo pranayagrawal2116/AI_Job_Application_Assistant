@@ -250,6 +250,16 @@ class TestBrowserAcceptancePhaseC1(unittest.TestCase):
             was_submitted = page.evaluate("() => window.formWasSubmitted")
             self.assertFalse(was_submitted, "SAFETY VIOLATION: Submit button must NEVER be clicked by automation!")
 
+            # 10. Capture screenshot evidence of populated form and human-controlled submit button
+            evidence_dir = PROJECT_ROOT / "docs" / "evidence"
+            evidence_dir.mkdir(parents=True, exist_ok=True)
+            screenshot_path = evidence_dir / "populated_employer_form_acceptance_proof.png"
+            page.screenshot(path=str(screenshot_path), full_page=True)
+
+            artifact_dir = Path("/Users/pranay/.gemini/antigravity/brain/e4de422d-0137-49d0-a8fa-119df764e89e/browser_evidence")
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            page.screenshot(path=str(artifact_dir / "populated_employer_form_acceptance_proof.png"), full_page=True)
+
         finally:
             page.close()
             Path(resume_path).unlink(missing_ok=True)

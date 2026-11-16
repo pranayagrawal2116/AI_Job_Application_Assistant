@@ -330,6 +330,70 @@ class UniversalFieldMapper:
             source_path="technical_skills",
         )
 
+        # 8.1 Professional Details (Current Employer & Job Title)
+        primary_exp = exp_list[0] if exp_list else {}
+        curr_company = (primary_exp.get("company") or primary_exp.get("organization") or "").strip()
+        curr_role = (primary_exp.get("title") or primary_exp.get("position") or primary_exp.get("job_title") or "").strip()
+        self.facts["current_company"] = CandidateFieldFact(
+            canonical_key="current_company",
+            label="Current Company / Organization",
+            value=curr_company,
+            provenance=primary_exp.get("verification_status") or ProvenanceStatus.VERIFIED_PROFILE if curr_company else ProvenanceStatus.UNAVAILABLE,
+            confidence=0.95 if curr_company else 0.0,
+            source_path="work_experience[0].company",
+        )
+        self.facts["current_job_title"] = CandidateFieldFact(
+            canonical_key="current_job_title",
+            label="Current Job Title",
+            value=curr_role,
+            provenance=primary_exp.get("verification_status") or ProvenanceStatus.VERIFIED_PROFILE if curr_role else ProvenanceStatus.UNAVAILABLE,
+            confidence=0.95 if curr_role else 0.0,
+            source_path="work_experience[0].title",
+        )
+
+        # 8.2 Certifications & Languages
+        certs = p.get("certifications") or []
+        cert_names = [c.get("name") if isinstance(c, dict) else str(c) for c in certs if c]
+        self.facts["certifications"] = CandidateFieldFact(
+            canonical_key="certifications",
+            label="Certifications",
+            value=", ".join(cert_names) if cert_names else None,
+            provenance=ProvenanceStatus.VERIFIED_PROFILE if cert_names else ProvenanceStatus.UNAVAILABLE,
+            confidence=0.90 if cert_names else 0.0,
+            source_path="certifications",
+        )
+
+        langs = p.get("languages") or []
+        lang_names = [l.get("language") if isinstance(l, dict) else str(l) for l in langs if l]
+        self.facts["languages"] = CandidateFieldFact(
+            canonical_key="languages",
+            label="Languages",
+            value=", ".join(lang_names) if lang_names else None,
+            provenance=ProvenanceStatus.VERIFIED_PROFILE if lang_names else ProvenanceStatus.UNAVAILABLE,
+            confidence=0.90 if lang_names else 0.0,
+            source_path="languages",
+        )
+
+        # 8.3 Application Preferences
+        work_arr = search_pref.get("workplace_type") or search_pref.get("work_arrangement") or "Remote"
+        self.facts["work_arrangement"] = CandidateFieldFact(
+            canonical_key="work_arrangement",
+            label="Work Arrangement Preference",
+            value=work_arr,
+            provenance=ProvenanceStatus.USER_CONFIRMED,
+            confidence=0.90,
+            source_path="search_preferences.workplace_type",
+        )
+        willing_reloc = "Yes" if search_pref.get("willing_to_relocate") else "No"
+        self.facts["relocation_preference"] = CandidateFieldFact(
+            canonical_key="relocation_preference",
+            label="Willing to Relocate",
+            value=willing_reloc,
+            provenance=ProvenanceStatus.USER_CONFIRMED,
+            confidence=0.90,
+            source_path="search_preferences.willing_to_relocate",
+        )
+
         # 9. STRICT RULES: Sensitive / Missing Candidate Inputs
         # NEVER infer Gender from full_name!
         gender_val = personal.get("gender") or p.get("gender")
@@ -722,6 +786,34 @@ class UniversalFieldMapper:
         # 21. Skills
         if any(w in combined for w in ["skill", "technologies", "tech stack", "tools"]):
             return ("skills", 0.90, "Matched skills input")
+
+        # 22. Current Company / Employer / Organization (e.g. Lever "org", Greenhouse "company")
+        if any(w in combined for w in ["current company", "current employer", "organization", "org", "company name", "employer"]):
+            return ("current_company", 0.95, "Matched current employer / organization")
+
+        # 23. Current Job Title / Role
+        if any(w in combined for w in ["job title", "designation", "current role", "current title", "headline", "position"]):
+            return ("current_job_title", 0.95, "Matched current job title / designation")
+
+        # 24. Degree
+        if any(w in combined for w in ["degree", "qualification", "education level", "degree level"]):
+            return ("degree", 0.95, "Matched degree")
+
+        # 25. Certifications
+        if any(w in combined for w in ["certification", "certificates", "license"]):
+            return ("certifications", 0.90, "Matched certifications")
+
+        # 26. Languages
+        if any(w in combined for w in ["language", "languages spoken", "languages known"]):
+            return ("languages", 0.90, "Matched languages")
+
+        # 27. Work Arrangement
+        if any(w in combined for w in ["work arrangement", "remote preference", "workplace"]):
+            return ("work_arrangement", 0.90, "Matched workplace preference")
+
+        # 28. Relocation
+        if any(w in combined for w in ["relocate", "relocation"]):
+            return ("relocation_preference", 0.90, "Matched relocation preference")
 
         return (None, 0.0, "")
 

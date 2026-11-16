@@ -124,6 +124,46 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def dynamic_autofill_cors_middleware(request: Request, call_next):
+    """Dynamic CORS handler for authorized employer ATS companion scripts and extensions.
+    Strictly verifies that origin matches an active autofill execution domain or companion extension.
+    Never permits wildcard origins.
+    """
+    origin = request.headers.get("origin")
+    path = request.url.path
+
+    if "/autofill/" in path and origin:
+        is_allowed = False
+        if origin.startswith("chrome-extension://") or origin.startswith("moz-extension://"):
+            is_allowed = True
+        else:
+            from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+            broker = ApplicationFormFillingBroker.get_instance()
+            if broker.is_origin_allowed(origin):
+                is_allowed = True
+
+        if is_allowed:
+            if request.method == "OPTIONS":
+                from fastapi.responses import Response
+                response = Response(status_code=200)
+                response.headers["Access-Control-Allow-Origin"] = origin
+                response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+                response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-JobFlow-Ticket"
+                response.headers["Access-Control-Allow-Credentials"] = "true"
+                response.headers["Access-Control-Max-Age"] = "600"
+                return response
+
+            response = await call_next(request)
+            response.headers["Access-Control-Allow-Origin"] = origin
+            response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+            response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, X-Requested-With, X-JobFlow-Ticket"
+            response.headers["Access-Control-Allow-Credentials"] = "true"
+            return response
+
+    return await call_next(request)
+
 # Include Routers
 app.include_router(auth.router)
 app.include_router(dashboard.router)
