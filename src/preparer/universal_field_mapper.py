@@ -465,7 +465,12 @@ class UniversalFieldMapper:
         if not value:
             return ProvenanceStatus.UNAVAILABLE
         prov_info = provenance_map.get(field_name) or {}
-        status = prov_info.get("verification_status")
+        if isinstance(prov_info, str):
+            status = prov_info
+        elif isinstance(prov_info, dict):
+            status = prov_info.get("verification_status") or prov_info.get("status")
+        else:
+            status = None
         if status in (ProvenanceStatus.USER_CONFIRMED, "USER_CONFIRMED"):
             return ProvenanceStatus.USER_CONFIRMED
         if status in (ProvenanceStatus.VERIFIED_PROFILE, "VERIFIED"):

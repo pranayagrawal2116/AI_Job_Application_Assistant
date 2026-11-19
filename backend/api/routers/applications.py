@@ -1346,11 +1346,12 @@ def prepare_autofill_plan(
 def get_autofill_resume_binary(
     app_id: int,
     ticket: str = Query(...),
+    execution_id: Optional[str] = Query(None),
     request: Request = None,
 ):
     """Serves the verified resume binary for the authorized form autofill execution.
     Secured by single-use signed action ticket with cryptographic HMAC verification,
-    domain binding, and atomic nonce replay prevention.
+    candidate binding, domain binding, and atomic nonce replay prevention.
     """
     from src.preparer.form_filling_broker import ApplicationFormFillingBroker
     service = DashboardService.get_instance()
@@ -1365,11 +1366,14 @@ def get_autofill_resume_binary(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Application #{app_id} not found.")
         owner_user_id = row["user_id"]
 
+    req_origin = request.headers.get("origin") if request else None
     try:
         raw_bytes, filename, content_type = broker.get_verified_resume_bytes(
             user_id=owner_user_id,
             application_id=app_id,
             ticket=ticket,
+            execution_id=execution_id,
+            origin=req_origin,
         )
         return Response(
             content=raw_bytes,
@@ -1437,11 +1441,13 @@ def record_autofill_handshake(
             ticket = auth_hdr[7:].strip()
 
     try:
+        req_origin = getattr(req, "origin", "") or (request.headers.get("origin") if request else "")
         res = broker.record_handshake(
             application_id=app_id,
             execution_id=req.execution_id,
             ticket=ticket or "",
             domain=req.domain or "",
+            origin=req_origin or "",
             companion_version=req.companion_version or "1.0.0",
             ats_detected=req.ats_detected or "universal",
             form_found=bool(req.form_found),

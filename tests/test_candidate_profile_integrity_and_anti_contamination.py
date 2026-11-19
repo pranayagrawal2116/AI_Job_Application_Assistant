@@ -10,12 +10,13 @@ Verifies:
 4. Resume binary binding: Plan references the authentic active user resume with exact SHA-256 integrity.
 """
 
+import hashlib
+from pathlib import Path
 import pytest
 from src.database.db_manager import DatabaseManager
 from src.preparer.form_filling_broker import ApplicationFormFillingBroker
 from src.preparer.universal_field_mapper import (
     FormFieldTarget,
-    ProvenanceStatus,
     UniversalFieldMapper,
 )
 
@@ -35,10 +36,90 @@ class TestCandidateProfileIntegrityAndAntiContamination:
     """Ensures production autofill is strictly rooted in real profile facts and free of fixture contamination."""
 
     @pytest.fixture(autouse=True)
-    def setup_db(self):
-        self.db = DatabaseManager()
-        self.broker = ApplicationFormFillingBroker(self.db)
-        self.user_id = 1
+    def setup_db(self, tmp_path):
+        """Sets up an isolated temporary database with realistic seeded candidate fixtures."""
+        db_path = tmp_path / "test_isolated.db"
+        self.db = DatabaseManager(db_path=db_path)
+        self.broker = ApplicationFormFillingBroker(db=self.db)
+
+        # 1. Create candidate user in isolated database
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT INTO users (email, password_hash, password_salt, full_name) VALUES (?, 'hash', 'salt', ?)",
+                ("pranayagrawal2116@gmail.com", "Pranay Agrawal"),
+            )
+            self.user_id = cursor.lastrowid
+
+        # 2. Seed realistic candidate profile
+        profile_data = {
+            "personal": {
+                "full_name": "Pranay Agrawal",
+                "email": "pranayagrawal2116@gmail.com",
+                "phone": "9510029575",
+                "current_company": "Sarita Infotech Private Limited",
+                "current_location": "Pune, India",
+                "linkedin": "https://www.linkedin.com/in/pranay",
+                "github": "",
+            },
+            "education": [],
+            "experience": [],
+            "technical_skills": ["Python", "FastAPI", "React"],
+            "field_provenance": {
+                "full_name": "USER_CONFIRMED",
+                "email": "USER_CONFIRMED",
+                "phone": "USER_CONFIRMED",
+                "current_company": "USER_CONFIRMED",
+            },
+        }
+        self.db.save_user_candidate_profile(self.user_id, profile_data)
+
+        # 3. Create minimal valid PDF in candidate's isolated resume directory
+        user_resumes_dir = Path("data") / "users" / str(self.user_id) / "resumes"
+        user_resumes_dir.mkdir(parents=True, exist_ok=True)
+        pdf_path = user_resumes_dir / "Pranay_Agrawal_CV.pdf"
+        minimal_pdf = (
+            b"%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n"
+            b"2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n"
+            b"3 0 obj<</Type/Page/MediaBox[0 0 612 792]/Parent 2 0 R/Resources<<>>>>endobj\n"
+            b"xref\n0 4\n0000000000 65535 f\n0000000010 00000 n\n0000000060 00000 n\n"
+            b"0000000117 00000 n\ntrailer<</Size 4/Root 1 0 R>>\nstartxref\n198\n%%EOF\n"
+        )
+        pdf_path.write_bytes(minimal_pdf)
+        pdf_hash = hashlib.sha256(minimal_pdf).hexdigest()
+
+        # 4. Seed into resumes and applications tables
+        with self.db.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """INSERT INTO resumes (
+                    user_id, storage_filename, original_filename, file_format, file_hash, file_size_bytes, is_primary, is_active
+                ) VALUES (?, ?, ?, 'pdf', ?, ?, 1, 1)""",
+                (self.user_id, "Pranay_Agrawal_CV.pdf", "Pranay_Agrawal_CV.pdf", pdf_hash, len(minimal_pdf)),
+            )
+            self.resume_id = cursor.lastrowid
+
+            cursor.execute(
+                """INSERT INTO applications (
+                    user_id, company_name, job_title, external_application_url, resume_id, status
+                ) VALUES (?, 'CIN7', 'Software Engineer', 'https://jobs.lever.co/cin7/510ff0bd-2b01-4645-bf6f-89be209ad154/apply', ?, 'APPROVED')""",
+                (self.user_id, self.resume_id),
+            )
+            self.app_id = cursor.lastrowid
+
+        yield
+
+        # 5. Clean up temporary filesystem artifacts
+        try:
+            if pdf_path.exists():
+                pdf_path.unlink()
+            if user_resumes_dir.exists() and not any(user_resumes_dir.iterdir()):
+                user_resumes_dir.rmdir()
+                user_parent = Path("data") / "users" / str(self.user_id)
+                if user_parent.exists() and not any(user_parent.iterdir()):
+                    user_parent.rmdir()
+        except Exception:
+            pass
 
     def test_plan_contains_no_banned_fixture_placeholders(self):
         """Verifies that generated plan facts never contain hardcoded sample/test strings."""

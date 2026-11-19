@@ -34,9 +34,10 @@
     "https://*.myworkdayjobs.com/*",
     "https://*.keka.com/*",
     "https://*.ripplehire.com/*",
-    "https://*.kula.ai/*",
-    "https://careers.*/*",
-    "https://jobs.*/*"
+    "https://*.kula.ai/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*"
   ],
   "content_scripts": [
     {
@@ -54,9 +55,7 @@
         "https://*.myworkdayjobs.com/*",
         "https://*.keka.com/*",
         "https://*.ripplehire.com/*",
-        "https://*.kula.ai/*",
-        "https://careers.*/*",
-        "https://jobs.*/*"
+        "https://*.kula.ai/*"
       ],
       "exclude_matches": [
         "http://localhost:3000/*",

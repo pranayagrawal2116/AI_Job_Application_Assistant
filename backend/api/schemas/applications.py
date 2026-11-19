@@ -153,6 +153,12 @@ class AutofillPlanResponseSchema(BaseModel):
     candidate_profile_provenance: Dict[str, Any] = {}
     known_fields_to_fill: List[Dict[str, Any]] = []
     safety_message: str = ""
+    canonical_target_origin: Optional[str] = ""
+    validated_target_hostname: Optional[str] = ""
+    approved_redirect_origins: Optional[List[str]] = []
+    candidate_id: Optional[str] = ""
+    expires_at: Optional[str] = ""
+    resume_binding: Optional[Dict[str, Any]] = None
 
 
 class AutofillExecuteBrowserRequest(BaseModel):
@@ -164,6 +170,7 @@ class AutofillHandshakeRequest(BaseModel):
     execution_id: str
     action_ticket: str
     domain: Optional[str] = ""
+    origin: Optional[str] = ""
     companion_version: Optional[str] = "1.0.0"
     ats_detected: Optional[str] = "universal"
     form_found: Optional[bool] = False

@@ -61,36 +61,65 @@ if (typeof chrome === "undefined" && typeof browser !== "undefined") {
   }
 
   // STRICT ORIGIN & TARGET DOMAIN SECURITY:
-  // Verify that the current page's hostname matches the authorized application target domain.
-  // Never expose or execute candidate data operations on unauthorized or unrelated websites.
+  // Verify that the current page's origin, protocol, and expiration match the authorized plan.
+  // Never expose or execute candidate data operations on unauthorized, cross-employer, or unrelated websites.
   function isAuthorizedOriginForPlan(plan) {
     if (!plan) return false;
+
+    // 1. Enforce HTTPS (except localhost / 127.0.0.1 for local test environments)
+    const currentProtocol = window.location.protocol;
     const currentHost = window.location.hostname.toLowerCase();
-
-    // 1. Direct match on plan's target_url host or validated_domain
-    const targetUrl = plan.target_url || "";
-    let targetHost = "";
-    try {
-      if (targetUrl) targetHost = new URL(targetUrl).hostname.toLowerCase();
-    } catch (_) {}
-
-    const validatedDomain = (plan.validated_domain || "").toLowerCase();
-
-    if (targetHost && (currentHost === targetHost || currentHost.endsWith("." + targetHost) || targetHost.endsWith("." + currentHost))) {
-      return true;
-    }
-    if (validatedDomain && (currentHost === validatedDomain || currentHost.endsWith("." + validatedDomain) || validatedDomain.endsWith("." + currentHost))) {
-      return true;
+    const isLocal = currentHost === "localhost" || currentHost === "127.0.0.1";
+    if (!isLocal && currentProtocol !== "https:") {
+      console.warn(`[JobFlow Security] Insecure protocol '${currentProtocol}' rejected for origin '${window.location.origin}'. HTTPS required.`);
+      return false;
     }
 
-    // 2. Authorized ATS redirect domains (e.g. redirected from career page to ripplehire, kula, lever, keka, greenhouse, workday)
-    const supportedAtsRootDomains = ["lever.co", "greenhouse.io", "myworkdayjobs.com", "keka.com", "ripplehire.com", "kula.ai"];
-    for (const root of supportedAtsRootDomains) {
-      if (currentHost === root || currentHost.endsWith("." + root)) {
-        return true;
+    // 2. Check execution ID and action ticket presence
+    if (!plan.execution_id || !plan.action_ticket) {
+      console.warn("[JobFlow Security] Missing execution_id or action_ticket in active plan.");
+      return false;
+    }
+
+    // 3. Check plan expiration
+    if (plan.expires_at) {
+      const expMs = typeof plan.expires_at === "number"
+        ? (plan.expires_at < 1e11 ? plan.expires_at * 1000 : plan.expires_at)
+        : Date.parse(plan.expires_at);
+      if (!isNaN(expMs) && Date.now() > expMs) {
+        console.warn("[JobFlow Security] Autofill plan has expired at:", new Date(expMs).toISOString());
+        return false;
       }
     }
 
+    // 4. Exact origin matching against canonical_target_origin
+    const currentOrigin = window.location.origin.toLowerCase();
+    const canonicalOrigin = (plan.canonical_target_origin || "").toLowerCase();
+
+    if (canonicalOrigin && currentOrigin === canonicalOrigin) {
+      return true;
+    }
+
+    // 5. Check membership in approved_redirect_origins
+    const approvedRedirects = Array.isArray(plan.approved_redirect_origins)
+      ? plan.approved_redirect_origins.map(o => String(o).toLowerCase().trim())
+      : [];
+    if (approvedRedirects.includes(currentOrigin)) {
+      return true;
+    }
+
+    // 6. Fallback exact hostname matching for port-agnostic or custom-port development
+    const validatedHost = (plan.validated_target_hostname || plan.validated_domain || "").toLowerCase();
+    let targetUrlHost = "";
+    try {
+      if (plan.target_url) targetUrlHost = new URL(plan.target_url).hostname.toLowerCase();
+    } catch (_) {}
+
+    if ((validatedHost && currentHost === validatedHost) || (targetUrlHost && currentHost === targetUrlHost)) {
+      return true;
+    }
+
+    // Strict boundary enforcement: do NOT perform wildcard, suffix, or global ATS matching
     return false;
   }
 
@@ -315,6 +344,7 @@ if (typeof chrome === "undefined" && typeof browser !== "undefined") {
           execution_id: EXECUTION_ID,
           action_ticket: TICKET,
           domain: host,
+          origin: window.location.origin,
           companion_version: "1.2.0",
           ats_detected: atsDetected,
           form_found: formFound,
@@ -496,7 +526,7 @@ if (typeof chrome === "undefined" && typeof browser !== "undefined") {
       }
 
       if (targetInput) {
-        const resumeUrl = `${API_BASE}/applications/${APP_ID}/autofill/resume-binary?ticket=${encodeURIComponent(TICKET)}`;
+        const resumeUrl = `${API_BASE}/applications/${APP_ID}/autofill/resume-binary?ticket=${encodeURIComponent(TICKET)}&execution_id=${encodeURIComponent(EXECUTION_ID)}`;
         const resumeResp = await fetch(resumeUrl);
         if (resumeResp.ok) {
           const blob = await resumeResp.blob();

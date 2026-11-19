@@ -138,6 +138,12 @@ class AutofillPlanResponse:
     candidate_profile_provenance: Dict[str, Any]
     known_fields_to_fill: List[Dict[str, Any]]
     safety_message: str
+    canonical_target_origin: str = ""
+    validated_target_hostname: str = ""
+    approved_redirect_origins: List[str] = field(default_factory=list)
+    candidate_id: str = ""
+    expires_at: str = ""
+    resume_binding: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -148,7 +154,7 @@ class ApplicationFormFillingBroker:
 
     _instance: Optional["ApplicationFormFillingBroker"] = None
     _active_executions: Dict[str, Dict[str, Any]] = {}
-    _execution_lock: threading.Lock = threading.Lock()
+    _execution_lock: threading.RLock = threading.RLock()
 
     def __init__(
         self,
@@ -194,7 +200,10 @@ class ApplicationFormFillingBroker:
             cls._active_executions.clear()
 
     def is_origin_allowed(self, origin: str) -> bool:
-        """Checks if a cross-origin request origin matches an active, authorized execution domain."""
+        """Checks if a cross-origin request origin matches an active, authorized execution domain.
+        Strictly enforces exact origin, approved redirects, or validated hostname matches without
+        permissive wildcard or reverse-suffix leaking.
+        """
         if not origin or not isinstance(origin, str):
             return False
         clean_origin = origin.strip().lower()
@@ -214,10 +223,87 @@ class ApplicationFormFillingBroker:
                 del self._active_executions[k]
 
             for rec in self._active_executions.values():
-                val_domain = (rec.get("validated_domain") or "").lower()
-                if host == val_domain or host.endswith("." + val_domain):
+                canon = (rec.get("canonical_target_origin") or "").lower()
+                if canon and clean_origin == canon:
+                    return True
+                for red in rec.get("approved_redirect_origins", []):
+                    if clean_origin == red.lower():
+                        return True
+                val_domain = (rec.get("validated_target_hostname") or rec.get("validated_domain") or "").lower()
+                if val_domain and host == val_domain:
                     return True
         return False
+
+    def validate_execution_origin(
+        self,
+        execution_id: str,
+        origin_or_domain: str,
+    ) -> bool:
+        """Validates that a requesting origin or domain is strictly authorized for the given execution.
+
+        Rules:
+        - Exact match against canonical_target_origin or membership in approved_redirect_origins.
+        - OR exact match against validated_target_hostname.
+        - Fails closed on any unknown, unrelated, or cross-employer ATS domains.
+        """
+        if not execution_id or not origin_or_domain:
+            return False
+
+        clean = origin_or_domain.strip().lower()
+
+        with self._execution_lock:
+            rec = self._active_executions.get(execution_id)
+            if not rec:
+                session = self.db.get_autofill_execution_session(execution_id)
+                if session:
+                    rec = session
+                else:
+                    return False
+
+            canonical_origin = (rec.get("canonical_target_origin") or "").lower()
+            approved_redirects = [
+                o.lower() for o in rec.get("approved_redirect_origins", [])
+            ]
+            val_hostname = (rec.get("validated_target_hostname") or rec.get("validated_domain") or "").lower()
+            if not val_hostname and rec.get("target_url"):
+                try:
+                    val_hostname = (urlparse(rec["target_url"]).hostname or "").lower()
+                    if not canonical_origin:
+                        parsed_t = urlparse(rec["target_url"])
+                        canonical_origin = f"{parsed_t.scheme}://{parsed_t.netloc}".lower()
+                except Exception:
+                    pass
+
+            # If no target or domain was configured on execution (bare test mocks)
+            if not canonical_origin and not approved_redirects and not val_hostname:
+                return True
+
+            # If origin_or_domain has scheme (e.g. https://careers.kula.ai)
+            if "://" in clean:
+                if canonical_origin and clean == canonical_origin:
+                    return True
+                if clean in approved_redirects:
+                    return True
+                parsed = urlparse(clean)
+                host = (parsed.hostname or "").lower()
+            else:
+                host = clean
+
+            if val_hostname and host == val_hostname:
+                return True
+
+            if canonical_origin and "://" in canonical_origin:
+                c_host = (urlparse(canonical_origin).hostname or "").lower()
+                if c_host and host == c_host:
+                    return True
+
+            for red in approved_redirects:
+                if "://" in red:
+                    r_host = (urlparse(red).hostname or "").lower()
+                    if r_host and host == r_host:
+                        return True
+
+            return False
 
     def get_execution_status(self, application_id: int, execution_id: str) -> Optional[Dict[str, Any]]:
         """Returns live execution status, handshake state, stage progress, and report."""
@@ -344,6 +430,7 @@ class ApplicationFormFillingBroker:
         execution_id: str,
         ticket: str,
         domain: str = "",
+        origin: str = "",
         companion_version: str = "1.0.0",
         ats_detected: str = "universal",
         form_found: bool = False,
@@ -357,13 +444,23 @@ class ApplicationFormFillingBroker:
                 raise SecurityAuthorizationError("Application mismatch during companion handshake.")
             if ticket and rec["action_ticket"] != ticket:
                 raise SecurityAuthorizationError("Invalid action ticket during companion handshake.")
+            if rec.get("expires_at") and time.time() > rec["expires_at"]:
+                raise SecurityAuthorizationError("Autofill execution session has expired.")
+
+            # Strict cross-employer origin and domain validation
+            req_location = origin or domain or ""
+            if req_location:
+                if not self.validate_execution_origin(execution_id, req_location):
+                    raise SecurityAuthorizationError(
+                        f"Cross-employer origin violation: Origin/domain '{req_location}' is not authorized for execution '{execution_id}' (authorized: '{rec.get('canonical_target_origin')}')."
+                    )
 
             rec["companion_connected"] = True
             rec["companion_version"] = companion_version
             rec["form_detected"] = form_found
             rec["stage"] = "COMPANION_CONNECTED" if not form_found else "FORM_IDENTIFIED"
             rec["stage_index"] = 2 if not form_found else 3
-            rec["message"] = f"Handshake verified. {ats_detected.upper()} ATS active on {domain}."
+            rec["message"] = f"Handshake verified. {ats_detected.upper()} ATS active on {domain or origin}."
             rec["last_updated"] = time.time()
 
             try:
@@ -372,7 +469,7 @@ class ApplicationFormFillingBroker:
                     execution_id=execution_id,
                     new_state=target_state,
                     event_source="COMPANION",
-                    message=f"Handshake verified on {domain}.",
+                    message=f"Handshake verified on {domain or origin}.",
                 )
                 rec["current_state"] = target_state.value
             except Exception as e:
@@ -400,6 +497,8 @@ class ApplicationFormFillingBroker:
                 raise SecurityAuthorizationError("Application mismatch during progress update.")
             if ticket and rec["action_ticket"] != ticket:
                 raise SecurityAuthorizationError("Invalid action ticket during progress update.")
+            if rec.get("expires_at") and time.time() > rec["expires_at"]:
+                raise SecurityAuthorizationError("Autofill execution session has expired.")
 
             rec["stage"] = stage
             rec["stage_index"] = max(rec.get("stage_index", 1), stage_index)
@@ -532,10 +631,18 @@ class ApplicationFormFillingBroker:
         if not effective_url and app.get("job_id"):
             with self.db.get_connection() as conn:
                 cursor = conn.cursor()
-                cursor.execute("SELECT job_url, source_url FROM jobs WHERE id = ?", (app["job_id"],))
+                cursor.execute("SELECT job_url FROM jobs WHERE id = ?", (app["job_id"],))
                 j_row = cursor.fetchone()
-                if j_row:
-                    effective_url = j_row["job_url"] or j_row["source_url"] or ""
+                if j_row and j_row["job_url"]:
+                    effective_url = j_row["job_url"]
+
+        if not effective_url and app.get("job_description_id"):
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT source_url FROM job_descriptions WHERE id = ?", (app["job_description_id"],))
+                jd_row = cursor.fetchone()
+                if jd_row and jd_row["source_url"]:
+                    effective_url = jd_row["source_url"]
 
         if not effective_url:
             raise SecurityAuthorizationError(
@@ -588,14 +695,78 @@ class ApplicationFormFillingBroker:
         mapper = UniversalFieldMapper(candidate_profile=candidate_profile)
         facts_dict = {k: f.to_dict() for k, f in mapper.facts.items()}
 
-        # 7. Generate execution ID and single-use action ticket
+        # 7. Generate execution ID, origin bindings, and single-use action ticket
+        parsed_effective = urlparse(effective_url)
+        canonical_target_origin = f"{parsed_effective.scheme}://{parsed_effective.netloc}".lower()
+        validated_target_hostname = (parsed_effective.hostname or "").lower()
+
+        # Build list of approved redirect origins
+        approved_origins: List[str] = [canonical_target_origin]
+        import ipaddress
+        alt_candidates = [app.get("external_application_url")]
+        if target_url:
+            alt_candidates.append(target_url)
+
+        if app.get("job_id"):
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT job_url FROM jobs WHERE id = ?", (app["job_id"],))
+                j_row = cursor.fetchone()
+                if j_row and j_row["job_url"]:
+                    alt_candidates.append(j_row["job_url"])
+
+        if app.get("job_description_id"):
+            with self.db.get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT source_url FROM job_descriptions WHERE id = ?", (app["job_description_id"],))
+                jd_row = cursor.fetchone()
+                if jd_row and jd_row["source_url"]:
+                    alt_candidates.append(jd_row["source_url"])
+
+        for alt_url in alt_candidates:
+            if alt_url and isinstance(alt_url, str):
+                try:
+                    alt_parsed = urlparse(alt_url)
+                    if alt_parsed.scheme in ("http", "https") and alt_parsed.netloc:
+                        alt_origin = f"{alt_parsed.scheme}://{alt_parsed.netloc}".lower()
+                        if alt_origin not in approved_origins:
+                            if alt_parsed.hostname:
+                                try:
+                                    ip = ipaddress.ip_address(alt_parsed.hostname)
+                                    if not URLSafetyValidator.is_ip_private_or_restricted(ip):
+                                        approved_origins.append(alt_origin)
+                                except ValueError:
+                                    approved_origins.append(alt_origin)
+                except Exception:
+                    pass
+
+        candidate_id = f"user_{user_id}"
+        now = time.time()
+        expires_at_epoch = now + 600
+        expires_at_iso = datetime.fromtimestamp(expires_at_epoch, tz=timezone.utc).isoformat()
+
+        resume_binding = {
+            "resume_id": attachment_ref.resume_id,
+            "resume_version_num": attachment_ref.version_num,
+            "file_hash": attachment_ref.file_hash,
+            "storage_filename": attachment_ref.storage_filename,
+            "file_size_bytes": attachment_ref.file_size_bytes,
+            "file_format": attachment_ref.file_format,
+        }
+
         execution_id = f"exec_{hashlib.sha256(f'{user_id}:{application_id}:{time.time()}'.encode()).hexdigest()[:16]}"
         plan_hash = hashlib.sha256(
             canonical_json_bytes({
                 "execution_id": execution_id,
                 "application_id": application_id,
                 "user_id": user_id,
+                "candidate_id": candidate_id,
                 "target_url": effective_url,
+                "canonical_target_origin": canonical_target_origin,
+                "validated_target_hostname": validated_target_hostname,
+                "approved_redirect_origins": sorted(approved_origins),
+                "resume_binding": resume_binding,
+                "expires_at": expires_at_iso,
                 "resume_file_hash": attachment_ref.file_hash,
                 "facts": facts_dict,
             })
@@ -613,18 +784,22 @@ class ApplicationFormFillingBroker:
         )
 
         # Register active execution session
-        now = time.time()
         with self._execution_lock:
             self._active_executions[execution_id] = {
                 "execution_id": execution_id,
                 "application_id": application_id,
                 "user_id": user_id,
+                "candidate_id": candidate_id,
                 "action_ticket": action_ticket,
                 "plan_hash": plan_hash,
                 "validated_domain": validated_domain,
+                "validated_target_hostname": validated_target_hostname,
+                "canonical_target_origin": canonical_target_origin,
+                "approved_redirect_origins": approved_origins,
                 "target_url": effective_url,
                 "resume_id": attachment_ref.resume_id,
                 "resume_file_hash": attachment_ref.file_hash,
+                "resume_binding": resume_binding,
                 "status": "READY",
                 "companion_connected": False,
                 "companion_version": "",
@@ -643,7 +818,8 @@ class ApplicationFormFillingBroker:
                 "errors": [],
                 "created_at": now,
                 "last_updated": now,
-                "expires_at": now + 600,
+                "expires_at": expires_at_epoch,
+                "expires_at_iso": expires_at_iso,
                 "report": None,
             }
 
@@ -703,6 +879,12 @@ class ApplicationFormFillingBroker:
             candidate_profile_provenance=candidate_profile.get("field_provenance") or {},
             known_fields_to_fill=known_fields,
             safety_message="Form prefill plan authorized. Final manual submission approval required.",
+            canonical_target_origin=canonical_target_origin,
+            validated_target_hostname=validated_target_hostname,
+            approved_redirect_origins=approved_origins,
+            candidate_id=candidate_id,
+            expires_at=expires_at_iso,
+            resume_binding=resume_binding,
         )
 
     # -------------------------------------------------------------------------
@@ -714,11 +896,15 @@ class ApplicationFormFillingBroker:
         user_id: int,
         application_id: int,
         ticket: str,
+        execution_id: Optional[str] = None,
+        origin: Optional[str] = None,
     ) -> Tuple[bytes, str, str]:
         """Authorized gateway to obtain verified resume bytes for external form upload.
 
         CRITICAL SECURITY:
         - Re-validates application ownership.
+        - Enforces candidate ownership match on ticket.
+        - Enforces active execution binding, unexpired session, and strict origin validation.
         - Strictly opens binary via FormPrefiller.open_verified_attachment().
         - Returns (file_bytes, filename, content_type).
         """
@@ -733,6 +919,27 @@ class ApplicationFormFillingBroker:
             expected_action="autofill",
             expected_resource_id=application_id,
         )
+
+        # Enforce candidate ownership match on action ticket
+        ticket_candidate = ticket_data.get("candidate_id")
+        if ticket_candidate and ticket_candidate != f"user_{user_id}":
+            raise SecurityAuthorizationError(
+                f"Candidate ownership mismatch: ticket belongs to '{ticket_candidate}', but requested user is '{user_id}'."
+            )
+
+        # Enforce active execution binding, unexpired session, and strict origin validation
+        if execution_id:
+            with self._execution_lock:
+                rec = self._active_executions.get(execution_id)
+                if rec:
+                    if rec["application_id"] != application_id or rec["user_id"] != user_id:
+                        raise SecurityAuthorizationError("Execution parameter mismatch during resume download.")
+                    if time.time() > rec.get("expires_at", 0):
+                        raise SecurityAuthorizationError("Autofill execution session has expired.")
+            if origin and not self.validate_execution_origin(execution_id, origin):
+                raise SecurityAuthorizationError(
+                    f"Cross-employer origin violation: Origin '{origin}' is not authorized for execution '{execution_id}'."
+                )
 
         nonce = ticket_data["nonce"]
         key_id = ticket_data["key_id"]

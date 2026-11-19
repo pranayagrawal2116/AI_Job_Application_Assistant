@@ -254,8 +254,12 @@ class TestLiveDatabaseFeedIntegrity:
 
         os.environ["DATABASE_PATH"] = live_db_path
         db = DatabaseManager(db_path=live_db_path)
+        with db.get_connection() as conn:
+            if not conn.execute("SELECT id FROM users WHERE id = 105").fetchone():
+                pytest.skip("User 105 not present in current database.")
+
         DashboardService.get_instance(db_manager=db)
-        session_mgr = SessionManager(db_manager=db)
+        session_mgr = SessionManager.get_instance(db_manager=db)
         session = session_mgr.create_user_session(user_id=105, email="pranjali.a.agrawal@gmail.com")
 
         items = list_jobs(

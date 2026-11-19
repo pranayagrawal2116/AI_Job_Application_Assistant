@@ -30,14 +30,47 @@ document.addEventListener("DOMContentLoaded", async () => {
           autofillBtn.disabled = true;
           autofillBtn.textContent = "Populating...";
           const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-          if (tab && tab.id) {
-            chrome.scripting.executeScript({
-              target: { tabId: tab.id },
-              files: ["content.js"],
-            });
-            setTimeout(() => {
-              window.close();
-            }, 1000);
+          if (tab && tab.id && tab.url) {
+            try {
+              const urlObj = new URL(tab.url);
+              const targetPattern = `${urlObj.origin}/*`;
+
+              const executeScriptOnTab = () => {
+                chrome.scripting.executeScript({
+                  target: { tabId: tab.id },
+                  files: ["content.js"],
+                });
+                setTimeout(() => {
+                  window.close();
+                }, 1000);
+              };
+
+              if (chrome.permissions && chrome.permissions.contains) {
+                chrome.permissions.contains({ origins: [targetPattern] }, (hasPerm) => {
+                  if (hasPerm) {
+                    executeScriptOnTab();
+                  } else if (chrome.permissions.request) {
+                    chrome.permissions.request({ origins: [targetPattern] }, (granted) => {
+                      if (granted) {
+                        executeScriptOnTab();
+                      } else {
+                        autofillBtn.disabled = false;
+                        autofillBtn.textContent = "Permission Denied";
+                        statusText.textContent = "Host permission required for this employer site.";
+                      }
+                    });
+                  } else {
+                    executeScriptOnTab();
+                  }
+                });
+              } else {
+                executeScriptOnTab();
+              }
+            } catch (urlErr) {
+              console.error("Invalid tab URL:", urlErr);
+              autofillBtn.disabled = false;
+              autofillBtn.textContent = "Auto-Fill";
+            }
           }
         };
       } else {
