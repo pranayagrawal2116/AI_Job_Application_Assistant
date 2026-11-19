@@ -350,8 +350,36 @@ export interface AutofillStatusResponse {
   execution_id: string;
   application_id: number;
   status: 'PENDING' | 'RUNNING' | 'COMPLETED' | 'WARNING' | 'BLOCKED' | 'FAILED';
+  current_state?: string;
   stage: string;
   stage_index: number;
+  message?: string;
+  gate_category?: string;
+  gate_type?: string;
+  is_blocking?: boolean;
+  required_user_action?: string;
+  interaction_guidance?: {
+    gate_type: string;
+    action_category: string;
+    title: string;
+    instruction: string;
+    action_prompt: string;
+    is_blocking: boolean;
+    completion_hint?: string;
+  } | null;
+  state_history?: any[];
+  companion_connected?: boolean;
+  companion_version?: string;
+  form_detected?: boolean;
+  resume_uploaded?: boolean;
+  fields_detected?: number;
+  fields_populated_count?: number;
+  fields_ats_parsed_count?: number;
+  fields_preserved_count?: number;
+  fields_manual_review_count?: number;
+  fields_verified_count?: number;
+  ats_provider?: string;
+  validated_domain?: string;
   updated_at?: string;
   report?: FormFillReport | null;
 }

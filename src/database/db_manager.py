@@ -2219,6 +2219,36 @@ class DatabaseManager:
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_due ON application_follow_ups(user_id, is_completed, follow_up_date)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_follow_ups_app ON application_follow_ups(application_id, user_id)")
 
+            # IAGH Autofill Execution Sessions table
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS autofill_execution_sessions (
+                    execution_id TEXT PRIMARY KEY,
+                    application_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    current_state TEXT NOT NULL,
+                    previous_state TEXT,
+                    gate_category TEXT,
+                    gate_type TEXT,
+                    is_blocking INTEGER DEFAULT 0,
+                    required_user_action TEXT,
+                    ats_provider TEXT,
+                    target_url TEXT,
+                    validated_domain TEXT,
+                    action_ticket TEXT,
+                    plan_hash TEXT,
+                    resume_id INTEGER,
+                    resume_file_hash TEXT,
+                    state_history_json TEXT NOT NULL DEFAULT '[]',
+                    metadata_json TEXT NOT NULL DEFAULT '{}',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    expires_at DATETIME,
+                    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_autofill_exec_app ON autofill_execution_sessions(application_id, user_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_autofill_exec_user_state ON autofill_execution_sessions(user_id, current_state)")
+
             # Backfill initial events for historical applications without events
             cursor.execute("SELECT id, user_id, status, created_at FROM applications")
             current_apps = [dict(r) for r in cursor.fetchall()]
@@ -2290,6 +2320,38 @@ class DatabaseManager:
 
         logger.info("Phase 7.1 application lifecycle migration completed successfully.")
 
+    def _migrate_autofill_execution_sessions(self, conn: sqlite3.Connection) -> None:
+        """Creates the autofill_execution_sessions table and indexes if not existing."""
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS autofill_execution_sessions (
+                execution_id TEXT PRIMARY KEY,
+                application_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                current_state TEXT NOT NULL,
+                previous_state TEXT,
+                gate_category TEXT,
+                gate_type TEXT,
+                is_blocking INTEGER DEFAULT 0,
+                required_user_action TEXT,
+                ats_provider TEXT,
+                target_url TEXT,
+                validated_domain TEXT,
+                action_ticket TEXT,
+                plan_hash TEXT,
+                resume_id INTEGER,
+                resume_file_hash TEXT,
+                state_history_json TEXT NOT NULL DEFAULT '[]',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                expires_at DATETIME,
+                FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_autofill_exec_app ON autofill_execution_sessions(application_id, user_id)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_autofill_exec_user_state ON autofill_execution_sessions(user_id, current_state)")
+
     def _init_db(self) -> None:
         """Initializes tables, indexes, and constraints using schema.sql."""
         if not self.schema_path.is_file():
@@ -2311,6 +2373,8 @@ class DatabaseManager:
             self._migrate_discovery_runs_table(conn)
             conn.commit()
             self._migrate_phase7_lifecycle_tables(conn)
+            conn.commit()
+            self._migrate_autofill_execution_sessions(conn)
             conn.commit()
             conn.executescript(schema_sql)
             conn.commit()
@@ -7346,6 +7410,7 @@ class DatabaseManager:
             # 2.5 Delete Phase 7 application lifecycle child tables and historical records in topological order:
             cursor.execute("DELETE FROM submission_confirmations WHERE user_id = ?", (user_id,))
             cursor.execute("DELETE FROM application_follow_ups WHERE user_id = ?", (user_id,))
+            cursor.execute("DELETE FROM autofill_execution_sessions WHERE user_id = ?", (user_id,))
 
             with self._authorized_privacy_erasure_scope(conn, user_id):
                 cursor.execute("DELETE FROM application_events WHERE user_id = ?", (user_id,))
@@ -8969,4 +9034,105 @@ class DatabaseManager:
             logger.warning(f"Could not record timeline event for archived application #{application_id}: {e}")
 
         return archived
+
+    # -------------------------------------------------------------------------
+    # IAGH AUTOFILL EXECUTION SESSION METHODS
+    # -------------------------------------------------------------------------
+
+    def save_autofill_execution_session(self, session_data: Dict[str, Any]) -> None:
+        """Saves or updates an autofill execution session record in SQLite."""
+        with self.transaction() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO autofill_execution_sessions (
+                    execution_id, application_id, user_id, current_state, previous_state,
+                    gate_category, gate_type, is_blocking, required_user_action, ats_provider,
+                    target_url, validated_domain, action_ticket, plan_hash, resume_id,
+                    resume_file_hash, state_history_json, metadata_json, expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(execution_id) DO UPDATE SET
+                    current_state = excluded.current_state,
+                    previous_state = excluded.previous_state,
+                    gate_category = excluded.gate_category,
+                    gate_type = excluded.gate_type,
+                    is_blocking = excluded.is_blocking,
+                    required_user_action = excluded.required_user_action,
+                    ats_provider = excluded.ats_provider,
+                    target_url = excluded.target_url,
+                    validated_domain = excluded.validated_domain,
+                    action_ticket = excluded.action_ticket,
+                    state_history_json = excluded.state_history_json,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = CURRENT_TIMESTAMP,
+                    expires_at = excluded.expires_at
+                """,
+                (
+                    session_data["execution_id"],
+                    session_data["application_id"],
+                    session_data["user_id"],
+                    session_data.get("current_state", "PORTAL_OPENED"),
+                    session_data.get("previous_state"),
+                    session_data.get("gate_category"),
+                    session_data.get("gate_type"),
+                    1 if session_data.get("is_blocking") else 0,
+                    session_data.get("required_user_action"),
+                    session_data.get("ats_provider"),
+                    session_data.get("target_url"),
+                    session_data.get("validated_domain"),
+                    session_data.get("action_ticket"),
+                    session_data.get("plan_hash"),
+                    session_data.get("resume_id"),
+                    session_data.get("resume_file_hash"),
+                    json.dumps(session_data.get("state_history", [])) if isinstance(session_data.get("state_history"), list) else session_data.get("state_history_json", "[]"),
+                    json.dumps(session_data.get("metadata", {})) if isinstance(session_data.get("metadata"), dict) else session_data.get("metadata_json", "{}"),
+                    session_data.get("expires_at"),
+                ),
+            )
+
+    def get_autofill_execution_session(self, execution_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves an autofill execution session by execution_id."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM autofill_execution_sessions WHERE execution_id = ?", (execution_id,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            try:
+                res["state_history"] = json.loads(res.get("state_history_json") or "[]")
+            except Exception:
+                res["state_history"] = []
+            try:
+                res["metadata"] = json.loads(res.get("metadata_json") or "{}")
+            except Exception:
+                res["metadata"] = {}
+            return res
+
+    def get_latest_autofill_execution_session(self, application_id: int, user_id: int) -> Optional[Dict[str, Any]]:
+        """Retrieves the most recent active autofill execution session for an application."""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT * FROM autofill_execution_sessions
+                WHERE application_id = ? AND user_id = ?
+                ORDER BY updated_at DESC, created_at DESC LIMIT 1
+                """,
+                (application_id, user_id),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            res = dict(row)
+            try:
+                res["state_history"] = json.loads(res.get("state_history_json") or "[]")
+            except Exception:
+                res["state_history"] = []
+            try:
+                res["metadata"] = json.loads(res.get("metadata_json") or "{}")
+            except Exception:
+                res["metadata"] = {}
+            return res
+
 

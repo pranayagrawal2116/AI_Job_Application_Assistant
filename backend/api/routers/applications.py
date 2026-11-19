@@ -18,8 +18,12 @@ from backend.api.schemas.applications import (
     AuthorizePacketRequest,
     AutofillCompleteRequest,
     AutofillExecuteBrowserRequest,
+    AutofillGateEventRequest,
+    AutofillHandshakeRequest,
     AutofillPlanRequest,
     AutofillPlanResponseSchema,
+    AutofillProgressRequest,
+    AutofillResumeRequest,
     ConfirmSubmissionRequest,
     CoverLetterRequest,
     FollowUpCreateRequest,
@@ -1321,7 +1325,7 @@ def prepare_autofill_plan(
     from src.preparer.form_filling_broker import ApplicationFormFillingBroker
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
-    broker = ApplicationFormFillingBroker(db_manager=service.db)
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
     try:
         plan = broker.prepare_autofill_plan(
             user_id=user_id,
@@ -1415,6 +1419,151 @@ def get_autofill_execution_status(
     return st
 
 
+@router.post("/{app_id}/autofill/handshake")
+def record_autofill_handshake(
+    app_id: int,
+    req: AutofillHandshakeRequest,
+    request: Request = None,
+):
+    """Establishes authenticated handshake between in-tab companion and backend."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+
+    ticket = req.action_ticket or (request.headers.get("X-JobFlow-Ticket") if request else None)
+    if not ticket and request and "authorization" in request.headers:
+        auth_hdr = request.headers["authorization"]
+        if auth_hdr.startswith("Bearer "):
+            ticket = auth_hdr[7:].strip()
+
+    try:
+        res = broker.record_handshake(
+            application_id=app_id,
+            execution_id=req.execution_id,
+            ticket=ticket or "",
+            domain=req.domain or "",
+            companion_version=req.companion_version or "1.0.0",
+            ats_detected=req.ats_detected or "universal",
+            form_found=bool(req.form_found),
+        )
+        return {
+            "success": True,
+            "status": "HANDSHAKE_ESTABLISHED",
+            "execution_id": req.execution_id,
+            "data": res,
+        }
+    except SecurityAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except Exception as e:
+        logger.error("Companion handshake error for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/{app_id}/autofill/progress")
+def record_autofill_progress(
+    app_id: int,
+    req: AutofillProgressRequest,
+    request: Request = None,
+):
+    """Pushes progressive stage and field count updates from companion to backend."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+
+    ticket = req.action_ticket or (request.headers.get("X-JobFlow-Ticket") if request else None)
+    if not ticket and request and "authorization" in request.headers:
+        auth_hdr = request.headers["authorization"]
+        if auth_hdr.startswith("Bearer "):
+            ticket = auth_hdr[7:].strip()
+
+    try:
+        res = broker.record_progress(
+            application_id=app_id,
+            execution_id=req.execution_id,
+            ticket=ticket or "",
+            stage=req.stage,
+            stage_index=req.stage_index,
+            message=req.message or "",
+            stats=req.stats,
+            errors=req.errors,
+        )
+        return {"success": True, "data": res}
+    except SecurityAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except Exception as e:
+        logger.error("Companion progress recording error for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/{app_id}/autofill/gate-event")
+def handle_autofill_gate_event(
+    app_id: int,
+    req: AutofillGateEventRequest,
+    request: Request = None,
+):
+    """Processes intermediate gate events (interactions, navigations, user decisions) from companion."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+
+    ticket = req.action_ticket or (request.headers.get("X-JobFlow-Ticket") if request else None)
+    if not ticket and request and "authorization" in request.headers:
+        auth_hdr = request.headers["authorization"]
+        if auth_hdr.startswith("Bearer "):
+            ticket = auth_hdr[7:].strip()
+
+    try:
+        res = broker.handle_gate_event(
+            application_id=app_id,
+            execution_id=req.execution_id,
+            ticket=ticket or "",
+            event_type=req.event_type,
+            current_url=req.current_url or "",
+            html_snippet=req.html_snippet or "",
+            control_interacted=req.control_interacted,
+        )
+        return {"success": True, "data": res.to_dict()}
+    except SecurityAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except Exception as e:
+        logger.error("Gate event processing error for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
+@router.post("/{app_id}/autofill/resume")
+def resume_autofill_workflow(
+    app_id: int,
+    req: AutofillResumeRequest,
+    request: Request = None,
+):
+    """Resumes the autofill workflow after an intermediate gate was completed."""
+    from src.preparer.form_filling_broker import ApplicationFormFillingBroker
+    service = DashboardService.get_instance()
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
+
+    ticket = req.action_ticket or (request.headers.get("X-JobFlow-Ticket") if request else None)
+    if not ticket and request and "authorization" in request.headers:
+        auth_hdr = request.headers["authorization"]
+        if auth_hdr.startswith("Bearer "):
+            ticket = auth_hdr[7:].strip()
+
+    try:
+        res = broker.handle_gate_event(
+            application_id=app_id,
+            execution_id=req.execution_id,
+            ticket=ticket or "",
+            event_type="GATE_COMPLETED",
+            current_url=req.current_url or "",
+            html_snippet=req.html_snippet or "",
+        )
+        return {"success": True, "data": res.to_dict()}
+    except SecurityAuthorizationError as e:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(e))
+    except Exception as e:
+        logger.error("Workflow resumption error for app #%d: %s", app_id, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e))
+
+
 @router.post("/{app_id}/autofill/execute-browser")
 def execute_autofill_in_browser(
     app_id: int,
@@ -1427,7 +1576,7 @@ def execute_autofill_in_browser(
 
     user_id, session = auth_ctx
     service = DashboardService.get_instance()
-    broker = ApplicationFormFillingBroker(db_manager=service.db)
+    broker = ApplicationFormFillingBroker.get_instance(db_manager=service.db)
 
     try:
         with sync_playwright() as p:

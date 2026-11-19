@@ -761,3 +761,31 @@ CREATE INDEX IF NOT EXISTS idx_security_scans_lookup ON security_scans(user_id, 
 CREATE INDEX IF NOT EXISTS idx_security_scans_hash ON security_scans(source_hash);
 CREATE INDEX IF NOT EXISTS idx_security_scan_overrides_lookup ON security_scan_overrides(user_id, scan_id);
 CREATE INDEX IF NOT EXISTS idx_legacy_evidence_attestations_lookup ON legacy_evidence_attestations(job_description_id, user_id);
+
+CREATE TABLE IF NOT EXISTS autofill_execution_sessions (
+    execution_id TEXT PRIMARY KEY,
+    application_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    current_state TEXT NOT NULL,
+    previous_state TEXT,
+    gate_category TEXT,
+    gate_type TEXT,
+    is_blocking INTEGER DEFAULT 0,
+    required_user_action TEXT,
+    ats_provider TEXT,
+    target_url TEXT,
+    validated_domain TEXT,
+    action_ticket TEXT,
+    plan_hash TEXT,
+    resume_id INTEGER,
+    resume_file_hash TEXT,
+    state_history_json TEXT NOT NULL DEFAULT '[]',
+    metadata_json TEXT NOT NULL DEFAULT '{}',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    FOREIGN KEY (application_id, user_id) REFERENCES applications(id, user_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_autofill_exec_app ON autofill_execution_sessions(application_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_autofill_exec_user_state ON autofill_execution_sessions(user_id, current_state);
+

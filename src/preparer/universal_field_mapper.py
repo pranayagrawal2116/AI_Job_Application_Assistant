@@ -332,8 +332,8 @@ class UniversalFieldMapper:
 
         # 8.1 Professional Details (Current Employer & Job Title)
         primary_exp = exp_list[0] if exp_list else {}
-        curr_company = (primary_exp.get("company") or primary_exp.get("organization") or "").strip()
-        curr_role = (primary_exp.get("title") or primary_exp.get("position") or primary_exp.get("job_title") or "").strip()
+        curr_company = (primary_exp.get("company") or primary_exp.get("employer") or primary_exp.get("organization") or p.get("current_company") or "").strip()
+        curr_role = (primary_exp.get("title") or primary_exp.get("job_title") or primary_exp.get("position") or primary_exp.get("designation") or p.get("current_job_title") or "").strip()
         self.facts["current_company"] = CandidateFieldFact(
             canonical_key="current_company",
             label="Current Company / Organization",
@@ -756,7 +756,7 @@ class UniversalFieldMapper:
             return ("preferred_location", 0.95, "Matched preferred location")
 
         # 15. Current Location / City
-        if any(w in combined for w in ["current location", "residing city", "city", "address", "current_location"]):
+        if any(w in combined for w in ["current location", "residing city", "city", "address", "current_location", "location"]):
             return ("current_location", 0.92, "Matched current location")
 
         # 16. College / University
@@ -776,11 +776,11 @@ class UniversalFieldMapper:
             return ("graduation_year", 0.95, "Matched graduation year")
 
         # 20. Social / Profile URLs
-        if any(w in combined for w in ["linkedin", "linked in"]):
+        if any(w in combined for w in ["linkedin", "linked in", "urls[linkedin]"]):
             return ("linkedin_url", 0.98, "Matched LinkedIn profile URL")
-        if any(w in combined for w in ["github", "git hub"]):
+        if any(w in combined for w in ["github", "git hub", "urls[github]"]):
             return ("github_url", 0.98, "Matched GitHub profile URL")
-        if any(w in combined for w in ["portfolio", "website", "personal site"]):
+        if any(w in combined for w in ["portfolio", "website", "personal site", "urls[portfolio]"]):
             return ("portfolio_url", 0.95, "Matched portfolio URL")
 
         # 21. Skills

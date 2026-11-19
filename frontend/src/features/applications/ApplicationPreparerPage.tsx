@@ -23,6 +23,7 @@ import {
   Globe,
   Wand2,
   Layers,
+  Activity,
 } from 'lucide-react';
 
 export const ApplicationPreparerPage: React.FC = () => {
@@ -79,6 +80,22 @@ export const ApplicationPreparerPage: React.FC = () => {
   const [autofillPlan, setAutofillPlan] = useState<AutofillPlan | null>(null);
   const [companionCopied, setCompanionCopied] = useState(false);
   const [editedFieldResults, setEditedFieldResults] = useState<FormFieldResultItem[]>([]);
+  const [companionInstalled, setCompanionInstalled] = useState(false);
+  const [companionHandshakeDone, setCompanionHandshakeDone] = useState(false);
+  const [liveExecutionStatus, setLiveExecutionStatus] = useState<any>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+
+  useEffect(() => {
+    const checkExt = () => {
+      if ((window as any).__JOBFLOW_EXTENSION_ACTIVE__ || document.documentElement.dataset.jobflowExtensionInstalled === 'true') {
+        setCompanionInstalled(true);
+      }
+    };
+    checkExt();
+    const handleExtReady = () => setCompanionInstalled(true);
+    window.addEventListener('JOBFLOW_EXTENSION_READY', handleExtReady);
+    return () => window.removeEventListener('JOBFLOW_EXTENSION_READY', handleExtReady);
+  }, []);
 
   useEffect(() => {
     const loadAppData = async () => {
@@ -287,12 +304,14 @@ export const ApplicationPreparerPage: React.FC = () => {
   const handleStartBrowserAutofill = async (options?: { openInNewTab?: boolean }) => {
     setIsAutofilling(true);
     setErrorMsg(null);
+    setSuccessMsg(null);
     setAutofillProgressStep(1); // 1. Opening employer portal
+    setCompanionHandshakeDone(false);
 
     try {
-      setAutofillProgressStep(2); // 2. Establishing browser connection
       const plan = await api.getAutofillPlan(appId, targetFormUrl || undefined);
       setAutofillPlan(plan);
+      setAutofillProgressStep(2); // 2. Establishing browser connection
 
       // Signal extension if installed in candidate's browser
       try {
@@ -306,9 +325,6 @@ export const ApplicationPreparerPage: React.FC = () => {
         window.open(plan.target_url, '_blank');
       }
 
-      setAutofillProgressStep(3); // 3. Identifying ATS & application form
-      setAutofillProgressStep(4); // 4. Retrieving verified candidate facts
-
       // Start live polling of status while background execution runs
       let pollCount = 0;
       let completedFromPolling = false;
@@ -316,29 +332,30 @@ export const ApplicationPreparerPage: React.FC = () => {
         pollCount++;
         try {
           const st = await api.getAutofillStatus(appId, plan.execution_id);
-          if (st && st.stage_index) {
-            setAutofillProgressStep(Math.min(st.stage_index, 9));
-          }
-          if (st && st.report) {
-            completedFromPolling = true;
-            clearInterval(pollInterval);
-            finishAutofill(st.report);
+          if (st) {
+            setLiveExecutionStatus(st);
+            if (st.companion_connected) {
+              setCompanionHandshakeDone(true);
+            }
+            if (st.stage_index) {
+              setAutofillProgressStep(st.stage_index);
+            }
+            if (st.report) {
+              completedFromPolling = true;
+              clearInterval(pollInterval);
+              finishAutofill(st.report);
+            }
           }
         } catch (e) {
           // ignore transient poll error
         }
-        if (pollCount > 40) {
+        if (pollCount > 60) {
           clearInterval(pollInterval);
         }
       }, 1000);
 
       // Concurrently run headless verification
       try {
-        setAutofillProgressStep(5); // 5. Uploading verified resume
-        setAutofillProgressStep(6); // 6. Waiting for ATS resume parsing
-        setAutofillProgressStep(7); // 7. Mapping and populating fields
-        setAutofillProgressStep(8); // 8. Verifying populated values
-
         const report = await api.executeBrowserAutofill(appId, targetFormUrl || plan.target_url);
         clearInterval(pollInterval);
         if (!completedFromPolling) {
@@ -346,10 +363,13 @@ export const ApplicationPreparerPage: React.FC = () => {
         }
       } catch (execErr: any) {
         if (!completedFromPolling) {
-          // If headless run had a portal connection issue, check if we have a partial plan to display
-          setAutofillProgressStep(9);
           setIsAutofilling(false);
-          setSuccessMsg('Employer portal opened in a new tab. Use the JobFlow Assistant overlay to inspect and verify populated fields.');
+          const st = await api.getAutofillStatus(appId, plan.execution_id).catch(() => null);
+          if (st && st.report) {
+            finishAutofill(st.report);
+          } else {
+            setErrorMsg(execErr.message || 'Browser execution stopped. If using the companion or extension, please inspect the employer tab.');
+          }
         }
       }
     } catch (err: any) {
@@ -362,11 +382,25 @@ export const ApplicationPreparerPage: React.FC = () => {
   const finishAutofill = (report: FormFillReport) => {
     setAutofillReport(report);
     setEditedFieldResults(report.field_results || []);
-    setAutofillProgressStep(9); // 9. Ready for human review
     setIsAutofilling(false);
-    setSuccessMsg(
-      `Form auto-population complete! ${report.fields_populated_count} fields filled, ${report.fields_ats_parsed_count} parsed by ATS. Review all values below before submitting.`
-    );
+
+    const hasAnyPopulated = (report.fields_populated_count > 0 || report.fields_ats_parsed_count > 0 || report.resume_uploaded);
+
+    if (!hasAnyPopulated || report.status === 'BLOCKED' || report.status === 'NO_FIELDS_POPULATED' || report.status === 'FAILED') {
+      // Eliminate false success!
+      setAutofillProgressStep(report.anti_automation_detected ? 2 : 4);
+      setSuccessMsg(null);
+      setErrorMsg(
+        report.message ||
+        'Autofill could not populate any fields. The employer form remains unchanged. Please check the browser companion connection.'
+      );
+    } else {
+      setAutofillProgressStep(9); // 9. Ready for human review
+      setErrorMsg(null);
+      setSuccessMsg(
+        `Form auto-population complete! ${report.fields_populated_count} fields filled, ${report.fields_ats_parsed_count} parsed by ATS. Review all values below before submitting.`
+      );
+    }
   };
 
   const handleCopyBookmarklet = () => {
@@ -1256,31 +1290,172 @@ export const ApplicationPreparerPage: React.FC = () => {
               </div>
             </div>
 
-            {/* In-Browser Companion Option */}
+            {/* In-Browser Companion Connection & Diagnostics */}
             <div className="pt-2 border-t border-indigo-200/60 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
-              <div className="text-indigo-800 flex items-center gap-1.5">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block"></span>
-                <span>Chrome/Edge Companion ready • Strict Human Control Guarantee</span>
+              <div className="flex items-center gap-2">
+                <span
+                  className={`w-2.5 h-2.5 rounded-full inline-block ${
+                    companionHandshakeDone
+                      ? 'bg-emerald-500'
+                      : companionInstalled
+                      ? 'bg-blue-500 animate-pulse'
+                      : 'bg-amber-400'
+                  }`}
+                ></span>
+                <span className="font-medium text-slate-700">
+                  {companionHandshakeDone
+                    ? 'Companion Handshake Verified • Active Tab Connected'
+                    : companionInstalled
+                    ? 'Extension Detected • Waiting for Tab Handshake'
+                    : 'Extension Not Detected • Use 1-Click Bookmarklet Companion'}
+                </span>
+                <span className="text-slate-400 hidden sm:inline">• Strict Human Control Guarantee</span>
               </div>
-              <button
-                onClick={handleCopyBookmarklet}
-                className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 flex items-center gap-1.5 self-start sm:self-auto"
-                title="Copy secure 1-click companion bookmarklet"
-              >
-                {companionCopied ? (
-                  <>
-                    <Check size={13} className="text-emerald-600" />
-                    <span className="text-emerald-700 font-bold">Companion Code Copied!</span>
-                  </>
-                ) : (
-                  <>
-                    <Copy size={13} />
-                    <span>Copy 1-Click Bookmarklet Companion</span>
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowDiagnostics((prev) => !prev)}
+                  className="text-xs font-semibold text-indigo-600 hover:text-indigo-800 flex items-center gap-1 transition-colors"
+                >
+                  <Activity size={13} />
+                  <span>{showDiagnostics ? 'Hide Diagnostics' : 'Diagnostics'}</span>
+                </button>
+                <button
+                  onClick={handleCopyBookmarklet}
+                  className="text-xs font-semibold text-indigo-700 hover:text-indigo-900 flex items-center gap-1.5 self-start sm:self-auto transition-colors"
+                  title="Copy secure 1-click companion bookmarklet"
+                >
+                  {companionCopied ? (
+                    <>
+                      <Check size={13} className="text-emerald-600" />
+                      <span className="text-emerald-700 font-bold">Bookmarklet Copied!</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy size={13} />
+                      <span>Copy 1-Click Bookmarklet</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
+
+            {/* Collapsible Diagnostic Panel */}
+            {showDiagnostics && (
+              <div className="p-4 rounded-xl bg-slate-900 text-slate-100 text-xs font-mono space-y-2 border border-slate-700 shadow-inner">
+                <div className="flex items-center justify-between border-b border-slate-700 pb-2">
+                  <span className="font-bold text-slate-300 flex items-center gap-1.5">
+                    <Activity size={13} className="text-indigo-400" />
+                    <span>Autofill Diagnostics & Handshake Inspector</span>
+                  </span>
+                  <span className="text-[11px] text-slate-400">Application #{appId}</span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px]">
+                  <div>
+                    <span className="text-slate-400 block">Companion Status:</span>
+                    <span className={companionHandshakeDone ? 'text-emerald-400 font-bold' : companionInstalled ? 'text-blue-400' : 'text-amber-400'}>
+                      {companionHandshakeDone ? 'CONNECTED (Verified)' : companionInstalled ? 'INSTALLED_WAITING' : 'NOT_DETECTED'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Employer ATS:</span>
+                    <span className="text-blue-300 font-bold">{autofillPlan?.ats_provider || liveExecutionStatus?.ats_provider || 'DETECTING...'}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Target Domain:</span>
+                    <span className="text-slate-300 truncate block">{autofillPlan?.validated_domain || liveExecutionStatus?.validated_domain || 'N/A'}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Execution ID:</span>
+                    <span className="text-slate-300 truncate block">{autofillPlan?.execution_id || 'N/A'}</span>
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] pt-1.5 border-t border-slate-800">
+                  <div>
+                    <span className="text-slate-400 block">Resume Staged:</span>
+                    <span className={(autofillReport?.resume_uploaded || liveExecutionStatus?.resume_uploaded) ? 'text-emerald-400 font-bold' : 'text-slate-400'}>
+                      {(autofillReport?.resume_uploaded || liveExecutionStatus?.resume_uploaded) ? 'YES (Uploaded)' : 'NO'}
+                    </span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Fields Populated:</span>
+                    <span className="text-emerald-400 font-bold">{autofillReport?.fields_populated_count ?? liveExecutionStatus?.fields_populated_count ?? 0}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Preserved / ATS:</span>
+                    <span className="text-blue-400 font-bold">{(autofillReport?.fields_ats_parsed_count ?? 0) + (autofillReport?.fields_preserved_count ?? 0)}</span>
+                  </div>
+                  <div>
+                    <span className="text-slate-400 block">Needs Input (Zero Hallucination):</span>
+                    <span className="text-amber-400 font-bold">{autofillReport?.fields_manual_review_count ?? liveExecutionStatus?.fields_manual_review_count ?? 0}</span>
+                  </div>
+                </div>
+                {(liveExecutionStatus?.message || autofillReport?.message) && (
+                  <div className="pt-1.5 text-[11px] text-slate-300 border-t border-slate-800 flex items-start gap-1.5">
+                    <span className="text-slate-400 shrink-0">Status Message:</span>
+                    <span className="text-slate-200">{liveExecutionStatus?.message || autofillReport?.message}</span>
+                  </div>
+                )}
+              </div>
+            )}
           </div>
+
+          {/* IAGH Intelligent Gate & Human Interaction Banner */}
+          {(liveExecutionStatus?.is_blocking || liveExecutionStatus?.current_state === 'WAITING_FOR_USER' || liveExecutionStatus?.current_state === 'AUTHENTICATION_REQUIRED' || liveExecutionStatus?.current_state === 'SECURITY_CHALLENGE_REQUIRED') && (
+            <div className="p-5 rounded-2xl bg-amber-500/10 border-2 border-amber-500/30 space-y-3 animate-in fade-in duration-300">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex items-start gap-3">
+                  <div className="p-2.5 rounded-xl bg-amber-500/20 text-amber-700 shrink-0 mt-0.5">
+                    <ShieldAlert size={20} className="animate-pulse" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <span className="px-2.5 py-0.5 rounded-full text-[10px] font-bold uppercase tracking-wider bg-amber-200 text-amber-900">
+                        {liveExecutionStatus.current_state === 'AUTHENTICATION_REQUIRED'
+                          ? 'Authentication Required'
+                          : liveExecutionStatus.current_state === 'SECURITY_CHALLENGE_REQUIRED'
+                          ? 'Security Challenge Required'
+                          : 'Action Required in Employer Tab'}
+                      </span>
+                      <span className="text-[11px] font-medium text-amber-800">
+                        Automation Paused Safely
+                      </span>
+                    </div>
+                    <h4 className="text-sm font-bold text-slate-900 mt-1">
+                      {liveExecutionStatus.interaction_guidance?.title ||
+                       (liveExecutionStatus.current_state === 'AUTHENTICATION_REQUIRED' ? 'Employer Portal Sign-In Required' :
+                        liveExecutionStatus.current_state === 'SECURITY_CHALLENGE_REQUIRED' ? 'Security Verification Required' :
+                        'Review & Decision Required in Employer Portal')}
+                    </h4>
+                    <p className="text-xs text-slate-700 mt-1 leading-relaxed">
+                      {liveExecutionStatus.interaction_guidance?.instruction ||
+                       liveExecutionStatus.required_user_action ||
+                       liveExecutionStatus.message ||
+                       'The employer requires you to perform a manual action (such as accepting terms or signing in) before displaying the application form. Please complete it in the employer tab.'}
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="pt-2 border-t border-amber-500/20 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                <div className="flex items-center gap-2 text-amber-900 font-medium">
+                  <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping"></span>
+                  <span>JobFlow will automatically resume once the application form becomes accessible.</span>
+                </div>
+                {targetFormUrl && (
+                  <a
+                    href={targetFormUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-xs transition-colors shrink-0"
+                  >
+                    <span>Go to Employer Tab</span>
+                    <ExternalLink size={12} />
+                  </a>
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Progress Stepper (Visible during or after autofill) */}
           {(isAutofilling || autofillProgressStep > 0) && (

@@ -81,13 +81,37 @@ class FormPrefiller:
         self.file_validator = file_validator
 
     def detect_anti_automation(self, snapshot_text: str) -> bool:
-        """Detects anti-bot mechanisms like Cloudflare, CAPTCHA, or login gates."""
+        """Detects anti-bot mechanisms like Cloudflare, CAPTCHA, or login gates.
+
+        Distinguishes true blocking interstitial challenges from application forms
+        that merely contain an hCaptcha or reCaptcha submission badge in their footer.
+        """
+        if not snapshot_text:
+            return False
+        lower_snap = snapshot_text.lower()
+
+        # Check if the page contains accessible application form fields
+        has_form_fields = (
+            ("data-qa=\"name-input\"" in lower_snap or "name=\"name\"" in lower_snap) or
+            ("name=\"email\"" in lower_snap or "type=\"email\"" in lower_snap) or
+            ("id=\"application-form\"" in lower_snap or "class=\"application-form\"" in lower_snap) or
+            ("name=\"resume\"" in lower_snap or "data-qa=\"input-resume\"" in lower_snap) or
+            ("resume-upload" in lower_snap or "id=\"resume-upload-input\"" in lower_snap)
+        )
+
+        if has_form_fields:
+            # Accessible form is present; only block if an explicit blocking interstitial covers it
+            if "cf-chl-widget" in lower_snap and "verify you are human" in lower_snap:
+                return True
+            if "access denied" in lower_snap and "403 forbidden" in lower_snap:
+                return True
+            return False
+
         anti_bot_patterns = [
             r"cloudflare", r"just a moment", r"turnstile", r"verify you are human",
             r"captcha", r"recaptcha", r"hcaptcha", r"bot detection", r"access denied",
             r"please log in to apply", r"sign in to apply"
         ]
-        lower_snap = snapshot_text.lower()
         for pat in anti_bot_patterns:
             if re.search(pat, lower_snap):
                 return True

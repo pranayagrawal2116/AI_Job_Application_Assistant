@@ -160,6 +160,25 @@ class AutofillExecuteBrowserRequest(BaseModel):
     timeout_seconds: Optional[float] = 20.0
 
 
+class AutofillHandshakeRequest(BaseModel):
+    execution_id: str
+    action_ticket: str
+    domain: Optional[str] = ""
+    companion_version: Optional[str] = "1.0.0"
+    ats_detected: Optional[str] = "universal"
+    form_found: Optional[bool] = False
+
+
+class AutofillProgressRequest(BaseModel):
+    execution_id: str
+    action_ticket: str
+    stage: str
+    stage_index: int
+    message: Optional[str] = ""
+    stats: Optional[Dict[str, Any]] = None
+    errors: Optional[List[str]] = None
+
+
 class AutofillCompleteRequest(BaseModel):
     execution_id: str
     application_id: Optional[int] = None
@@ -186,4 +205,21 @@ class AutofillCompleteRequest(BaseModel):
     status: str = "SUCCESS"
     message: str = ""
     timestamp: Optional[str] = None
+
+
+class AutofillGateEventRequest(BaseModel):
+    execution_id: str
+    action_ticket: str
+    event_type: str  # USER_INTERACTION, PAGE_NAVIGATION, GATE_COMPLETED, USER_DECLINED
+    current_url: Optional[str] = ""
+    html_snippet: Optional[str] = ""
+    control_interacted: Optional[Dict[str, Any]] = None
+
+
+class AutofillResumeRequest(BaseModel):
+    execution_id: str
+    action_ticket: str
+    current_url: Optional[str] = ""
+    html_snippet: Optional[str] = ""
+
 

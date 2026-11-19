@@ -33,7 +33,17 @@ from src.database.exceptions import (
     JobNotFoundError,
     SecurityAuthorizationError,
 )
+from src.preparer.ats_adapter_registry import ATSAdapterRegistry, BaseATSAdapter
+from src.preparer.execution_state_machine import ApplicationExecutionStateMachine, ExecutionState
 from src.preparer.form_prefiller import FormPrefiller
+from src.preparer.gate_detector import (
+    GateCategory,
+    GateDetectionResult,
+    GateType,
+    PreApplicationGateDetector,
+)
+from src.preparer.human_interaction_manager import HumanInteractionManager, InteractionGuidance
+from src.preparer.application_workflow_resumer import ApplicationWorkflowResumer, WorkflowResumptionResult
 from src.preparer.universal_field_mapper import (
     CandidateFieldFact,
     FormFieldTarget,
@@ -147,12 +157,31 @@ class ApplicationFormFillingBroker:
         self.db = db or db_manager or DatabaseManager()
         self.file_validator = file_validator
         self.prefiller = FormPrefiller(db_manager=self.db, file_validator=self.file_validator)
+        self.detector = PreApplicationGateDetector()
+        self.state_machine = ApplicationExecutionStateMachine(db_manager=self.db)
+        self.interaction_mgr = HumanInteractionManager()
+        self.resumer = ApplicationWorkflowResumer(
+            db_manager=self.db,
+            detector=self.detector,
+            state_machine=self.state_machine,
+            interaction_mgr=self.interaction_mgr,
+        )
 
     @classmethod
     def get_instance(cls, db_manager: Optional[DatabaseManager] = None) -> "ApplicationFormFillingBroker":
         """Singleton accessor for broker instance."""
         if cls._instance is None:
             cls._instance = cls(db_manager=db_manager)
+        elif db_manager is not None and cls._instance.db is not db_manager:
+            cls._instance.db = db_manager
+            cls._instance.prefiller = FormPrefiller(db_manager=db_manager)
+            cls._instance.state_machine = ApplicationExecutionStateMachine(db_manager=db_manager)
+            cls._instance.resumer = ApplicationWorkflowResumer(
+                db_manager=db_manager,
+                detector=cls._instance.detector,
+                state_machine=cls._instance.state_machine,
+                interaction_mgr=cls._instance.interaction_mgr,
+            )
         return cls._instance
 
     @classmethod
@@ -189,22 +218,210 @@ class ApplicationFormFillingBroker:
         return False
 
     def get_execution_status(self, application_id: int, execution_id: str) -> Optional[Dict[str, Any]]:
-        """Returns live execution status and report if completed."""
+        """Returns live execution status, handshake state, stage progress, and report."""
         with self._execution_lock:
             rec = self._active_executions.get(execution_id)
             if not rec or rec.get("application_id") != application_id:
-                return None
+                # Attempt recovery from SQLite
+                session = self.db.get_autofill_execution_session(execution_id)
+                if session and session.get("application_id") == application_id:
+                    rec = {
+                        "execution_id": session["execution_id"],
+                        "application_id": session["application_id"],
+                        "user_id": session["user_id"],
+                        "status": "READY",
+                        "current_state": session.get("current_state", "PORTAL_OPENED"),
+                        "stage": session.get("current_state", "PORTAL_OPENED"),
+                        "stage_index": 1,
+                        "message": session.get("required_user_action") or "Session restored from audit log.",
+                        "gate_category": session.get("gate_category"),
+                        "gate_type": session.get("gate_type"),
+                        "is_blocking": bool(session.get("is_blocking")),
+                        "required_user_action": session.get("required_user_action", ""),
+                        "interaction_guidance": None,
+                        "state_history": session.get("state_history", []),
+                        "form_detected": False,
+                        "resume_uploaded": False,
+                        "fields_detected": 0,
+                        "fields_populated_count": 0,
+                        "fields_ats_parsed_count": 0,
+                        "fields_preserved_count": 0,
+                        "fields_manual_review_count": 0,
+                        "fields_verified_count": 0,
+                        "field_results": [],
+                        "errors": [],
+                        "ats_provider": session.get("ats_provider") or "universal",
+                        "target_url": session.get("target_url"),
+                        "validated_domain": session.get("validated_domain"),
+                        "report": None,
+                        "created_at": session.get("created_at"),
+                        "last_updated": session.get("updated_at"),
+                    }
+                else:
+                    return None
+
             return {
                 "execution_id": rec["execution_id"],
                 "application_id": rec["application_id"],
                 "user_id": rec["user_id"],
-                "status": rec["status"],
+                "status": rec.get("status", "READY"),
+                "current_state": rec.get("current_state", rec.get("stage", "PORTAL_OPENED")),
+                "companion_connected": rec.get("companion_connected", False),
+                "companion_version": rec.get("companion_version", ""),
+                "stage": rec.get("stage", "INITIATED"),
+                "stage_index": rec.get("stage_index", 1),
+                "message": rec.get("message", ""),
+                "gate_category": rec.get("gate_category"),
+                "gate_type": rec.get("gate_type"),
+                "is_blocking": rec.get("is_blocking", False),
+                "required_user_action": rec.get("required_user_action", ""),
+                "interaction_guidance": rec.get("interaction_guidance"),
+                "state_history": rec.get("state_history", []),
+                "form_detected": rec.get("form_detected", False),
+                "resume_uploaded": rec.get("resume_uploaded", False),
+                "fields_detected": rec.get("fields_detected", 0),
+                "fields_populated_count": rec.get("fields_populated_count", 0),
+                "fields_ats_parsed_count": rec.get("fields_ats_parsed_count", 0),
+                "fields_preserved_count": rec.get("fields_preserved_count", 0),
+                "fields_manual_review_count": rec.get("fields_manual_review_count", 0),
+                "fields_verified_count": rec.get("fields_verified_count", 0),
+                "field_results": rec.get("field_results", []),
+                "errors": rec.get("errors", []),
                 "ats_provider": self.identify_ats_provider(rec.get("target_url", "")),
                 "target_url": rec.get("target_url"),
                 "validated_domain": rec.get("validated_domain"),
                 "report": rec.get("report"),
                 "created_at": rec.get("created_at"),
+                "last_updated": rec.get("last_updated", rec.get("created_at")),
             }
+
+    def handle_gate_event(
+        self,
+        application_id: int,
+        execution_id: str,
+        ticket: str,
+        event_type: str,
+        current_url: str = "",
+        html_snippet: str = "",
+        control_interacted: Optional[Dict[str, Any]] = None,
+        user_id: Optional[int] = None,
+    ) -> WorkflowResumptionResult:
+        """Processes intermediate gate events (interactions, navigations, completions)."""
+        res = self.resumer.process_gate_event(
+            application_id=application_id,
+            execution_id=execution_id,
+            ticket=ticket,
+            event_type=event_type,
+            current_url=current_url,
+            html_snippet=html_snippet,
+            control_interacted=control_interacted,
+            user_id=user_id,
+        )
+        # Synchronize active in-memory execution status
+        with self._execution_lock:
+            rec = self._active_executions.get(execution_id)
+            if rec:
+                rec["current_state"] = res.current_state
+                rec["stage"] = res.current_state
+                rec["message"] = res.message
+                rec["last_updated"] = time.time()
+                if res.gate_detected and res.gate_result:
+                    rec["gate_category"] = res.gate_result.get("category")
+                    rec["gate_type"] = res.gate_result.get("gate_type")
+                    rec["is_blocking"] = res.gate_result.get("is_blocking", True)
+                    rec["required_user_action"] = res.gate_result.get("required_user_action", "")
+                    rec["interaction_guidance"] = res.interaction_guidance
+                elif res.is_ready_for_autofill:
+                    rec["form_detected"] = True
+                    rec["gate_detected"] = False
+        return res
+
+    def record_handshake(
+        self,
+        application_id: int,
+        execution_id: str,
+        ticket: str,
+        domain: str = "",
+        companion_version: str = "1.0.0",
+        ats_detected: str = "universal",
+        form_found: bool = False,
+    ) -> Dict[str, Any]:
+        """Registers verified handshake from browser companion on employer page."""
+        with self._execution_lock:
+            rec = self._active_executions.get(execution_id)
+            if not rec:
+                raise SecurityAuthorizationError(f"No active execution found for execution_id '{execution_id}'.")
+            if rec["application_id"] != application_id:
+                raise SecurityAuthorizationError("Application mismatch during companion handshake.")
+            if ticket and rec["action_ticket"] != ticket:
+                raise SecurityAuthorizationError("Invalid action ticket during companion handshake.")
+
+            rec["companion_connected"] = True
+            rec["companion_version"] = companion_version
+            rec["form_detected"] = form_found
+            rec["stage"] = "COMPANION_CONNECTED" if not form_found else "FORM_IDENTIFIED"
+            rec["stage_index"] = 2 if not form_found else 3
+            rec["message"] = f"Handshake verified. {ats_detected.upper()} ATS active on {domain}."
+            rec["last_updated"] = time.time()
+
+            try:
+                target_state = ExecutionState.COMPANION_CONNECTED if not form_found else ExecutionState.APPLICATION_FORM_DETECTED
+                self.state_machine.transition(
+                    execution_id=execution_id,
+                    new_state=target_state,
+                    event_source="COMPANION",
+                    message=f"Handshake verified on {domain}.",
+                )
+                rec["current_state"] = target_state.value
+            except Exception as e:
+                logger.warning(f"State machine handshake transition warning: {e}")
+
+            return dict(rec)
+
+    def record_progress(
+        self,
+        application_id: int,
+        execution_id: str,
+        ticket: str,
+        stage: str,
+        stage_index: int,
+        message: str = "",
+        stats: Optional[Dict[str, Any]] = None,
+        errors: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Pushes progressive autofill execution updates from companion for live UI tracking."""
+        with self._execution_lock:
+            rec = self._active_executions.get(execution_id)
+            if not rec:
+                raise SecurityAuthorizationError(f"No active execution found for execution_id '{execution_id}'.")
+            if rec["application_id"] != application_id:
+                raise SecurityAuthorizationError("Application mismatch during progress update.")
+            if ticket and rec["action_ticket"] != ticket:
+                raise SecurityAuthorizationError("Invalid action ticket during progress update.")
+
+            rec["stage"] = stage
+            rec["stage_index"] = max(rec.get("stage_index", 1), stage_index)
+            if message:
+                rec["message"] = message
+            if stats:
+                if "resume_uploaded" in stats:
+                    rec["resume_uploaded"] = stats["resume_uploaded"]
+                if "fields_detected" in stats:
+                    rec["fields_detected"] = stats["fields_detected"]
+                if "fields_populated_count" in stats:
+                    rec["fields_populated_count"] = stats["fields_populated_count"]
+                if "fields_ats_parsed_count" in stats:
+                    rec["fields_ats_parsed_count"] = stats["fields_ats_parsed_count"]
+                if "fields_preserved_count" in stats:
+                    rec["fields_preserved_count"] = stats["fields_preserved_count"]
+                if "fields_manual_review_count" in stats:
+                    rec["fields_manual_review_count"] = stats["fields_manual_review_count"]
+                if "fields_verified_count" in stats:
+                    rec["fields_verified_count"] = stats["fields_verified_count"]
+            if errors:
+                rec.setdefault("errors", []).extend(errors)
+            rec["last_updated"] = time.time()
+            return dict(rec)
 
     # -------------------------------------------------------------------------
     # DOMAIN & ATS IDENTIFICATION
@@ -230,7 +447,7 @@ class ApplicationFormFillingBroker:
             return ATSProvider.GREENHOUSE
 
         # Lever detection
-        if "lever.co" in host or "lever-form" in lower_html:
+        if "lever.co" in host or "jobs.lever.co" in host or "lever-form" in lower_html or "application-form" in lower_html or "data-qa=\"name-input\"" in lower_html or "resume-upload-input" in lower_html:
             return ATSProvider.LEVER
 
         # Workday detection
@@ -399,10 +616,59 @@ class ApplicationFormFillingBroker:
                 "resume_id": attachment_ref.resume_id,
                 "resume_file_hash": attachment_ref.file_hash,
                 "status": "READY",
+                "companion_connected": False,
+                "companion_version": "",
+                "stage": "INITIATED",
+                "stage_index": 1,
+                "message": "Autofill plan authorized. Waiting for companion connection...",
+                "form_detected": False,
+                "resume_uploaded": False,
+                "fields_detected": 0,
+                "fields_populated_count": 0,
+                "fields_ats_parsed_count": 0,
+                "fields_preserved_count": 0,
+                "fields_manual_review_count": 0,
+                "fields_verified_count": 0,
+                "field_results": [],
+                "errors": [],
                 "created_at": now,
+                "last_updated": now,
                 "expires_at": now + 600,
                 "report": None,
             }
+
+        # Persist session to SQLite
+        try:
+            self.db.save_autofill_execution_session({
+                "execution_id": execution_id,
+                "application_id": application_id,
+                "user_id": user_id,
+                "current_state": ExecutionState.PORTAL_OPENED.value,
+                "previous_state": None,
+                "ats_provider": ats_provider,
+                "target_url": effective_url,
+                "validated_domain": validated_domain,
+                "action_ticket": action_ticket,
+                "plan_hash": plan_hash,
+                "resume_id": attachment_ref.resume_id,
+                "resume_file_hash": attachment_ref.file_hash,
+                "state_history": [
+                    {
+                        "execution_id": execution_id,
+                        "application_id": application_id,
+                        "previous_state": None,
+                        "new_state": ExecutionState.PORTAL_OPENED.value,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "event_source": "BACKEND",
+                        "validation_result": "VALID",
+                        "message": "Autofill plan authorized. Portal opened.",
+                    }
+                ],
+                "metadata": {"company_name": app.get("company_name"), "job_title": app.get("job_title")},
+                "expires_at": datetime.fromtimestamp(now + 600, tz=timezone.utc).isoformat(),
+            })
+        except Exception as db_err:
+            logger.warning(f"Failed to persist initial execution session to SQLite: {db_err}")
 
         # 8. Known fields list
         known_fields = [asdict(f) for f in form_plan.fields_to_fill]
@@ -530,10 +796,57 @@ class ApplicationFormFillingBroker:
         plan = self.prepare_autofill_plan(user_id=user_id, application_id=application_id, target_url=target_url)
         raw_resume_bytes, resume_filename, _ = self.get_verified_resume_bytes(user_id=user_id, application_id=application_id, ticket=plan.action_ticket)
 
-        # 2. Inspect page for anti-automation challenges
+        # 2. Inspect page with PreApplicationGateDetector
         page_content = page.content()
-        if self.prefiller.detect_anti_automation(page_content):
-            logger.warning("Anti-automation mechanism detected on target page. Halting form population.")
+        gate_res = self.detector.detect_from_playwright_page(page)
+
+        if gate_res.is_blocking:
+            guidance = self.interaction_mgr.evaluate_gate_interaction(gate_res)
+            logger.info("Intermediate gate detected on employer portal: %s (%s). Pausing for human action.", gate_res.gate_type, gate_res.category)
+
+            # Transition state machine
+            next_state = ExecutionState.GATE_DETECTED
+            if gate_res.category == GateCategory.AUTHENTICATION.value:
+                next_state = ExecutionState.AUTHENTICATION_REQUIRED
+            elif gate_res.category == GateCategory.SECURITY.value:
+                next_state = ExecutionState.SECURITY_CHALLENGE_REQUIRED
+
+            try:
+                self.state_machine.transition(
+                    execution_id=plan.execution_id,
+                    new_state=next_state,
+                    event_source="PLAYWRIGHT",
+                    message=f"Gate detected: {gate_res.gate_type}.",
+                    metadata={
+                        "gate_category": gate_res.category,
+                        "gate_type": gate_res.gate_type,
+                        "is_blocking": True,
+                        "required_user_action": guidance.instruction,
+                    },
+                )
+                self.state_machine.transition(
+                    execution_id=plan.execution_id,
+                    new_state=ExecutionState.WAITING_FOR_USER,
+                    event_source="PLAYWRIGHT",
+                    message=guidance.instruction,
+                )
+            except Exception as sm_err:
+                logger.warning(f"State machine transition warning: {sm_err}")
+
+            with self._execution_lock:
+                rec = self._active_executions.get(plan.execution_id)
+                if rec:
+                    rec["status"] = "PAUSED_FOR_USER_ACTION"
+                    rec["current_state"] = ExecutionState.WAITING_FOR_USER.value
+                    rec["stage"] = ExecutionState.WAITING_FOR_USER.value
+                    rec["gate_category"] = gate_res.category
+                    rec["gate_type"] = gate_res.gate_type
+                    rec["is_blocking"] = True
+                    rec["required_user_action"] = guidance.instruction
+                    rec["interaction_guidance"] = guidance.to_dict()
+                    rec["message"] = guidance.instruction
+                    rec["last_updated"] = time.time()
+
             return FormFillExecutionReport(
                 execution_id=plan.execution_id,
                 application_id=application_id,
@@ -553,29 +866,31 @@ class ApplicationFormFillingBroker:
                 fields_preserved_count=0,
                 fields_manual_review_count=0,
                 fields_unmatched_count=0,
-                anti_automation_detected=True,
-                status="BLOCKED",
-                message="Anti-automation or login gate detected on employer website. Please proceed manually.",
+                anti_automation_detected=(gate_res.category == GateCategory.SECURITY.value),
+                status="PAUSED_FOR_USER_ACTION",
+                message=guidance.instruction,
             )
 
-        ats_provider = self.identify_ats_provider(page.url, page_content)
+        # 3. Resolve matching ATS adapter from registry
+        adapter = ATSAdapterRegistry.resolve(page.url, page_content)
+        ats_provider = adapter.provider_name
+        with self._execution_lock:
+            rec = self._active_executions.get(plan.execution_id)
+            if rec:
+                rec["companion_connected"] = True
+                rec["form_detected"] = True
+                rec["stage"] = "FORM_IDENTIFIED"
+                rec["stage_index"] = 3
+                rec["last_updated"] = time.time()
 
-        # 3. Locate resume file upload control and upload verified resume
+        # 4. Locate resume file upload control and upload verified resume
         resume_uploaded = False
         with tempfile.NamedTemporaryFile(suffix=f"_{resume_filename}", delete=False) as tmp_file:
             tmp_path = Path(tmp_file.name)
             tmp_path.write_bytes(raw_resume_bytes)
 
         try:
-            resume_selectors = [
-                "#resume-upload",
-                ".resume-upload",
-                "input[data-field-identifier='resume']",
-                "input[field-name='resume']",
-                "input[type='file'][name*='resume']",
-                "input[type='file'][id*='resume']",
-                "input[type='file']",
-            ]
+            resume_selectors = adapter.get_resume_selectors()
             file_input = None
             for sel in resume_selectors:
                 loc = page.locator(sel)
@@ -588,9 +903,22 @@ class ApplicationFormFillingBroker:
                 file_input.set_input_files(str(tmp_path))
                 resume_uploaded = True
                 logger.info("Uploaded verified resume '%s' to employer ATS file input.", resume_filename)
+                with self._execution_lock:
+                    rec = self._active_executions.get(plan.execution_id)
+                    if rec:
+                        rec["resume_uploaded"] = True
+                        rec["stage"] = "RESUME_UPLOADED"
+                        rec["stage_index"] = 5
+                        rec["last_updated"] = time.time()
 
                 # 4. Wait for ATS asynchronous resume parsing to complete
                 self._wait_for_ats_parsing(page, ats_provider, timeout_seconds=timeout_seconds)
+                with self._execution_lock:
+                    rec = self._active_executions.get(plan.execution_id)
+                    if rec:
+                        rec["stage"] = "ATS_PARSING_COMPLETED"
+                        rec["stage_index"] = 6
+                        rec["last_updated"] = time.time()
             else:
                 logger.warning("No file upload input found on page. Proceeding with direct field mapping.")
         finally:
@@ -608,7 +936,17 @@ class ApplicationFormFillingBroker:
         unm_cnt = sum(1 for r in field_results if r.status == "UNMATCHED")
 
         # 6. Verify that final submission controls are NOT clicked
-        # Ensure #jobApplicationSubmitButton or similar submit button is intact and application not submitted
+        if pop_cnt == 0 and ats_cnt == 0 and not resume_uploaded:
+            exec_status = "NO_FIELDS_POPULATED"
+            exec_message = "Autofill could not populate any fields. The employer form remains unchanged. Please check the browser companion connection."
+            final_stage_idx = 4
+            final_stage = "FAILED"
+        else:
+            exec_status = "SUCCESS"
+            exec_message = f"Auto-populated {pop_cnt} fields, preserved {pres_cnt + ats_cnt} existing/ATS fields. Ready for candidate review."
+            final_stage_idx = 9
+            final_stage = "READY_FOR_REVIEW"
+
         report = FormFillExecutionReport(
             execution_id=plan.execution_id,
             application_id=application_id,
@@ -631,9 +969,26 @@ class ApplicationFormFillingBroker:
             field_results=field_results,
             anti_automation_detected=False,
             submission_prevented=True,
-            status="SUCCESS",
-            message=f"Auto-populated {pop_cnt} fields, preserved {pres_cnt + ats_cnt} existing/ATS fields. Ready for candidate review.",
+            status=exec_status,
+            message=exec_message,
         )
+
+        with self._execution_lock:
+            rec = self._active_executions.get(plan.execution_id)
+            if rec:
+                rec["status"] = "COMPLETED" if exec_status == "SUCCESS" else exec_status
+                rec["stage"] = final_stage
+                rec["stage_index"] = final_stage_idx
+                rec["message"] = exec_message
+                rec["fields_detected"] = len(field_results)
+                rec["fields_populated_count"] = pop_cnt
+                rec["fields_ats_parsed_count"] = ats_cnt
+                rec["fields_preserved_count"] = pres_cnt
+                rec["fields_manual_review_count"] = rev_cnt
+                rec["fields_verified_count"] = pop_cnt
+                rec["field_results"] = [r.to_dict() for r in field_results]
+                rec["report"] = report.to_dict()
+                rec["last_updated"] = time.time()
 
         # 7. Record EXTERNAL_FORM_AUTOFILLED audit event
         audit_event = self._record_autofill_audit_event(report)
@@ -656,18 +1011,25 @@ class ApplicationFormFillingBroker:
             # 1. Loader is shown (.loader or .loader-container)
             # 2. When parsing finishes: #resume text input gets the file name, or .loader hides
             try:
-                # Wait briefly for loader to appear or complete
                 page.wait_for_timeout(1000)
-                # Wait for loader to disappear
                 loader = page.locator(".loader, .loader-container, #loading")
                 if loader.count() > 0:
                     loader.first.wait_for(state="hidden", timeout=int(timeout_seconds * 1000))
-                # Wait for uploaded filename or field update
                 page.wait_for_timeout(1000)
             except Exception as e:
                 logger.info("Keka parsing wait completed or timed out: %s", e)
+        elif ats_provider == ATSProvider.LEVER:
+            # On Lever:
+            # When resume is uploaded, Lever shows '.application-file-upload .file-name' or '[data-qa="resume-upload-success"]'
+            try:
+                page.wait_for_timeout(1200)
+                file_badge = page.locator(".file-name, [data-qa='resume-upload-success'], .application-file-upload")
+                if file_badge.count() > 0:
+                    logger.info("Lever resume file attachment confirmed.")
+                page.wait_for_timeout(800)
+            except Exception as e:
+                logger.info("Lever wait completed or timed out: %s", e)
         else:
-            # Generic wait
             try:
                 page.wait_for_load_state("networkidle", timeout=int(timeout_seconds * 1000))
             except Exception:
@@ -742,7 +1104,16 @@ class ApplicationFormFillingBroker:
                 # Map field using UniversalFieldMapper rules
                 # Create mapper from facts
                 mapper = UniversalFieldMapper()
-                mapper.facts = {k: CandidateFieldFact(**v) for k, v in facts_dict.items()}
+                facts_map = {}
+                for k, v in facts_dict.items():
+                    if isinstance(v, CandidateFieldFact):
+                        facts_map[k] = v
+                    elif isinstance(v, dict):
+                        f_dict = dict(v)
+                        f_dict.setdefault("canonical_key", k)
+                        f_dict.setdefault("label", k.replace("_", " ").title())
+                        facts_map[k] = CandidateFieldFact(**f_dict)
+                mapper.facts = facts_map
                 decision = mapper.match_field(target)
 
                 # Determine action
@@ -768,8 +1139,27 @@ class ApplicationFormFillingBroker:
                 elif decision.action == "FILL" and decision.intended_value is not None:
                     # Populate the control
                     self._fill_control(ctrl, tag_name, target.field_type, decision.intended_value)
-                    # Verify populated value
-                    new_val = ctrl.evaluate("el => el.value") or ""
+                    # Independently verify populated value in DOM
+                    new_val = (ctrl.evaluate("el => el.value") or "").strip()
+                    intended_str = str(decision.intended_value).strip()
+
+                    # Retry with native prototype value setter if framework/autocomplete cleared it
+                    if new_val != intended_str:
+                        ctrl.evaluate("""(el, val) => {
+                            const desc = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value') ||
+                                         Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value');
+                            if (desc && desc.set) {
+                                desc.set.call(el, val);
+                            } else {
+                                el.value = val;
+                            }
+                            el.dispatchEvent(new Event('input', { bubbles: true }));
+                            el.dispatchEvent(new Event('change', { bubbles: true }));
+                        }""", decision.intended_value)
+                        new_val = (ctrl.evaluate("el => el.value") or "").strip()
+
+                    fill_status = "AUTO_FILLED" if new_val == intended_str else "VERIFICATION_FAILED"
+                    err_msg = None if fill_status == "AUTO_FILLED" else f"Value verification failed: expected '{intended_str}', found '{new_val}'."
                     results.append(
                         FormFieldResult(
                             field_name=field_display_name,
@@ -778,10 +1168,11 @@ class ApplicationFormFillingBroker:
                             intended_value=decision.intended_value,
                             actual_value=new_val,
                             provenance=decision.provenance,
-                            status="AUTO_FILLED",
+                            status=fill_status,
+                            error_message=err_msg,
                         )
                     )
-                    logger.info("Auto-filled '%s' (%s) -> '%s'", field_display_name, selector, decision.intended_value)
+                    logger.info("Auto-filled '%s' (%s) -> '%s' (status: %s)", field_display_name, selector, decision.intended_value, fill_status)
                 elif decision.action == "NEEDS_INPUT":
                     results.append(
                         FormFieldResult(
@@ -867,7 +1258,21 @@ class ApplicationFormFillingBroker:
                 if ticket and rec["action_ticket"] != ticket:
                     raise SecurityAuthorizationError("Invalid action ticket for execution.")
                 rec["status"] = "COMPLETED"
+                rec["current_state"] = ExecutionState.READY_FOR_HUMAN_REVIEW.value
+                rec["stage"] = ExecutionState.READY_FOR_HUMAN_REVIEW.value
                 rec["report"] = report.to_dict()
+
+        try:
+            self.state_machine.transition(
+                execution_id=report.execution_id,
+                new_state=ExecutionState.READY_FOR_HUMAN_REVIEW,
+                event_source="PLAYWRIGHT",
+                message=f"Form auto-population complete: {report.fields_populated_count} fields populated. Ready for human review.",
+                metadata={"report": report.to_dict()},
+                force=True,
+            )
+        except Exception as sm_err:
+            logger.warning(f"State machine transition warning on completion: {sm_err}")
 
         return self._record_autofill_audit_event(report)
 

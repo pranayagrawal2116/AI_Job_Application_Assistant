@@ -18,10 +18,20 @@
  */
 
 (async function () {
-    const JOBFLOW_API_BASE = window.JOBFLOW_CONFIG?.apiBase || 'http://127.0.0.1:8000/api';
-    const APP_ID = window.JOBFLOW_CONFIG?.appId;
-    const TICKET = window.JOBFLOW_CONFIG?.ticket || null;
-    const EXECUTION_ID = window.JOBFLOW_CONFIG?.executionId || null;
+    // Session restoration across page reloads/transitions
+    const savedSession = (() => {
+        try {
+            const raw = sessionStorage.getItem('__JOBFLOW_EXECUTION__');
+            return raw ? JSON.parse(raw) : null;
+        } catch (e) {
+            return null;
+        }
+    })();
+
+    const JOBFLOW_API_BASE = window.JOBFLOW_CONFIG?.apiBase || savedSession?.apiBase || 'http://127.0.0.1:8000/api';
+    const APP_ID = window.JOBFLOW_CONFIG?.appId || savedSession?.appId;
+    const TICKET = window.JOBFLOW_CONFIG?.ticket || savedSession?.ticket || null;
+    const EXECUTION_ID = window.JOBFLOW_CONFIG?.executionId || savedSession?.executionId || null;
 
     if (!APP_ID) {
         alert('JobFlow AI: Application ID is missing from configuration.');
@@ -197,6 +207,317 @@
         const activeTicket = plan.action_ticket || TICKET;
         const activeExecutionId = plan.execution_id || EXECUTION_ID;
 
+        // Save session in sessionStorage so page reloads / SPA navigations can re-handshake automatically
+        try {
+            sessionStorage.setItem('__JOBFLOW_EXECUTION__', JSON.stringify({
+                apiBase: JOBFLOW_API_BASE,
+                appId: APP_ID,
+                ticket: activeTicket,
+                executionId: activeExecutionId,
+                companyName: plan.company_name,
+                jobTitle: plan.job_title,
+            }));
+        } catch (e) {}
+
+        // Listen for navigation events
+        window.addEventListener('beforeunload', () => {
+            try {
+                navigator.sendBeacon(
+                    `${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/gate-event`,
+                    new Blob([JSON.stringify({
+                        execution_id: activeExecutionId,
+                        action_ticket: activeTicket,
+                        event_type: 'PAGE_NAVIGATION',
+                        current_url: window.location.href,
+                    })], { type: 'application/json' })
+                );
+            } catch (e) {}
+        });
+
+        // Step 1.5: Connection Handshake & Form Identification
+        const host = window.location.hostname.toLowerCase();
+        let atsDetected = plan.ats_provider || 'universal';
+        if (host.includes('lever.co')) atsDetected = 'lever';
+        else if (host.includes('keka.com')) atsDetected = 'keka';
+        else if (host.includes('greenhouse.io')) atsDetected = 'greenhouse';
+        else if (host.includes('workday.com')) atsDetected = 'workday';
+
+        const formFound = !!(
+            document.querySelector('form#application-form') ||
+            document.querySelector('form') ||
+            document.querySelector('[data-qa="name-input"]') ||
+            document.querySelector('input[name="name"]') ||
+            document.querySelector('input[type="file"]')
+        );
+
+        async function pushProgress(stage, stageIndex, message, stats = null) {
+            try {
+                await fetch(`${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/progress`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-JobFlow-Ticket': activeTicket,
+                        'Authorization': `Bearer ${activeTicket}`,
+                    },
+                    body: JSON.stringify({
+                        execution_id: activeExecutionId,
+                        action_ticket: activeTicket,
+                        stage: stage,
+                        stage_index: stageIndex,
+                        message: message,
+                        stats: stats,
+                    }),
+                    credentials: 'include',
+                });
+            } catch (e) {}
+        }
+
+        try {
+            await fetch(`${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/handshake`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-JobFlow-Ticket': activeTicket,
+                    'Authorization': `Bearer ${activeTicket}`,
+                },
+                body: JSON.stringify({
+                    execution_id: activeExecutionId,
+                    action_ticket: activeTicket,
+                    domain: host,
+                    companion_version: '1.2.0',
+                    ats_detected: atsDetected,
+                    form_found: formFound,
+                }),
+                credentials: 'include',
+            });
+        } catch (hErr) {
+            console.warn('[JobFlow Companion] Handshake warning:', hErr);
+        }
+
+        // Step 1.8: Intelligent Pre-Application Gate Detection (IAGH)
+        function detectPageGate() {
+            // A. Check for Cloudflare / CAPTCHA
+            const cf = document.querySelector('iframe[src*="challenges.cloudflare.com"], #cf-chl-widget, .cf-turnstile');
+            const h1Text = (document.querySelector('h1, h2, title')?.innerText || '').toLowerCase();
+            if (cf || h1Text.includes('just a moment') || h1Text.includes('verify you are human')) {
+                return {
+                    category: 'SECURITY',
+                    gateType: 'CLOUDFLARE_VERIFICATION',
+                    isBlocking: true,
+                    title: 'Security Verification Required',
+                    instruction: 'Please complete the Cloudflare verification in this tab. JobFlow will resume automatically.',
+                };
+            }
+
+            // B. Check for Cookie banners
+            const cookieBanner = document.querySelector('#onetrust-banner-sdk, .cookie-banner, .cookie-consent, [aria-label*="cookie" i], [id*="cookie" i]');
+            if (cookieBanner && cookieBanner.querySelector('button, a')) {
+                return {
+                    category: 'COOKIE',
+                    gateType: 'COOKIE_CONSENT',
+                    isBlocking: true,
+                    title: 'Cookie Consent Preferences',
+                    instruction: 'Please select your cookie preferences in this tab to proceed.',
+                    element: cookieBanner,
+                };
+            }
+
+            // C. Check for Login / Sign-in required
+            const pwdInput = document.querySelector('input[type="password"]');
+            const hasResumeInput = !!document.querySelector('input[type="file"], [data-qa="input-resume"]');
+            if (pwdInput && !hasResumeInput) {
+                return {
+                    category: 'AUTHENTICATION',
+                    gateType: 'LOGIN_REQUIRED',
+                    isBlocking: true,
+                    title: 'Employer Portal Sign-In Required',
+                    instruction: 'Please sign in to your candidate account in this tab. JobFlow will resume once authenticated.',
+                    element: pwdInput.closest('form') || pwdInput,
+                };
+            }
+
+            // D. Check for Legal / Privacy agreements
+            const modalDialog = document.querySelector('dialog[open], [role="dialog"], .modal.show, .modal-open, .terms-modal');
+            const scope = modalDialog || document;
+            const consentHeader = scope.querySelector('h1, h2, h3, h4, legend, strong');
+            const headerText = (consentHeader?.innerText || '').toLowerCase();
+            const hasConsentHeading = /privacy notice|candidate privacy|terms and conditions|recruitment consent|data processing|applicant declaration/i.test(headerText);
+            const agreeBtn = scope.querySelector('button, input[type="submit"], a');
+            const agreeBtnText = (agreeBtn?.innerText || agreeBtn?.value || '').toLowerCase();
+            const hasAgreeBtn = /i agree|i accept|accept and continue|acknowledge|agree & continue/i.test(agreeBtnText);
+            const consentCheckbox = scope.querySelector('input[type="checkbox"][name*="consent" i], input[type="checkbox"][name*="privacy" i], input[type="checkbox"][name*="agree" i]');
+
+            if ((hasConsentHeading && (hasAgreeBtn || consentCheckbox)) || (modalDialog && (hasAgreeBtn || consentCheckbox))) {
+                if (!consentHeader?.closest('footer, .footer, #footer')) {
+                    return {
+                        category: 'LEGAL_PRIVACY',
+                        gateType: headerText.includes('terms') ? 'TERMS_AND_CONDITIONS' : 'PRIVACY_POLICY',
+                        isBlocking: true,
+                        title: 'Legal & Privacy Agreement Review',
+                        instruction: 'The employer requires you to review and accept their agreement before continuing. Please review it in this tab.',
+                        element: modalDialog || agreeBtn || consentCheckbox,
+                    };
+                }
+            }
+
+            // E. Check for Application Form Ready
+            const hasName = !!document.querySelector('[data-qa="name-input"], input[name="name"], input[name*="fullname" i]');
+            const hasEmail = !!document.querySelector('[data-qa="email-input"], input[type="email"], input[name="email"]');
+            if ((hasResumeInput && (hasName || hasEmail)) || (hasName && hasEmail)) {
+                return {
+                    category: 'NONE',
+                    gateType: 'APPLICATION_FORM_READY',
+                    isBlocking: false,
+                    title: 'Application Form Ready',
+                    instruction: 'Application form is ready for auto-population.',
+                    formDetected: true,
+                };
+            }
+
+            return {
+                category: 'NONE',
+                gateType: 'GENERIC_PAGE',
+                isBlocking: false,
+                title: 'Page Analyzing',
+                instruction: 'Analyzing page structure...',
+                formDetected: false,
+            };
+        }
+
+        function showGateWaitingOverlay(gateInfo, company, role) {
+            const wrap = el('div', { padding: '10px 0' });
+            
+            const badge = el('div', {
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: '6px',
+                padding: '4px 10px',
+                borderRadius: '9999px',
+                background: '#fef3c7',
+                color: '#92400e',
+                fontSize: '11px',
+                fontWeight: '600',
+                marginBottom: '8px',
+            }, {}, '⏳ Action Required in This Tab');
+
+            const title = el('div', { fontWeight: '700', fontSize: '14px', color: '#0f172a', marginBottom: '6px' }, {}, gateInfo.title);
+            const desc = el('div', { fontSize: '12px', color: '#475569', marginBottom: '12px', lineHeight: '1.4' }, {}, gateInfo.instruction);
+            
+            const hintWrap = el('div', {
+                display: 'flex',
+                alignItems: 'center',
+                gap: '8px',
+                padding: '8px 12px',
+                background: '#f8fafc',
+                borderRadius: '8px',
+                border: '1px solid #e2e8f0',
+                fontSize: '11px',
+                color: '#64748b',
+            });
+            const dot = el('div', {
+                width: '8px',
+                height: '8px',
+                borderRadius: '50%',
+                background: '#f59e0b',
+            });
+            const hintText = el('span', {}, {}, 'JobFlow has paused automation and will resume once you complete this step.');
+            hintWrap.appendChild(dot);
+            hintWrap.appendChild(hintText);
+
+            wrap.appendChild(badge);
+            wrap.appendChild(title);
+            wrap.appendChild(desc);
+            wrap.appendChild(hintWrap);
+
+            setOverlayContent(wrap, company, role);
+        }
+
+        // Evaluate Gate
+        let currentGate = detectPageGate();
+        if (currentGate.isBlocking) {
+            console.log('[JobFlow Companion] Blocking gate detected:', currentGate.gateType, currentGate.category);
+            showGateWaitingOverlay(currentGate, plan.company_name, plan.job_title);
+
+            try {
+                await fetch(`${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/gate-event`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-JobFlow-Ticket': activeTicket,
+                        'Authorization': `Bearer ${activeTicket}`,
+                    },
+                    body: JSON.stringify({
+                        execution_id: activeExecutionId,
+                        action_ticket: activeTicket,
+                        event_type: 'GATE_DETECTED',
+                        current_url: window.location.href,
+                        html_snippet: document.documentElement.outerHTML.substring(0, 5000),
+                    }),
+                    credentials: 'include',
+                });
+            } catch (e) {}
+
+            // Wait for user interaction or DOM clearance
+            await new Promise((resolve) => {
+                const interval = setInterval(() => {
+                    const check = detectPageGate();
+                    if (!check.isBlocking) {
+                        clearInterval(interval);
+                        resolve(true);
+                    }
+                }, 800);
+
+                const clickHandler = (evt) => {
+                    const target = evt.target;
+                    const text = (target.innerText || target.value || '').toLowerCase();
+                    if (/agree|accept|continue|sign in|submit|log in|got it|allow/i.test(text)) {
+                        try {
+                            fetch(`${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/gate-event`, {
+                                method: 'POST',
+                                headers: {
+                                    'Content-Type': 'application/json',
+                                    'X-JobFlow-Ticket': activeTicket,
+                                    'Authorization': `Bearer ${activeTicket}`,
+                                },
+                                body: JSON.stringify({
+                                    execution_id: activeExecutionId,
+                                    action_ticket: activeTicket,
+                                    event_type: 'USER_INTERACTION',
+                                    current_url: window.location.href,
+                                    control_interacted: { text: text, tag: target.tagName },
+                                }),
+                                credentials: 'include',
+                            }).catch(() => {});
+                        } catch (e) {}
+                    }
+                };
+                document.addEventListener('click', clickHandler, { capture: true, passive: true });
+            });
+
+            console.log('[JobFlow Companion] Gate resolved. Re-evaluating application form...');
+            showStatus('Application form accessible. Resuming autofill...', plan.company_name, plan.job_title);
+
+            try {
+                await fetch(`${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/resume`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-JobFlow-Ticket': activeTicket,
+                        'Authorization': `Bearer ${activeTicket}`,
+                    },
+                    body: JSON.stringify({
+                        execution_id: activeExecutionId,
+                        action_ticket: activeTicket,
+                        current_url: window.location.href,
+                    }),
+                    credentials: 'include',
+                });
+            } catch (e) {}
+        }
+
+        await pushProgress('FORM_IDENTIFIED', 3, `Identified ${atsDetected.toUpperCase()} application form on ${host}`);
+        await pushProgress('FACTS_RETRIEVED', 4, 'Retrieved verified candidate facts from JobFlow profile');
+
         showStatus(`Downloading verified resume (${plan.resume_filename})...`, plan.company_name, plan.job_title);
 
         // Step 2: Fetch Verified Resume Binary
@@ -223,6 +544,9 @@
         showStatus('Uploading verified resume to employer ATS...', plan.company_name, plan.job_title);
 
         const fileInputSelectors = [
+            'input[data-qa="input-resume"]',
+            '#resume-upload-input',
+            'input[type="file"][name="resume"]',
             '#resume-upload',
             'input[data-field-identifier="resume"]',
             'input[type="file"][name*="resume"]',
@@ -258,6 +582,8 @@
             console.warn('[JobFlow Companion] No file upload control found on this page.');
         }
 
+        await pushProgress('RESUME_UPLOADED', 5, resumeUploaded ? 'Verified resume uploaded to file input' : 'No file upload input found; proceeding with text fields', { resume_uploaded: resumeUploaded });
+
         // Step 4: Bounded Polling & DOM Mutation Observation for ATS Resume Parsing
         showStatus('Observing employer ATS resume parsing...', plan.company_name, plan.job_title);
 
@@ -269,11 +595,11 @@
             await new Promise((r) => setTimeout(r, 400));
 
             // Check if any personal field received a value from ATS background parser
-            const testFields = ['#firstName', '#lastName', '#email', 'input[name="firstName"]', 'input[name="email"]'];
+            const testFields = ['#firstName', '#lastName', '#email', 'input[name="firstName"]', 'input[name="email"]', '[data-qa="name-input"]', '.file-name'];
             let filledCount = 0;
             for (const tf of testFields) {
                 const elFound = document.querySelector(tf);
-                if (elFound && elFound.value && elFound.value.trim().length > 0) {
+                if (elFound && ((elFound.value && elFound.value.trim().length > 0) || (elFound.textContent && elFound.textContent.trim().length > 0))) {
                     filledCount++;
                 }
             }
@@ -296,6 +622,8 @@
             }
         }
 
+        await pushProgress('ATS_PARSING_COMPLETED', 6, 'Observed ATS parsing completion');
+
         // Step 5: Map and Populate Remaining Blank Fields
         showStatus('Mapping verified candidate facts to remaining blank fields...', plan.company_name, plan.job_title);
 
@@ -307,28 +635,28 @@
             { key: 'first_name', selectors: ['#firstName', '[name="firstName"]', '[name*="first_name"]', 'input[autocomplete="given-name"]'], val: facts.first_name?.value },
             { key: 'middle_name', selectors: ['#middleName', '[name="middleName"]', '[name*="middle_name"]'], val: facts.middle_name?.value },
             { key: 'last_name', selectors: ['#lastName', '[name="lastName"]', '[name*="last_name"]', 'input[autocomplete="family-name"]'], val: facts.last_name?.value },
-            { key: 'full_name', selectors: ['#fullName', '[name="name"]', 'input[name="full_name"]', 'input[name="applicant_name"]'], val: facts.full_name?.value },
-            { key: 'email', selectors: ['#email', '[name="email"]', 'input[type="email"]', 'input[autocomplete="email"]'], val: facts.email?.value },
+            { key: 'full_name', selectors: ['#fullName', '[data-qa="name-input"]', '[name="name"]', 'input[name="full_name"]', 'input[name="applicant_name"]'], val: facts.full_name?.value },
+            { key: 'email', selectors: ['#email', '[data-qa="email-input"]', '[name="email"]', 'input[type="email"]', 'input[autocomplete="email"]'], val: facts.email?.value },
             { key: 'country_code', selectors: ['#mobilePhone\\.countryCode', '[name="mobilePhone.countryCode"]', '#countryCode', '.countryCode'], val: facts.country_code?.value, isSelect: true },
-            { key: 'phone', selectors: ['#mobilePhone\\.number', '[name="mobilePhone.number"]', '#phone', 'input[type="tel"]', 'input[name*="phone"]'], val: facts.phone?.value },
-            { key: 'gender', selectors: ['#gender', '[name="gender"]', 'select[name*="gender"]'], val: facts.gender?.value, isSelect: true },
+            { key: 'phone', selectors: ['#mobilePhone\\.number', '[name="mobilePhone.number"]', '[data-qa="phone-input"]', '#phone', 'input[type="tel"]', 'input[name*="phone"]'], val: facts.phone?.value },
+            { key: 'gender', selectors: ['#gender', '[name="gender"]', 'select[name*="gender"]', 'select[name="eeo[gender]"]'], val: facts.gender?.value, isSelect: true },
             { key: 'date_of_birth', selectors: ['#dateOfBirth', '[name*="dateOfBirth"]', '#dob', 'input[name*="dob"]'], val: facts.date_of_birth?.value },
             { key: 'experience_years', selectors: ['#workExperience', '[name="workExperience.years"]', 'input[name*="experience_years"]'], val: facts.experience_years?.value },
             { key: 'experience_months', selectors: ['[name="workExperience.months"]', '#workExperience\\.months', '.workExperienceMonths'], val: facts.experience_months?.value, isSelect: true },
-            { key: 'current_company', selectors: ['#currentCompany', '[name="org"]', 'input[name*="company"]', 'input[name*="employer"]'], val: facts.current_company?.value },
+            { key: 'current_company', selectors: ['#currentCompany', '[data-qa="org-input"]', '[name="org"]', 'input[name*="company"]', 'input[name*="employer"]'], val: facts.current_company?.value },
             { key: 'current_job_title', selectors: ['#currentRole', 'input[name*="title"]', 'input[name*="designation"]'], val: facts.current_job_title?.value },
-            { key: 'current_location', selectors: ['#currentLocation', '[name*="currentLocation"]', 'input[name*="city"]', 'input[autocomplete="address-level2"]'], val: facts.current_location?.value },
+            { key: 'current_location', selectors: ['#currentLocation', '[data-qa="location-input"]', '#location-input', '[name="location"]', '[name*="currentLocation"]', 'input[name*="city"]', 'input[autocomplete="address-level2"]'], val: facts.current_location?.value },
             { key: 'preferred_location', selectors: ['#locationPreference', '[name*="locationPreference"]'], val: facts.preferred_location?.value, isSelect: true },
             { key: 'current_salary', selectors: ['#currentSalary', '[name*="currentSalary"]'], val: facts.current_salary?.value },
-            { key: 'expected_salary', selectors: ['#expectedSalary', '[name*="expectedSalary"]', 'input[name*="stipend"]'], val: facts.expected_salary?.value },
-            { key: 'availability_days', selectors: ['#availability', '[name*="availability"]', 'input[name*="notice"]'], val: facts.availability_days?.value },
+            { key: 'expected_salary', selectors: ['#expectedSalary', '[name*="expectedSalary"]', 'input[name*="stipend"]', 'input[name*="[field1]"]'], val: facts.expected_salary?.value },
+            { key: 'availability_days', selectors: ['#availability', '[name*="availability"]', 'input[name*="notice"]', 'input[name*="[field0]"]'], val: facts.availability_days?.value },
             { key: 'college_name', selectors: ['#1d9c080f-d347-4129-bc69-68e84b90402c', 'input[name*="college"]', 'input[name*="university"]', 'input[name*="institution"]'], val: facts.college_name?.value },
             { key: 'branch', selectors: ['#df9e8b1c-376f-4061-848c-1be135a8266e', 'input[name*="branch"]', 'input[name*="major"]', 'input[name*="field_of_study"]'], val: facts.branch?.value },
             { key: 'cgpa', selectors: ['#c5c44e06-12b2-45e1-bbc7-029c00746894', 'input[name*="cgpa"]', 'input[name*="gpa"]', 'input[name*="grade"]'], val: facts.cgpa?.value },
             { key: 'graduation_year', selectors: ['#graduationYear', 'input[name*="grad_year"]', 'input[name*="graduation_year"]'], val: facts.graduation_year?.value },
-            { key: 'linkedin_url', selectors: ['#linkedin', 'input[name*="linkedin"]', 'input[name="urls[LinkedIn]"]'], val: facts.linkedin_url?.value },
-            { key: 'github_url', selectors: ['#github', 'input[name*="github"]', 'input[name="urls[GitHub]"]'], val: facts.github_url?.value },
-            { key: 'portfolio_url', selectors: ['#portfolio', 'input[name*="portfolio"]', 'input[name="urls[Portfolio]"]', 'input[name*="website"]'], val: facts.portfolio_url?.value },
+            { key: 'linkedin_url', selectors: ['#linkedin', 'input[name*="linkedin"]', 'input[name="urls[LinkedIn]"]', '[name="urls[LinkedIn]"]'], val: facts.linkedin_url?.value },
+            { key: 'github_url', selectors: ['#github', 'input[name*="github"]', 'input[name="urls[GitHub]"]', '[name="urls[GitHub]"]'], val: facts.github_url?.value },
+            { key: 'portfolio_url', selectors: ['#portfolio', 'input[name*="portfolio"]', 'input[name="urls[Portfolio]"]', '[name="urls[Portfolio]"]', 'input[name*="website"]'], val: facts.portfolio_url?.value },
         ];
 
         let populatedCount = 0;
@@ -428,18 +756,42 @@
                     }
                 } else {
                     setNativeValue(elem, strVal);
-                    populatedCount++;
-                    fieldResults.push({
-                        field_name: displayName,
-                        selector: matchedSelector,
-                        field_type: tag,
-                        intended_value: strVal,
-                        actual_value: strVal,
-                        provenance: facts[item.key]?.provenance || 'VERIFIED_PROFILE',
-                        status: 'AUTO_FILLED',
-                    });
-                    elem.style.backgroundColor = '#ecfdf5';
-                    elem.style.borderColor = '#10b981';
+                    // Independent verification of populated value
+                    let finalVal = (elem.value || '').trim();
+                    if (finalVal !== strVal) {
+                        setNativeValue(elem, strVal);
+                        finalVal = (elem.value || '').trim();
+                    }
+
+                    const isMatch = (finalVal === strVal);
+                    if (isMatch) {
+                        populatedCount++;
+                        fieldResults.push({
+                            field_name: displayName,
+                            selector: matchedSelector,
+                            field_type: tag,
+                            intended_value: strVal,
+                            actual_value: finalVal,
+                            provenance: facts[item.key]?.provenance || 'VERIFIED_PROFILE',
+                            status: 'AUTO_FILLED',
+                        });
+                        elem.style.backgroundColor = '#ecfdf5';
+                        elem.style.borderColor = '#10b981';
+                    } else {
+                        manualReviewCount++;
+                        fieldResults.push({
+                            field_name: displayName,
+                            selector: matchedSelector,
+                            field_type: tag,
+                            intended_value: strVal,
+                            actual_value: finalVal,
+                            provenance: facts[item.key]?.provenance || 'VERIFIED_PROFILE',
+                            status: 'MANUAL_REVIEW',
+                            error_message: `Value verification failed: expected '${strVal}', found '${finalVal}'`,
+                        });
+                        elem.style.backgroundColor = '#fffbeb';
+                        elem.style.borderColor = '#f59e0b';
+                    }
                 }
             } else {
                 // Missing / sensitive fact: requires manual review
@@ -459,6 +811,20 @@
         }
 
         // Step 6: Post completion report to backend
+        const isSuccess = (populatedCount > 0 || atsParsedCount > 0 || resumeUploaded);
+        const reportStatus = isSuccess ? 'SUCCESS' : 'NO_FIELDS_POPULATED';
+        const reportMsg = isSuccess
+            ? `Populated ${populatedCount} fields, ${atsParsedCount} parsed by ATS, ${manualReviewCount} require manual review.`
+            : 'Autofill could not populate any fields. The employer form remains unchanged. Please check the browser companion connection.';
+
+        await pushProgress(isSuccess ? 'READY_FOR_REVIEW' : 'FAILED', isSuccess ? 9 : 4, reportMsg, {
+            fields_populated_count: populatedCount,
+            fields_ats_parsed_count: atsParsedCount,
+            fields_preserved_count: preservedCount,
+            fields_manual_review_count: manualReviewCount,
+            fields_verified_count: populatedCount,
+        });
+
         const reportPayload = {
             execution_id: activeExecutionId,
             application_id: APP_ID,
@@ -482,8 +848,8 @@
             field_results: fieldResults,
             anti_automation_detected: false,
             submission_prevented: true,
-            status: 'SUCCESS',
-            message: `Populated ${populatedCount} fields, ${atsParsedCount} parsed by ATS, ${manualReviewCount} require manual review.`,
+            status: reportStatus,
+            message: reportMsg,
         };
 
         fetch(`${JOBFLOW_API_BASE}/applications/${APP_ID}/autofill/complete`, {
@@ -500,26 +866,26 @@
         // Step 7: Render Safe Completion Review Card
         const reviewContainer = el('div', { display: 'flex', flexDirection: 'column', gap: '10px' });
 
-        // Success banner
+        // Outcome banner
         const banner = el('div', {
-            background: '#f0fdf4',
-            border: '1px solid #bbf7d0',
+            background: isSuccess ? '#f0fdf4' : '#fffbeb',
+            border: `1px solid ${isSuccess ? '#bbf7d0' : '#fde68a'}`,
             borderRadius: '12px',
             padding: '12px',
         });
         const bannerTitle = el('div', {
-            color: '#15803d',
+            color: isSuccess ? '#15803d' : '#b45309',
             fontWeight: '700',
             fontSize: '13px',
             marginBottom: '4px',
             display: 'flex',
             alignItems: 'center',
             gap: '6px',
-        }, {}, '✓ Form Auto-Population Complete');
+        }, {}, isSuccess ? '✓ Form Auto-Population Complete' : '⚠ Autofill Could Not Populate Fields');
         const bannerDesc = el('div', {
-            color: '#166534',
+            color: isSuccess ? '#166534' : '#92400e',
             fontSize: '12px',
-        }, {}, 'Your application form is ready for review. Green highlighted fields have been populated from your verified profile.');
+        }, {}, isSuccess ? 'Your application form is ready for review. Green highlighted fields have been populated from your verified profile.' : 'The employer form remains unchanged. Please check field mappings or complete manually.');
         banner.appendChild(bannerTitle);
         banner.appendChild(bannerDesc);
         reviewContainer.appendChild(banner);

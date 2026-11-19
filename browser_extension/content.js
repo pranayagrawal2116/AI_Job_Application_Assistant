@@ -222,7 +222,203 @@
 
     const companyName = fetchedPlan.company_name || "";
     const jobTitle = fetchedPlan.job_title || "";
-    const facts = fetchedPlan.candidate_facts || {};
+    const facts = fetchedPlan.candidate_facts || fetchedPlan.facts || {};
+    const host = window.location.hostname.toLowerCase();
+
+    let atsDetected = fetchedPlan.ats_provider || "universal";
+    if (host.includes("lever.co")) atsDetected = "lever";
+    else if (host.includes("keka.com")) atsDetected = "keka";
+    else if (host.includes("greenhouse.io")) atsDetected = "greenhouse";
+    else if (host.includes("workday.com")) atsDetected = "workday";
+
+    const formFound = !!(
+      document.querySelector("form#application-form") ||
+      document.querySelector("form") ||
+      document.querySelector('[data-qa="name-input"]') ||
+      document.querySelector('input[name="name"]') ||
+      document.querySelector('input[type="file"]')
+    );
+
+    async function pushProgress(stage, stageIndex, message, stats = null) {
+      try {
+        const headers = { "Content-Type": "application/json" };
+        if (TICKET) headers["Authorization"] = `Bearer ${TICKET}`;
+        await fetch(`${API_BASE}/applications/${APP_ID}/autofill/progress`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({
+            execution_id: EXECUTION_ID,
+            action_ticket: TICKET,
+            stage: stage,
+            stage_index: stageIndex,
+            message: message,
+            stats: stats,
+          }),
+        });
+      } catch (e) {}
+    }
+
+    // Handshake
+    try {
+      const headers = { "Content-Type": "application/json" };
+      if (TICKET) headers["Authorization"] = `Bearer ${TICKET}`;
+      await fetch(`${API_BASE}/applications/${APP_ID}/autofill/handshake`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          execution_id: EXECUTION_ID,
+          action_ticket: TICKET,
+          domain: host,
+          companion_version: "1.2.0",
+          ats_detected: atsDetected,
+          form_found: formFound,
+        }),
+      });
+    } catch (hErr) {
+      console.warn("[JobFlow Content] Handshake warning:", hErr);
+    }
+
+    // Step 1.8: Pre-Application Gate Detection (IAGH)
+    function detectPageGate() {
+      const cf = document.querySelector('iframe[src*="challenges.cloudflare.com"], #cf-chl-widget, .cf-turnstile');
+      const h1Text = (document.querySelector('h1, h2, title')?.innerText || '').toLowerCase();
+      if (cf || h1Text.includes('just a moment') || h1Text.includes('verify you are human')) {
+        return {
+          category: 'SECURITY',
+          gateType: 'CLOUDFLARE_VERIFICATION',
+          isBlocking: true,
+          title: 'Security Verification Required',
+          instruction: 'Please complete the Cloudflare verification in this tab. JobFlow will resume automatically.',
+        };
+      }
+
+      const cookieBanner = document.querySelector('#onetrust-banner-sdk, .cookie-banner, .cookie-consent, [aria-label*="cookie" i], [id*="cookie" i]');
+      if (cookieBanner && cookieBanner.querySelector('button, a')) {
+        return {
+          category: 'COOKIE',
+          gateType: 'COOKIE_CONSENT',
+          isBlocking: true,
+          title: 'Cookie Consent Preferences',
+          instruction: 'Please select your cookie preferences in this tab to proceed.',
+          element: cookieBanner,
+        };
+      }
+
+      const pwdInput = document.querySelector('input[type="password"]');
+      const hasResumeInput = !!document.querySelector('input[type="file"], [data-qa="input-resume"]');
+      if (pwdInput && !hasResumeInput) {
+        return {
+          category: 'AUTHENTICATION',
+          gateType: 'LOGIN_REQUIRED',
+          isBlocking: true,
+          title: 'Employer Portal Sign-In Required',
+          instruction: 'Please sign in to your candidate account in this tab. JobFlow will resume once authenticated.',
+          element: pwdInput.closest('form') || pwdInput,
+        };
+      }
+
+      const modalDialog = document.querySelector('dialog[open], [role="dialog"], .modal.show, .modal-open, .terms-modal');
+      const scope = modalDialog || document;
+      const consentHeader = scope.querySelector('h1, h2, h3, h4, legend, strong');
+      const headerText = (consentHeader?.innerText || '').toLowerCase();
+      const hasConsentHeading = /privacy notice|candidate privacy|terms and conditions|recruitment consent|data processing|applicant declaration/i.test(headerText);
+      const agreeBtn = scope.querySelector('button, input[type="submit"], a');
+      const agreeBtnText = (agreeBtn?.innerText || agreeBtn?.value || '').toLowerCase();
+      const hasAgreeBtn = /i agree|i accept|accept and continue|acknowledge|agree & continue/i.test(agreeBtnText);
+      const consentCheckbox = scope.querySelector('input[type="checkbox"][name*="consent" i], input[type="checkbox"][name*="privacy" i], input[type="checkbox"][name*="agree" i]');
+
+      if ((hasConsentHeading && (hasAgreeBtn || consentCheckbox)) || (modalDialog && (hasAgreeBtn || consentCheckbox))) {
+        if (!consentHeader?.closest('footer, .footer, #footer')) {
+          return {
+            category: 'LEGAL_PRIVACY',
+            gateType: headerText.includes('terms') ? 'TERMS_AND_CONDITIONS' : 'PRIVACY_POLICY',
+            isBlocking: true,
+            title: 'Legal & Privacy Agreement Review',
+            instruction: 'The employer requires you to review and accept their agreement before continuing. Please make your decision in this tab.',
+            element: modalDialog || agreeBtn || consentCheckbox,
+          };
+        }
+      }
+
+      const hasName = !!document.querySelector('[data-qa="name-input"], input[name="name"], input[name*="fullname" i]');
+      const hasEmail = !!document.querySelector('[data-qa="email-input"], input[type="email"], input[name="email"]');
+      if ((hasResumeInput && (hasName || hasEmail)) || (hasName && hasEmail)) {
+        return {
+          category: 'NONE',
+          gateType: 'APPLICATION_FORM_READY',
+          isBlocking: false,
+          title: 'Application Form Ready',
+          instruction: 'Application form is ready for auto-population.',
+          formDetected: true,
+        };
+      }
+
+      return {
+        category: 'NONE',
+        gateType: 'GENERIC_PAGE',
+        isBlocking: false,
+        title: 'Page Analyzing',
+        instruction: 'Analyzing page structure...',
+        formDetected: false,
+      };
+    }
+
+    let currentGate = detectPageGate();
+    if (currentGate.isBlocking) {
+      console.log('[JobFlow Content] Blocking gate detected:', currentGate.gateType);
+      const wrap = el('div', { padding: '10px 0' });
+      const badge = el('div', {
+        display: 'inline-flex',
+        alignItems: 'center',
+        padding: '4px 10px',
+        borderRadius: '9999px',
+        background: '#fef3c7',
+        color: '#92400e',
+        fontSize: '11px',
+        fontWeight: '600',
+        marginBottom: '8px',
+      }, {}, '⏳ Action Required in This Tab');
+      const title = el('div', { fontWeight: '700', fontSize: '14px', color: '#0f172a', marginBottom: '6px' }, {}, currentGate.title);
+      const desc = el('div', { fontSize: '12px', color: '#475569', marginBottom: '12px' }, {}, currentGate.instruction);
+      wrap.appendChild(badge);
+      wrap.appendChild(title);
+      wrap.appendChild(desc);
+      setOverlayContent(wrap, companyName, jobTitle);
+
+      try {
+        await fetch(`${API_BASE}/applications/${APP_ID}/autofill/gate-event`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TICKET}` },
+          body: JSON.stringify({
+            execution_id: EXECUTION_ID,
+            action_ticket: TICKET,
+            event_type: 'GATE_DETECTED',
+            current_url: window.location.href,
+          }),
+        });
+      } catch (e) {}
+
+      await new Promise((resolve) => {
+        const interval = setInterval(() => {
+          const check = detectPageGate();
+          if (!check.isBlocking) {
+            clearInterval(interval);
+            resolve(true);
+          }
+        }, 800);
+      });
+
+      try {
+        await fetch(`${API_BASE}/applications/${APP_ID}/autofill/resume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${TICKET}` },
+          body: JSON.stringify({ execution_id: EXECUTION_ID, action_ticket: TICKET }),
+        });
+      } catch (e) {}
+    }
+
+    await pushProgress("FORM_IDENTIFIED", 3, `Identified ${atsDetected.toUpperCase()} application form on ${host}`);
+    await pushProgress("FACTS_RETRIEVED", 4, "Retrieved verified candidate facts from JobFlow profile");
 
     const progressDiv = el("div", { display: "flex", flexDirection: "column", gap: "8px" });
     const stepLabel = el("div", { fontWeight: "600", color: "#334155" }, {}, "Step 1/3: Attaching verified resume...");
@@ -232,11 +428,26 @@
     // 4. Attach Resume Binary to File Upload
     let resumeAttached = false;
     try {
-      const fileInputs = Array.from(document.querySelectorAll('input[type="file"]'));
-      let targetInput = fileInputs.find((i) => {
-        const idName = ((i.id || "") + " " + (i.name || "") + " " + (i.getAttribute("aria-label") || "")).toLowerCase();
-        return idName.includes("resume") || idName.includes("cv") || idName.includes("file");
-      }) || fileInputs[0];
+      const fileInputSelectors = [
+        'input[data-qa="input-resume"]',
+        '#resume-upload-input',
+        'input[type="file"][name="resume"]',
+        '#resume-upload',
+        'input[data-field-identifier="resume"]',
+        'input[type="file"][name*="resume"]',
+        'input[type="file"][id*="resume"]',
+        'input[type="file"][accept*="pdf"]',
+        '.resume-upload input[type="file"]',
+        'input[type="file"]',
+      ];
+      let targetInput = null;
+      for (const sel of fileInputSelectors) {
+        const found = document.querySelector(sel);
+        if (found) {
+          targetInput = found;
+          break;
+        }
+      }
 
       if (targetInput) {
         const resumeUrl = `${API_BASE}/applications/${APP_ID}/autofill/resume-binary?ticket=${encodeURIComponent(TICKET)}`;
@@ -262,9 +473,12 @@
       console.warn("[JobFlow Content] Error attaching resume binary:", err);
     }
 
+    await pushProgress("RESUME_UPLOADED", 5, resumeAttached ? "Verified resume uploaded to file input" : "No file upload input found; proceeding with text fields", { resume_uploaded: resumeAttached });
+
     // 5. Wait for ATS Resume Parsing
     stepLabel.textContent = "Step 2/3: Observing ATS resume parsing...";
     await new Promise((r) => setTimeout(r, 2000));
+    await pushProgress("ATS_PARSING_COMPLETED", 6, "Observed ATS resume parsing response");
 
     // 6. Map and Populate Fields
     stepLabel.textContent = "Step 3/3: Auto-populating verified fields...";
@@ -277,7 +491,8 @@
     const allInputs = Array.from(document.querySelectorAll(fieldSelectors));
 
     for (const input of allInputs) {
-      const idName = ((input.id || "") + " " + (input.name || "") + " " + (input.getAttribute("placeholder") || "") + " " + (input.getAttribute("aria-label") || "")).toLowerCase();
+      const dataQa = (input.getAttribute("data-qa") || "").toLowerCase();
+      const idName = ((input.id || "") + " " + (input.name || "") + " " + (input.getAttribute("placeholder") || "") + " " + (input.getAttribute("aria-label") || "") + " " + dataQa).toLowerCase();
       let labelText = "";
       if (input.id) {
         const l = document.querySelector(`label[for="${input.id}"]`);
@@ -296,7 +511,8 @@
 
       // Check against sensitive fields (Zero Hallucination)
       if (combined.includes("gender") || combined.includes("birth") || combined.includes("dob") ||
-          combined.includes("salary") || combined.includes("notice period") || combined.includes("ctc")) {
+          combined.includes("salary") || combined.includes("notice period") || combined.includes("ctc") ||
+          combined.includes("race") || combined.includes("veteran") || combined.includes("eeo")) {
         manualReviewFields.push({ label: labelText || input.name || input.id, reason: "Requires Candidate Input (Zero Hallucination)" });
         input.style.backgroundColor = "#fffbeb";
         input.style.border = "1.5px solid #f59e0b";
@@ -307,25 +523,54 @@
       let matchedKey = null;
       if (combined.includes("first name") || combined.includes("firstname")) matchedKey = "first_name";
       else if (combined.includes("last name") || combined.includes("lastname") || combined.includes("surname")) matchedKey = "last_name";
-      else if (combined.includes("full name") || combined.includes("fullname") || combined.includes("your name") || combined.includes("candidate name") || combined === "name") matchedKey = "full_name";
-      else if (combined.includes("email") || combined.includes("e-mail")) matchedKey = "email";
-      else if (combined.includes("phone") || combined.includes("mobile") || combined.includes("contact number") || combined.includes("tel")) matchedKey = "phone";
-      else if (combined.includes("linkedin")) matchedKey = "linkedin_url";
-      else if (combined.includes("github")) matchedKey = "github_url";
-      else if (combined.includes("portfolio") || combined.includes("website") || combined.includes("personal url")) matchedKey = "portfolio_url";
-      else if (combined.includes("city") || combined.includes("location") || combined.includes("address")) matchedKey = "location";
-      else if (combined.includes("company") || combined.includes("employer") || combined.includes("organization") || combined.includes("org")) matchedKey = "current_company";
+      else if (combined.includes("name-input") || combined.includes("full name") || combined.includes("fullname") || combined.includes("your name") || combined.includes("candidate name") || combined === "name") matchedKey = "full_name";
+      else if (combined.includes("email-input") || combined.includes("email") || combined.includes("e-mail")) matchedKey = "email";
+      else if (combined.includes("phone-input") || combined.includes("phone") || combined.includes("mobile") || combined.includes("contact number") || combined.includes("tel")) matchedKey = "phone";
+      else if (combined.includes("urls[linkedin]") || combined.includes("linkedin")) matchedKey = "linkedin_url";
+      else if (combined.includes("urls[github]") || combined.includes("github")) matchedKey = "github_url";
+      else if (combined.includes("urls[portfolio]") || combined.includes("portfolio") || combined.includes("website") || combined.includes("personal url")) matchedKey = "portfolio_url";
+      else if (combined.includes("location-input") || combined.includes("city") || combined.includes("location") || combined.includes("address")) matchedKey = "current_location";
+      else if (combined.includes("org-input") || combined.includes("company") || combined.includes("employer") || combined.includes("organization") || combined === "org") matchedKey = "current_company";
       else if (combined.includes("job title") || combined.includes("designation") || combined.includes("title") || combined.includes("current role")) matchedKey = "current_job_title";
       else if (combined.includes("skills") || combined.includes("technologies")) matchedKey = "skills";
 
       if (matchedKey && facts[matchedKey] && facts[matchedKey].value) {
         const fact = facts[matchedKey];
-        setNativeValue(input, fact.value);
-        input.style.backgroundColor = "#ecfdf5";
-        input.style.border = "1.5px solid #10b981";
-        populatedFields.push({ label: labelText || matchedKey, value: fact.value, key: matchedKey });
+        const valToSet = String(fact.value).trim();
+        setNativeValue(input, valToSet);
+
+        // Independent verification in DOM
+        let finalVal = (input.value || "").trim();
+        if (finalVal !== valToSet) {
+          setNativeValue(input, valToSet);
+          finalVal = (input.value || "").trim();
+        }
+
+        if (finalVal === valToSet) {
+          input.style.backgroundColor = "#ecfdf5";
+          input.style.border = "1.5px solid #10b981";
+          populatedFields.push({ label: labelText || matchedKey, value: valToSet, key: matchedKey });
+        } else {
+          manualReviewFields.push({ label: labelText || matchedKey, reason: `Verification mismatch: expected '${valToSet}', got '${finalVal}'` });
+          input.style.backgroundColor = "#fffbeb";
+          input.style.border = "1.5px solid #f59e0b";
+        }
       }
     }
+
+    const isSuccess = (populatedFields.length > 0 || atsParsedFields.length > 0 || resumeAttached);
+    const reportStatus = isSuccess ? "SUCCESS" : "NO_FIELDS_POPULATED";
+    const reportMsg = isSuccess
+      ? `Populated ${populatedFields.length} fields, ${atsParsedFields.length} parsed by ATS, ${manualReviewFields.length} require manual review.`
+      : "Autofill could not populate any fields. The employer form remains unchanged. Please check the browser companion connection.";
+
+    await pushProgress(isSuccess ? "READY_FOR_REVIEW" : "FAILED", isSuccess ? 9 : 4, reportMsg, {
+      fields_populated_count: populatedFields.length,
+      fields_ats_parsed_count: atsParsedFields.length,
+      fields_preserved_count: 0,
+      fields_manual_review_count: manualReviewFields.length,
+      fields_verified_count: populatedFields.length,
+    });
 
     // 7. Render Final Summary Card in Overlay
     const summaryCard = el("div", { display: "flex", flexDirection: "column", gap: "12px" });
@@ -335,8 +580,8 @@
       gap: "6px",
       fontSize: "14px",
       fontWeight: "600",
-      color: "#059669",
-    }, {}, "✓ Form Auto-Population Complete");
+      color: isSuccess ? "#059669" : "#b45309",
+    }, {}, isSuccess ? "✓ Form Auto-Population Complete" : "⚠ Autofill Could Not Populate Fields");
 
     const statGrid = el("div", {
       display: "grid",
@@ -365,15 +610,17 @@
     statGrid.appendChild(statBox(manualReviewFields.length, "Review", "#f59e0b"));
 
     const alertBanner = el("div", {
-      background: "#eff6ff",
-      border: "1px solid #bfdbfe",
-      color: "#1e40af",
+      background: isSuccess ? "#eff6ff" : "#fffbeb",
+      border: `1px solid ${isSuccess ? "#bfdbfe" : "#fde68a"}`,
+      color: isSuccess ? "#1e40af" : "#92400e",
       borderRadius: "8px",
       padding: "10px",
       fontSize: "11px",
       lineHeight: "1.4",
       fontWeight: "500",
-    }, {}, "Strict Human Control: Please review all populated fields above. JobFlow AI never submits forms automatically. When satisfied, click the employer's Apply button yourself.");
+    }, {}, isSuccess
+      ? "Strict Human Control: Please review all populated fields above. JobFlow AI never submits forms automatically. When satisfied, click the employer's Apply button yourself."
+      : "The employer form remains unchanged. Please inspect the page or complete the application manually.");
 
     summaryCard.appendChild(successTitle);
     summaryCard.appendChild(statGrid);
@@ -390,6 +637,8 @@
       fields_populated: populatedFields.length,
       fields_preserved: atsParsedFields.length,
       manual_review_fields: manualReviewFields.length,
+      status: reportStatus,
+      message: reportMsg,
       field_results: populatedFields.map((f) => ({
         target_name: f.label,
         matched_fact: f.key,
