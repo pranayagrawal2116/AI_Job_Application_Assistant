@@ -61,6 +61,11 @@ class HumanInteractionManager:
         # Legal / Consent
         r"i agree",
         r"i accept",
+        r"i don't agree",
+        r"don't agree",
+        r"disagree",
+        r"decline",
+        r"reject",
         r"accept and continue",
         r"acknowledge",
         r"consent",
