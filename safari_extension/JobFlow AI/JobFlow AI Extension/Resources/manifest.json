@@ -27,18 +27,41 @@
   ],
   "host_permissions": [
     "http://localhost:3000/*",
+    "http://127.0.0.1:3000/*",
     "http://127.0.0.1:8000/*",
-    "https://*/*"
+    "https://*.lever.co/*",
+    "https://*.greenhouse.io/*",
+    "https://*.myworkdayjobs.com/*",
+    "https://*.keka.com/*",
+    "https://*.ripplehire.com/*",
+    "https://*.kula.ai/*",
+    "https://careers.*/*",
+    "https://jobs.*/*"
   ],
   "content_scripts": [
     {
-      "matches": ["http://localhost:3000/*"],
+      "matches": [
+        "http://localhost:3000/*",
+        "http://127.0.0.1:3000/*"
+      ],
       "js": ["jobflow_bridge.js"],
       "run_at": "document_idle"
     },
     {
-      "matches": ["https://*/*", "http://*/*"],
-      "exclude_matches": ["http://localhost:3000/*", "http://127.0.0.1:8000/*"],
+      "matches": [
+        "https://*.lever.co/*",
+        "https://*.greenhouse.io/*",
+        "https://*.myworkdayjobs.com/*",
+        "https://*.keka.com/*",
+        "https://*.ripplehire.com/*",
+        "https://*.kula.ai/*",
+        "https://careers.*/*",
+        "https://jobs.*/*"
+      ],
+      "exclude_matches": [
+        "http://localhost:3000/*",
+        "http://127.0.0.1:8000/*"
+      ],
       "js": ["content.js"],
       "css": ["styles.css"],
       "run_at": "document_idle"

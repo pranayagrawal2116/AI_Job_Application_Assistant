@@ -60,6 +60,45 @@ if (typeof chrome === "undefined" && typeof browser !== "undefined") {
     return;
   }
 
+  // STRICT ORIGIN & TARGET DOMAIN SECURITY:
+  // Verify that the current page's hostname matches the authorized application target domain.
+  // Never expose or execute candidate data operations on unauthorized or unrelated websites.
+  function isAuthorizedOriginForPlan(plan) {
+    if (!plan) return false;
+    const currentHost = window.location.hostname.toLowerCase();
+
+    // 1. Direct match on plan's target_url host or validated_domain
+    const targetUrl = plan.target_url || "";
+    let targetHost = "";
+    try {
+      if (targetUrl) targetHost = new URL(targetUrl).hostname.toLowerCase();
+    } catch (_) {}
+
+    const validatedDomain = (plan.validated_domain || "").toLowerCase();
+
+    if (targetHost && (currentHost === targetHost || currentHost.endsWith("." + targetHost) || targetHost.endsWith("." + currentHost))) {
+      return true;
+    }
+    if (validatedDomain && (currentHost === validatedDomain || currentHost.endsWith("." + validatedDomain) || validatedDomain.endsWith("." + currentHost))) {
+      return true;
+    }
+
+    // 2. Authorized ATS redirect domains (e.g. redirected from career page to ripplehire, kula, lever, keka, greenhouse, workday)
+    const supportedAtsRootDomains = ["lever.co", "greenhouse.io", "myworkdayjobs.com", "keka.com", "ripplehire.com", "kula.ai"];
+    for (const root of supportedAtsRootDomains) {
+      if (currentHost === root || currentHost.endsWith("." + root)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  if (!isAuthorizedOriginForPlan(activePlan)) {
+    console.warn(`[JobFlow Security] Origin '${window.location.hostname}' does not match authorized application target '${activePlan.validated_domain || activePlan.target_url}'. Halting to protect candidate data.`);
+    return;
+  }
+
   // Set global config so existing companion script functions can read it seamlessly
   window.JOBFLOW_CONFIG = {
     apiBase: activePlan.api_base || "http://127.0.0.1:8000/api",
