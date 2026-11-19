@@ -1,3 +1,10 @@
+// Cross-browser compatibility polyfill (Safari Web Extension / Chrome / Firefox)
+if (typeof chrome === "undefined" && typeof browser !== "undefined") {
+  globalThis.chrome = browser;
+} else if (typeof browser === "undefined" && typeof chrome !== "undefined") {
+  globalThis.browser = chrome;
+}
+
 document.addEventListener("DOMContentLoaded", async () => {
   const statusBadge = document.getElementById("statusBadge");
   const statusDot = document.getElementById("statusDot");

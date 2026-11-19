@@ -104,3 +104,9 @@ Thumbs.db
 *.swp
 *.swo
 
+# Xcode & Safari Web Extension Build Artifacts
+safari_extension/build_derived/
+*.xcuserstate
+xcuserdata/
+
+

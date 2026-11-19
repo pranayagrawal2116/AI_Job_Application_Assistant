@@ -1,7 +1,14 @@
 /**
- * JobFlow AI — Chrome Extension Content Script (content.js)
+ * JobFlow AI — Cross-Browser Extension Content Script (Chrome, Safari, Firefox)
  * Automatically detects employer ATS forms and performs autofill using verified candidate data.
  */
+
+// Cross-browser compatibility polyfill (Safari Web Extension / Chrome / Firefox)
+if (typeof chrome === "undefined" && typeof browser !== "undefined") {
+  globalThis.chrome = browser;
+} else if (typeof browser === "undefined" && typeof chrome !== "undefined") {
+  globalThis.browser = chrome;
+}
 
 (async function () {
   console.log("[JobFlow Content] Initialized on:", window.location.href);

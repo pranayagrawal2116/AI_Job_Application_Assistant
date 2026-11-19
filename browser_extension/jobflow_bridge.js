@@ -1,7 +1,14 @@
 /**
  * JobFlow AI — React Web App Bridge (jobflow_bridge.js)
- * Injected on http://localhost:3000 to bridge web UI actions with the Chrome Extension.
+ * Injected on http://localhost:3000 to bridge web UI actions with the Chrome/Safari Extension.
  */
+
+// Cross-browser compatibility polyfill (Safari Web Extension / Chrome / Firefox)
+if (typeof chrome === "undefined" && typeof browser !== "undefined") {
+  globalThis.chrome = browser;
+} else if (typeof browser === "undefined" && typeof chrome !== "undefined") {
+  globalThis.browser = chrome;
+}
 
 (function () {
   // 1. Signal to React that the JobFlow Extension is active and ready

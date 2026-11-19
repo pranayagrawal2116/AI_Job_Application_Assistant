@@ -62,6 +62,8 @@ class ATSProvider:
     GREENHOUSE = "GREENHOUSE"
     LEVER = "LEVER"
     WORKDAY = "WORKDAY"
+    RIPPLEHIRE = "RIPPLEHIRE"
+    KULA = "KULA"
     UNIVERSAL = "UNIVERSAL"
 
 
@@ -453,6 +455,14 @@ class ApplicationFormFillingBroker:
         # Workday detection
         if "myworkdayjobs.com" in host or "workday" in host:
             return ATSProvider.WORKDAY
+
+        # RippleHire detection
+        if "ripplehire.com" in host or "candidate.ripplehire" in host or "ripplehire" in lower_html:
+            return ATSProvider.RIPPLEHIRE
+
+        # Kula detection
+        if "kula.ai" in host or "careers.kula.ai" in host or "kula" in lower_html or "info.first_name" in lower_html:
+            return ATSProvider.KULA
 
         return ATSProvider.UNIVERSAL
 

@@ -1,0 +1,36 @@
+/**
+ * JobFlow AI — Chrome Extension In-Page Styles
+ */
+
+#jobflow-assistant-overlay {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif !important;
+  transition: all 0.2s ease-in-out;
+}
+
+#jobflow-assistant-overlay * {
+  box-sizing: border-box;
+}
+
+/* Pulsing highlight for currently auto-filling elements */
+.jobflow-highlight-active {
+  outline: 2px solid #4f46e5 !important;
+  box-shadow: 0 0 0 4px rgba(79, 70, 229, 0.2) !important;
+}
+
+/* Populated fields highlight */
+.jobflow-highlight-populated {
+  background-color: #ecfdf5 !important;
+  border-color: #10b981 !important;
+}
+
+/* Manual review highlight */
+.jobflow-highlight-review {
+  background-color: #fffbeb !important;
+  border-color: #f59e0b !important;
+}
+
+/* ATS parsed highlight */
+.jobflow-highlight-atsparsed {
+  background-color: #eff6ff !important;
+  border-color: #3b82f6 !important;
+}

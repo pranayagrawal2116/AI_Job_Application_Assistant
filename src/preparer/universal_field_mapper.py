@@ -115,7 +115,7 @@ class UniversalFieldMapper:
         provenance_map = p.get("field_provenance") or {}
 
         # 1. Name fields
-        full_name = (personal.get("full_name") or p.get("full_name") or "").strip()
+        full_name = (personal.get("full_name") or p.get("full_name") or personal.get("name") or p.get("name") or "").strip()
         name_prov = self._resolve_provenance("full_name", full_name, provenance_map)
         self.facts["full_name"] = CandidateFieldFact(
             canonical_key="full_name",
@@ -788,8 +788,11 @@ class UniversalFieldMapper:
             return ("skills", 0.90, "Matched skills input")
 
         # 22. Current Company / Employer / Organization (e.g. Lever "org", Greenhouse "company")
-        if any(w in combined for w in ["current company", "current employer", "organization", "org", "company name", "employer"]):
-            return ("current_company", 0.95, "Matched current employer / organization")
+        # Ensure open-ended essay questions (e.g. "Why do you think Avoma will be a good choice as your next organization...")
+        # are NEVER falsely matched to the candidate's current employer.
+        if not any(w in combined for w in ["why", "choice", "fit", "tell us", "describe", "reason", "motivate", "next organization"]):
+            if any(w in combined for w in ["current company", "current employer", "organization", "org", "company name", "employer"]):
+                return ("current_company", 0.95, "Matched current employer / organization")
 
         # 23. Current Job Title / Role
         if any(w in combined for w in ["job title", "designation", "current role", "current title", "headline", "position"]):

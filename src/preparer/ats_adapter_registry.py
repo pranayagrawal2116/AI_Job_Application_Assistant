@@ -327,6 +327,61 @@ class RippleHireATSAdapter(BaseATSAdapter):
         }
 
 
+class KulaATSAdapter(BaseATSAdapter):
+    """Adapter for Kula ATS (e.g. careers.kula.ai, kula.ai)."""
+
+    @property
+    def provider_name(self) -> str:
+        return "KULA"
+
+    def matches(self, url: str, html_snippet: str = "") -> bool:
+        parsed = urlparse(url or "")
+        host = (parsed.hostname or "").lower()
+        lower_html = html_snippet.lower() if html_snippet else ""
+        return (
+            "kula.ai" in host or
+            "careers.kula.ai" in host or
+            "kula" in lower_html or
+            ("chakra-tabs" in lower_html and "apply for this position" in lower_html) or
+            "info.first_name" in lower_html
+        )
+
+    def get_resume_selectors(self) -> List[str]:
+        return [
+            "input#resume[type='file']",
+            "input[type='file']#resume",
+            "input[type='file']",
+        ]
+
+    def get_parsing_indicators(self) -> List[str]:
+        return [
+            "[data-qa='resume-success']",
+            ".uploaded-resume-info",
+            ".chakra-alert",
+            "p:has-text('Autofill from resume')",
+        ]
+
+    def get_form_selectors(self) -> List[str]:
+        return [
+            "form",
+            "[role='tabpanel']",
+            ".chakra-tabs__tab-panel",
+        ]
+
+    def get_submit_selectors(self) -> List[str]:
+        return [
+            "button:has-text('Apply for this position')",
+            "button[type='submit']",
+            "button:has-text('Apply')",
+        ]
+
+    def get_known_gate_hints(self) -> Dict[str, Any]:
+        return {
+            "has_autofill_from_resume_feature": True,
+            "has_country_phone_prefix_selector": True,
+        }
+
+
 class UniversalATSAdapter(BaseATSAdapter):
     """Universal fallback adapter for generic employer career sites."""
 
@@ -383,6 +438,7 @@ class ATSAdapterRegistry:
         WorkdayATSAdapter(),
         KekaATSAdapter(),
         RippleHireATSAdapter(),
+        KulaATSAdapter(),
     ]
     _fallback_adapter: BaseATSAdapter = UniversalATSAdapter()
 
